@@ -2316,7 +2316,7 @@ int request_remote_pages(unsigned long img_id, unsigned long addr, unsigned long
 		.vaddr = addr,
 		.dst_id = img_id,
 	};
-
+	pr_debug("file = %s line = %d, PS_IOV_GET\n", __FILE__, __LINE__);
 	/* XXX: why MSG_DONTWAIT here? */
 	if (send_psi_flags(page_server_sk, &pi, MSG_DONTWAIT))
 		return -1;
