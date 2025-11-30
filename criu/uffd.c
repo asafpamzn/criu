@@ -630,17 +630,26 @@ static int __drop_iovs(struct list_head *iovs, unsigned long addr, int len)
 {
 	struct lazy_iov *iov, *n;
 
+	pr_err("__drop_iovs: addr=0x%lx len=0x%x\n", addr, len);
+
 	list_for_each_entry_safe(iov, n, iovs, l) {
 		unsigned long start = iov->start;
 		unsigned long end = iov->end;
 
-		if (len <= 0 || addr + len < start)
-			break;
+		pr_err("  Processing IOV: 0x%lx-0x%lx\n", start, end);
 
-		if (addr >= end)
+		if (len <= 0 || addr + len < start) {
+			pr_err("    Breaking: len exhausted or before iov\n");
+			break;
+		}
+
+		if (addr >= end) {
+			pr_err("    Skipping: addr >= iov->end\n");
 			continue;
+		}
 
 		if (addr < start) {
+			pr_err("    Adjusting: addr < start, moving addr to 0x%lx\n", start);
 			len -= (start - addr);
 			addr = start;
 		}
@@ -654,9 +663,13 @@ static int __drop_iovs(struct list_head *iovs, unsigned long addr, int len)
 		 */
 		if (addr + len < end) {
 			if (addr == start) {
+				pr_err("    Partial drop: adjusting IOV start 0x%lx -> 0x%lx\n", 
+				       iov->start, iov->start + len);
 				iov->start += len;
 				iov->img_start += len;
 			} else {
+				pr_err("    Partial drop: splitting at 0x%lx, truncating to 0x%lx\n",
+				       addr + len, addr);
 				if (split_iov(iov, addr + len))
 					return -1;
 				iov->end = addr;
@@ -671,9 +684,11 @@ static int __drop_iovs(struct list_head *iovs, unsigned long addr, int len)
 		 * and continue to the next one with the updated range
 		 */
 		if (addr == start) {
+			pr_err("    Full drop: deleting entire IOV 0x%lx-0x%lx\n", start, end);
 			list_del(&iov->l);
 			xfree(iov);
 		} else {
+			pr_err("    Partial drop: truncating IOV end 0x%lx -> 0x%lx\n", end, addr);
 			iov->end = addr;
 		}
 
@@ -681,6 +696,7 @@ static int __drop_iovs(struct list_head *iovs, unsigned long addr, int len)
 		addr = end;
 	}
 
+	pr_err("__drop_iovs: complete\n");
 	return 0;
 }
 
@@ -719,19 +735,29 @@ static int __remap_iovs(struct list_head *iovs, unsigned long from, unsigned lon
 	unsigned long off = to - from;
 	struct lazy_iov *iov, *n;
 
-	list_for_each_entry_safe(iov, n, iovs, l) {
-		if (from >= iov->end)
-			continue;
+	pr_err("__remap_iovs: from=0x%lx to=0x%lx len=0x%lx (off=0x%lx)\n", from, to, len, off);
 
-		if (len <= 0 || from + len <= iov->start)
+	list_for_each_entry_safe(iov, n, iovs, l) {
+		pr_err("  Processing IOV: 0x%lx-0x%lx\n", iov->start, iov->end);
+		
+		if (from >= iov->end) {
+			pr_err("    Skipping: from >= iov->end\n");
+			continue;
+		}
+
+		if (len <= 0 || from + len <= iov->start) {
+			pr_err("    Breaking: len exhausted or past iov\n");
 			break;
+		}
 
 		if (from < iov->start) {
+			pr_err("    Adjusting: from < iov->start, moving from to 0x%lx\n", iov->start);
 			len -= (iov->start - from);
 			from = iov->start;
 		}
 
 		if (from > iov->start) {
+			pr_err("    Splitting IOV at from=0x%lx\n", from);
 			if (split_iov(iov, from))
 				return -1;
 			list_safe_reset_next(iov, n, l);
@@ -739,12 +765,15 @@ static int __remap_iovs(struct list_head *iovs, unsigned long from, unsigned lon
 		}
 
 		if (from + len < iov->end) {
+			pr_err("    Splitting IOV at from+len=0x%lx\n", from + len);
 			if (split_iov(iov, from + len))
 				return -1;
 			list_safe_reset_next(iov, n, l);
 		}
 
 		/* here we have iov->start = from, iov->end <= from + len */
+		pr_err("    Remapping IOV: 0x%lx-0x%lx -> 0x%lx-0x%lx\n", 
+		       iov->start, iov->end, iov->start + off, iov->end + off);
 		from = iov->end;
 		len -= iov->end - iov->start;
 		iov->start += off;
@@ -753,6 +782,7 @@ static int __remap_iovs(struct list_head *iovs, unsigned long from, unsigned lon
 	}
 
 	merge_iov_lists(&remaps, iovs);
+	pr_err("__remap_iovs: complete\n");
 
 	return 0;
 }
