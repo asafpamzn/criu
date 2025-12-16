@@ -36,6 +36,7 @@
 #include "criu-plugin.h"
 #include "plugin.h"
 #include "dump.h"
+#include "mem.h"
 
 static int page_server_sk = -1;
 
