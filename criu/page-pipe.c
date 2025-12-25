@@ -11,11 +11,288 @@
 #include "fcntl.h"
 #include "stats.h"
 #include "cr_options.h"
-
+#include <time.h>
 #include "syscall.h"
 #include <sys/ioctl.h>  // defines FIONREAD
 
 /* can existing iov accumulate the page? */
+
+/* ============================================================================
+ * HASH TABLE FOR O(1) PAGE LOOKUP
+ * 
+ * Maps: page_address -> (ppb, seg_idx, prefix_len)
+ * 
+ * This gives O(1) lookup for ALL access patterns:
+ * - P1 (COW): Random addresses -> O(1)
+ * - P2 (Request): Random addresses -> O(1)  
+ * - P3 (Regular): Sequential addresses -> O(1)
+ * ============================================================================
+ */
+
+/* Hash table size: 2^20 = 1M buckets */
+#define PP_HASH_BITS    20
+#define PP_HASH_SIZE    (1UL << PP_HASH_BITS)
+#define PP_HASH_MASK    (PP_HASH_SIZE - 1)
+
+/* Hash entry: stores location info for one page */
+struct pp_hash_entry {
+	unsigned long page_addr;        /* Page address (key) */
+	struct page_pipe_buf *ppb;      /* Buffer containing this page */
+	unsigned int seg_idx;           /* Segment index within buffer */
+	unsigned long seg_start;        /* Segment start address */
+	unsigned long prefix_len;       /* Sum of segment lengths before this segment */
+	struct pp_hash_entry *next;     /* Collision chain */
+};
+
+/* Hash table state */
+static struct pp_hash_entry **g_hash_buckets = NULL;
+static struct page_pipe *g_hash_owner = NULL;
+static unsigned long g_hash_num_entries = 0;
+static bool g_hash_built = false;
+
+/* Statistics */
+static unsigned long g_hash_lookups = 0;
+static unsigned long g_hash_hits = 0;
+static unsigned long g_hash_misses = 0;
+static unsigned long g_hash_chain_walks = 0;
+static time_t g_hash_last_log_time = 0;
+
+/* 
+ * Hash function: Knuth multiplicative hash
+ * Good distribution for page-aligned addresses
+ */
+static inline unsigned long pp_hash_func(unsigned long addr)
+{
+	unsigned long page_num = addr >> PAGE_SHIFT;
+	return (page_num * 2654435761UL) & PP_HASH_MASK;
+}
+
+/*
+ * Build hash table from page_pipe
+ * Call this AFTER all pages have been added to page_pipe
+ * Returns: 0 on success, -1 on failure
+ */
+int page_pipe_build_hash(struct page_pipe *pp)
+{
+	struct page_pipe_buf *ppb;
+	struct pp_hash_entry *entry;
+	struct pp_hash_entry *tmp;
+	struct pp_hash_entry *e;
+	struct pp_hash_entry *next_e;
+	struct iovec *iov;
+	unsigned int seg_idx;
+	unsigned long bucket;
+	unsigned long total_pages = 0;
+	unsigned long collisions = 0;
+	unsigned long max_chain = 0;
+	unsigned long prefix_len;
+	unsigned long seg_start;
+	unsigned long seg_pages;
+	unsigned long page_addr;
+	unsigned long chain_len;
+	unsigned long p;
+	unsigned long i;
+	unsigned long bucket_mem;
+	unsigned long entry_mem;
+	unsigned long total_mem;
+	
+	pr_info("Building hash table for O(1) page lookup...\n");
+	
+	/* Free existing hash table if any */
+	if (g_hash_buckets) {
+		for (i = 0; i < PP_HASH_SIZE; i++) {
+			e = g_hash_buckets[i];
+			while (e) {
+				next_e = e->next;
+				xfree(e);
+				e = next_e;
+			}
+		}
+		xfree(g_hash_buckets);
+		g_hash_buckets = NULL;
+	}
+	
+	/* Allocate bucket array (zeroed) */
+	g_hash_buckets = xzalloc(PP_HASH_SIZE * sizeof(struct pp_hash_entry *));
+	if (!g_hash_buckets) {
+		pr_err("Failed to allocate hash table (%lu bytes)\n", 
+		       PP_HASH_SIZE * sizeof(struct pp_hash_entry *));
+		return -1;
+	}
+	
+	/* Reset state */
+	g_hash_owner = pp;
+	g_hash_num_entries = 0;
+	g_hash_lookups = 0;
+	g_hash_hits = 0;
+	g_hash_misses = 0;
+	g_hash_chain_walks = 0;
+	g_hash_built = false;
+	
+	/* Iterate through all buffers and segments */
+	list_for_each_entry(ppb, &pp->bufs, l) {
+		prefix_len = 0;  /* Cumulative length before current segment */
+		
+		for (seg_idx = 0; seg_idx < ppb->nr_segs; seg_idx++) {
+			iov = &ppb->iov[seg_idx];
+			seg_start = (unsigned long)iov->iov_base;
+			seg_pages = iov->iov_len / PAGE_SIZE;
+			
+			/* Insert each page in this segment */
+			for (p = 0; p < seg_pages; p++) {
+				page_addr = seg_start + (p * PAGE_SIZE);
+				
+				/* Allocate entry */
+				entry = xmalloc(sizeof(*entry));
+				if (!entry) {
+					pr_err("Failed to allocate hash entry (page %lu)\n", total_pages);
+					/* Clean up on failure */
+					for (i = 0; i < PP_HASH_SIZE; i++) {
+						e = g_hash_buckets[i];
+						while (e) {
+							next_e = e->next;
+							xfree(e);
+							e = next_e;
+						}
+					}
+					xfree(g_hash_buckets);
+					g_hash_buckets = NULL;
+					return -1;
+				}
+				
+				/* Fill entry */
+				entry->page_addr = page_addr;
+				entry->ppb = ppb;
+				entry->seg_idx = seg_idx;
+				entry->seg_start = seg_start;
+				entry->prefix_len = prefix_len;
+				
+				/* Insert at head of bucket chain */
+				bucket = pp_hash_func(page_addr);
+				
+				/* Count chain length for statistics */
+				chain_len = 0;
+				if (g_hash_buckets[bucket]) {
+					collisions++;
+					tmp = g_hash_buckets[bucket];
+					while (tmp) {
+						chain_len++;
+						tmp = tmp->next;
+					}
+					if (chain_len > max_chain)
+						max_chain = chain_len;
+				}
+				
+				entry->next = g_hash_buckets[bucket];
+				g_hash_buckets[bucket] = entry;
+				
+				g_hash_num_entries++;
+				total_pages++;
+			}
+			
+			/* Update prefix_len for next segment */
+			prefix_len += iov->iov_len;
+		}
+	}
+	
+	g_hash_built = true;
+	
+	/* Calculate memory usage */
+	bucket_mem = PP_HASH_SIZE * sizeof(struct pp_hash_entry *);
+	entry_mem = total_pages * sizeof(struct pp_hash_entry);
+	total_mem = bucket_mem + entry_mem;
+	
+	pr_info("Hash table built successfully:\n");
+	pr_info("  Pages indexed: %lu\n", total_pages);
+	pr_info("  Buckets: %lu (%.1f%% load factor)\n", 
+	        PP_HASH_SIZE, (double)total_pages * 100.0 / PP_HASH_SIZE);
+	pr_info("  Collisions: %lu (%.1f%%)\n",
+	        collisions, total_pages > 0 ? (double)collisions * 100.0 / total_pages : 0.0);
+	pr_info("  Max chain length: %lu\n", max_chain);
+	pr_info("  Memory usage: %.1f MB (buckets: %.1f MB, entries: %.1f MB)\n",
+	        total_mem / 1048576.0, bucket_mem / 1048576.0, entry_mem / 1048576.0);
+	
+	return 0;
+}
+
+/*
+ * Destroy hash table and free all memory
+ */
+void page_pipe_destroy_hash(void)
+{
+	struct pp_hash_entry *e;
+	struct pp_hash_entry *next_e;
+	unsigned long i;
+	
+	if (!g_hash_buckets)
+		return;
+	
+	pr_info("Destroying hash table...\n");
+	pr_info("  Final stats: %lu lookups, %lu hits (%.2f%%), %lu misses, %lu chain walks\n",
+	        g_hash_lookups, g_hash_hits,
+	        g_hash_lookups > 0 ? (double)g_hash_hits * 100.0 / g_hash_lookups : 0.0,
+	        g_hash_misses, g_hash_chain_walks);
+	
+	/* Free all entries */
+	for (i = 0; i < PP_HASH_SIZE; i++) {
+		e = g_hash_buckets[i];
+		while (e) {
+			next_e = e->next;
+			xfree(e);
+			e = next_e;
+		}
+	}
+	
+	/* Free bucket array */
+	xfree(g_hash_buckets);
+	g_hash_buckets = NULL;
+	g_hash_owner = NULL;
+	g_hash_num_entries = 0;
+	g_hash_built = false;
+}
+
+/*
+ * Hash table lookup - O(1) average case
+ */
+static inline struct pp_hash_entry *pp_hash_lookup(unsigned long addr)
+{
+	unsigned long bucket;
+	struct pp_hash_entry *entry;
+	
+	bucket = pp_hash_func(addr);
+	entry = g_hash_buckets[bucket];
+	
+	while (entry) {
+		if (entry->page_addr == addr) {
+			return entry;
+		}
+		g_hash_chain_walks++;
+		entry = entry->next;
+	}
+	
+	return NULL;
+}
+
+/*
+ * Log hash table statistics every second
+ */
+static void pp_hash_log_stats(void)
+{
+	time_t now = time(NULL);
+	
+	if (now != g_hash_last_log_time) {
+		double hit_rate = g_hash_lookups > 0 ? 
+			(double)g_hash_hits * 100.0 / g_hash_lookups : 0.0;
+		double avg_chain = g_hash_hits > 0 ?
+			(double)g_hash_chain_walks / g_hash_hits : 0.0;
+		
+		pr_warn("[HASH_STATS] lookups=%lu hits=%lu (%.1f%%) misses=%lu avg_chain=%.2f\n",
+		        g_hash_lookups, g_hash_hits, hit_rate, g_hash_misses, avg_chain);
+		
+		g_hash_last_log_time = now;
+	}
+}
+
 static inline bool iov_grow_page(struct iovec *iov, unsigned long addr)
 {
 	if ((unsigned long)iov->iov_base + iov->iov_len == addr) {
@@ -229,6 +506,11 @@ void destroy_page_pipe(struct page_pipe *pp)
 
 	pr_debug("Killing page pipe\n");
 
+	/* Destroy hash table if this page_pipe owns it */
+	if (g_hash_owner == pp) {
+		page_pipe_destroy_hash();
+	}
+
 	list_splice(&pp->free_bufs, &pp->bufs);
 	list_for_each_entry_safe(ppb, n, &pp->bufs, l)
 		ppb_destroy(ppb);
@@ -327,35 +609,57 @@ out:
 	return 0;
 }
 
+/* ============================================================================
+ * GET_PPB: O(1) HASH TABLE LOOKUP
+ * ============================================================================
+ */
+
 /*
  * Get ppb and iov that contain addr and count amount of data between
  * beginning of the pipe belonging to the ppb and addr
+ *
+ * HASH TABLE VERSION: O(1) for ALL access patterns
+ * - P1 (COW random): O(1)
+ * - P2 (Request random): O(1)
+ * - P3 (Sequential): O(1)
  */
 static struct page_pipe_buf *get_ppb(struct page_pipe *pp, unsigned long addr, struct iovec **iov_ret,
 				     unsigned long *len)
 {
-	struct page_pipe_buf *ppb;
-	int i;
-
-	list_for_each_entry(ppb, &pp->bufs, l) {
-		for (i = 0, *len = 0; i < ppb->nr_segs; i++) {
-			struct iovec *iov = &ppb->iov[i];
-			unsigned long base = (unsigned long)iov->iov_base;
-
-			if (addr < base || addr >= base + iov->iov_len) {
-				*len += iov->iov_len;
-				continue;
-			}
-
-			/* got iov that contains the addr */
-			*len += (addr - base);
-			*iov_ret = iov;
-			//pr_warn("DEBUG file =%s, line = %d\n", __FILE__, __LINE__);
-			//list_move(&ppb->l, &pp->bufs); TODO ADD BACK
-			return ppb;
-		}
+	struct pp_hash_entry *entry;
+	
+	g_hash_lookups++;
+	
+	/* Verify hash table is built and belongs to this page_pipe */
+	if (!g_hash_built || g_hash_owner != pp) {
+		pr_err("Hash table not built or wrong owner! Call page_pipe_build_hash() first.\n");
+		g_hash_misses++;
+		return NULL;
 	}
-
+	
+	/* O(1) hash lookup */
+	entry = pp_hash_lookup(addr);
+	
+	if (entry) {
+		/* Hit! Compute outputs */
+		g_hash_hits++;
+		
+		/* iov_ret: pointer to the segment */
+		*iov_ret = &entry->ppb->iov[entry->seg_idx];
+		
+		/* len: prefix_len + offset within segment */
+		*len = entry->prefix_len + (addr - entry->seg_start);
+		
+		/* Log stats periodically */
+		pp_hash_log_stats();
+		
+		return entry->ppb;
+	}
+	
+	/* Miss: address not in page_pipe */
+	g_hash_misses++;
+	pp_hash_log_stats();
+	
 	return NULL;
 }
 
@@ -406,7 +710,7 @@ int page_pipe_read(struct page_pipe *pp, unsigned long addr, unsigned long int *
 
 	if (!(ppb->flags & ppb_flags)) {
 		pr_err("PPB flags mismatch: %x %x\n", ppb_flags, ppb->flags);
-		return false;
+		return -1;
 	}
 
 	/* clamp the request if it passes the end of iovec */
@@ -451,8 +755,9 @@ int page_pipe_read(struct page_pipe *pp, unsigned long addr, unsigned long int *
 		pr_debug("process_vm_readv: read %lu bytes from pid=%d addr=%lx\n", len, pp->source_pid, addr);
 		return 0;
 	}
-	pr_perror("No pid exot\n");
-	exit(0);
+
+	pr_perror("No source_pid set\n");
+	exit(1);
 	/*
 	 * Fallback path: Read from pipe (for compatibility when
 	 * source process is not available). Skip unwanted bytes,

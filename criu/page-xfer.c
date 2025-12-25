@@ -1728,6 +1728,17 @@ static int add_active_image(u64 dst_id, int sk)
 		return 0;  /* Nothing to send */
 	}
 	pr_warn("DEBUG file =%s, line = %d\n", __FILE__, __LINE__);
+	
+	/* ============================================================
+	 * BUILD HASH TABLE FOR O(1) LOOKUP
+	 * This must be done AFTER page_pipe is fully populated
+	 * and BEFORE we start transferring pages
+	 * ============================================================ */
+	if (page_pipe_build_hash(pp) < 0) {
+		pr_err("Failed to build page hash table for dst_id=%lu\n", dst_id);
+		return -1;
+	}
+	
 	/* Allocate per-buffer sent bitmaps for PPB_LAZY buffers */
 	buf_idx = 0;
 	list_for_each_entry(ppb, &pp->bufs, l) {
@@ -1747,6 +1758,8 @@ static int add_active_image(u64 dst_id, int sk)
 						tmp_ppb->sent_bitmap = NULL;
 					}
 				}
+				/* Also destroy hash table on failure */
+				page_pipe_destroy_hash();
 				return -1;
 			}
 			pr_debug("Allocated %lu-byte bitmap for buffer %u (%lu pages)\n",
@@ -1759,6 +1772,14 @@ static int add_active_image(u64 dst_id, int sk)
 	img = xzalloc(sizeof(*img));
 	if (!img) {
 		pr_err("Failed to allocate active image\n");
+		/* Clean up bitmaps and hash table */
+		list_for_each_entry(ppb, &pp->bufs, l) {
+			if (ppb->sent_bitmap) {
+				xfree(ppb->sent_bitmap);
+				ppb->sent_bitmap = NULL;
+			}
+		}
+		page_pipe_destroy_hash();
 		return -1;
 	}
 	

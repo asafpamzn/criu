@@ -156,4 +156,13 @@ extern int pipe_read_dest_init(struct pipe_read_dest *prd);
 extern int page_pipe_read(struct page_pipe *pp, unsigned long addr, unsigned long *nr_pages,
 			  unsigned int ppb_flags, void **out_buffer, size_t *out_len);
 
+/*
+ * Hash table for O(1) page lookup
+ * 
+ * Build the hash table AFTER all pages have been added to page_pipe.
+ * This enables O(1) lookup for all access patterns (P1 COW, P2 Request, P3 Regular).
+ */
+extern int page_pipe_build_hash(struct page_pipe *pp);
+extern void page_pipe_destroy_hash(void);
+
 #endif /* __CR_PAGE_PIPE_H__ */
