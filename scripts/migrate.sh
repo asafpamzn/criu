@@ -14,14 +14,12 @@ log() { echo "[$(date '+%H:%M:%S')] $*"; }
 
 # Step 1: Kill on both
 log "Step 1: Kill processes..."
-sudo pkill -9 valkey-server 2>/dev/null || true
 sudo pkill -9 criu 2>/dev/null || true
 $SSH ubuntu@$REPLICA_SSH_HOST "sudo systemctl stop valkey-server; sudo pkill -9 criu" 2>/dev/null || true
 sleep 1
 
-# Step 2: Start valkey on master
-log "Step 2: Start valkey..."
-setsid valkey-server --daemonize no --protected-mode no --save "" >/tmp/valkey.log 2>&1 &
+# Step 2: Ensure valkey already running on master (do not restart)
+log "Step 2: Check valkey..."
 PID=""
 for i in $(seq 1 20); do
   PID=$(pgrep -x valkey-server || true)
@@ -31,7 +29,7 @@ for i in $(seq 1 20); do
   sleep 0.5
 done
 if [ -z "$PID" ]; then
-  log "ERROR: valkey-server failed to start"
+  log "ERROR: valkey-server not running"
   exit 1
 fi
 log "  PID: $PID"
