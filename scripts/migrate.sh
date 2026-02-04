@@ -34,6 +34,10 @@ if [ -z "$PID" ]; then
 fi
 log "  PID: $PID"
 
+# Step 2b: Flush valkey data on master to avoid OOM
+log "Step 2b: Flush valkey..."
+valkey-cli -p "$VALKEY_PORT" flushall
+
 # Step 3: Fill using valkey-benchmark
 # Empirical: ~25300 keys per GB with 64KB values (includes overhead)
 NUM_KEYS=$((DATA_SIZE_GB * 25300))
