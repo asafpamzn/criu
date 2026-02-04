@@ -53,11 +53,8 @@ log "Step 4: Clean $IMAGES_DIR..."
 sudo rm -rf "$IMAGES_DIR"/*
 
 # Step 5: Start replica FIRST (it will create ready signal and wait)
-# Use timeout to ensure it doesn't hang forever
 log "Step 5: Start replica (will wait for page server)..."
-# Timeout scales with data size: base 15s + 1s per GB
-TIMEOUT=$((15 + DATA_SIZE_GB))
-timeout $TIMEOUT $SSH ubuntu@$REPLICA_SSH_HOST "sudo $SCRIPT_DIR/restore.sh" &
+$SSH ubuntu@$REPLICA_SSH_HOST "sudo $SCRIPT_DIR/restore.sh" &
 REPLICA_PID=$!
 
 # Step 5b: Wait for replica ready signal
@@ -77,8 +74,8 @@ sudo gdb -p $PID -batch -ex "call close(12)" -ex "call close(13)" -ex detach -ex
 sudo taskset -pc 0 $PID >/dev/null 2>&1 || true
 sudo touch "$IMAGES_DIR/lazy-primary.log"
 sudo chmod 644 "$IMAGES_DIR/lazy-primary.log"
-# Run dump with timeout - cow-dump keeps running, we'll kill it after restore
-timeout $TIMEOUT sudo criu dump \
+# Run dump - cow-dump keeps running, we'll kill it after restore
+sudo criu dump \
     --tree $PID \
     --images-dir "$IMAGES_DIR" \
     --cow-dump \
