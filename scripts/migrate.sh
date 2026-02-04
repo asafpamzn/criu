@@ -19,10 +19,9 @@ sudo pkill -9 criu 2>/dev/null || true
 $SSH ubuntu@$REPLICA_SSH_HOST "sudo pkill -9 valkey-server; sudo pkill -9 criu" 2>/dev/null || true
 sleep 1
 
-# Step 2: Ensure valkey already running on master (do not restart)
+# Step 2: Wait for valkey to be running on master
 log "Step 2: Check valkey..."
 PID=""
-log "  Start valkey manually (no password) if needed..."
 for i in $(seq 1 240); do
   PID=$(pgrep -x valkey-server || true)
   if [ -n "$PID" ]; then
