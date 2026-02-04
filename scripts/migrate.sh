@@ -21,7 +21,7 @@ sleep 1
 
 # Step 2: Start valkey on master
 log "Step 2: Start valkey..."
-valkey-server --daemonize yes --protected-mode no --save ""
+valkey-server --daemonize no --protected-mode no --save "" &
 PID=""
 for i in $(seq 1 20); do
   PID=$(pgrep -x valkey-server || true)
