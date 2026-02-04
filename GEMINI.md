@@ -1,136 +1,169 @@
-# CRIU (Checkpoint/Restore In User-space)
+# CRIU - COW Dump Development
 
-CRIU is a tool for saving the state of a running application to a set of files
-(checkpointing) and restoring it back to a live state. It is primarily used for
-live migration of containers, in-place updates, and fast application startup.
+## Hard Constraints (non-negotiable)
 
-It is implemented as a command-line tool called `criu`. The two primary commands
-are `dump` and `restore`.
+- **ALWAYS include tests** that cover new functionality and pass
+  *WHY: Untested code causes regressions; CRIU bugs can corrupt process state.*
 
-- `dump`: Saves a process tree and all its related resources (file
-  descriptors, IPC, sockets, namespaces, etc.) into a collection of image
-  files.
-- `restore`: Restores processes from image files to the same state they were
-  in before the dump.
+- **ALWAYS run multi-agent review** before creating PRs
+  *WHY: Parallel specialist agents (code quality, security, performance, test coverage) catch issues humans miss. Spawn parallel review agents for each pass.*
+
+- **ALWAYS address all review findings** before creating PRs
+  *WHY: Multi-perspective review catches issues early; unresolved findings indicate incomplete work.*
+
+- **ALWAYS address all PR comments** after PR creation
+  *WHY: Reviewer feedback is critical; unaddressed comments block merge and erode trust.*
+
+- **ALWAYS verify with tests and benchmarks** - never assume behavior
+  *WHY: Assumptions about memory/kernel behavior cause subtle bugs.*
+
+- **ALWAYS open issues for bugs** discovered, even if out of scope
+  *WHY: Tracking prevents forgotten issues; helps prioritization.*
+
+## Key Rules
+
+- Direct and concise, no compliments or apologies
+  *WHY: Saves tokens and keeps focus on technical content.*
+
+- Ask if unsure, stop and reassess if looping
+  *WHY: Prevents wasted effort on wrong approaches.*
+
+- Commit frequently with meaningful messages
+  *WHY: Git history is documentation; enables bisect debugging.*
+
+- Keep PRs small and focused
+  *WHY: Easier review, faster merge, cleaner history.*
+
+## Priority Order
+
+When rules conflict: Hard Constraints > Key Rules > Convenience.
+When code style conflicts with functionality: Functionality wins.
+
+---
+
+# Current Focus: COW Dump Stabilization & Optimization
+
+Our main task is stabilizing and optimizing the **COW (Copy-on-Write) dump**
+feature for live migration of large-memory processes (e.g., Valkey/Redis).
+
+## Idea
+
+COW dump allows a process to **keep running** during migration by using
+userfaultfd write-protection (Linux 5.7+):
+
+1. Register writable pages with write-protection
+2. Process continues running; writes trigger faults
+3. On fault: copy original page, unprotect, queue for transfer
+4. Page server sends original copies to replica on-demand
+5. Replica restores lazily, becomes a replica of the still-running primary
+
+## Key Files
+
+| File | Purpose |
+|------|---------|
+| `criu/cow-dump.c` | Core COW logic: init, monitor thread, fault handling, hash table |
+| `criu/include/cow-dump.h` | COW API and data structures |
+| `criu/page-xfer.c` | Page transfer - integrates COW pages with page server |
+| `criu/uffd.c` | Userfaultfd utilities |
+| `criu/pie/parasite.c` | Parasite code for in-process operations (including COW uffd registration) |
+
+## Migration Scripts
+
+| Script | Purpose |
+|--------|---------|
+| `scripts/migrate.sh` | Master script (PRIMARY): starts valkey, fills data, runs dump |
+| `scripts/restore.sh` | Replica script: waits for page server, runs lazy-pages + restore |
+| `scripts/wait_and_replicate.sh` | Configures restored valkey as replica of primary |
+| `scripts/.env` | Configuration: IPs, ports, paths |
+
+## Migration Flow
+
+```
+PRIMARY                              REPLICA
+  |                                    |
+  | 1. valkey-server + fill data       |
+  |                                    |
+  | 2. criu dump --cow-dump            |
+  |    --lazy-pages --leave-running    |
+  |    [process keeps running]   -->   | 3. criu lazy-pages (connect to primary)
+  |                                    | 4. criu restore --lazy-pages
+  |                                    |    [pages fetched on-demand]
+  | 5. COW monitor catches writes,     |
+  |    sends original page copies      | 6. valkey starts, becomes replica
+```
+
+---
+
+# Project Overview
+
+CRIU (Checkpoint/Restore In Userspace) saves running application state to files
+and restores it later. Primary commands:
+
+- `criu dump` - Checkpoint process tree to image files
+- `criu restore` - Restore process from images
 
 ## Quick Start
 
-To get a feel for `criu`, you can try checkpointing and restoring a simple
-process.
+```bash
+# 1. Start a process
+sleep 1000 &
+PID=$!
 
-1.  **Run a simple process:**
-    Open a terminal and run a command that will run for a while. Find its PID.
-    ```bash
-    sleep 1000 &
-    [1] 12345
-    ```
+# 2. Dump it
+sudo criu dump -t $PID -D /tmp/images -v4 --shell-job
 
-2.  **Dump the process:**
-    As root, use `criu dump` with the process ID (`-t`) and a directory for the
-    image files (`-D`).
-    ```bash
-    sudo criu dump -t 12345 -D /tmp/sleep_images -v4 --shell-job
-    ```
-    The `sleep` process will no longer be running.
+# 3. Restore it
+sudo criu restore -D /tmp/images -v4 --shell-job
+```
 
-3.  **Restore the process:**
-    Use `criu restore` to bring the process back to life from the images.
-    ```bash
-    sudo criu restore -D /tmp/sleep_images -v4 --shell-job
-    ```
-    The `sleep` process will be running again as if nothing happened.
+---
 
-# For Developers and Contributors
-
-This section contains more technical details about CRIU's internals and
-development process.
+# Developer Reference
 
 ## Dump Process
 
-On dump, CRIU uses available kernel interfaces to collect information about
-processes. For properties that can only be retrieved from within the process
-itself, CRIU injects a binary blob (called a "parasite") into the process's
-address space and executes it in the context of one of the process's threads.
-This injection is handled by a subproject called **Compel**.
+- Uses kernel interfaces to collect process info
+- Injects "parasite" blob via Compel for in-process data
+- Parasite runs in target's address space to access thread-local state
 
 ## Restore Process
 
-On restore, CRIU reads the image files to reconstruct the processes. The goal is
-to restore them to the exact state they were in before the dump. The restore
-process is divided into several stages (defined as `CR_STATE_*` in
-`./criu/include/restorer.h`).
-
-The main `criu` process acts as a coordinator. It first restores resources with
-inter-process dependencies (file descriptors, sockets, shared memory,
-namespaces, etc.). It then forks the process tree and sets up namespaces.
-Finally, it restores process-specific resources like file descriptors and memory
-mappings.
-
-A key step involves a small, self-contained binary called the "restorer". All
-restored processes switch to executing this code, which unmaps the CRIU-specific
-memory and restores the application's original memory mappings. On the final
-step, the restorer calls `sigreturn` on a prepared signal frame to resume the
-process with the state it had at the moment of the dump.
+- Reads image files to reconstruct processes
+- Stages defined in `criu/include/restorer.h` (`CR_STATE_*`)
+- Coordinator forks process tree, restores resources
+- Restorer blob unmaps CRIU memory, calls `sigreturn` to resume
 
 ## Compel
 
-Compel is a subproject responsible for generating the binary blobs used for the
-parasite code (for dumping) and the restorer code (for restoring). It provides a
-library for injecting and executing this code within the target process's
-address space. It is a separate project because the logic for generating and
-injecting Position-Independent Executable (PIE) code is complex and
-self-contained.
-
-## Coding Style
-
-The C code in the CRIU project follows the
-[Linux Kernel Coding Style](https://www.kernel.org/doc/html/latest/process/coding-style.html).
-Here are some of the main points:
-
--   **Indentation**: Use tabs, which are set to 8 characters.
--   **Line Length**: The preferred line limit is 80 characters, but it can be
-    extended to 120 if it improves code readability.
--   **Braces**:
-    -   The opening brace for a function goes on a new line.
-    -   The opening brace for a block (like `if`, `for`, `while`, `switch`) goes
-        on the same line.
--   **Spaces**: Use spaces around operators (`+`, `-`, `*`, `/`, `%`, `<`, `>`,
-    `=`, etc.).
--   **Naming**: Use descriptive names for functions and variables.
--   **Comments**: Use C-style comments (`/* ... */`). For multi-line comments,
-    the preferred format is:
-    ```c
-    /*
-     * This is a multi-line
-     * comment.
-     */
-    ```
+- Subproject for generating parasite/restorer blobs
+- Handles Position-Independent Executable (PIE) code injection
+- Located in `./compel`
 
 ## Code Layout
 
-The code is organized into the following directories:
+| Directory | Purpose |
+|-----------|---------|
+| `./criu` | Main criu tool source |
+| `./compel` | Compel sub-project |
+| `./images` | Protobuf image definitions |
+| `./test/zdtm` | ZDTM test suite |
+| `./scripts` | Helper scripts |
+| `./crit` | Image inspection tool |
+| `./soccr` | TCP socket C/R library |
 
--   `./compel`: The Compel sub-project.
--   `./criu`: The main `criu` tool source code.
--   `./images`: Protobuf descriptions for the image files.
--   `./test`: All tests.
--   `./test/zdtm`: The Zero-Downtime Migration (ZDTM) test suite.
--   `./test/zdtm.py`: The executor script for ZDTM tests.
--   `./scripts`: Helper scripts.
--   `./scripts/build`: Docker image files used for CI and cross-compilation
-    checks.
--   `./crit`: A tool to inspect and manipulate CRIU image files.
--   `./soccr`: A library for TCP socket checkpoint/restore.
+## Coding Style
+
+Linux Kernel style:
+- Tabs (8 chars), 80-120 char lines
+- Function braces on new line, block braces on same line
+- C-style comments (`/* ... */`)
 
 ## Tests
 
-The main test suite is ZDTM. Here is an example of how to run a single test:
-
 ```bash
+# Run single ZDTM test
 sudo ./test/zdtm.py run -t zdtm/static/env00
 ```
 
-Each ZDTM test has three stages: preparation, C/R, and results checks. During
-the test, a process calls `test_daemon()` to signal it is ready for C/R, then
-calls `test_waitsig()` to wait for the C/R stage to complete. After being
-restored, the test checks that all its resources are still in a valid state.
+Test stages: preparation → C/R → validation.
+Process calls `test_daemon()` when ready, `test_waitsig()` to wait for restore.
