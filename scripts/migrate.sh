@@ -14,14 +14,16 @@ log() { echo "[$(date '+%H:%M:%S')] $*"; }
 
 # Step 1: Kill on both
 log "Step 1: Kill processes..."
+sudo pkill -9 valkey-server 2>/dev/null || true
 sudo pkill -9 criu 2>/dev/null || true
-$SSH ubuntu@$REPLICA_SSH_HOST "sudo systemctl stop valkey-server; sudo pkill -9 criu" 2>/dev/null || true
+$SSH ubuntu@$REPLICA_SSH_HOST "sudo pkill -9 valkey-server; sudo pkill -9 criu" 2>/dev/null || true
 sleep 1
 
 # Step 2: Ensure valkey already running on master (do not restart)
 log "Step 2: Check valkey..."
 PID=""
-for i in $(seq 1 20); do
+log "  Start valkey manually (no password) if needed..."
+for i in $(seq 1 240); do
   PID=$(pgrep -x valkey-server || true)
   if [ -n "$PID" ]; then
     break
@@ -33,10 +35,6 @@ if [ -z "$PID" ]; then
   exit 1
 fi
 log "  PID: $PID"
-
-# Step 2b: Flush valkey data on master to avoid OOM
-log "Step 2b: Flush valkey..."
-valkey-cli -p "$VALKEY_PORT" flushall
 
 # Step 3: Fill using valkey-benchmark
 # Empirical: ~25300 keys per GB with 64KB values (includes overhead)
