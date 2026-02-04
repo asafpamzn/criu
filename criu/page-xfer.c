@@ -2017,7 +2017,7 @@ static int send_image_complete(struct active_image *img)
 		.dst_id = img->dst_id,
 	};
 	int32_t status;
-
+	exit(0); //TODO COW EXIT gracefully
 	pr_warn("Image dst_id=%lu complete: %lu total pages (%lu COW, %lu req)\n",
 		img->dst_id, img->total_pages,
 		img->total_cow_pages, img->total_req_pages);
