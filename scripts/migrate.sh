@@ -15,11 +15,12 @@ log() { echo "[$(date '+%H:%M:%S')] $*"; }
 # Step 1: Kill on both
 log "Step 1: Kill processes..."
 sudo pkill -9 valkey-server 2>/dev/null || true
+sudo pkill -9 valkey-benchmark 2>/dev/null || true
 sudo pkill -9 criu 2>/dev/null || true
 $SSH ubuntu@$REPLICA_SSH_HOST "sudo pkill -9 valkey-server; sudo pkill -9 criu" 2>/dev/null || true
 sleep 1
 
-# Step 2: Wait for valkey to be running on master
+# Step 2: Wait for valkey to be running and responsive on master
 log "Step 2: Check valkey..."
 PID=""
 for i in $(seq 1 240); do
@@ -34,6 +35,12 @@ if [ -z "$PID" ]; then
   exit 1
 fi
 log "  PID: $PID"
+for i in $(seq 1 40); do
+  if valkey-cli -h 127.0.0.1 -p "$VALKEY_PORT" ping &>/dev/null; then
+    break
+  fi
+  sleep 0.25
+done
 
 # Step 3: Fill using valkey-benchmark
 # Empirical: ~25300 keys per GB with 64KB values (includes overhead)
@@ -41,7 +48,7 @@ NUM_KEYS=$((DATA_SIZE_GB * 25300))
 NUM_OPS=$((NUM_KEYS + 50000))
 log "Step 3: Fill ~${DATA_SIZE_GB}GB using valkey-benchmark..."
 log "  Keys: $NUM_KEYS, Ops: $NUM_OPS, Value size: 64KB"
-valkey-benchmark -t set -d 64000 -r $NUM_KEYS -n $NUM_OPS --threads 10 -q
+valkey-benchmark -h 127.0.0.1 -p "$VALKEY_PORT" -t set -d 64000 -r $NUM_KEYS -n $NUM_OPS --threads 10 -q
 MEM=$(valkey-cli info memory | grep used_memory_human | cut -d: -f2 | tr -d '\r')
 log "  Memory: $MEM"
 
