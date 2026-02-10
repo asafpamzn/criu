@@ -608,6 +608,8 @@ static int handle_vma(pid_t pid, struct vma_area *vma_area, const char *file_pat
 			goto err;
 	} else if (!strcmp(file_path, "[heap]")) {
 		vma_area->e->status |= VMA_AREA_REGULAR | VMA_AREA_HEAP;
+	} else if (!strcmp(file_path, "[stack]")) {
+		vma_area->e->status |= VMA_AREA_REGULAR | VMA_AREA_STACK;
 	} else if (!strcmp(file_path, "[uprobes]")) {
 		uprobes_vma_exists = true;
 		if (!opts.allow_uprobes) {
