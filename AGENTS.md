@@ -83,23 +83,51 @@ self-contained.
 
 ### COW Dump (this fork)
 
-This repository contains an experimental COW (copy-on-write) dump implementation
-aimed at minimizing source downtime during migration by tracking writes while
-the process continues to run.
+This repository contains a COW (copy-on-write) dump implementation for
+live migration with minimal source downtime. The source process resumes
+with write-protect tracking while pages transfer in the background.
+
+40GB Valkey results: 771ms dump freeze, 511ms cutover, 297ms to PING.
+Cutover is data-size-independent.
 
 - User-facing docs: `COW_DUMP_README.md`
 - Design doc + code pointers: `COW_DUMP_DESIGN.md`
+- Developer setup: `COW_DEVELOPER.md`
 - Entry points and key files:
   - `criu/config.c` parses `--cow-dump`
-  - `criu/cr-dump.c` initializes COW tracking on dump and resumes the process
-    early when combined with lazy pages
-  - `criu/pie/parasite.c` registers VMAs for userfaultfd write-protect inside
-    the target process via parasite RPC
-  - `criu/cow-dump.c` monitors userfaultfd events and snapshots pages on first
-    write (WP fault)
-  - `criu/mem.c` changes lazy-capable VMA handling for COW mode
-  - `criu/page-xfer.c` integrates COW pages into page-server transfer
-  - `criu/uffd.c` has restore-side changes for bulk transfer in COW mode
+  - `criu/cr-dump.c` orchestrates dump, COW init, and waits for the
+    background page server thread before cleanup
+  - `criu/pie/parasite.c` registers VMAs for userfaultfd write-protect
+    inside the target process via parasite RPC
+  - `criu/cow-dump.c` monitors userfaultfd events and snapshots pages on
+    first write (WP fault)
+  - `criu/mem.c` COW lazy VMA tracking, pagemap cache skip for lazy VMAs,
+    VMA priority assignment (stack=0, heap=1, other=2)
+  - `criu/proc_parse.c` sets `VMA_AREA_STACK` for `[stack]` VMAs
+  - `criu/page-xfer.c` background page server thread with priority-sorted
+    VMA iteration, COW hash lock fallback, bulk stream close protocol
+  - `criu/uffd.c` restore-side lazy-pages with 64-page fault prefetch
+  - `scripts/migrate.sh` source-side migration orchestrator
+  - `scripts/restore.sh` replica-side restore with retry loop and socket poll
+
+### Testing COW Migration
+
+**Quick 1GB test:**
+```bash
+# On PRIMARY (valkey must be running via systemd)
+sudo FAST_CUTOVER=1 ./scripts/migrate.sh 1
+```
+
+**40GB with traffic harness:**
+```bash
+./scripts/run_migration_scenario.sh 40
+```
+
+**Verify results:**
+- Source log: `/fsx/lazy/lazy-primary.log`
+- Restore log: `/fsx/lazy/lazy-restore.log`
+- Timing markers: pass `CUTOVER_MARKER_FILE=/fsx/lazy/cutover_markers.log`
+- Harness report: `/tmp/valkey_traffic_harness_report.json`
 
 ### Coding Style
 

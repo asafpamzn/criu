@@ -229,6 +229,74 @@ echo 1 > /proc/sys/vm/unprivileged_userfaultfd
 
 ---
 
+## Recent Architectural Improvements
+
+### dst_id Fix and Page Server Lifecycle
+
+**Problem:** Lazy VMAs stored an encoded `xfer->dst_id` (with type bits shifted
+in) while the replica sent raw PIDs in `PS_IOV_GET_ALL` requests. The page
+server background thread found zero matching pages, exited, closed the socket.
+
+**Fix:** Lazy VMAs now store `vpid(item)` (the virtual PID) as `dst_id`,
+matching what `request_all_remote_pages()` sends. The `write_lazy_vmas_before`
+function uses `lve->start`/`lve->end` instead of dereferencing `lve->vma->e`
+(which may be freed after dump completes).
+
+**Lifecycle:** `wait_for_page_server_thread()` in `cr-dump.c` ensures the
+background thread finishes before `cow_dump_fini()` destroys the hash table.
+`send_lazy_vma_page()` handles a missing COW hash lock gracefully by falling
+back to `process_vm_readv`.
+
+### VMA Priority Sort
+
+The background page server thread now sorts VMAs by transfer priority before
+iterating:
+
+| Priority | VMA Type | Example | Typical Size |
+|---|---|---|---|
+| 0 | Stack (`VMA_AREA_STACK`) | `[stack]` | 132KB |
+| 1 | Heap (`VMA_AREA_HEAP`) | `[heap]` | 132KB |
+| 2 | Other (by size ascending) | anonymous, thread stacks | 4KB - 1.95GB |
+
+`VMA_AREA_STACK` is now set for `[stack]` VMAs in `proc_parse.c` (was defined
+but never assigned). The ~600 critical pages for process startup arrive in
+~20ms, before cutover triggers.
+
+### Page Fault Prefetch
+
+`handle_page_fault()` in `uffd.c` now requests 64 pages centered on the fault
+address (clamped to IOV boundaries) instead of a single page. Each batch is one
+network round-trip.
+
+### Pagemap Cache Skip
+
+`generate_vma_iovs()` in `mem.c` calls `is_cow_lazy_eligible()` before
+`pmc_get_map()`. COW-lazy VMAs bypass the PAGEMAP_SCAN ioctl entirely
+(`generate_vma_iovs`: 187ms -> 0.15ms for 40GB).
+
+### Benchmark Results (40GB Valkey)
+
+| Metric | Before Optimizations | After |
+|---|---|---|
+| Background pages found | 0 (broken) | 521,111 |
+| Dump freeze | 925ms | 771ms (-17%) |
+| Cutover window | N/A (hung) | 511ms |
+| PING response | N/A | 297ms |
+| `generate_vma_iovs` | 187ms | 0.15ms |
+
+Cutover is data-size-independent: 1GB and 40GB show the same ~510ms window.
+
+### Remaining Bottleneck
+
+`parse_smaps` dominates the dump freeze at ~468ms. This is the kernel walking
+page tables for `/proc/pid/smaps`. In COW mode we don't need the per-page
+counters (RSS, PSS, etc.), but we need the `VmFlags` line. Next step: use
+`/proc/pid/maps` (fast, ~5ms) with conservative flag defaults for COW-lazy
+VMAs, or use `PROCMAP_QUERY` ioctl (Linux 6.7+) for VMA metadata without
+page-table walks.
+
+---
+
 ## Future Work
 
 #### 1. Explore UFFD_FEATURE_WP_ASYNC

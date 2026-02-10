@@ -169,11 +169,15 @@ Use this order as the source of truth for debugging:
 
 1. Dump phase registers per-task COW VMAs (parasite UFFD WP).
 2. Non-registerable VMAs are marked fallback and dumped via normal path.
-3. Base dump completes while source is still frozen.
-4. Just before source resume, CRIU starts one session monitor thread.
-5. Source resumes; monitor handles write faults and queues COW pages.
-6. Bulk sender ends each image stream with `nr_pages == 0` close marker.
-7. Receiver sends 32-bit ACK on end marker; sender accepts ACK or clean EOF for compatibility.
+3. COW-lazy VMAs skip pagemap cache (`is_cow_lazy_eligible` fast path).
+4. Base dump completes while source is still frozen (~771ms for 40GB).
+5. Just before source resume, CRIU starts one session monitor thread.
+6. Source resumes; monitor handles write faults and queues COW pages.
+7. Background page server thread sends pages in priority order:
+   stack (prio 0) -> heap (prio 1) -> other by size ascending.
+8. Bulk sender ends each image stream with `nr_pages == 0` close marker.
+9. Receiver sends 32-bit ACK; sender accepts ACK or clean EOF.
+10. `wait_for_page_server_thread()` blocks cleanup until transfer completes.
 
 If this contract is broken, fix CRIU core first; do not rely on script timeouts.
 
@@ -181,11 +185,120 @@ If this contract is broken, fix CRIU core first; do not rely on script timeouts.
 
 For each run, capture:
 
-- cutover pause p50/p95/p99 (source freeze/resume boundary),
-- restore completion time,
+- dump freeze time (from `dump_one_task TOTAL` in source log),
+- cutover window (from `CUTOVER_START_MS` to `CUTOVER_END_MS` in marker file),
+- PING response time (from `CUTOVER_START_MS` to `REPLICA_WAIT_PING_READY`),
 - full migration wall time.
 
-Measure under active traffic (not idle), and compare baseline lazy mode vs `--cow-dump`.
+Use `CUTOVER_MARKER_FILE=/fsx/lazy/cutover_markers.log` to enable timing markers.
+
+**Current results (40GB Valkey):**
+
+| Metric | Value |
+|---|---|
+| Dump freeze | 771ms |
+| Cutover window | 511ms |
+| PING response | 297ms |
+| Cutover data-size-independent | Yes (same for 1GB and 40GB) |
+
+## Testing
+
+### Quick Smoke Test (1GB)
+
+Verifies the full migration flow works end-to-end:
+
+```bash
+# On PRIMARY (valkey must be running via systemd)
+sudo FAST_CUTOVER=1 CUTOVER_MARKER_FILE=/fsx/lazy/cutover_markers.log \
+  ./scripts/migrate.sh 1
+```
+
+**Expected:** Migration completes in ~5s. Output shows:
+- `Migration complete!`
+- `Replica Memory: 1.81G`
+- `dump_one_task TOTAL: ~0.13s`
+
+**Verify timing:**
+```bash
+cat /fsx/lazy/cutover_markers.log
+```
+
+### Full 40GB Test
+
+```bash
+sudo FAST_CUTOVER=1 CUTOVER_MARKER_FILE=/fsx/lazy/cutover_markers.log \
+  ./scripts/migrate.sh 40
+```
+
+**Expected:** ~40s fill + ~5s migration. `dump_one_task TOTAL: ~0.77s`.
+
+### Scenario Test with Traffic
+
+Runs migration under production-like workload with integrity checks:
+
+```bash
+./scripts/run_migration_scenario.sh 40
+```
+
+**Artifacts:**
+- `/tmp/valkey_traffic_harness_report.json` — pass/fail, latencies, outages
+- `/tmp/valkey_traffic_harness.log` — live harness output
+- `/fsx/lazy/lazy-primary.log` — source CRIU log
+- `/fsx/lazy/cutover_markers.log` — phase timing markers
+
+**Pass conditions:**
+- `replica_write_accepted == 0` (no writes accepted during migration)
+- `replication_caught_up == true`
+- `sample_value_mismatches == 0`
+
+### Checking Source Logs
+
+```bash
+# Did background transfer find pages?
+grep "Added active image" /fsx/lazy/lazy-primary.log
+# Should show: "with 521111 lazy VMA pages" (not 0)
+
+# VMA transfer order
+grep "VMA\[" /fsx/lazy/lazy-primary.log
+# Should show: VMA[0] prio=0 (stack first)
+
+# Dump timing breakdown
+grep "TIMING:" /fsx/lazy/lazy-primary.log
+```
+
+### Checking Replica Logs
+
+```bash
+# IOV count (should be 18, not 0)
+grep "IOV DUMP END" /fsx/lazy/lazy-server.log
+
+# Page transfer activity
+grep "uffd_copy\|io_complete_bulk" /fsx/lazy/lazy-server.log | tail -5
+```
+
+### Analyzing Cutover Timing
+
+```bash
+awk '{name[NR]=$1; ts[NR]=$2; n=NR} END {
+  for(i=1;i<=n;i++){
+    if(name[i]=="CUTOVER_START_MS") s=ts[i]
+    if(name[i]=="CUTOVER_END_MS") e=ts[i]
+    if(name[i]=="REPLICA_WAIT_PING_READY") p=ts[i]
+  }
+  printf "CUTOVER WINDOW: %d ms\nSTART->PING: %d ms\n",e-s,p-s
+}' /fsx/lazy/cutover_markers.log
+```
+
+### Common Test Failures
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| "has no lazy VMA pages" | dst_id mismatch | Ensure `lve->dst_id = vpid(item)` |
+| "Remote side closed connection" | Page server exited early | Check `wait_for_page_server_thread` |
+| "Bad file descriptor" in loop | COW session destroyed | Check hash lock fallback |
+| "IOV DUMP END: 0 IOVs" | No pagemap entries written | Check `write_lazy_vmas_before` |
+| Restore retries 200 times | Empty-image race | Normal on shared storage, retries handle it |
+| "bad build-ID" | Library version mismatch | `--file-validation filesize` in restore args |
 
 ---
 
