@@ -274,58 +274,151 @@ network round-trip.
 `pmc_get_map()`. COW-lazy VMAs bypass the PAGEMAP_SCAN ioctl entirely
 (`generate_vma_iovs`: 187ms -> 0.15ms for 40GB).
 
-### Benchmark Results (40GB Valkey)
+### Benchmark Results (Valkey)
 
-| Metric | Before Optimizations | After |
-|---|---|---|
-| Background pages found | 0 (broken) | 521,111 |
-| Dump freeze | 925ms | 771ms (-17%) |
-| Cutover window | N/A (hung) | 511ms |
-| PING response | N/A | 297ms |
-| `generate_vma_iovs` | 187ms | 0.15ms |
+| Metric | Original | After all opts (40GB) | After all opts (100GB) |
+|---|---|---|---|
+| Background pages found | 0 (broken) | 521,111 | 27,396,503 |
+| Dump freeze | 925ms | 218ms (-72%) | 455ms |
+| Cutover window | N/A (hung) | 511ms | ~510ms |
+| PING response | N/A | 297ms | ~300ms |
+| `parse_maps/smaps` | 468ms | 1.5ms | 1.5ms |
+| `generate_vma_iovs` | 187ms | 0.15ms | 0.15ms |
+| `lazy iovec memcpy` | 216ms (100GB) | N/A | 0.02ms |
 
-Cutover is data-size-independent: 1GB and 40GB show the same ~510ms window.
+Cutover is data-size-independent: 1GB, 40GB, and 100GB show the same
+~510ms window.
+
+### Optimization: parse_maps_cow
+
+`parse_smaps` dominated the dump freeze at ~468ms (40GB). The kernel walks
+page tables for `/proc/pid/smaps` to generate RSS/PSS/Referenced counters
+that CRIU discards. `parse_maps_cow` reads `/proc/pid/maps` instead (~1.5ms,
+constant regardless of data size).
+
+**Implementation:** `criu/proc_parse.c:parse_maps_cow()` — same structure as
+`parse_smaps()` but opens `maps`, skips VmFlags handling, applies
+`MAP_GROWSDOWN` for `[stack]` VMAs. Gated behind `opts.cow_dump` in
+`collect_mappings()`.
+
+**Trade-off:** VmFlags are defaulted to zero. `MAP_LOCKED`, `MAP_DROPPABLE`,
+`MADV_*`, shadow stack status are lost in the image. Acceptable for live
+migration where the process continues running. See the trade-offs analysis
+in `COW_DUMP_README.md`.
+
+### Optimization: Lazy iovec memcpy fix
+
+After `generate_vma_iovs`, the code copies iovec arrays into parasite args
+for lazy mode. The copy used `pp->nr_iovs` (total allocated = `nr_priv_pages`,
+27.4M for 100GB) instead of `pp->free_iov` (actually populated, ~19 for COW
+mode). This copied 438MB of mostly zeros during freeze.
+
+**Fix:** `memcpy(pargs_iovs(args), pp->iovs, sizeof(struct iovec) * pp->free_iov)`
 
 ### Remaining Bottleneck
 
-`parse_smaps` dominates the dump freeze at ~468ms. This is the kernel walking
-page tables for `/proc/pid/smaps`. In COW mode we don't need the per-page
-counters (RSS, PSS, etc.), but we need the `VmFlags` line. Next step: use
-`/proc/pid/maps` (fast, ~5ms) with conservative flag defaults for COW-lazy
-VMAs, or use `PROCMAP_QUERY` ioctl (Linux 6.7+) for VMA metadata without
-page-table walks.
+`cow_dump_init` dominates at 413ms (100GB) / 176ms (40GB). This is the
+kernel walking page tables to set write-protect bits via
+`UFFDIO_WRITEPROTECT`. The cost is O(pages) — the kernel's
+`change_protection()` must flip PTE WP bits on every mapped page.
+
+For 100GB Valkey: 18 VMAs, dominated by one 104GB mapping. Batching or
+merging REGISTER calls doesn't help (only ~18 ioctls, microseconds of
+overhead). The 413ms is pure kernel PTE walk time.
 
 ---
 
-## Future Work
+## Future Work — Directions and Trade-offs
 
-#### 1. Explore UFFD_FEATURE_WP_ASYNC
+### 1. PROCMAP_QUERY ioctl for VmFlags recovery (Linux 6.7+)
 
-We should explore how to use this feature. It should only mark the page as touched and then we can do a second pass to copy only the touched pages. I will dive deeper to see if it is more efficient.
+**Problem:** `parse_maps_cow` defaults VmFlags to zero, losing `MAP_LOCKED`,
+`MADV_*`, and shadow stack status in the image.
 
-#### 2. Reduce communication overhead between source and destination
+**Approach:** After parsing `/proc/pid/maps`, use the `PROCMAP_QUERY` ioctl
+on `/proc/pid/maps` to retrieve per-VMA `vm_flags` without page table walks.
+Each query is O(log n) in the VMA tree — no RSS/PSS computation.
 
-Currently the communication is driven by the destination which sends requests. We can improve this by making the source send the data and the destination only asks if there is a read page fault. That way, we reduce the amount of work from the source.
+**Trade-offs:**
+- Recovers full VmFlags fidelity in the image
+- Adds ~18 ioctl calls (one per VMA), microseconds each
+- Requires kernel 6.7+; needs fallback for older kernels
+- Raw `vm_flags` need translation to CRIU's `MAP_*` / `MADV_*` format
+- Moderate implementation complexity
 
-#### 3. Make the source multithreaded
+**Expected impact on freeze:** Negligible (microseconds). This is about
+image correctness, not performance.
 
-Can we make the source multithreaded to reduce the overall time? Should be explored.
+### 2. UFFD_FEATURE_WP_ASYNC — eliminate monitor thread
 
-#### 4. Non-Registerable VMAs
+**Problem:** The COW monitor thread handles synchronous write faults:
+read page, copy to hash, unprotect, wake thread. This adds jitter to
+the source process and requires a dedicated thread.
 
-**Issue:** Some VMAs cannot be write-protected.
+**Approach:** With `WP_ASYNC` (Linux 6.1+), the kernel auto-resolves
+write faults by clearing the WP bit without delivering to userspace.
+Dirty pages are later identified via `PAGEMAP_SCAN` with
+`PM_SCAN_WP_MATCHING`.
 
-I will be happy to get advice.
+**Trade-offs:**
+- Eliminates monitor thread and source-side write jitter
+- Simpler architecture: no hash table, no per-fault page copies
+- Does NOT reduce initial UFFDIO_WRITEPROTECT cost (still O(pages))
+- Requires a second-pass scan before transfer to identify dirty pages
+- Changes the transfer model: instead of "snapshot on first write", it
+  becomes "mark dirty, scan later, read current content"
+- Risk: page content may change between scan and read (need careful
+  ordering or a final freeze-and-scan pass before cutover)
+- The current codebase already checks for WP_ASYNC support
+  (`cow-dump.c:136`) but uses synchronous WP faults
 
+**Expected impact on freeze:** None (doesn't change initial WP setup).
+Impact is on background transfer latency and source-side jitter.
 
+### 3. Reduce cow_dump_init cost (413ms for 100GB)
 
-### Next Steps
+This is the kernel's `change_protection()` walking page tables to flip
+PTE write-protect bits. Currently O(pages) and unavoidable with UFFD.
 
-For maintainers reviewing this code:
+**Options explored:**
+- **Batch UFFDIO_REGISTER calls:** Only 18 VMAs for 100GB Valkey,
+  dominated by one 104GB mapping. Batching gains nothing.
+- **Single UFFDIO_WRITEPROTECT for entire VA:** Not supported — ranges
+  must match registered VMAs, can't span gaps.
+- **Register from CRIU side (not parasite):** UFFD creation requires
+  target process context. Registration can be done from CRIU side after
+  receiving the fd, but doesn't reduce kernel PTE walk cost.
+- **Soft-dirty tracking (alternative to UFFD):** Use
+  `/proc/pid/clear_refs` to reset soft-dirty bits, then read pagemap
+  after resume to find dirty pages. Avoids UFFD entirely but
+  `clear_refs` itself walks page tables (similar O(pages) cost). Also
+  soft-dirty is less precise and doesn't provide per-fault snapshots.
+- **Kernel-side async WP setup:** Would require kernel patches to defer
+  PTE walks to a background thread. Not currently available.
 
-1. **Testing:** Extensive testing with various workloads + add regression tests.
-2. **Documentation:** Update user-facing documentation
-3. **Performance Tuning:** Try differnt techniques discussed at the Future Work section.
+**Conclusion:** The 413ms scales linearly with mapped memory and is
+fundamentally kernel PTE walk cost. No userspace optimization can
+eliminate it. The most promising path is kernel-level improvements
+(e.g., lazy PTE marking, batch TLB flush optimizations).
+
+### 4. Reduce communication overhead between source and destination
+
+Currently the communication is driven by the destination which sends
+requests. Improvement: make the source push pages proactively and have
+the destination only request pages on read faults. Reduces round-trips.
+
+### 5. Multithreaded source transfer
+
+Parallelize page reading and network transfer on the source side.
+Multiple threads could read different VMA ranges simultaneously via
+`process_vm_readv` while a sender thread handles the network.
+
+### 6. Non-registerable VMAs
+
+Some VMAs cannot be write-protected via UFFD (e.g., certain shared
+mappings). These fall back to the standard dump path via the
+`failed_indices` mechanism in the parasite. The fallback is functional
+but means those VMAs' pages must be fully captured during freeze.
 
 
 ### Usage

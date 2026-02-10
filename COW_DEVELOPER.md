@@ -192,14 +192,14 @@ For each run, capture:
 
 Use `CUTOVER_MARKER_FILE=/fsx/lazy/cutover_markers.log` to enable timing markers.
 
-**Current results (40GB Valkey):**
+**Current results (Valkey):**
 
-| Metric | Value |
-|---|---|
-| Dump freeze | 771ms |
-| Cutover window | 511ms |
-| PING response | 297ms |
-| Cutover data-size-independent | Yes (same for 1GB and 40GB) |
+| Metric | 40GB | 100GB |
+|---|---|---|
+| Dump freeze | 218ms | 455ms |
+| Cutover window | 511ms | ~510ms |
+| PING response | 297ms | ~300ms |
+| Cutover data-size-independent | Yes | Yes |
 
 ## Testing
 

@@ -87,7 +87,8 @@ This repository contains a COW (copy-on-write) dump implementation for
 live migration with minimal source downtime. The source process resumes
 with write-protect tracking while pages transfer in the background.
 
-40GB Valkey results: 771ms dump freeze, 511ms cutover, 297ms to PING.
+40GB Valkey results: 218ms dump freeze, 511ms cutover, 297ms to PING.
+100GB Valkey results: 455ms dump freeze, ~510ms cutover.
 Cutover is data-size-independent.
 
 - User-facing docs: `COW_DUMP_README.md`
@@ -102,8 +103,10 @@ Cutover is data-size-independent.
   - `criu/cow-dump.c` monitors userfaultfd events and snapshots pages on
     first write (WP fault)
   - `criu/mem.c` COW lazy VMA tracking, pagemap cache skip for lazy VMAs,
-    VMA priority assignment (stack=0, heap=1, other=2)
-  - `criu/proc_parse.c` sets `VMA_AREA_STACK` for `[stack]` VMAs
+    VMA priority assignment (stack=0, heap=1, other=2), lazy iovec
+    memcpy fix (free_iov not nr_iovs)
+  - `criu/proc_parse.c` sets `VMA_AREA_STACK` for `[stack]` VMAs;
+    `parse_maps_cow()` reads /proc/pid/maps for fast COW dump
   - `criu/page-xfer.c` background page server thread with priority-sorted
     VMA iteration, COW hash lock fallback, bulk stream close protocol
   - `criu/uffd.c` restore-side lazy-pages with 64-page fault prefetch
