@@ -2163,6 +2163,20 @@ static int final_queue_drain(struct active_image *img, pid_t source_pid,
 	return 0;
 }
 
+static int cmp_lazy_vma_priority(const void *a, const void *b)
+{
+	const struct lazy_vma_entry *va = *(const struct lazy_vma_entry **)a;
+	const struct lazy_vma_entry *vb = *(const struct lazy_vma_entry **)b;
+	unsigned long sa, sb;
+
+	if (va->transfer_priority != vb->transfer_priority)
+		return va->transfer_priority - vb->transfer_priority;
+	/* Same priority: smaller VMAs first */
+	sa = va->end - va->start;
+	sb = vb->end - vb->start;
+	return (sa > sb) - (sa < sb);
+}
+
 /* Unified background thread serving all images */
 static void *unified_page_server_thread(void *arg)
 {
@@ -2178,24 +2192,45 @@ static void *unified_page_server_thread(void *arg)
 
 		list_for_each_entry_safe(img, tmp, &active_images_queue, list) {
 			struct lazy_vma_entry *lve;
+			struct lazy_vma_entry **sorted = NULL;
 			pid_t source_pid = 0;
+			int nvmas = 0, i;
 
 			pthread_spin_unlock(&active_images_lock);
 
 			pr_info("Processing image dst_id=%lu remaining=%lu pages\n",
 				img->dst_id, img->remaining_pages);
 
-			/* Process each lazy VMA */
+			/* Build sorted array: stack first, heap, then by size */
 			list_for_each_entry(lve, get_global_lazy_vmas(), list) {
-				if (lve->dst_id != img->dst_id)
-					continue;
+				if (lve->dst_id == img->dst_id)
+					nvmas++;
+			}
 
+			if (nvmas > 0)
+				sorted = xmalloc(nvmas * sizeof(*sorted));
+
+			if (sorted) {
+				i = 0;
+				list_for_each_entry(lve, get_global_lazy_vmas(), list) {
+					if (lve->dst_id == img->dst_id && i < nvmas)
+						sorted[i++] = lve;
+				}
+				nvmas = i;
+				qsort(sorted, nvmas, sizeof(*sorted),
+				      cmp_lazy_vma_priority);
+			}
+
+			for (i = 0; i < nvmas && sorted; i++) {
+				lve = sorted[i];
 				source_pid = lve->source_pid;
 
 				if (process_vma_pages(img, lve, source_pid, &stats) < 0)
 					pr_err("Error processing VMA %lx-%lx\n",
 					       lve->start, lve->end);
 			}
+
+			xfree(sorted);
 
 			/* Final drain of any remaining queued pages */
 			pthread_spin_lock(&active_images_lock);

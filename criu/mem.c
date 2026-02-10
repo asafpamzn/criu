@@ -349,7 +349,15 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 		 */
 		lve->dst_id = vpid(item);
 		lve->source_pid = item->pid->real;
-		
+
+		/* Set transfer priority (safe to read vma->e now, may be freed later) */
+		if (vma->e->status & VMA_AREA_STACK)
+			lve->transfer_priority = 0;
+		else if (vma->e->status & VMA_AREA_HEAP)
+			lve->transfer_priority = 1;
+		else
+			lve->transfer_priority = 2;
+
 		/* Allocate sent bitmap for this VMA */
 		bitmap_size = (nr_pages + 7) / 8;
 		lve->sent_bitmap = xzalloc(bitmap_size);
