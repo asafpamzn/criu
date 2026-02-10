@@ -375,31 +375,66 @@ Dirty pages are later identified via `PAGEMAP_SCAN` with
 **Expected impact on freeze:** None (doesn't change initial WP setup).
 Impact is on background transfer latency and source-side jitter.
 
-### 3. Reduce cow_dump_init cost (413ms for 100GB)
+### 3. Deferred WRITEPROTECT — reduce freeze to ~42ms (IN PROGRESS)
 
-This is the kernel's `change_protection()` walking page tables to flip
-PTE write-protect bits. Currently O(pages) and unavoidable with UFFD.
+**Problem:** `cow_dump_init` costs 413ms (100GB) / 176ms (40GB). This
+is the kernel walking PTEs to set write-protect bits via
+`UFFDIO_WRITEPROTECT`. The cost is O(pages).
 
-**Options explored:**
-- **Batch UFFDIO_REGISTER calls:** Only 18 VMAs for 100GB Valkey,
-  dominated by one 104GB mapping. Batching gains nothing.
-- **Single UFFDIO_WRITEPROTECT for entire VA:** Not supported — ranges
-  must match registered VMAs, can't span gaps.
-- **Register from CRIU side (not parasite):** UFFD creation requires
-  target process context. Registration can be done from CRIU side after
-  receiving the fd, but doesn't reduce kernel PTE walk cost.
-- **Soft-dirty tracking (alternative to UFFD):** Use
-  `/proc/pid/clear_refs` to reset soft-dirty bits, then read pagemap
-  after resume to find dirty pages. Avoids UFFD entirely but
-  `clear_refs` itself walks page tables (similar O(pages) cost). Also
-  soft-dirty is less precise and doesn't provide per-fault snapshots.
-- **Kernel-side async WP setup:** Would require kernel patches to defer
-  PTE walks to a background thread. Not currently available.
+**Key insight (verified):** `UFFDIO_REGISTER` and `UFFDIO_WRITEPROTECT`
+both operate on `ctx->mm` (target's mm set at uffd creation), not
+`current->mm`. CRIU can call them from its own process after the target
+resumes. `UFFDIO_REGISTER` is cheap (VMA metadata, no PTE walk).
+`UFFDIO_WRITEPROTECT` is the expensive O(pages) part.
 
-**Conclusion:** The 413ms scales linearly with mapped memory and is
-fundamentally kernel PTE walk cost. No userspace optimization can
-eliminate it. The most promising path is kernel-level improvements
-(e.g., lazy PTE marking, batch TLB flush optimizations).
+**Approach:** Keep REGISTER in the parasite during freeze (cheap,
+enables fallback on failure). Defer WRITEPROTECT to after resume —
+CRIU applies it from its own process on the uffd fd.
+
+**Implementation status:** Prototype built and tested. Results:
+- Freeze confirmed at **41ms** for 100GB (down from 455ms)
+- WP applied post-resume in 406ms (process running, not frozen)
+- 1GB migration: **works end-to-end**
+- 40GB/100GB migration: page transfer completes but **bulk stream
+  close protocol fails** — source sends all pages (11.5M/27M), replica
+  never ACKs the close marker. Replica Valkey doesn't respond.
+
+**Root cause of failure:** The close-protocol handshake between
+`page-xfer.c` (source) and `uffd.c` (replica) times out at scale.
+Source logs: "Timed out waiting for close acknowledgment". Replica
+logs: stuck in `page_server_start_read` loop. The page transfer itself
+completes correctly (all pages sent, 526 COW overlays, 4871 demand
+requests served). The issue is in the close/teardown sequence, not
+data transfer.
+
+**Stashed changes:** `git stash` contains the working prototype:
+- `criu/pie/parasite.c`: WRITEPROTECT removed from per-VMA loop
+- `criu/cow-dump.c`: new `cow_dump_apply_writeprotect()` function
+- `criu/cr-dump.c`: reordered post-resume flow (resume → monitor →
+  WP → page server)
+- `criu/include/cow-dump.h`: declaration
+
+**To complete:** Debug the bulk stream close protocol interaction.
+The close handshake (`nr_pages==0` marker, 32-bit ACK) may have a
+timing dependency on WP being active during the image creation
+phase. Investigate `page-xfer.c:2031-2052` (close timeout) and
+`uffd.c` (ACK handling).
+
+**Safety considerations for deferred WP:**
+- Writes between resume and WP completion are untracked — page server
+  reads current content via `process_vm_readv` (correct for live
+  migration, not for exact-snapshot checkpointing)
+- VMA mutations (mmap/munmap) between resume and WP: handle
+  `UFFDIO_WRITEPROTECT` returning `-ENOENT` gracefully
+- `UFFDIO_WRITEPROTECT` holds `mmap_write_lock`, blocking
+  `process_vm_readv` — page server must not run concurrently with WP
+  on the same mm
+
+**Other options explored (not viable):**
+- Batch UFFDIO_REGISTER calls: only 18 VMAs, no benefit
+- Single UFFDIO_WRITEPROTECT for entire VA: can't span gaps
+- Soft-dirty tracking: `clear_refs` also walks page tables (similar cost)
+- Kernel-side async WP setup: would require upstream kernel patches
 
 ### 4. Reduce communication overhead between source and destination
 
