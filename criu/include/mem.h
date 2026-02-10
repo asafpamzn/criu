@@ -23,7 +23,8 @@ struct lazy_vma_entry {
 	unsigned char *sent_bitmap;   /* Track which pages have been sent */
 	unsigned long total_pages;    /* Total pages in this VMA */
 	u64 dst_id;                   /* Process identifier for this VMA */
-	pid_t source_pid;             /* PID for process_vm_readv */	
+	pid_t source_pid;             /* PID for process_vm_readv */
+	int transfer_priority;        /* 0=stack, 1=heap, 2=other */
 };
 
 

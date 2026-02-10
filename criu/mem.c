@@ -281,6 +281,79 @@ static bool is_stack(struct pstree_item *item, unsigned long vaddr)
  * the memory contents is present in the parent image set.
  */
 
+/*
+ * Create a COW lazy VMA entry without requiring pagemap data.
+ * Called from generate_vma_iovs() to bypass pmc_get_map() entirely.
+ */
+static int create_cow_lazy_vma(struct pstree_item *item, struct vma_area *vma,
+			       struct page_xfer *xfer)
+{
+	struct lazy_vma_entry *lve = xmalloc(sizeof(*lve));
+	unsigned long nr_pages, bitmap_size;
+
+	if (!lve)
+		return -1;
+
+	init_global_lazy_vmas();
+	lve->vma = vma;
+	nr_pages = vma_entry_len(vma->e) / PAGE_SIZE;
+	lve->total_pages = nr_pages;
+	lve->dst_id = vpid(item);
+	lve->source_pid = item->pid->real;
+
+	if (vma->e->status & VMA_AREA_STACK)
+		lve->transfer_priority = 0;
+	else if (vma->e->status & VMA_AREA_HEAP)
+		lve->transfer_priority = 1;
+	else
+		lve->transfer_priority = 2;
+
+	bitmap_size = (nr_pages + 7) / 8;
+	lve->sent_bitmap = xzalloc(bitmap_size);
+	if (!lve->sent_bitmap) {
+		xfree(lve);
+		return -1;
+	}
+
+	lve->start = vma->e->start;
+	lve->end = vma->e->end;
+
+	pthread_spin_lock(&lazy_vmas_lock);
+	list_add_tail(&lve->list, &global_lazy_vmas);
+	pthread_spin_unlock(&lazy_vmas_lock);
+
+	pr_debug("Added lazy VMA 0x%llx-0x%llx (%lu pages, dst_id=%lu)\n",
+		(unsigned long long)lve->start, (unsigned long long)lve->end,
+		nr_pages, (unsigned long)lve->dst_id);
+	return 0;
+}
+
+/*
+ * Check if a VMA qualifies for COW lazy tracking (no pagemap needed).
+ */
+static bool is_cow_lazy_eligible(struct pstree_item *item, struct vma_area *vma)
+{
+	bool cow_tracked;
+
+	if (!opts.cow_dump)
+		return false;
+
+	cow_tracked = cow_dump_is_vma_tracked(item->pid->real,
+					      vma->e->start, vma->e->end);
+
+	return vma_entry_can_be_lazy(vma->e) &&
+		!vma_area_is(vma, VMA_AREA_GUARD) &&
+		(vma->e->prot & PROT_WRITE) &&
+		!(!vma_area_is_private(vma, kdat.task_size) &&
+		  !vma_area_is(vma, VMA_ANON_SHARED)) &&
+		!(vma->e->flags & MAP_DROPPABLE) &&
+		(vma->e->prot & PROT_READ) &&
+		!is_stack(item, vma->e->start) &&
+		!should_dump_entire_vma(vma->e) &&
+		cow_tracked &&
+		!vma_area_is(vma, VMA_ANON_SHARED);
+}
+
 static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct page_pipe *pp, pmc_t *pmc, u64 *pvaddr,
 			 bool has_parent, struct page_xfer *xfer)
 {
@@ -331,46 +404,8 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 	 * faults for COW tracking. Their content must be captured immediately.
 	 */
 
-	if (opts.cow_dump && lazy_capable) {
-		struct lazy_vma_entry *lve = xmalloc(sizeof(*lve));
-		unsigned long nr_pages, bitmap_size;
-		
-		if (!lve)
-			return -1;
-		
-		/* Initialize global list on first use */
-		init_global_lazy_vmas();
-		lve->vma = vma;
-		nr_pages = vma_entry_len(vma->e) / PAGE_SIZE;
-		lve->total_pages = nr_pages;
-		
-		/* Store virtual PID to match request_all_remote_pages() which
-		 * sends lpi->pr.img_id (the vpid).
-		 */
-		lve->dst_id = vpid(item);
-		lve->source_pid = item->pid->real;
-		
-		/* Allocate sent bitmap for this VMA */
-		bitmap_size = (nr_pages + 7) / 8;
-		lve->sent_bitmap = xzalloc(bitmap_size);
-		if (!lve->sent_bitmap) {
-			xfree(lve);
-			return -1;
-		}
-
-		lve->start = vma->e->start;
-		lve->end = vma->e->end;
-		
-		/* Add to global list (thread-safe) */
-		pthread_spin_lock(&lazy_vmas_lock);
-		list_add_tail(&lve->list, &global_lazy_vmas);
-		pthread_spin_unlock(&lazy_vmas_lock);
-		
-		pr_debug("Added lazy VMA 0x%llx-0x%llx to global list (%lu pages, %lu byte bitmap, dst_id=%lu, pid=%d)\n",
-			(unsigned long long)vma->e->start, (unsigned long long)vma->e->end, nr_pages, bitmap_size,
-			(unsigned long)lve->dst_id, lve->source_pid);
-		return 0;
-	}
+	if (opts.cow_dump && lazy_capable)
+		return create_cow_lazy_vma(item, vma, xfer);
 
 	if (collect_timing) {
 		gettimeofday(&loop_start, NULL);
@@ -706,6 +741,15 @@ static int generate_vma_iovs(struct pstree_item *item, struct vma_area *vma, str
 			return 0;
 		has_parent = false;
 	}
+
+	/*
+	 * COW optimization: skip the expensive pagemap cache fill for VMAs
+	 * that will be tracked via userfaultfd write-protect.  The pagemap
+	 * data is never used for these — they take the lazy early-return
+	 * path in generate_iovs().
+	 */
+	if (is_cow_lazy_eligible(item, vma))
+		return create_cow_lazy_vma(item, vma, xfer);
 
 	if (pmc_get_map(pmc, vma))
 		return -1;
