@@ -1585,10 +1585,17 @@ static bool is_page_queued(struct lazy_pages_info *lpi, unsigned long addr)
 	return false;
 }
 
+/*
+ * Number of pages to prefetch around a page fault.
+ * Fetching a window reduces network round-trips during cutover.
+ */
+#define PF_PREFETCH_PAGES 64
+
 static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 {
 	struct lazy_iov *iov;
 	__u64 address;
+	__u64 prefetch_start, prefetch_end;
 	int ret;
 	unsigned long nr_pages;
 	int bucket;
@@ -1608,7 +1615,18 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 		return uffd_zero(lpi, address, 1);
 	}
 
-	iov = extract_range(iov, address, address + PAGE_SIZE);
+	/*
+	 * Prefetch a window around the faulted page, clamped to the IOV.
+	 * This reduces the number of network round-trips during cutover.
+	 */
+	prefetch_start = address - (PF_PREFETCH_PAGES / 2) * page_size();
+	if (prefetch_start < iov->start || prefetch_start > address)
+		prefetch_start = iov->start;
+	prefetch_end = prefetch_start + PF_PREFETCH_PAGES * page_size();
+	if (prefetch_end > iov->end)
+		prefetch_end = iov->end;
+
+	iov = extract_range(iov, prefetch_start, prefetch_end);
 	if (!iov) {
 		lp_warn(lpi, "#PF at 0x%llx !iov2\n", address);
 		return -1;
