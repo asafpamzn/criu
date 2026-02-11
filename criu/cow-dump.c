@@ -45,6 +45,7 @@ struct cow_tracked_vma {
 struct cow_tracked_task {
 	pid_t source_pid;
 	int uffd;
+	int pagemap_fd;		/* cached /proc/pid/pagemap fd for PAGEMAP_SCAN */
 	unsigned long total_pages;
 	unsigned int nr_tracked_vmas;
 	struct cow_tracked_vma *tracked_vmas;
@@ -149,6 +150,7 @@ int cow_dump_init(struct pstree_item *item,
 	INIT_LIST_HEAD(&task->list);
 	task->source_pid = item->pid->real;
 	task->uffd = -1;
+	task->pagemap_fd = -1;
 
 	/* Count writable VMAs matching generate_vma_iovs() filters */
 	list_for_each_entry(vma, &vma_area_list->h, list) {
@@ -230,6 +232,18 @@ int cow_dump_init(struct pstree_item *item,
 
 	task->total_pages = args->total_pages;
 
+	/* Cache pagemap fd for PAGEMAP_SCAN — avoids open/close per scan */
+	{
+		char path[64];
+
+		snprintf(path, sizeof(path), "/proc/%d/pagemap",
+			 task->source_pid);
+		task->pagemap_fd = open(path, O_RDONLY);
+		if (task->pagemap_fd < 0)
+			pr_pwarn("Can't open %s (dirty scan will open per call)",
+				 path);
+	}
+
 	/* Build tracked VMA list excluding failures */
 	if (args->nr_vmas > 0) {
 		failed_map = xzalloc(args->nr_vmas * sizeof(*failed_map));
@@ -309,6 +323,8 @@ void cow_dump_fini(void)
 
 	list_for_each_entry_safe(task, tmp, &g_cow_info->tracked_tasks, list) {
 		list_del(&task->list);
+		if (task->pagemap_fd >= 0)
+			close(task->pagemap_fd);
 		if (task->uffd >= 0)
 			close(task->uffd);
 		xfree(task->tracked_vmas);
@@ -381,8 +397,8 @@ int cow_dump_scan_dirty(pid_t source_pid,
 			struct page_region *regs, unsigned long max_regs,
 			unsigned long *nr_dirty_pages)
 {
-	char path[64];
-	int fd, ret;
+	struct cow_tracked_task *task;
+	int fd, ret, i;
 	struct pm_scan_arg args = {
 		.size = sizeof(args),
 		.flags = PM_SCAN_WP_MATCHING,
@@ -396,17 +412,28 @@ int cow_dump_scan_dirty(pid_t source_pid,
 		.category_anyof_mask = PAGE_IS_WRITTEN,
 		.return_mask = PAGE_IS_WRITTEN,
 	};
-	int i;
 
-	snprintf(path, sizeof(path), "/proc/%d/pagemap", source_pid);
-	fd = open(path, O_RDONLY);
-	if (fd < 0) {
-		pr_perror("Can't open %s for dirty scan", path);
-		return -1;
+	/* Use cached pagemap fd if available */
+	task = cow_find_task_by_pid(source_pid);
+	if (task && task->pagemap_fd >= 0) {
+		fd = task->pagemap_fd;
+	} else {
+		char path[64];
+
+		snprintf(path, sizeof(path), "/proc/%d/pagemap",
+			 source_pid);
+		fd = open(path, O_RDONLY);
+		if (fd < 0) {
+			pr_perror("Can't open pagemap for pid %d", source_pid);
+			return -1;
+		}
 	}
 
 	ret = ioctl(fd, PAGEMAP_SCAN, &args);
-	close(fd);
+
+	/* Only close if we opened it (not the cached fd) */
+	if (!task || task->pagemap_fd < 0)
+		close(fd);
 
 	if (ret < 0) {
 		pr_perror("PAGEMAP_SCAN failed for %lx-%lx", start, end);
