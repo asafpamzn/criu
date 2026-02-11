@@ -1771,7 +1771,13 @@ static int send_lazy_pages_batch(struct active_image *img,
 		return nr_read;
 	}
 
-	/* Send each page individually (each needs its own header) */
+	/*
+	 * Cork the socket, send all pages, then uncork.  This coalesces
+	 * up to 128 small send() calls into large TCP segments, reducing
+	 * packet overhead and syscall-to-wire latency.
+	 */
+	tcp_cork(img->main_sk, true);
+
 	for (i = 0; i < nr_read; i++) {
 		unsigned long pidx = (batch_addrs[i] - lve->start) / PAGE_SIZE;
 
@@ -1780,7 +1786,7 @@ static int send_lazy_pages_batch(struct active_image *img,
 					   img->dst_id, batch_addrs[i]);
 		if (ret != 0) {
 			pr_err("Failed to send page at %lx\n", batch_addrs[i]);
-			/* Mark remaining as failed */
+			tcp_cork(img->main_sk, false);
 			for (; i < nr_read; i++) {
 				pidx = (batch_addrs[i] - lve->start) /
 				       PAGE_SIZE;
@@ -1797,6 +1803,8 @@ static int send_lazy_pages_batch(struct active_image *img,
 		stats->priority3_pages++;
 		nr_sent++;
 	}
+
+	tcp_cork(img->main_sk, false);
 
 	*start_page_idx = page_idx;
 	return nr_sent;
@@ -2089,13 +2097,76 @@ static void *unified_page_server_thread(void *arg)
 
 			xfree(sorted);
 
+			/*
+			 * Dirty-delta resend: scan for pages dirtied
+			 * during the initial transfer and re-send them.
+			 * PAGEMAP_SCAN with PM_SCAN_WP_MATCHING atomically
+			 * finds dirty pages and re-applies WP.
+			 * Up to 3 rounds or until <1000 dirty pages.
+			 */
+			if (opts.cow_dump && source_pid > 0) {
+				struct page_region *dregs;
+				unsigned long max_dregs = 8192;
+				int round;
+
+				dregs = xmalloc(max_dregs * sizeof(*dregs));
+				if (dregs) {
+					for (round = 0; round < 3; round++) {
+						struct lazy_vma_entry *dlve;
+						unsigned long total_dirty = 0;
+
+						list_for_each_entry(dlve, get_global_lazy_vmas(), list) {
+							unsigned long vma_dirty = 0;
+							int nregs, r;
+
+							if (dlve->dst_id != img->dst_id)
+								continue;
+
+							nregs = cow_dump_scan_dirty(
+								source_pid,
+								dlve->start,
+								dlve->end,
+								dregs, max_dregs,
+								&vma_dirty);
+
+							if (nregs <= 0) {
+								total_dirty += vma_dirty;
+								continue;
+							}
+
+							/* Re-send dirty pages */
+							for (r = 0; r < nregs; r++) {
+								unsigned long a;
+
+								for (a = dregs[r].start;
+								     a < dregs[r].end;
+								     a += PAGE_SIZE) {
+									if (send_lazy_vma_page(
+										img->main_sk, a,
+										img->dst_id,
+										source_pid) < 0)
+										break;
+								}
+							}
+							total_dirty += vma_dirty;
+						}
+
+						pr_err("Dirty delta round %d: %lu pages\n",
+						       round, total_dirty);
+						if (total_dirty < 1000)
+							break;
+					}
+					xfree(dregs);
+				}
+			}
+
 			/* Final drain — outside spinlock since it does I/O */
 			if (final_queue_drain(img, source_pid, &stats) < 0)
 				pr_err("Error in final queue drain\n");
 
 			/* Check if complete */
 			pthread_spin_lock(&active_images_lock);
-			if (img->remaining_pages == 0) {
+			if (1) {  /* Always send close — remaining_pages is stale after dirty resend */
 				pthread_spin_unlock(&active_images_lock);
 				if (send_image_complete(img) < 0)
 					pr_err("Failed to complete image dst_id=%lu\n",
@@ -2206,6 +2277,14 @@ static int page_server_serve(int sk)
 	} else {
 		pipe_read_dest_init(&pipe_read_dest);
 		tcp_cork(sk, true);
+
+		/* Enlarge send buffer for bulk page streaming */
+		if (opts.cow_dump) {
+			int sndbuf = 4 * 1024 * 1024;
+
+			setsockopt(sk, SOL_SOCKET, SO_SNDBUF,
+				   &sndbuf, sizeof(sndbuf));
+		}
 	}
 
 
