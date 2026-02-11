@@ -7,27 +7,7 @@
 struct pstree_item;
 struct vm_area_list;
 struct parasite_ctl;
-
-#define COW_HASH_BITS 16
-#define COW_HASH_SIZE (1 << COW_HASH_BITS)
-
-struct cow_page {
-	unsigned long vaddr;
-	void *data;
-	struct hlist_node hash;
-};
-
-/* Forward declaration */
-struct page_pipe_buf;
-
-/* Queue entry for COW pages waiting to be sent */
-struct cow_page_queue_entry {
-	unsigned long vaddr;
-	struct page_pipe_buf *ppb;      /* Buffer containing this page */
-	unsigned int seg_idx;            /* Segment index within buffer */
-	unsigned long page_idx_in_seg;   /* Page index within segment */
-	struct list_head list;
-};
+struct page_region;
 
 /**
  * cow_dump_init - Initialize COW dump for a process
@@ -35,71 +15,73 @@ struct cow_page_queue_entry {
  * @vma_area_list: List of VMAs to track
  * @ctl: Parasite control structure for RPC
  *
- * Sets up userfaultfd with write-protection for all writable memory
- * regions of the target process. The registration is performed via
- * parasite RPC to ensure it runs in the target process's context.
+ * Sets up userfaultfd with WP_ASYNC write-protection for all writable
+ * memory regions of the target process.  Registration is performed via
+ * parasite RPC; WRITEPROTECT is deferred to post-resume.
  *
  * Returns: 0 on success, -1 on error
  */
-extern int cow_dump_init(struct pstree_item *item, struct vm_area_list *vma_area_list, struct parasite_ctl *ctl);
+extern int cow_dump_init(struct pstree_item *item,
+			 struct vm_area_list *vma_area_list,
+			 struct parasite_ctl *ctl);
 
 /**
  * cow_dump_fini - Clean up COW dump resources
- *
- * Releases all resources allocated for COW tracking.
  */
 extern void cow_dump_fini(void);
 
 /**
  * cow_check_kernel_support - Check if kernel supports COW dump
  *
- * Verifies that the kernel has necessary userfaultfd write-protect
- * features (requires Linux 5.7+).
+ * Verifies WP_ASYNC and PAGEFAULT_FLAG_WP (requires Linux 5.7+).
  *
  * Returns: true if supported, false otherwise
  */
 extern bool cow_check_kernel_support(void);
 
 /**
- * cow_start_monitor_thread - Start background thread to monitor page faults
+ * cow_dump_apply_writeprotect - Apply UFFDIO_WRITEPROTECT from CRIU side
  *
- * Creates a pthread that continuously monitors the userfaultfd for
- * write faults and handles them immediately, preventing the target
- * process from blocking during the dump phase.
- *
- * Returns: 0 on success, -1 on error
- */
-extern int cow_start_monitor_thread(void);
-
-/**
- * cow_stop_monitor_thread - Stop the monitoring thread
- *
- * Signals the monitor thread to stop and waits for it to complete.
+ * Called after the target process resumes.  Iterates all registered VMAs
+ * and applies write-protection via ioctl on the uffd fd.  With WP_ASYNC
+ * the kernel auto-resolves write faults (~1-2us), so the process
+ * experiences no meaningful write stall.
  *
  * Returns: 0 on success, -1 on error
  */
-extern int cow_stop_monitor_thread(void);
+extern int cow_dump_apply_writeprotect(void);
 
 /**
- * cow_get_uffd - Get the userfaultfd file descriptor
+ * cow_dump_scan_dirty - Scan for dirty pages and re-apply write-protection
+ * @source_pid: PID of the tracked process
+ * @start: Start address of the range to scan
+ * @end: End address of the range to scan
+ * @regs: Output buffer for page_region entries
+ * @max_regs: Size of the output buffer
+ * @nr_dirty_pages: Output count of dirty pages found
  *
- * Returns the userfaultfd associated with the current COW dump session.
+ * Uses PAGEMAP_SCAN with PM_SCAN_WP_MATCHING to atomically find pages
+ * whose WP bit was cleared (written pages) and re-apply write-protection.
  *
- * Returns: userfaultfd on success, -1 if COW dump not initialized
+ * Returns: number of page_region entries on success, -1 on error
  */
-extern int cow_get_uffd(void);
+extern int cow_dump_scan_dirty(pid_t source_pid,
+			       unsigned long start, unsigned long end,
+			       struct page_region *regs,
+			       unsigned long max_regs,
+			       unsigned long *nr_dirty_pages);
 
 /**
  * cow_get_uffd_for_pid - Get the userfaultfd for a tracked source pid
- * @source_pid: Source process pid from dump-time tree
+ * @source_pid: Source process pid
  *
- * Returns: userfaultfd on success, -1 if not found
+ * Returns: userfaultfd fd on success, -1 if not found
  */
 extern int cow_get_uffd_for_pid(pid_t source_pid);
 
 /**
  * cow_dump_is_vma_tracked - Check whether a VMA is COW-tracked
- * @source_pid: Source process pid from dump-time tree
+ * @source_pid: Source process pid
  * @start: VMA start address
  * @end: VMA end address
  *
@@ -108,87 +90,5 @@ extern int cow_get_uffd_for_pid(pid_t source_pid);
 extern bool cow_dump_is_vma_tracked(pid_t source_pid,
 				    unsigned long start,
 				    unsigned long end);
-
-/**
- * cow_lookup_page - Look up a COW page without removing it
- * @vaddr: Virtual address of the page
- *
- * Look up a page in the COW hash table without removing it.
- * IMPORTANT: Caller must hold the hash bucket lock for this page.
- *
- * Returns: cow_page structure on success, NULL if not found
- */
-extern struct cow_page *cow_lookup_page(unsigned long vaddr);
-
-/**
- * cow_remove_page - Remove and free a COW page
- * @vaddr: Virtual address of the page
- *
- * Remove a page from the COW hash table and free its memory.
- * IMPORTANT: Caller must hold the hash bucket lock for this page.
- */
-extern void cow_remove_page(unsigned long vaddr);
-
-/**
- * cow_lookup_and_remove_page - Look up and remove a COW page
- * @vaddr: Virtual address of the page
- *
- * Thread-safe lookup and removal of a copied page from the hash table.
- * The caller is responsible for freeing the returned cow_page structure
- * and its data.
- *
- * Returns: cow_page structure on success, NULL if not found
- */
-extern struct cow_page *cow_lookup_and_remove_page(unsigned long vaddr);
-
-/**
- * cow_get_hash_lock - Get pointer to the spinlock for a page's hash bucket
- * @vaddr: Virtual address of the page
- *
- * Returns the spinlock that protects the hash bucket for the given address.
- * Used for manual locking around cow_lookup_page/cow_remove_page.
- *
- * Returns: Pointer to the spinlock
- */
-extern pthread_spinlock_t *cow_get_hash_lock(unsigned long vaddr);
-
-struct cow_page_queue_entry;
-
-/**
- * cow_get_next_page - Get next COW page from the queue
- *
- * Thread-safe dequeue of the next COW page that needs to be sent.
- * The caller is responsible for freeing the returned entry.
- *
- * Returns: cow_page_queue_entry on success, NULL if queue is empty
- */
-extern struct cow_page_queue_entry *cow_get_next_page(void);
-
-/**
- * cow_has_pending_pages - Check if there are pending COW pages
- *
- * Thread-safe check for whether the COW page queue has any entries.
- *
- * Returns: true if there are pending pages, false otherwise
- */
-extern bool cow_has_pending_pages(void);
-
-/**
- * cow_put_back_page - Put a COW page back in the queue
- * @entry: Queue entry to re-queue
- *
- * Thread-safe re-insertion of a COW page at the head of the queue.
- * Used when a page doesn't belong to the current image being processed.
- */
-extern void cow_put_back_page(struct cow_page_queue_entry *entry);
-
-/**
- * cow_get_queue_size - Get the number of pending COW pages in the queue
- *
- * Thread-safe count of COW pages waiting to be sent.
- *
- * Returns: Number of entries in the COW page queue
- */
-extern unsigned long cow_get_queue_size(void);
 
 #endif /* __CR_COW_DUMP_H_ */
