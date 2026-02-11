@@ -356,6 +356,111 @@ work/wp-async-cow           — WP_ASYNC + PAGEMAP_SCAN (this work)
 | `src/server.h` | `struct serverObject` | Object layout — ptr field points to data, need to map to pages |
 | `src/rio.h` | `struct _rio` | I/O abstraction — supports buffer, file, socket, connset targets |
 
+## What Next
+
+### Phase 1: Prototype WP_ASYNC Inside Valkey (Proof of Concept)
+
+**Goal**: Prove that per-object WP_ASYNC eliminates the latency spike during
+serialization, using a standalone test inside Valkey.
+
+1. **Add userfaultfd setup to Valkey startup**
+   - Create uffd with `UFFD_FEATURE_WP_ASYNC` in `server.c:initServer()`
+   - Register the heap region(s) with `UFFDIO_REGISTER_MODE_WP`
+   - Open `/proc/self/pagemap` for `PAGEMAP_SCAN`
+   - Store uffd and pagemap_fd in `server` struct
+
+2. **Build a `DEBUG WP-SERIALIZE` test command**
+   - Pick a large key (e.g., a hash with 1M fields)
+   - WP the pages backing the object
+   - Serialize to a buffer using existing `rdbSaveObject()`
+   - `PAGEMAP_SCAN` to check if any pages were dirtied
+   - Log: serialization time, dirty pages found, re-serialization count
+   - Unprotect (or let WP_ASYNC handle it)
+   - Run `latency-bench` during this to measure write latency impact
+
+3. **Validate zero L3 eviction**
+   - The serialization thread reads from its OWN address space
+   - Data is already in cache — no cross-process reads
+   - Benchmark should show baseline latency throughout serialization
+
+**Files to modify**: `src/server.c`, `src/server.h`, `src/debug.c`
+**Dependencies**: Linux 6.1+ (WP_ASYNC), Linux 6.7+ (PAGEMAP_SCAN)
+**Expected outcome**: Serialization of a 1GB hash with <50μs max write
+latency impact (vs current lock-based approach which blocks for the
+entire serialization duration)
+
+### Phase 2: Integrate with Thread-Save
+
+**Goal**: Replace thread-save's per-object locking with per-object WP_ASYNC.
+
+4. **Hook into thread-save's object iteration loop**
+   - Before serializing each object: WP its pages
+   - After serializing: PAGEMAP_SCAN for dirty detection
+   - If dirty: re-serialize modified portions
+   - This replaces the application-level copy-on-write / object lock
+
+5. **Handle jemalloc slab sharing**
+   - Small objects share slab pages — WP on a slab page affects neighbors
+   - Options: (a) accept false positives (re-serialize more than needed),
+     (b) WP only for large objects (>PAGE_SIZE), use existing locking for small ones,
+     (c) batch serialize all objects on the same slab page together
+
+6. **Handle nested allocations**
+   - A hash's field-value pairs are separately allocated
+   - Need to walk the object's allocation tree to find all pages
+   - For each object type: STRING is contiguous, HASH/SET/ZSET have
+     hashtable + entries, LIST has quicklist nodes
+   - `rdbSaveObject()` already knows how to iterate each type — WP
+     before the iteration begins, scan after it completes
+
+### Phase 3: Integrate with Replication for Live Migration
+
+**Goal**: Use thread-save with WP_ASYNC as the data source for live migration.
+
+7. **Stream RDB to remote replica via replication protocol**
+   - Thread-save produces an RDB byte stream (via `rio`)
+   - Route this stream to the replication channel (existing `rdbSaveToReplicasSockets` pattern)
+   - Replica loads the stream as a standard full-sync
+
+8. **Use PSYNC for the delta**
+   - During thread-save, all write commands go to the replication backlog
+   - After RDB stream completes, replica catches up via PSYNC
+   - This is the standard replication flow — no CRIU needed
+
+9. **Cutover**
+   - When replica is caught up (backlog offset matches), promote replica
+   - Redirect clients to the new instance
+   - Client reconnection handled by standard Redis/Valkey client libraries
+
+### Phase 4: Benchmark and Validate
+
+10. **Compare with current approaches**
+    - Baseline: fork-based BGSAVE + replication (current)
+    - Thread-save without WP_ASYNC (application-level locking)
+    - Thread-save with per-object WP_ASYNC (our approach)
+    - CRIU COW dump (our current implementation, for reference)
+    - Metrics: source p99 latency, total migration time, memory overhead
+
+11. **Test edge cases**
+    - Large objects (1GB+ hashes, sorted sets)
+    - Active defrag during migration
+    - High write rate during migration
+    - Object resize / rehash during serialization
+    - Memory pressure (jemalloc arena contention)
+
+### Key Decision Points
+
+- **Phase 1 result determines viability**: If the `DEBUG WP-SERIALIZE`
+  test shows >100μs write latency, the jemalloc slab sharing problem
+  is worse than expected and we need a different approach.
+
+- **Phase 2 depends on thread-save availability**: The upstream thread-save
+  contribution must land (or we fork it) before integration work begins.
+
+- **Phase 3 may not need CRIU at all**: If thread-save + replication
+  handles migration correctly, CRIU becomes unnecessary for Valkey
+  migration. CRIU's value would be limited to non-Valkey workloads.
+
 ## Proven Facts (with test data)
 
 1. **WP_ASYNC max write latency: 13μs** (100GB, 565K samples, 393ms WP duration)
