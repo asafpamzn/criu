@@ -891,7 +891,7 @@ static int parasite_cow_dump_init(struct parasite_cow_dump_args *args)
 
 	ret = sys_ioctl(uffd, UFFDIO_API, (unsigned long)&api);
 	if (ret < 0) {
-		int e = (ret < 0) ? -ret : ret;     /* convert to +errno code */
+		int e = -ret;
 
 		pr_err("Failed to initialize userfaultfd API: %d uffd=%d but continue\n", e, uffd);
 		sys_close(uffd);
@@ -907,13 +907,6 @@ static int parasite_cow_dump_init(struct parasite_cow_dump_args *args)
 		vma = vmas + i;
 		addr = vma->start;
 		len = vma->len;
-#if 0
-		if (!vma_entry_can_be_lazy(vma->e))
-		{
-			pr_err("Skipping VMEs that cannot be lazy VMA: %lx-%lx len=%lu\n", addr, addr + len, len);
-			continue;
-		}
-#endif
 
 		pr_err("Registering VMA %d: %lx-%lx prot=%x len=%lu\n",
 			i, addr, addr + len, vma->prot, len);
@@ -935,7 +928,7 @@ static int parasite_cow_dump_init(struct parasite_cow_dump_args *args)
 		ret = sys_ioctl(uffd, UFFDIO_REGISTER, (unsigned long)&reg);
 		if (ret) {
 			/* Some VMAs may not support WP - record index for CRIU to dump */
-			if (ret == EINVAL) {
+			if (ret == -EINVAL) {
 				pr_warn("Cannot WP-register VMA %lx-%lx len=%lu (unsupported), marking for later dump\n",
 					addr, addr + len, len);
 				
