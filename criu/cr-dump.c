@@ -1786,16 +1786,10 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 		}
 
 		/*
-		 * COW tracking applies UFFD write-protect to writable VMAs.
-		 * The parasite itself can fault on protected pages (e.g. rseq/TLS
-		 * writes) while we are still in dump_one_task(), so start monitor
-		 * early to service those faults and avoid deadlock in RPC commands.
+		 * WP_ASYNC: no monitor thread needed.  The kernel
+		 * auto-resolves write faults.  WRITEPROTECT is deferred
+		 * to post-resume in cr_dump_finish().
 		 */
-		if (opts.lazy_pages && cow_start_monitor_thread()) {
-			pr_err("Failed to start COW monitor thread\n");
-			ret = -1;
-			goto err_cure;
-		}
 	}
 
 	ret = parasite_dump_pages_seized(item, &vmas, &mdc, parasite_ctl);
@@ -2240,15 +2234,9 @@ static int cr_dump_finish(int ret)
 
 	/* Resume process early if using COW dump with lazy pages */
 	if (!ret && opts.lazy_pages && opts.cow_dump) {
-		pr_err("PAGE SERVER READY TO SERVE\n");
-		pr_info("Resuming process with COW protection active\n");
+		struct timeval t_wp_start, t_wp_end, t_wp_delta;
 
-		if (cow_start_monitor_thread()) {
-			pr_err("Failed to start COW monitor thread\n");
-			ret = -1;
-			goto out_release_cow;
-		}
-
+		/* Resume process FIRST — before applying write-protection */
 		if (arch_set_thread_regs(root_item, true) < 0) {
 			ret = -1;
 			goto out_release_cow;
@@ -2258,8 +2246,22 @@ static int cr_dump_finish(int ret)
 
 		pstree_switch_state(root_item, TASK_ALIVE);
 		timing_stop(TIME_FROZEN);
-		
-		/* Now start lazy page transfer with process running */
+
+		/*
+		 * Apply WRITEPROTECT from CRIU side while process runs.
+		 * With WP_ASYNC the kernel auto-resolves write faults
+		 * (~1-2us per write).  The ioctl uses mmap_read_lock
+		 * (shared) so it doesn't block process writes.
+		 */
+		gettimeofday(&t_wp_start, NULL);
+		cow_dump_apply_writeprotect();
+		gettimeofday(&t_wp_end, NULL);
+		timersub(&t_wp_end, &t_wp_start, &t_wp_delta);
+		pr_err("TIMING: cow_dump_apply_writeprotect took %ld.%06ld seconds (post-resume, WP_ASYNC)\n",
+		       t_wp_delta.tv_sec, t_wp_delta.tv_usec);
+
+		/* Start lazy page transfer with WP active */
+		pr_err("PAGE SERVER READY TO SERVE\n");
 		ret = cr_lazy_mem_dump();
 	} else {
 		/* Standard path: transfer pages then resume */

@@ -859,7 +859,6 @@ static int parasite_cow_dump_init(struct parasite_cow_dump_args *args)
 {
 	struct parasite_vma_entry *vmas, *vma;
 	struct uffdio_register reg;
-	struct uffdio_writeprotect wp;
 	struct uffdio_api api;
 	int uffd, tsock, i;
 	int ret = 0;
@@ -884,10 +883,10 @@ static int parasite_cow_dump_init(struct parasite_cow_dump_args *args)
    		 return -1;
 	}
 
-	/* Initialize userfaultfd API with WP features */
+	/* Initialize userfaultfd API with WP_ASYNC for low-latency writes */
 	memset(&api, 0, sizeof(api));
 	api.api = UFFD_API;
-	api.features = 0;
+	api.features = UFFD_FEATURE_WP_ASYNC;
 	api.ioctls = 0;
 
 	ret = sys_ioctl(uffd, UFFDIO_API, (unsigned long)&api);
@@ -958,20 +957,15 @@ static int parasite_cow_dump_init(struct parasite_cow_dump_args *args)
 
 		}
 
-		/* Apply write-protection */
-		wp.range.start = addr;
-		wp.range.len = len;
-		wp.mode = UFFDIO_WRITEPROTECT_MODE_WP;
-		ret = sys_ioctl(uffd, UFFDIO_WRITEPROTECT, (unsigned long)&wp);
-		if (ret) {
-			pr_err("Failed to write-protect VMA %lx-%lx: ret=%d\n",
-			       addr, addr + len, ret);
-			sys_close(uffd);
-			return -1;
-		}
+		/*
+		 * WRITEPROTECT is deferred to post-resume — CRIU applies it
+		 * from its own process via cow_dump_apply_writeprotect().
+		 * With WP_ASYNC the kernel auto-resolves write faults so
+		 * there is no write stall during the PTE walk.
+		 */
 
 		total_pages += len / PAGE_SIZE;
-		pr_info("Successfully registered and WP'd VMA: %lx-%lx (%lu pages)\n",
+		pr_info("Successfully registered VMA: %lx-%lx (%lu pages)\n",
 			addr, addr + len, len / PAGE_SIZE);
 	}
 
