@@ -172,19 +172,6 @@ extern void cow_put_back_page(struct cow_page_queue_entry *entry);
 extern unsigned long cow_get_queue_size(void);
 
 /**
- * cow_bitmap_init - Initialize the COW tracking bitmap
- * @base_addr: Lowest virtual address being tracked
- * @total_pages: Total number of pages in the tracked range
- *
- * Allocates a bitmap with one bit per page covering the address range
- * [base_addr, base_addr + total_pages * PAGE_SIZE). Used to quickly
- * check whether a page has been write-faulted.
- *
- * Returns: 0 on success, -1 on error
- */
-extern int cow_bitmap_init(unsigned long base_addr, unsigned long total_pages);
-
-/**
  * cow_bitmap_fini - Free the COW tracking bitmap
  */
 extern void cow_bitmap_fini(void);
