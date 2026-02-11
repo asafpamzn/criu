@@ -1643,15 +1643,21 @@ static int add_active_image(u64 dst_id, int sk)
 static int send_lazy_vma_page(int sk, unsigned long vaddr, u64 dst_id,
 			      pid_t source_pid)
 {
-	void *buffer;
+	static __thread void *req_buf;
 	struct iovec local_iov, remote_iov;
 	int ret;
 
-	buffer = xmalloc(PAGE_SIZE);
-	if (!buffer)
-		return -1;
+	/* Persistent per-thread buffer — avoids malloc/free per demand page */
+	if (!req_buf) {
+		req_buf = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE,
+			       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (req_buf == MAP_FAILED) {
+			req_buf = NULL;
+			return -1;
+		}
+	}
 
-	local_iov.iov_base = buffer;
+	local_iov.iov_base = req_buf;
 	local_iov.iov_len = PAGE_SIZE;
 	remote_iov.iov_base = (void *)vaddr;
 	remote_iov.iov_len = PAGE_SIZE;
@@ -1660,12 +1666,10 @@ static int send_lazy_vma_page(int sk, unsigned long vaddr, u64 dst_id,
 	if (ret != PAGE_SIZE) {
 		pr_perror("Failed to read page at %lx from pid %d",
 			  vaddr, source_pid);
-		xfree(buffer);
 		return -1;
 	}
 
-	ret = send_page_compressed(sk, buffer, dst_id, vaddr);
-	xfree(buffer);
+	ret = send_page_compressed(sk, req_buf, dst_id, vaddr);
 
 	if (ret != 0) {
 		pr_perror("Failed to send page at %lx", vaddr);
@@ -2085,12 +2089,12 @@ static void *unified_page_server_thread(void *arg)
 
 			xfree(sorted);
 
-			/* Final drain of any remaining queued pages */
-			pthread_spin_lock(&active_images_lock);
+			/* Final drain — outside spinlock since it does I/O */
 			if (final_queue_drain(img, source_pid, &stats) < 0)
 				pr_err("Error in final queue drain\n");
 
 			/* Check if complete */
+			pthread_spin_lock(&active_images_lock);
 			if (img->remaining_pages == 0) {
 				pthread_spin_unlock(&active_images_lock);
 				if (send_image_complete(img) < 0)
