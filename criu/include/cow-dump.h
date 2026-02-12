@@ -171,4 +171,41 @@ extern void cow_put_back_page(struct cow_page_queue_entry *entry);
  */
 extern unsigned long cow_get_queue_size(void);
 
+/**
+ * cow_bitmap_init - Initialize the COW tracking bitmap
+ * @base_addr: Lowest virtual address being tracked
+ * @total_pages: Total number of pages in the tracked range
+ *
+ * Allocates a bitmap with one bit per page covering the address range
+ * [base_addr, base_addr + total_pages * PAGE_SIZE). Used to quickly
+ * check whether a page has been write-faulted.
+ *
+ * Returns: 0 on success, -1 on error
+ */
+extern int cow_bitmap_init(unsigned long base_addr, unsigned long total_pages);
+
+/**
+ * cow_bitmap_fini - Free the COW tracking bitmap
+ */
+extern void cow_bitmap_fini(void);
+
+/**
+ * cow_set_bitmap - Mark a page as write-faulted in the bitmap
+ * @vaddr: Virtual address of the faulted page
+ *
+ * Atomically sets the bit for this page. Called by Thread 1 (write fault
+ * monitor). Thread 3 reads these bits via cow_test_bitmap().
+ */
+extern void cow_set_bitmap(unsigned long vaddr);
+
+/**
+ * cow_test_bitmap - Check if a page was write-faulted
+ * @vaddr: Virtual address to check
+ *
+ * Atomically reads the bit for this page. Safe to call from any thread.
+ *
+ * Returns: true if the page was write-faulted, false otherwise
+ */
+extern bool cow_test_bitmap(unsigned long vaddr);
+
 #endif /* __CR_COW_DUMP_H_ */
