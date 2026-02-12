@@ -1685,6 +1685,18 @@ static int send_lazy_vma_page(int sk, unsigned long vaddr, u64 dst_id,
 	if (lock)
 		pthread_spin_unlock(lock);
 
+	/* M1: Verify bitmap agrees with hash lookup.
+	 * If hash has an entry, bitmap must also be set.
+	 * The reverse is not necessarily true: bitmap may be set
+	 * but hash entry already removed by P1. */
+	if (cow_pg) {
+		if (!cow_test_bitmap(vaddr)) {
+			pr_err("M1 BITMAP MISMATCH: hash has 0x%lx but bitmap bit is NOT set\n",
+			       vaddr);
+		}
+	}
+
+
 	if (cow_pg) {
 		pr_debug("[SEND_PAGE] Sending COW page at vaddr=0x%lx\n", vaddr);
 

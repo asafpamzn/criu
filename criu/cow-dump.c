@@ -55,6 +55,11 @@ struct cow_dump_info {
 	pthread_spinlock_t cow_hash_locks[COW_HASH_SIZE];	/* Per-bucket spinlocks */
 	struct list_head cow_page_queue;	/* FIFO queue of COW pages */
 	pthread_spinlock_t queue_lock;		/* Protects the queue */
+	/* M1: Bitmap tracking write-faulted pages (1 bit per page) */
+	uint8_t *cow_bitmap;			/* Bitmap array */
+	unsigned long cow_bitmap_bytes;		/* Size of bitmap in bytes */
+	unsigned long cow_bitmap_base;		/* Lowest tracked address (page-aligned) */
+	unsigned long cow_bitmap_pages;		/* Total pages covered by bitmap */
 };
 
 /*
@@ -569,6 +574,9 @@ int cow_dump_init(struct pstree_item *item, struct vm_area_list *vma_area_list, 
 	unsigned long args_size;
 	unsigned int i;
 	unsigned long want_generation = 0;
+	/* M1: Track address range for bitmap */
+	unsigned long bitmap_min = ULONG_MAX;
+	unsigned long bitmap_max = 0;
 
 	pr_info("Initializing COW dump for pid %d\n", item->pid->real);
 
@@ -705,6 +713,27 @@ int cow_dump_init(struct pstree_item *item, struct vm_area_list *vma_area_list, 
 		item->pid->real, task->nr_tracked_vmas,
 		task->total_pages, task->uffd);
 
+	/* M1: Calculate bitmap range from tracked VMAs */
+	for (i = 0; i < task->nr_tracked_vmas; i++) {
+		if (task->tracked_vmas[i].start < bitmap_min)
+			bitmap_min = task->tracked_vmas[i].start;
+		if (task->tracked_vmas[i].end > bitmap_max)
+			bitmap_max = task->tracked_vmas[i].end;
+	}
+
+	/* M1: Allocate bitmap covering the full VMA range */
+	if (bitmap_max > bitmap_min) {
+		unsigned long bitmap_pages = (bitmap_max - bitmap_min) / PAGE_SIZE;
+		if (cow_bitmap_init(bitmap_min, bitmap_pages)) {
+			pr_err("Failed to initialize COW bitmap\n");
+			/* Non-fatal for M1: bitmap is observation only */
+		}
+	} else {
+		pr_warn("No VMA range for COW bitmap (min=0x%lx max=0x%lx)\n",
+			bitmap_min, bitmap_max);
+	}
+
+
 	return 0;
 
 err:
@@ -730,6 +759,96 @@ err:
 	return -1;
 }
 
+int cow_bitmap_init(unsigned long base_addr, unsigned long total_pages)
+{
+	unsigned long bitmap_bytes;
+
+	if (!g_cow_info) {
+		pr_err("cow_bitmap_init: g_cow_info is NULL\n");
+		return -1;
+	}
+
+	if (total_pages == 0) {
+		pr_warn("cow_bitmap_init: zero pages, skipping bitmap\n");
+		return 0;
+	}
+
+	bitmap_bytes = (total_pages + 7) / 8;
+	g_cow_info->cow_bitmap = xzalloc(bitmap_bytes);
+	if (!g_cow_info->cow_bitmap) {
+		pr_err("cow_bitmap_init: failed to allocate %lu bytes\n", bitmap_bytes);
+		return -1;
+	}
+
+	g_cow_info->cow_bitmap_bytes = bitmap_bytes;
+	g_cow_info->cow_bitmap_base = base_addr;
+	g_cow_info->cow_bitmap_pages = total_pages;
+
+	pr_info("COW bitmap initialized: base=0x%lx pages=%lu bytes=%lu\n",
+		base_addr, total_pages, bitmap_bytes);
+	return 0;
+}
+
+void cow_bitmap_fini(void)
+{
+	if (!g_cow_info)
+		return;
+
+	if (g_cow_info->cow_bitmap) {
+		xfree(g_cow_info->cow_bitmap);
+		g_cow_info->cow_bitmap = NULL;
+	}
+	g_cow_info->cow_bitmap_bytes = 0;
+	g_cow_info->cow_bitmap_base = 0;
+	g_cow_info->cow_bitmap_pages = 0;
+}
+
+void cow_set_bitmap(unsigned long vaddr)
+{
+	unsigned long page_addr = vaddr & ~(PAGE_SIZE - 1);
+	unsigned long page_idx;
+
+	if (!g_cow_info || !g_cow_info->cow_bitmap)
+		return;
+
+	if (page_addr < g_cow_info->cow_bitmap_base) {
+		pr_warn("cow_set_bitmap: addr 0x%lx below base 0x%lx\n",
+			page_addr, g_cow_info->cow_bitmap_base);
+		return;
+	}
+
+	page_idx = (page_addr - g_cow_info->cow_bitmap_base) / PAGE_SIZE;
+	if (page_idx >= g_cow_info->cow_bitmap_pages) {
+		pr_warn("cow_set_bitmap: addr 0x%lx idx %lu beyond range %lu\n",
+			page_addr, page_idx, g_cow_info->cow_bitmap_pages);
+		return;
+	}
+
+	__atomic_or_fetch(&g_cow_info->cow_bitmap[page_idx / 8],
+			  (uint8_t)(1 << (page_idx % 8)), __ATOMIC_RELEASE);
+}
+
+bool cow_test_bitmap(unsigned long vaddr)
+{
+	unsigned long page_addr = vaddr & ~(PAGE_SIZE - 1);
+	unsigned long page_idx;
+	uint8_t val;
+
+	if (!g_cow_info || !g_cow_info->cow_bitmap)
+		return false;
+
+	if (page_addr < g_cow_info->cow_bitmap_base)
+		return false;
+
+	page_idx = (page_addr - g_cow_info->cow_bitmap_base) / PAGE_SIZE;
+	if (page_idx >= g_cow_info->cow_bitmap_pages)
+		return false;
+
+	val = __atomic_load_n(&g_cow_info->cow_bitmap[page_idx / 8],
+			      __ATOMIC_ACQUIRE);
+	return (val & (1 << (page_idx % 8))) != 0;
+}
+
 void cow_dump_fini(void)
 {	
 	struct cow_page *cp;
@@ -747,6 +866,9 @@ void cow_dump_fini(void)
 	}
 
 	pr_info("Cleaning up COW dump\n");
+
+	/* M1: Free bitmap */
+	cow_bitmap_fini();
 
 	if (g_monitor_eventfd >= 0) {
 		close(g_monitor_eventfd);
@@ -851,6 +973,10 @@ static int cow_handle_write_fault(struct cow_dump_info *cdi,
 		cow_stats.read_failures++;
 		return -1;
 	}
+
+	/* M1: Set bitmap bit BEFORE hash add (ensures bitmap is visible
+	 * when Thread 3 sees the hash entry for assertion checking) */
+	cow_set_bitmap(page_addr);
 
 	/* Add to hash table (thread-safe with per-bucket spinlock) */
 	hash = (page_addr >> PAGE_SHIFT) & (COW_HASH_SIZE - 1);
