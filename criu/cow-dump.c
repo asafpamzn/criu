@@ -1453,6 +1453,17 @@ struct cow_page *cow_lookup_page(unsigned long vaddr)
 	unsigned long page_addr = vaddr & ~(PAGE_SIZE - 1);
 	unsigned int hash;
 
+	/*
+	 * M3 verification: After M3, only send_cow_page_lazy (P1) should
+	 * call cow_remove_page which is the only remaining hash reader.
+	 * cow_lookup_page should no longer be called by P2/P3.
+	 * This warning helps detect if we missed a call site.
+	 */
+	static unsigned long lookup_call_count = 0;
+	if (++lookup_call_count <= 3)
+		pr_warn("M3 VERIFY: cow_lookup_page called for 0x%lx (call #%lu)\n",
+			page_addr, lookup_call_count);
+
 	if (!g_cow_info)
 		return NULL;
 
