@@ -8,15 +8,6 @@ struct pstree_item;
 struct vm_area_list;
 struct parasite_ctl;
 
-#define COW_HASH_BITS 16
-#define COW_HASH_SIZE (1 << COW_HASH_BITS)
-
-struct cow_page {
-	unsigned long vaddr;
-	void *data;
-	struct hlist_node hash;
-};
-
 /* Forward declaration */
 struct page_pipe_buf;
 
@@ -111,49 +102,6 @@ extern int cow_get_uffd_for_pid(pid_t source_pid);
 extern bool cow_dump_is_vma_tracked(pid_t source_pid,
 				    unsigned long start,
 				    unsigned long end);
-
-/**
- * cow_lookup_page - Look up a COW page without removing it
- * @vaddr: Virtual address of the page
- *
- * Look up a page in the COW hash table without removing it.
- * IMPORTANT: Caller must hold the hash bucket lock for this page.
- *
- * Returns: cow_page structure on success, NULL if not found
- */
-extern struct cow_page *cow_lookup_page(unsigned long vaddr);
-
-/**
- * cow_remove_page - Remove and free a COW page
- * @vaddr: Virtual address of the page
- *
- * Remove a page from the COW hash table and free its memory.
- * IMPORTANT: Caller must hold the hash bucket lock for this page.
- */
-extern void cow_remove_page(unsigned long vaddr);
-
-/**
- * cow_lookup_and_remove_page - Look up and remove a COW page
- * @vaddr: Virtual address of the page
- *
- * Thread-safe lookup and removal of a copied page from the hash table.
- * The caller is responsible for freeing the returned cow_page structure
- * and its data.
- *
- * Returns: cow_page structure on success, NULL if not found
- */
-extern struct cow_page *cow_lookup_and_remove_page(unsigned long vaddr);
-
-/**
- * cow_get_hash_lock - Get pointer to the spinlock for a page's hash bucket
- * @vaddr: Virtual address of the page
- *
- * Returns the spinlock that protects the hash bucket for the given address.
- * Used for manual locking around cow_lookup_page/cow_remove_page.
- *
- * Returns: Pointer to the spinlock
- */
-extern pthread_spinlock_t *cow_get_hash_lock(unsigned long vaddr);
 
 struct cow_page_queue_entry;
 

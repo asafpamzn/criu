@@ -1795,21 +1795,6 @@ static int send_cow_page_lazy(struct cow_page_queue_entry *entry, struct active_
 		return -1;
 	}
 	
-	/*
-	 * M2: Remove from hash table (cleanup).
-	 * P2/P3 still use hash for their lookups, but this page is now
-	 * sent so they will hit sent_bitmap and skip it anyway.
-	 * Removing from hash frees memory sooner.
-	 */
-	{
-		pthread_spinlock_t *lock = cow_get_hash_lock(entry->vaddr);
-		if (lock) {
-			pthread_spin_lock(lock);
-			cow_remove_page(entry->vaddr);
-			pthread_spin_unlock(lock);
-		}
-	}
-	
 	/* Mark as sent */
 	lve->sent_bitmap[page_idx / 8] |= (1 << (page_idx % 8));
 	
@@ -2083,7 +2068,13 @@ static int process_vma_pages(struct active_image *img,
 	for (vaddr = lve->start; vaddr < lve->end; vaddr += PAGE_SIZE, page_idx++) {
 		maybe_print_stats(stats);
 
-		/* Priority 1: Drain COW pages */
+		/*
+		 * P1: Drain pending COW pages in bounded batches.
+		 * A batch limit ensures P2 (urgent page fault requests)
+		 * and P3 (sequential scan) are not starved under heavy
+		 * writes. COW pages skipped by P3 (bitmap check) are
+		 * sent by P1 in subsequent iterations or final_queue_drain().
+		 */
 		if (drain_cow_pages(img, source_pid, 100, stats) < 0)
 			return -1;
 
@@ -2110,6 +2101,10 @@ static int final_queue_drain(struct active_image *img, pid_t source_pid,
 	while (img->remaining_pages > 0) {
 		int cow_sent, req_sent;
 
+		/*
+		 * Drain COW pages in batches so that P2 (page fault
+		 * requests) is still served after P3 scan completes.
+		 */
 		cow_sent = drain_cow_pages(img, source_pid, 100, stats);
 		if (cow_sent < 0)
 			return -1;

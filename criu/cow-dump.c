@@ -59,8 +59,6 @@ struct cow_dump_info {
 	struct list_head tracked_tasks;
 	unsigned long total_pages;
 	unsigned long iteration;
-	struct hlist_head cow_hash[COW_HASH_SIZE];	/* Hash table for copied pages */
-	pthread_spinlock_t cow_hash_locks[COW_HASH_SIZE];	/* Per-bucket spinlocks */
 	struct list_head cow_page_queue;	/* FIFO queue of COW pages */
 	pthread_spinlock_t queue_lock;		/* Protects the queue */
 
@@ -596,10 +594,6 @@ int cow_dump_init(struct pstree_item *item, struct vm_area_list *vma_area_list, 
 			return -1;
 
 		INIT_LIST_HEAD(&cdi->tracked_tasks);
-		for (i = 0; i < COW_HASH_SIZE; i++) {
-			INIT_HLIST_HEAD(&cdi->cow_hash[i]);
-			pthread_spin_init(&cdi->cow_hash_locks[i], PTHREAD_PROCESS_PRIVATE);
-		}
 		INIT_LIST_HEAD(&cdi->cow_page_queue);
 		pthread_spin_init(&cdi->queue_lock, PTHREAD_PROCESS_PRIVATE);
 		g_cow_info = cdi;
@@ -917,12 +911,10 @@ bool cow_test_bitmap(unsigned long vaddr)
 }
 
 void cow_dump_fini(void)
-{	
-	struct cow_page *cp;
+{
 	struct cow_page_queue_entry *qe, *qe_tmp;
 	struct cow_tracked_task *task, *task_tmp;
-	struct hlist_node *n;
-	int i, remaining = 0, queue_remaining = 0;
+	int queue_remaining = 0;
 
 	if (!g_cow_info)
 		return;
@@ -962,22 +954,6 @@ void cow_dump_fini(void)
 	if (queue_remaining > 0)
 		pr_warn("Freed %d remaining queue entries\n", queue_remaining);
 
-	/* Clean up any remaining COW pages */
-	for (i = 0; i < COW_HASH_SIZE; i++) {
-		pthread_spin_lock(&g_cow_info->cow_hash_locks[i]);
-		hlist_for_each_entry_safe(cp, n, &g_cow_info->cow_hash[i], hash) {
-			hlist_del(&cp->hash);
-			xfree(cp->data);
-			xfree(cp);
-			remaining++;
-		}
-		pthread_spin_unlock(&g_cow_info->cow_hash_locks[i]);
-		pthread_spin_destroy(&g_cow_info->cow_hash_locks[i]);
-	}
-
-	if (remaining > 0)
-		pr_warn("Freed %d remaining COW pages\n", remaining);
-
 	list_for_each_entry_safe(task, task_tmp, &g_cow_info->tracked_tasks, list) {
 		list_del(&task->list);
 		if (task->uffd >= 0)
@@ -994,68 +970,48 @@ static int cow_handle_write_fault(struct cow_dump_info *cdi,
 				  struct cow_tracked_task *task,
 				  unsigned long addr)
 {
-	struct cow_page *cp;
 	unsigned long page_addr = addr & ~(PAGE_SIZE - 1);
 	struct uffdio_writeprotect wp;
 	struct uffdio_range range;
 	ssize_t ret;
-	unsigned int hash;
+	struct cow_page_queue_entry *entry;
 	struct iovec local_iov, remote_iov;
-	struct cow_page_queue_entry* entry;
+	void *page_data;
 
-	pr_debug("Write fault at 0x%lx\n", page_addr);
+	pr_info("Write fault at 0x%lx\n", page_addr);
 
-	cow_stats.write_faults++;	
+	cow_stats.write_faults++;
 
-	/* Allocate cow_page structure */
-	cp = xmalloc(sizeof(*cp));
-	if (!cp) {
-		pr_err("Failed to allocate cow_page structure\n");
+	/*
+	 * M4: Allocate a single page buffer. This will be transferred
+	 * directly to the queue entry (zero-copy within the fault handler).
+	 */
+	page_data = xmalloc(PAGE_SIZE);
+	if (!page_data) {
+		pr_err("Failed to allocate page data buffer\n");
 		cow_stats.alloc_failures++;
 		return -1;
 	}
-
-	cp->data = xmalloc(PAGE_SIZE);
-	if (!cp->data) {
-		pr_err("Failed to allocate page data\n");
-		xfree(cp);
-		cow_stats.alloc_failures++;
-		return -1;
-	}
-
-	cp->vaddr = page_addr;
-	INIT_HLIST_NODE(&cp->hash);
 
 	/* Read original page content using process_vm_readv */
-	
-	local_iov.iov_base = cp->data;
+	local_iov.iov_base = page_data;
 	local_iov.iov_len = PAGE_SIZE;
 	remote_iov.iov_base = (void *)page_addr;
 	remote_iov.iov_len = PAGE_SIZE;
-	
+
 	ret = process_vm_readv(task->source_pid, &local_iov, 1, &remote_iov, 1, 0);
 	if (ret != PAGE_SIZE) {
-		pr_perror("Failed to read page at 0x%lx from pid %d (read %zd bytes)", 
+		pr_perror("Failed to read page at 0x%lx from pid %d (read %zd bytes)",
 			  page_addr, task->source_pid, ret);
-		xfree(cp->data);
-		xfree(cp);
+		xfree(page_data);
 		cow_stats.read_failures++;
 		return -1;
 	}
 
-	/* M1: Set bitmap bit BEFORE hash add (ensures bitmap is visible
-	 * when Thread 3 sees the hash entry for assertion checking) */
-	cow_set_bitmap(page_addr);
-
-	/* Add to hash table (thread-safe with per-bucket spinlock) */
-	hash = (page_addr >> PAGE_SHIFT) & (COW_HASH_SIZE - 1);
-	
-	pthread_spin_lock(&cdi->cow_hash_locks[hash]);
-	hlist_add_head(&cp->hash, &cdi->cow_hash[hash]);
-	pthread_spin_unlock(&cdi->cow_hash_locks[hash]);
-
 	cow_stats.pages_copied++;
-	pr_debug("Copied page at 0x%lx to hash bucket %u\n", page_addr, hash);
+
+	/* M1: Set bitmap bit (Thread 3 reads via cow_test_bitmap) */
+	cow_set_bitmap(page_addr);
 
 	/* Unprotect the page so the process can continue */
 	wp.range.start = page_addr;
@@ -1064,6 +1020,7 @@ static int cow_handle_write_fault(struct cow_dump_info *cdi,
 
 	if (ioctl(task->uffd, UFFDIO_WRITEPROTECT, &wp)) {
 		pr_perror("Failed to unprotect page at 0x%lx", page_addr);
+		xfree(page_data);
 		cow_stats.unprotect_failures++;
 		return -1;
 	}
@@ -1073,9 +1030,10 @@ static int cow_handle_write_fault(struct cow_dump_info *cdi,
 	/* Wake up the faulting thread */
 	range.start = page_addr;
 	range.len = PAGE_SIZE;
-	
+
 	if (ioctl(task->uffd, UFFDIO_WAKE, &range)) {
 		pr_perror("Failed to wake thread after unprotect");
+		xfree(page_data);
 		cow_stats.wake_failures++;
 		return -1;
 	}
@@ -1084,24 +1042,15 @@ static int cow_handle_write_fault(struct cow_dump_info *cdi,
 	cdi->total_pages--;
 
 	/*
-	 * COW faults only happen on lazy VMAs, which are NOT in page pipes.
-	 * Lazy VMAs are read directly via process_vm_readv(), so we don't
-	 * need to store location info (ppb, seg_idx, page_idx_in_seg).
-	 * Just store the vaddr in the queue for the page server.
-	 *
-	 * M2: Queue entry now carries a copy of the original page data
-	 * so that P1 can send directly from it without hash lookup.
+	 * M4: Enqueue with zero-copy — transfer page_data ownership
+	 * to the queue entry. No memcpy, no intermediate cow_page struct.
+	 * P1 (send_cow_page_lazy) will send from entry->data and free it.
 	 */
 	entry = xmalloc(sizeof(*entry));
 	if (entry) {
 		entry->vaddr = page_addr;
-		entry->data = xmalloc(PAGE_SIZE);
-		if (entry->data) {
-			memcpy(entry->data, cp->data, PAGE_SIZE);
-		} else {
-			pr_warn("Failed to allocate data for queue entry 0x%lx\n",
-				page_addr);
-		}
+		entry->data = page_data;	/* Transfer ownership */
+		page_data = NULL;		/* Prevent double-free */
 		entry->ppb = NULL;
 		entry->seg_idx = 0;
 		entry->page_idx_in_seg = 0;
@@ -1112,6 +1061,7 @@ static int cow_handle_write_fault(struct cow_dump_info *cdi,
 		pr_debug("Added lazy VMA COW page 0x%lx to queue\n", page_addr);
 	} else {
 		pr_warn("Failed to allocate queue entry for page 0x%lx\n", page_addr);
+		xfree(page_data);
 	}
 
 	return 0;
@@ -1433,102 +1383,6 @@ bool cow_dump_is_vma_tracked(pid_t source_pid, unsigned long start, unsigned lon
 	}
 
 	return false;
-}
-
-pthread_spinlock_t *cow_get_hash_lock(unsigned long vaddr)
-{
-	unsigned long page_addr = vaddr & ~(PAGE_SIZE - 1);
-	unsigned int hash;
-
-	if (!g_cow_info)
-		return NULL;
-
-	hash = (page_addr >> PAGE_SHIFT) & (COW_HASH_SIZE - 1);
-	return &g_cow_info->cow_hash_locks[hash];
-}
-
-struct cow_page *cow_lookup_page(unsigned long vaddr)
-{
-	struct cow_page *cp;
-	unsigned long page_addr = vaddr & ~(PAGE_SIZE - 1);
-	unsigned int hash;
-
-	/*
-	 * M3 verification: After M3, only send_cow_page_lazy (P1) should
-	 * call cow_remove_page which is the only remaining hash reader.
-	 * cow_lookup_page should no longer be called by P2/P3.
-	 * This warning helps detect if we missed a call site.
-	 */
-	static unsigned long lookup_call_count = 0;
-	if (++lookup_call_count <= 3)
-		pr_warn("M3 VERIFY: cow_lookup_page called for 0x%lx (call #%lu)\n",
-			page_addr, lookup_call_count);
-
-	if (!g_cow_info)
-		return NULL;
-
-	hash = (page_addr >> PAGE_SHIFT) & (COW_HASH_SIZE - 1);
-
-	/* NOTE: Caller must hold the lock for this hash bucket */
-	hlist_for_each_entry(cp, &g_cow_info->cow_hash[hash], hash) {
-		if (cp->vaddr == page_addr)
-			return cp;
-	}
-
-	return NULL;
-}
-
-void cow_remove_page(unsigned long vaddr)
-{
-	struct cow_page *cp;
-	struct hlist_node *n;
-	unsigned long page_addr = vaddr & ~(PAGE_SIZE - 1);
-	unsigned int hash;
-
-	if (!g_cow_info)
-		return;
-
-	hash = (page_addr >> PAGE_SHIFT) & (COW_HASH_SIZE - 1);
-
-	/* NOTE: Caller must hold the lock for this hash bucket */
-	hlist_for_each_entry_safe(cp, n, &g_cow_info->cow_hash[hash], hash) {
-		if (cp->vaddr == page_addr) {
-			hlist_del(&cp->hash);
-			xfree(cp->data);
-			xfree(cp);
-			pr_debug("Removed COW page at 0x%lx from hash bucket %u\n",
-				 page_addr, hash);
-			return;
-		}
-	}
-}
-
-struct cow_page *cow_lookup_and_remove_page(unsigned long vaddr)
-{
-	struct cow_page *cp;
-	struct hlist_node *n;
-	unsigned int hash;
-	unsigned long page_addr = vaddr & ~(PAGE_SIZE - 1);
-
-	if (!g_cow_info)
-		return NULL;
-
-	hash = (page_addr >> PAGE_SHIFT) & (COW_HASH_SIZE - 1);
-
-	pthread_spin_lock(&g_cow_info->cow_hash_locks[hash]);
-	
-	hlist_for_each_entry_safe(cp, n, &g_cow_info->cow_hash[hash], hash) {
-		if (cp->vaddr == page_addr) {
-			hlist_del(&cp->hash);
-			pthread_spin_unlock(&g_cow_info->cow_hash_locks[hash]);
-			pr_debug("Found and removed COW page at 0x%lx from hash bucket %u\n", 
-				 page_addr, hash);
-			return cp;
-		}
-	}
-	
-	pthread_spin_unlock(&g_cow_info->cow_hash_locks[hash]);
-	return NULL;
 }
 
 struct cow_page_queue_entry *cow_get_next_page(void)
