@@ -14,6 +14,7 @@
 #include <string.h>
 #include <pthread.h>
 #include <lz4.h>
+#include <limits.h>
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "page-xfer: "
@@ -1612,135 +1613,85 @@ static struct {
 	unsigned long send_sub_count;
 } cow_timing;
 
-/* Helper to send a lazy VMA page using process_vm_readv with LZ4 compression */
+/*
+ * Helper to send a non-COW lazy VMA page using process_vm_readv.
+ *
+ * M3: This function is now only called for pages where cow_bitmap=0,
+ * meaning the source process has NOT written to this page. The live
+ * memory still contains the original snapshot-consistent data.
+ * Hash lookup is no longer needed here.
+ */
 static int send_lazy_vma_page(int sk, unsigned long vaddr, u64 dst_id, pid_t source_pid)
 {
-	struct cow_page *cow_pg;
-	pthread_spinlock_t *lock;
 	void *buffer;
 	int ret;
 	int uffd;
 	struct iovec local_iov, remote_iov;
-	struct timespec t_start, t_lock, t_cow, t_readv, t_socket, t_unprot, t_end;
-	
-	pr_debug("[SEND_PAGE] Entering send_lazy_vma_page: vaddr=0x%lx dst_id=%lu pid=%d\n", 
-		 vaddr, (unsigned long)dst_id, source_pid);
-	
+	struct timespec t_start, t_readv, t_socket, t_unprot, t_end;
+
+	pr_debug("[SEND_PAGE] Sending non-COW page at vaddr=0x%lx pid=%d\n",
+		 vaddr, source_pid);
+
 	clock_gettime(CLOCK_MONOTONIC, &t_start);
-	
-	/* Get hash bucket lock */
-	lock = cow_get_hash_lock(vaddr);
-	if (!lock) {
-		pr_err("Failed to get COW hash lock\n");
+
+	/* M3: Sanity check — caller should have verified bitmap */
+	if (cow_test_bitmap(vaddr)) {
+		pr_err("M3 BUG: send_lazy_vma_page called for COW page 0x%lx!\n",
+		       vaddr);
 		return -1;
 	}
-	
-	pthread_spin_lock(lock);
-	clock_gettime(CLOCK_MONOTONIC, &t_lock);
-	
-	/* Check for COW page */
-	cow_pg = cow_lookup_page(vaddr);
-	clock_gettime(CLOCK_MONOTONIC, &t_cow);
 
-	/* M1: Verify bitmap agrees with hash lookup.
-	 * If hash has an entry, bitmap must also be set.
-	 * The reverse is not necessarily true: bitmap may be set
-	 * but hash entry already removed by P1. */
-	if (cow_pg) {
-		if (!cow_test_bitmap(vaddr)) {
-			pr_err("M1 BITMAP MISMATCH: hash has 0x%lx but bitmap bit is NOT set\n",
-			       vaddr);
-		}
-	}
+	buffer = xmalloc(PAGE_SIZE);
+	if (!buffer)
+		return -1;
 
-	/* Send data with compression */
-	if (cow_pg) {
-		/* Send COW data with compression */
-		pr_debug("[SEND_PAGE] Sending compressed COW page at vaddr=0x%lx\n", vaddr);
-		
-		t_readv = t_cow; /* No readv for COW pages */
-		ret = send_page_compressed(sk, cow_pg->data, dst_id, vaddr);
-		clock_gettime(CLOCK_MONOTONIC, &t_socket); /* compress+send combined */		
-		
-		if (ret != 0) {
-			pr_perror("Failed to send compressed COW page");
-			pthread_spin_unlock(lock);
-			return -1;
-		}
-		pr_debug("[SEND_PAGE] Successfully sent compressed COW page at vaddr=0x%lx\n", vaddr);
-		t_unprot = t_socket; /* No unprotect for COW */
-	} else {
-		/* Read from process memory */
-		pr_debug("[SEND_PAGE] Reading regular page from process memory at vaddr=0x%lx pid=%d\n", vaddr, source_pid);
-		
-		buffer = xmalloc(PAGE_SIZE);
-		if (!buffer) {
-			pthread_spin_unlock(lock);
-			return -1;
-		}
-		
-		local_iov.iov_base = buffer;
-		local_iov.iov_len = PAGE_SIZE;
-		remote_iov.iov_base = (void *)vaddr;
-		remote_iov.iov_len = PAGE_SIZE;
-		
-		ret = process_vm_readv(source_pid, &local_iov, 1, &remote_iov, 1, 0);
-		clock_gettime(CLOCK_MONOTONIC, &t_readv);
-		
-		if (ret != PAGE_SIZE) {
-			pr_perror("Failed to read page at %lx from pid %d", vaddr, source_pid);
-			xfree(buffer);
-			pthread_spin_unlock(lock);
-			return -1;
-		}
-		
-		pr_debug("[SEND_PAGE] Read successful, sending compressed page at vaddr=0x%lx\n", vaddr);
-		
-		/* Send buffer with compression */
-		ret = send_page_compressed(sk, buffer, dst_id, vaddr);
-		clock_gettime(CLOCK_MONOTONIC, &t_socket);
+	/* Read directly from process memory (safe — page not modified) */
+	local_iov.iov_base = buffer;
+	local_iov.iov_len = PAGE_SIZE;
+	remote_iov.iov_base = (void *)vaddr;
+	remote_iov.iov_len = PAGE_SIZE;
+
+	ret = process_vm_readv(source_pid, &local_iov, 1, &remote_iov, 1, 0);
+	clock_gettime(CLOCK_MONOTONIC, &t_readv);
+
+	if (ret != PAGE_SIZE) {
+		pr_perror("Failed to read page at %lx from pid %d", vaddr, source_pid);
 		xfree(buffer);
-		
-		if (ret != 0) {
-			pr_perror("Failed to send compressed page");
-			pthread_spin_unlock(lock);
-			return -1;
-		}
-		
-		pr_debug("[SEND_PAGE] Successfully sent compressed regular page at vaddr=0x%lx\n", vaddr);
-		
-		/* Unprotect non-COW page */
-		uffd = cow_get_uffd();
-		if (uffd >= 0) {
-			struct uffdio_writeprotect wp;
-			wp.range.start = vaddr;
-			wp.range.len = PAGE_SIZE;
-			wp.mode = 0;
-			if (ioctl(uffd, UFFDIO_WRITEPROTECT, &wp)) {
-				pr_perror("Failed to unprotect page at 0x%lx", vaddr);
-				pthread_spin_unlock(lock);
-				return -1;
-			}
-		}
-		clock_gettime(CLOCK_MONOTONIC, &t_unprot);
+		return -1;
 	}
-	
-	/* Remove COW page if it exists */
-	if (cow_pg)
-		cow_remove_page(vaddr);
-	
-	pthread_spin_unlock(lock);
+
+	/* Compress and send */
+	ret = send_page_compressed(sk, buffer, dst_id, vaddr);
+	clock_gettime(CLOCK_MONOTONIC, &t_socket);
+	xfree(buffer);
+
+	if (ret != 0) {
+		pr_perror("Failed to send page at 0x%lx", vaddr);
+		return -1;
+	}
+
+	/* Unprotect page — it's been sent, no need to track writes anymore */
+	uffd = cow_get_uffd();
+	if (uffd >= 0) {
+		struct uffdio_writeprotect wp;
+		wp.range.start = vaddr;
+		wp.range.len = PAGE_SIZE;
+		wp.mode = 0;
+		if (ioctl(uffd, UFFDIO_WRITEPROTECT, &wp))
+			pr_perror("Failed to unprotect page at 0x%lx", vaddr);
+	}
+	clock_gettime(CLOCK_MONOTONIC, &t_unprot);
+
+	/* Accumulate timing stats */
 	clock_gettime(CLOCK_MONOTONIC, &t_end);
-	
-	/* Accumulate sub-timings (nanoseconds) */
-	cow_timing.send_lock_ns += (t_lock.tv_sec - t_start.tv_sec) * 1000000000 + (t_lock.tv_nsec - t_start.tv_nsec);
-	cow_timing.send_cow_lookup_ns += (t_cow.tv_sec - t_lock.tv_sec) * 1000000000 + (t_cow.tv_nsec - t_lock.tv_nsec);
-	cow_timing.send_vm_readv_ns += (t_readv.tv_sec - t_cow.tv_sec) * 1000000000 + (t_readv.tv_nsec - t_cow.tv_nsec);
-	cow_timing.send_compress_ns += (t_socket.tv_sec - t_readv.tv_sec) * 1000000000 + (t_socket.tv_nsec - t_readv.tv_nsec);
-	cow_timing.send_unprotect_ns += (t_unprot.tv_sec - t_socket.tv_sec) * 1000000000 + (t_unprot.tv_nsec - t_socket.tv_nsec);
-	cow_timing.send_unlock_ns += (t_end.tv_sec - t_unprot.tv_sec) * 1000000000 + (t_end.tv_nsec - t_unprot.tv_nsec);
+	cow_timing.send_vm_readv_ns += (t_readv.tv_sec - t_start.tv_sec) * 1000000000 +
+				       (t_readv.tv_nsec - t_start.tv_nsec);
+	cow_timing.send_compress_ns += (t_socket.tv_sec - t_readv.tv_sec) * 1000000000 +
+				       (t_socket.tv_nsec - t_readv.tv_nsec);
+	cow_timing.send_unprotect_ns += (t_unprot.tv_sec - t_socket.tv_sec) * 1000000000 +
+					(t_unprot.tv_nsec - t_socket.tv_nsec);
 	cow_timing.send_sub_count++;
-	
+
 	return 0;
 }
 
@@ -1836,7 +1787,7 @@ static int send_request_page_lazy(struct page_request_entry *req, struct active_
 		unsigned long page_vaddr = req->vaddr + (i * PAGE_SIZE);
 		struct lazy_vma_entry *lve;
 		unsigned long page_idx;
-	//	verify_vmas(__FILE__, __LINE__);
+
 		/* Find which lazy VMA contains this page (uses global list) */
 		lve = find_lazy_vma_for_addr(page_vaddr, req->dst_id);
 		if (!lve) {
@@ -1853,7 +1804,24 @@ static int send_request_page_lazy(struct page_request_entry *req, struct active_
 			continue;
 		}
 		
-		/* Send the page */
+		/*
+		 * M3: Check cow_bitmap. If the page was write-faulted,
+		 * the original data is in the P1 queue. We cannot read
+		 * live memory because it contains post-write data.
+		 * Skip and let P1 handle it — drain_cow_pages runs
+		 * before drain_page_requests in the main loop.
+		 *
+		 * If we get here with cow_bitmap=1, it means a fault
+		 * arrived AFTER the latest P1 drain. Next loop iteration
+		 * will drain it.
+		 */
+		if (cow_test_bitmap(page_vaddr)) {
+			pr_debug("P2: page 0x%lx is COW, skipping for P1\n",
+				 page_vaddr);
+			continue;
+		}
+		
+		/* Page is not modified — send live data */
 		ret = send_lazy_vma_page(req->sk, page_vaddr, req->dst_id, source_pid);
 		if (ret < 0)
 			return -1;
@@ -2035,6 +2003,18 @@ static int send_single_lazy_page(struct active_image *img,
 		return 0;
 	}
 
+	/*
+	 * M3: Check cow_bitmap. If the page was write-faulted,
+	 * the original data is in the P1 queue. Skip it — P1 will
+	 * send the saved copy. drain_cow_pages runs before this
+	 * function in the main loop.
+	 */
+	if (cow_test_bitmap(vaddr)) {
+		pr_debug("P3: page 0x%lx is COW, skipping for P1\n", vaddr);
+		stats->priority3_skips++;
+		return 0;
+	}
+
 	ret = send_lazy_vma_page(img->main_sk, vaddr, img->dst_id, source_pid);
 	if (ret < 0) {
 		pr_err("Failed to send lazy VMA page at %lx\n", vaddr);
@@ -2084,10 +2064,6 @@ static int send_image_complete(struct active_image *img)
 	return 0;
 }
 
-/*
- * Process all pages for a single VMA
- * Returns: 0 on success, -1 on error
- */
 static int process_vma_pages(struct active_image *img,
 			     struct lazy_vma_entry *lve,
 			     pid_t source_pid,
@@ -2102,8 +2078,13 @@ static int process_vma_pages(struct active_image *img,
 	for (vaddr = lve->start; vaddr < lve->end; vaddr += PAGE_SIZE, page_idx++) {
 		maybe_print_stats(stats);
 
-		/* Priority 1: Drain COW pages */
-		if (drain_cow_pages(img, source_pid, 100, stats) < 0)
+		/*
+		 * M3: Priority 1 must drain ALL pending COW pages before
+		 * P2/P3 run, because P2/P3 now skip COW pages (bitmap check).
+		 * If P1 doesn't drain them, those pages would never be sent.
+		 * Changed from 100 to INT_MAX.
+		 */
+		if (drain_cow_pages(img, source_pid, INT_MAX, stats) < 0)
 			return -1;
 
 		/* Priority 2: Drain page requests */
@@ -2129,7 +2110,8 @@ static int final_queue_drain(struct active_image *img, pid_t source_pid,
 	while (img->remaining_pages > 0) {
 		int cow_sent, req_sent;
 
-		cow_sent = drain_cow_pages(img, source_pid, 100, stats);
+		/* M3: Drain all pending COW pages */
+		cow_sent = drain_cow_pages(img, source_pid, INT_MAX, stats);
 		if (cow_sent < 0)
 			return -1;
 
