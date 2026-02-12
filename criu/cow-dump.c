@@ -951,6 +951,8 @@ void cow_dump_fini(void)
 	pthread_spin_lock(&g_cow_info->queue_lock);
 	list_for_each_entry_safe(qe, qe_tmp, &g_cow_info->cow_page_queue, list) {
 		list_del(&qe->list);
+		if (qe->data)	/* M2: free page data */
+			xfree(qe->data);
 		xfree(qe);
 		queue_remaining++;
 	}
@@ -1077,11 +1079,30 @@ static int cow_handle_write_fault(struct cow_dump_info *cdi,
 		cow_stats.wake_failures++;
 		return -1;
 	}
-	
+
+	cow_stats.pages_woken++;
+	cdi->total_pages--;
+
+	/*
+	 * COW faults only happen on lazy VMAs, which are NOT in page pipes.
+	 * Lazy VMAs are read directly via process_vm_readv(), so we don't
+	 * need to store location info (ppb, seg_idx, page_idx_in_seg).
+	 * Just store the vaddr in the queue for the page server.
+	 *
+	 * M2: Queue entry now carries a copy of the original page data
+	 * so that P1 can send directly from it without hash lookup.
+	 */
 	entry = xmalloc(sizeof(*entry));
 	if (entry) {
 		entry->vaddr = page_addr;
-		entry->ppb = NULL;  /* Indicates lazy VMA - no location info needed */
+		entry->data = xmalloc(PAGE_SIZE);
+		if (entry->data) {
+			memcpy(entry->data, cp->data, PAGE_SIZE);
+		} else {
+			pr_warn("Failed to allocate data for queue entry 0x%lx\n",
+				page_addr);
+		}
+		entry->ppb = NULL;
 		entry->seg_idx = 0;
 		entry->page_idx_in_seg = 0;
 		INIT_LIST_HEAD(&entry->list);
@@ -1092,8 +1113,6 @@ static int cow_handle_write_fault(struct cow_dump_info *cdi,
 	} else {
 		pr_warn("Failed to allocate queue entry for page 0x%lx\n", page_addr);
 	}
-	cow_stats.pages_woken++;
-	cdi->total_pages--;
 
 	return 0;
 }

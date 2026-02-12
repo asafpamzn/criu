@@ -23,6 +23,7 @@ struct page_pipe_buf;
 /* Queue entry for COW pages waiting to be sent */
 struct cow_page_queue_entry {
 	unsigned long vaddr;
+	void *data;                      /* M2: Original page content (4KB) */
 	struct page_pipe_buf *ppb;      /* Buffer containing this page */
 	unsigned int seg_idx;            /* Segment index within buffer */
 	unsigned long page_idx_in_seg;   /* Page index within segment */
