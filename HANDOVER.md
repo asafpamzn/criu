@@ -375,90 +375,151 @@ before the dump and PSYNC can succeed after restore.
 **The bottleneck is step 1**: CRIU's page transfer via `process_vm_readv`
 causes 84 seconds of 1.5-3ms latency on the source (100GB).
 
-### Phase 1: Replace CRIU Page Transfer with In-Process Serialization
+### Phase 1: Main-Thread Incremental Serialization with WP_ASYNC
 
-**Goal**: Eliminate cross-process memory reads entirely. Serialize inside
-Valkey's own process where data is already hot in cache.
+**Goal**: Replace fork() in Valkey's replication FULLRESYNC with
+main-thread incremental serialization. No fork, no cross-process reads,
+no L3 eviction. Data is read from the process's own address space
+(already in cache). WP_ASYNC provides consistency without blocking writes.
 
-1. **Add userfaultfd + WP_ASYNC setup to Valkey**
+**Architecture** (validated with Codex, Option A):
+
+The main thread alternates between serving commands and serializing:
+
+```
+event loop iteration:
+  1. Process pending client commands     (~variable)
+  2. Serialize N keys to RDB stream      (~100μs-1ms, configurable)
+  3. Repeat
+```
+
+No object is ever locked. No command ever blocks beyond the serialization
+time budget per iteration. Large objects are serialized incrementally
+(e.g., 1000 hash fields per iteration), same pattern as Valkey's
+incremental rehash.
+
+WP_ASYNC tracks modifications between serialization batches:
+- WP the pages of the current serialization region
+- Serialize (reads only — WP doesn't affect reads)
+- Yield to command processing
+- If the application modifies serialized data, WP_ASYNC auto-resolves
+  the write (~1-2μs) and the kernel records the dirty page
+- After full pass: PAGEMAP_SCAN finds all dirty pages
+- Re-serialize dirty portions in iterative rounds
+- Brief final pause to capture replication offset, then PSYNC backlog
+  handles any remaining delta
+
+**Why this is safe** (single-threaded, no cross-thread data races):
+- Valkey is single-threaded for command processing
+- The serialization runs in the SAME thread (cooperative, not concurrent)
+- No hashtable iterator races — the iterator pauses between batches,
+  and the same thread processes any rehash/realloc between batches
+- WP_ASYNC is the safety net for changes between batches, not the
+  primary consistency mechanism
+
+**Implementation steps:**
+
+1. **Add uffd + WP_ASYNC + PAGEMAP_SCAN setup to Valkey**
    - Create uffd with `UFFD_FEATURE_WP_ASYNC` in `server.c:initServer()`
    - Register heap region(s) with `UFFDIO_REGISTER_MODE_WP`
    - Open `/proc/self/pagemap` for `PAGEMAP_SCAN`
    - Store uffd and pagemap_fd in `server` struct
 
-2. **Build a background RDB serialization thread with per-object WP_ASYNC**
-   - Spawn a thread that iterates the keyspace (like `rdbSaveDb`)
-   - Before serializing each large object: WP its pages
-   - Serialize using existing `rdbSaveObject()` (reads from own address space — no L3 eviction)
-   - After serialization: `PAGEMAP_SCAN` detects if pages were dirtied
-   - If dirty: re-serialize the modified portions
-   - Small objects (<PAGE_SIZE): serialize directly without WP (too small to benefit)
+2. **Build incremental RDB serializer in the event loop**
+   - New state machine: `MIGRATE_STATE_IDLE`, `_SERIALIZING`, `_DIRTY_SCAN`,
+     `_CONVERGING`, `_FINAL_PAUSE`, `_DONE`
+   - In `serverCron()` or `beforeSleep()`: call `migrateIncrementalSerialize()`
+   - Time-budgeted: serialize for at most N microseconds per call
+   - Uses existing `rdbSaveObject()` / `rdbSaveKeyValuePair()`
+   - Large objects: serialize M entries per call (like incremental rehash)
+   - Stream output via `rio` to socket (diskless replication pattern)
 
-3. **Stream RDB to replica via existing replication protocol**
-   - Use `rdbSaveToReplicasSockets` pattern (diskless replication)
-   - Or: write RDB to shared storage, replica loads it
-   - Then PSYNC catches up the delta (existing flow)
+3. **WP_ASYNC dirty tracking between batches**
+   - Before each serialization batch: WP the pages being read
+   - After full pass: `PAGEMAP_SCAN(PM_SCAN_WP_MATCHING)` for dirty pages
+   - Re-serialize dirty keys (key-level dirty tracking preferred,
+     page-level as safety net)
+   - Iterate until dirty set < threshold
 
-4. **Validate with latency benchmark**
-   - Run `latency-bench` during serialization
-   - Expected: baseline latency throughout (data already in cache)
-   - Compare against CRIU COW dump (84s of 1.5-3ms)
+4. **Final consistency fence**
+   - Brief pause (stop processing commands, ~1ms)
+   - Final `PAGEMAP_SCAN` — send last dirty delta
+   - Capture `replication_offset` — this is the PSYNC start point
+   - Resume command processing
+   - Replica catches up via PSYNC backlog from that offset
 
-**Files to modify**: `src/server.c`, `src/server.h`, `src/rdb.c`
+5. **Integration with replication protocol**
+   - When replica connects for FULLRESYNC: start incremental serializer
+     instead of fork() + child RDB
+   - Stream RDB via `rdbSaveToReplicasSockets` pattern
+   - After RDB complete + dirty converged: replica does PSYNC
+
+6. **Disable churn sources during migration window**
+   - Pause active defrag (`server.active_defrag_enabled = 0`)
+   - Pause jemalloc background thread
+   - Pause lazy-free background operations
+   - Re-enable after migration completes
+
+**Files to modify**: `src/server.c`, `src/server.h`, `src/rdb.c`,
+`src/replication.c`
 **Dependencies**: Linux 6.1+ (WP_ASYNC), Linux 6.7+ (PAGEMAP_SCAN)
 
 ### Phase 2: Handle Edge Cases
 
-5. **jemalloc slab sharing**
+7. **jemalloc slab sharing**
    - Small objects share slab pages — WP on a slab page affects neighbors
-   - Options: (a) accept false positives (re-serialize more), (b) WP only
-     for large objects (>PAGE_SIZE), serialize small ones without WP,
-     (c) batch all objects on the same slab page together
+   - Accept false positives: re-serialize objects on dirty slab pages
+   - For small objects (<PAGE_SIZE): serialize without WP (fast enough
+     that modification during serialization is negligible)
 
-6. **Nested allocations**
-   - A hash's entries are separately allocated across many pages
-   - `rdbSaveObject()` already walks each type's structure — WP before
-     the walk, scan after it completes
-   - For very large objects spanning thousands of pages: chunk the WP
-     to limit scope
+8. **Large objects (1GB+ hashes, sorted sets)**
+   - Serialize incrementally: N entries per event loop iteration
+   - WP the object's pages at start of serialization
+   - Between iterations: commands may modify the object (WP_ASYNC resolves)
+   - After full iteration: PAGEMAP_SCAN detects dirty pages
+   - Re-serialize only the dirty entries
+   - Max added latency per command = serialization time budget (~1ms)
 
-7. **Object mutations during serialization**
-   - WP_ASYNC auto-resolves writes (~1-2μs) — no blocking
-   - PAGEMAP_SCAN detects dirty pages after serialization
-   - Re-serialize dirty portions, iterate until clean
-   - Final: accept remaining dirty as "close enough" — PSYNC backlog
-     covers any commands that happened during serialization
+9. **Key-level dirty tracking (optimization)**
+   - Maintain a dirty bit per key in the keyspace
+   - Set dirty bit in command processing when a key is modified
+   - During dirty-delta rounds: only re-serialize keys with dirty bit set
+   - Faster than page-level PAGEMAP_SCAN for sparse modifications
+   - Page-level scan remains as safety net for non-command mutations
+     (defrag, rehash, jemalloc internal operations)
 
 ### Phase 3: Benchmark and Validate
 
-8. **Compare approaches**
+10. **Compare approaches**
 
-   | Approach | Source Latency | Transfer Time | Freeze |
-   |---|---|---|---|
-   | Fork BGSAVE + replication | Near zero (COW) | ~100s for 100GB | fork() ~500ms |
-   | CRIU COW dump (current) | 1.5-3ms for 84s | 84s | 35ms |
-   | In-process WP_ASYNC + replication | **Near zero** (expected) | ~100s | **0ms** (no freeze needed) |
+    | Approach | Source Latency | Transfer Time | Freeze | Memory Overhead |
+    |---|---|---|---|---|
+    | Fork BGSAVE + replication | Near zero | ~100s for 100GB | fork() ~500ms | 2x RSS (COW) |
+    | CRIU COW dump (current) | 1.5-3ms for 84s | 84s | 35ms | Minimal |
+    | **Main-thread WP_ASYNC** | **~1ms max** (budget) | ~100s | **~1ms** (final fence) | **Minimal** |
 
-9. **Test edge cases**
-   - Large objects (1GB+ hashes)
-   - Active defrag during migration
-   - High write rate
-   - Object rehash during serialization
+11. **Test edge cases**
+    - Large objects (1GB+ hashes) — verify incremental serialization
+    - Active defrag disabled — verify no interference
+    - High write rate — verify dirty convergence
+    - Object rehash during serialization — verify no crash
+    - Replica disconnect during serialization — verify cleanup
 
 ### Key Decision Points
 
-- **Phase 1 determines viability**: If in-process serialization with
-  WP_ASYNC shows near-zero latency impact, this replaces CRIU for
-  Valkey migration entirely.
+- **Phase 1 PoC determines viability**: Build `DEBUG WP-MIGRATE` command
+  that serializes one DB incrementally with WP_ASYNC. Measure latency.
+  If p99 stays under 1ms, this approach works.
 
-- **No dependency on upstream thread-save**: We build our own background
-  serialization thread. The upstream thread-save contribution may
-  provide useful infrastructure later, but is not a blocker.
+- **No dependency on upstream thread-save**: Main-thread incremental
+  serialization is a different pattern. Thread-save uses a background
+  thread with object locks. We use the main thread with cooperative
+  yielding and WP_ASYNC. No locks, no thread safety issues.
 
-- **CRIU remains useful for non-Valkey workloads**: The WP_ASYNC
-  CRIU implementation (this branch) works for any process. The
-  Valkey-specific approach is an optimization for the specific case
-  where application-level serialization is possible.
+- **This is a new migration protocol, not drop-in FULLRESYNC**: The
+  serialization is incremental and eventually-consistent, unlike fork's
+  point-in-time snapshot. The final consistency fence + PSYNC backlog
+  makes it equivalent, but the wire protocol and state machine are new.
 
 ## Proven Facts (with test data)
 
