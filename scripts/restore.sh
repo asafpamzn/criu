@@ -136,7 +136,7 @@ RESTORE_ARGS=(
 	--tcp-close
 	--cow-dump
 	--skip-file-rwx-check
-	--file-validation filesize   # Tolerate library build-ID mismatches
+	--file-validation filesize
 )
 if [ "$FAST_CUTOVER" = "1" ]; then
 	RESTORE_ARGS+=(--leave-stopped)  # Restore process in SIGSTOP state
@@ -177,6 +177,11 @@ for attempt in $(seq 1 "$RESTORE_RETRY_ATTEMPTS"); do
 		sudo tail -n 120 "$IMAGES_DIR/lazy-server.log" 2>/dev/null || true
 		exit 1
 	fi
+
+	# Truncate log files that may have grown since the dump was taken,
+	# otherwise CRIU's file-size validation rejects the restore.
+	sudo truncate -s 0 /var/log/valkey/stderr.log 2>/dev/null || true
+	echo "  stderr.log size after truncate: $(stat -c%s /var/log/valkey/stderr.log 2>/dev/null || echo 'N/A')"
 
 	# Run CRIU restore: recreates the process from dump images.
 	# In FAST_CUTOVER mode, the process is left in SIGSTOP state.
