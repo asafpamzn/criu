@@ -31,6 +31,18 @@
 #undef LOG_PREFIX
 #define LOG_PREFIX "cow-dump: "
 
+/*
+ * M5: Lock-free SPSC queue wrapper node.
+ *
+ * Separates queue linkage from payload (cow_page_queue_entry) so that
+ * the standard "consumed node becomes new dummy" pattern works without
+ * use-after-free: the caller frees the entry, the queue frees the node.
+ */
+struct cow_spsc_node {
+	struct cow_spsc_node *next;		/* Atomic: producer writes, consumer reads */
+	struct cow_page_queue_entry *entry;	/* Payload (NULL for dummy node) */
+};
+
 /* COW dump state for a single process */
 
 /* M1: Per-VMA bitmap for tracking write-faulted pages */
@@ -44,10 +56,17 @@ struct cow_vma_bitmap {
 struct cow_dump_info {
 	struct pstree_item *item;
 	int uffd;				/* userfaultfd for write tracking */
-	unsigned long total_pages;		/* Total pages being tracked */		
-	unsigned long iteration;		/* Current iteration number */	
-	struct list_head cow_page_queue;	/* FIFO queue of COW pages */
-	pthread_spinlock_t queue_lock;		/* Protects the queue */
+	unsigned long total_pages;		/* Total pages being tracked */
+	unsigned long iteration;		/* Current iteration number */
+
+	/*
+	 * M5: Lock-free SPSC queue (Thread 1 produces, Thread 3 consumes).
+	 * head and tail are on separate cache lines to prevent false sharing.
+	 */
+	struct cow_spsc_node *spsc_head;	/* Consumer side */
+	char _pad[64 - sizeof(struct cow_spsc_node *)];
+	struct cow_spsc_node *spsc_tail;	/* Producer side */
+	unsigned long spsc_size;		/* Atomic: approximate queue size */
 
 	/* M1: Per-VMA bitmaps tracking write-faulted pages */
 	struct cow_vma_bitmap *vma_bitmaps;	/* Array of per-VMA bitmaps */
@@ -58,6 +77,12 @@ struct cow_dump_info {
 static struct cow_dump_info *g_cow_info = NULL;
 static pthread_t g_monitor_thread;
 static volatile bool g_stop_monitoring = false;
+/*
+ * M5: Consumer-side putback list. Only Thread 3 accesses this,
+ * so no synchronization is needed. cow_get_next_page() drains
+ * this list before checking the SPSC queue.
+ */
+static struct cow_page_queue_entry *g_putback_list = NULL;
 
 #define COW_CONVERGENCE_THRESHOLD 100  /* Stop if < 100 pages dirty per iteration */
 #define COW_FLUSH_THRESHOLD 1000       /* Flush to disk every 1000 pages */
@@ -172,9 +197,19 @@ int cow_dump_init(struct pstree_item *item, struct vm_area_list *vma_area_list, 
 	cdi->item = item;	
 	cdi->uffd = -1; /* Will be received from parasite */
 
-	/* Initialize COW page queue */
-	INIT_LIST_HEAD(&cdi->cow_page_queue);
-	pthread_spin_init(&cdi->queue_lock, PTHREAD_PROCESS_PRIVATE);
+	/* M5: Initialize lock-free SPSC queue with dummy node */
+	{
+		struct cow_spsc_node *dummy = xzalloc(sizeof(*dummy));
+		if (!dummy) {
+			xfree(cdi);
+			return -1;
+		}
+		dummy->next = NULL;
+		dummy->entry = NULL;
+		cdi->spsc_head = dummy;
+		cdi->spsc_tail = dummy;
+		cdi->spsc_size = 0;
+	}
 
 	/* Prepare parasite arguments - count writable VMAs */
 	/* IMPORTANT: Apply same filters as generate_vma_iovs() to avoid mismatches */
@@ -465,7 +500,7 @@ bool cow_test_bitmap(unsigned long vaddr)
 
 void cow_dump_fini(void)
 {
-	struct cow_page_queue_entry *qe, *qe_tmp;
+	struct cow_page_queue_entry *qe;
 	int queue_remaining = 0;
 
 	if (!g_cow_info)
@@ -476,17 +511,36 @@ void cow_dump_fini(void)
 	/* M1: Free bitmap */
 	cow_bitmap_fini();
 
-	/* Clean up any remaining queue entries */
-	pthread_spin_lock(&g_cow_info->queue_lock);
-	list_for_each_entry_safe(qe, qe_tmp, &g_cow_info->cow_page_queue, list) {
-		list_del(&qe->list);
-		if (qe->data)	/* M2: free page data */
+	/* M5: Drain consumer-side putback list */
+	while (g_putback_list) {
+		qe = g_putback_list;
+		g_putback_list = qe->next;
+		if (qe->data)
 			xfree(qe->data);
 		xfree(qe);
 		queue_remaining++;
 	}
-	pthread_spin_unlock(&g_cow_info->queue_lock);
-	pthread_spin_destroy(&g_cow_info->queue_lock);
+
+	/* M5: Drain SPSC queue */
+	if (g_cow_info->spsc_head) {
+		struct cow_spsc_node *node = g_cow_info->spsc_head;
+
+		while (node) {
+			struct cow_spsc_node *next = node->next;
+
+			/* Free payload if present (dummy has entry==NULL) */
+			if (node->entry) {
+				if (node->entry->data)
+					xfree(node->entry->data);
+				xfree(node->entry);
+				queue_remaining++;
+			}
+			xfree(node);
+			node = next;
+		}
+		g_cow_info->spsc_head = NULL;
+		g_cow_info->spsc_tail = NULL;
+	}
 
 	if (queue_remaining > 0)
 		pr_warn("Freed %d remaining queue entries\n", queue_remaining);
@@ -576,19 +630,37 @@ static int cow_handle_write_fault(struct cow_dump_info *cdi, unsigned long addr)
 	 * to the queue entry. No memcpy, no intermediate cow_page struct.
 	 * P1 (send_cow_page_lazy) will send from entry->data and free it.
 	 */
+	/*
+	 * M5: Lock-free SPSC enqueue. Allocate a wrapper node and link
+	 * it at the tail. The release store on tail->next publishes both
+	 * the node and the entry data to the consumer (Thread 3).
+	 */
 	entry = xmalloc(sizeof(*entry));
 	if (entry) {
-		entry->vaddr = page_addr;
-		entry->data = page_data;	/* Transfer ownership */
-		page_data = NULL;		/* Prevent double-free */
-		entry->ppb = NULL;
-		entry->seg_idx = 0;
-		entry->page_idx_in_seg = 0;
-		INIT_LIST_HEAD(&entry->list);
-		pthread_spin_lock(&cdi->queue_lock);
-		list_add_tail(&entry->list, &cdi->cow_page_queue);
-		pthread_spin_unlock(&cdi->queue_lock);
-		pr_debug("Added lazy VMA COW page 0x%lx to queue\n", page_addr);
+		struct cow_spsc_node *node = xmalloc(sizeof(*node));
+		if (node) {
+			entry->vaddr = page_addr;
+			entry->data = page_data;	/* Transfer ownership */
+			page_data = NULL;		/* Prevent double-free */
+			entry->ppb = NULL;
+			entry->seg_idx = 0;
+			entry->page_idx_in_seg = 0;
+			entry->next = NULL;
+
+			node->entry = entry;
+			node->next = NULL;
+
+			/* Publish: consumer sees node only after this store */
+			__atomic_store_n(&cdi->spsc_tail->next, node, __ATOMIC_RELEASE);
+			cdi->spsc_tail = node;
+			__atomic_fetch_add(&cdi->spsc_size, 1, __ATOMIC_RELAXED);
+
+			pr_debug("Added lazy VMA COW page 0x%lx to SPSC queue\n", page_addr);
+		} else {
+			pr_warn("Failed to allocate SPSC node for page 0x%lx\n", page_addr);
+			xfree(entry);
+			xfree(page_data);
+		}
 	} else {
 		pr_warn("Failed to allocate queue entry for page 0x%lx\n", page_addr);
 		xfree(page_data);
@@ -753,34 +825,56 @@ int cow_get_uffd(void)
 
 struct cow_page_queue_entry *cow_get_next_page(void)
 {
-	struct cow_page_queue_entry *entry = NULL;
+	struct cow_page_queue_entry *entry;
+	struct cow_spsc_node *head, *next;
 
 	if (!g_cow_info)
 		return NULL;
 
-	pthread_spin_lock(&g_cow_info->queue_lock);
-	if (!list_empty(&g_cow_info->cow_page_queue)) {
-		entry = list_first_entry(&g_cow_info->cow_page_queue,
-					 struct cow_page_queue_entry, list);
-		list_del(&entry->list);
+	/* M5: Check consumer-side putback list first (no atomics needed) */
+	if (g_putback_list) {
+		entry = g_putback_list;
+		g_putback_list = entry->next;
+		entry->next = NULL;
+		__atomic_fetch_sub(&g_cow_info->spsc_size, 1, __ATOMIC_RELAXED);
+		return entry;
 	}
-	pthread_spin_unlock(&g_cow_info->queue_lock);
 
+	/* M5: Lock-free SPSC dequeue */
+	head = g_cow_info->spsc_head;
+	next = __atomic_load_n(&head->next, __ATOMIC_ACQUIRE);
+
+	if (!next)
+		return NULL;	/* Queue is empty */
+
+	/* Extract payload from the next node */
+	entry = next->entry;
+	next->entry = NULL;	/* next becomes the new dummy */
+
+	/* Advance head: next is now the dummy */
+	g_cow_info->spsc_head = next;
+
+	/* Free old dummy (no thread references it anymore) */
+	xfree(head);
+
+	__atomic_fetch_sub(&g_cow_info->spsc_size, 1, __ATOMIC_RELAXED);
 	return entry;
 }
 
 bool cow_has_pending_pages(void)
 {
-	bool has_pages;
+	struct cow_spsc_node *next;
 
 	if (!g_cow_info)
 		return false;
 
-	pthread_spin_lock(&g_cow_info->queue_lock);
-	has_pages = !list_empty(&g_cow_info->cow_page_queue);
-	pthread_spin_unlock(&g_cow_info->queue_lock);
+	/* Check putback list first (consumer-local, no atomic needed) */
+	if (g_putback_list)
+		return true;
 
-	return has_pages;
+	/* Check SPSC queue */
+	next = __atomic_load_n(&g_cow_info->spsc_head->next, __ATOMIC_ACQUIRE);
+	return next != NULL;
 }
 
 void cow_put_back_page(struct cow_page_queue_entry *entry)
@@ -788,26 +882,22 @@ void cow_put_back_page(struct cow_page_queue_entry *entry)
 	if (!g_cow_info || !entry)
 		return;
 
-	pthread_spin_lock(&g_cow_info->queue_lock);
-	list_add(&entry->list, &g_cow_info->cow_page_queue);
-	pthread_spin_unlock(&g_cow_info->queue_lock);
+	/*
+	 * M5: Push onto consumer-side putback list. Only Thread 3 calls
+	 * this, so no synchronization needed. cow_get_next_page() drains
+	 * this list before the SPSC queue, preserving FIFO-ish ordering.
+	 */
+	entry->next = g_putback_list;
+	g_putback_list = entry;
 
-	pr_debug("Re-queued COW page 0x%lx\n", entry->vaddr);
+	/* Don't increment spsc_size — it was already counted when enqueued */
+	pr_debug("Re-queued COW page 0x%lx to putback list\n", entry->vaddr);
 }
 
 unsigned long cow_get_queue_size(void)
 {
-	unsigned long count = 0;
-	struct cow_page_queue_entry *entry;
-
 	if (!g_cow_info)
 		return 0;
 
-	pthread_spin_lock(&g_cow_info->queue_lock);
-	list_for_each_entry(entry, &g_cow_info->cow_page_queue, list) {
-		count++;
-	}
-	pthread_spin_unlock(&g_cow_info->queue_lock);
-
-	return count;
+	return __atomic_load_n(&g_cow_info->spsc_size, __ATOMIC_RELAXED);
 }
