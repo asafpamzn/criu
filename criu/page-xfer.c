@@ -1765,7 +1765,7 @@ static int send_cow_page_lazy(struct cow_page_queue_entry *entry, struct active_
 	cow_timing.vma_lookup_total_ns += (t2.tv_sec - t1.tv_sec) * 1000000000 + (t2.tv_nsec - t1.tv_nsec);
 	cow_timing.vma_lookup_count++;
 	
-	if (!lve){
+	if (!lve) {
 		pr_err("COW page 0x%lx not in any lazy VMA\n", entry->vaddr);
 		return -1;
 	}
@@ -1778,18 +1778,45 @@ static int send_cow_page_lazy(struct cow_page_queue_entry *entry, struct active_
 		return 0;
 	}
 	
+	/*
+	 * M2: Send directly from entry->data instead of hash lookup.
+	 * The queue entry carries the original page content captured
+	 * by Thread 1 before the write was allowed to proceed.
+	 */
+	if (!entry->data) {
+		pr_err("COW queue entry 0x%lx has no data!\n", entry->vaddr);
+		return -1;
+	}
+	
 	/* Time page send */
 	clock_gettime(CLOCK_MONOTONIC, &t1);
 	
-	/* Send the page */
-	ret = send_lazy_vma_page(img->main_sk, entry->vaddr, img->dst_id, source_pid);
+	ret = send_page_compressed(img->main_sk, entry->data, img->dst_id,
+				   entry->vaddr);
 	
 	clock_gettime(CLOCK_MONOTONIC, &t2);
 	cow_timing.send_page_total_ns += (t2.tv_sec - t1.tv_sec) * 1000000000 + (t2.tv_nsec - t1.tv_nsec);
 	cow_timing.send_page_count++;
 	
-	if (ret < 0)
+	if (ret < 0) {
+		pr_err("Failed to send COW page 0x%lx\n", entry->vaddr);
 		return -1;
+	}
+	
+	/*
+	 * M2: Remove from hash table (cleanup).
+	 * P2/P3 still use hash for their lookups, but this page is now
+	 * sent so they will hit sent_bitmap and skip it anyway.
+	 * Removing from hash frees memory sooner.
+	 */
+	{
+		pthread_spinlock_t *lock = cow_get_hash_lock(entry->vaddr);
+		if (lock) {
+			pthread_spin_lock(lock);
+			cow_remove_page(entry->vaddr);
+			pthread_spin_unlock(lock);
+		}
+	}
 	
 	/* Mark as sent */
 	lve->sent_bitmap[page_idx / 8] |= (1 << (page_idx % 8));
@@ -1933,6 +1960,8 @@ static int drain_cow_pages(struct active_image *img, pid_t source_pid,
 			break;
 
 		ret = send_cow_page_lazy(entry, img, source_pid);
+		if (entry->data)	/* M2: free page data */
+			xfree(entry->data);
 		xfree(entry);
 
 		if (ret < 0) {
