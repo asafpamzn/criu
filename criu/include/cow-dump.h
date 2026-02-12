@@ -18,7 +18,7 @@ struct cow_page_queue_entry {
 	struct page_pipe_buf *ppb;      /* Buffer containing this page */
 	unsigned int seg_idx;            /* Segment index within buffer */
 	unsigned long page_idx_in_seg;   /* Page index within segment */
-	struct list_head list;
+	struct cow_page_queue_entry *next;   /* Used by consumer-side putback list */
 };
 
 /**
