@@ -299,10 +299,29 @@ gcc -O2 -o latency-bench test/latency-bench.c -lhiredis
 ./latency-bench 127.0.0.1 6379 90 256  # 90 seconds, 256-byte values
 ```
 
+## Valkey In-Process Attempt (Explored and Abandoned)
+
+We built a Valkey in-process incremental serializer with WP_ASYNC on branch
+`work/wp-async-migrate` in the valkey repo. Results:
+
+- **Correctness**: ✓ RDB digest matches, valkey-check-rdb passes
+- **Latency**: ✓ Zero impact during serialization (data in same L3 cache)
+- **Speed**: ✗ 76 keys/sec for 65KB values = **5.5 hours for 100GB**
+
+The main-thread event loop is the fundamental bottleneck. A background thread
+can't safely traverse pointer-heavy structures (hashtables, skiplists) without
+locks. Background blob copy works for contiguous objects only, not a general
+solution. See `HANDOVER.md` for the full comparison.
+
+**Conclusion**: CRIU WP_ASYNC remains the best approach. The 84-second 3x
+latency degradation is a hardware constraint (L3 cache eviction from
+`process_vm_readv`) but is within most production SLAs.
+
 ## Branches
 
 | Branch | Contents |
 |---|---|
 | `work/cow-dump-freeze-opt` | Original optimized COW dump (sync WP) |
 | `work/deferred-writeprotect` | Deferred WP + close protocol fix |
-| `work/wp-async-cow` | WP_ASYNC + PAGEMAP_SCAN (this work) |
+| `work/wp-async-cow` | WP_ASYNC + PAGEMAP_SCAN (this work) — **best current solution** |
+| `work/wp-async-migrate` (valkey repo) | Valkey in-process PoC (correct but too slow) |

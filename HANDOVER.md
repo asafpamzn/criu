@@ -356,11 +356,52 @@ work/wp-async-cow           — WP_ASYNC + PAGEMAP_SCAN (this work)
 | `src/server.h` | `struct serverObject` | Object layout — ptr field points to data, need to map to pages |
 | `src/rio.h` | `struct _rio` | I/O abstraction — supports buffer, file, socket, connset targets |
 
-## What Next
+## Why CRIU WP_ASYNC Is the Best Current Approach
+
+### Alternatives Evaluated
+
+| Approach | Memory Cost | Latency Impact | Speed | Verdict |
+|---|---|---|---|---|
+| **fork() BGSAVE + replication** | **2x RSS** (always reserved) | Near zero during save | ~90s for 100GB | Memory waste unacceptable |
+| **Thread-save (per-object lock)** | Minimal | **Unpredictable spikes** on large objects (seconds) | Fast | Large-object spikes unacceptable |
+| **Valkey in-process (main-thread)** | Minimal | Zero | **5.5 hours for 100GB** | Too slow |
+| **Valkey in-process (background thread)** | Minimal | Zero for blobs | Fast for blobs only | **Only works for contiguous blobs**, not hashtables/skiplists |
+| **CRIU WP_ASYNC** | Minimal | **3x degradation for 84s** | 84s for 100GB | **Best overall tradeoff** |
+
+### Why Valkey In-Process Failed
+
+We built and tested a Valkey in-process incremental serializer with WP_ASYNC
+(branch: `work/wp-async-migrate` in valkey repo). Results:
+
+- **Correctness**: Verified — RDB digest matches, valkey-check-rdb passes
+- **Latency impact**: Zero during serialization (data in same L3 cache)
+- **Speed**: **76 keys/sec for 65KB values = 5.5 hours for 100GB**
+
+The event loop is the fundamental bottleneck. The main thread can only
+serialize between command processing ticks. A background thread can't safely
+traverse pointer-heavy structures (hashtables, skiplists) without locks,
+which reintroduces the thread-save large-object problem.
+
+Background blob copy works for contiguous objects (strings, listpacks) but
+NOT for hashtable/skiplist-encoded objects — the snapshot contains pointers
+to live memory that can't be followed from a copy. This limits it to one
+encoding type, not a general solution.
+
+### Why CRIU WP_ASYNC Wins
+
+- **32ms freeze** (ptrace stop, dump metadata)
+- **Zero WP latency** (13μs max during 438ms WP setup, proven)
+- **84 seconds of 3x latency degradation** (L3 cache eviction from
+  `process_vm_readv` — hardware limit, not software)
+- **No memory doubling** (unlike fork)
+- **No large-object spikes** (unlike thread-save)
+- **Works for all object types** (page-level, encoding-agnostic)
+- **3x degradation is within most production SLAs** (3.5ms p50 during
+  transfer, typical SLA allows 5-10ms p99)
 
 ### Existing Flow (branch: `criu-sync` in valkey repo)
 
-The migration already works end-to-end without thread-save:
+The migration already works end-to-end:
 
 1. **CRIU dumps source** (with COW/lazy pages) — 35ms freeze
 2. **CRIU restores on replica** — exact copy of the process
@@ -372,10 +413,23 @@ The Valkey-side change (`src/replication.c`): force backlog creation for
 standalone primaries when `repl-backlog-ttl` is 0, so the backlog exists
 before the dump and PSYNC can succeed after restore.
 
-**The bottleneck is step 1**: CRIU's page transfer via `process_vm_readv`
-causes 84 seconds of 1.5-3ms latency on the source (100GB).
+### Remaining Work on CRIU WP_ASYNC
 
-### Phase 1: Main-Thread Incremental Serialization with WP_ASYNC
+The page transfer causes 84 seconds of 3x latency for 100GB. Options to
+reduce this (none eliminate it — hardware wall):
+- Multi-stream TCP (15Gbps available, using 9.5Gbps) → ~56s instead of 84s
+- Requires protocol changes for multiple connections to replica
+- Pre-copy before freeze → spreads impact but extends total time
+
+### Future: Valkey In-Process Direction
+
+If/when Valkey gets a mechanism for safe background serialization of
+pointer-heavy objects (e.g., object-level MVCC, lock-free snapshots),
+the in-process WP_ASYNC approach becomes viable. The PoC code exists on
+`work/wp-async-migrate` in the valkey repo. The latency impact is zero
+— the only blocker is serialization speed.
+
+### Phase 1 (DONE): Main-Thread Incremental Serialization with WP_ASYNC
 
 **Goal**: Replace fork() in Valkey's replication FULLRESYNC with
 main-thread incremental serialization. No fork, no cross-process reads,
