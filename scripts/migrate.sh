@@ -23,8 +23,8 @@ CRIU_DUMP_STRACE_OUT=${CRIU_DUMP_STRACE_OUT:-}
 CUTOVER_MARKER_FILE=${CUTOVER_MARKER_FILE:-}
 REPLICA_PING_POLL_INTERVAL_S=${REPLICA_PING_POLL_INTERVAL_S:-0.01}
 VALKEY_CMD_TIMEOUT_S=${VALKEY_CMD_TIMEOUT_S:-2}
-POST_REPLICA_SYNC_CHECK=${POST_REPLICA_SYNC_CHECK:-0}
-CUTOVER_GATE_EVENT_WAIT_S=${CUTOVER_GATE_EVENT_WAIT_S:-15}
+FAST_CUTOVER_MAX_WAIT_S=30
+FAST_CUTOVER_PING_TIMEOUT_S=0.05
 SSH="ssh -i $SSH_KEY -o StrictHostKeyChecking=no -o ConnectTimeout=10"
 REPLICA_SSH_HOST="${REPLICA_IP:-$REPLICA_HOST}"
 
@@ -63,6 +63,18 @@ stop_workload() {
 	sudo pkill -9 valkey-benchmark 2>/dev/null || true
 }
 
+stop_dump() {
+	if [ -n "${DUMP_PID:-}" ] && kill -0 "$DUMP_PID" 2>/dev/null; then
+		sudo kill -9 "$DUMP_PID" 2>/dev/null || true
+		wait "$DUMP_PID" 2>/dev/null || true
+	fi
+
+	DUMP_PIDS=$(sudo pgrep -f "[c]riu dump --tree" 2>/dev/null || true)
+	if [ -n "$DUMP_PIDS" ]; then
+		sudo kill -9 $DUMP_PIDS 2>/dev/null || true
+	fi
+}
+
 # Step 1: Kill on both
 log "Step 1: Kill processes..."
 if [ "$KEEP_SOURCE_RUNNING" = "1" ] || [ "$SKIP_FILL" = "1" ]; then
@@ -76,7 +88,7 @@ else
 fi
 sudo pkill -9 valkey-benchmark 2>/dev/null || true
 sudo pkill -9 criu 2>/dev/null || true
-$SSH ubuntu@$REPLICA_SSH_HOST "sudo pkill -9 valkey-server; sudo pkill -9 criu" 2>/dev/null || true
+$SSH ubuntu@$REPLICA_SSH_HOST "sudo pkill -9 valkey-server || true; sudo pkill -9 criu || true; sudo pkill -9 -f '[/]scripts/restore.sh' || true; sudo pkill -9 -f '[/]scripts/wait_and_replicate.sh' || true; sudo pkill -9 -f '[c]riu lazy-pages' || true" 2>/dev/null || true
 sleep 1
 
 # Step 2: Wait for valkey to be running and responsive on master
@@ -132,19 +144,6 @@ REMOTE_RESTORE_ENV=("CUTOVER_MARKER_FILE='$CUTOVER_MARKER_FILE'")
 if [ "$FAST_CUTOVER" = "1" ]; then
   REMOTE_RESTORE_ENV+=("FAST_CUTOVER=1" "CUTOVER_PAUSE_MS='$CUTOVER_PAUSE_MS'")
 fi
-for env_key in \
-  WAIT_REPLICA_ROLE_ACTIVE \
-  WAIT_REPLICA_LINK_UP \
-  REPLICA_POLL_INTERVAL_S \
-  RESTORE_MAX_PING_ATTEMPTS \
-  RESTORE_PING_INTERVAL_S \
-  RESTORE_WRITE_GUARD_ATTEMPTS \
-  RESTORE_WRITE_GUARD_INTERVAL_S; do
-  env_val="${!env_key:-}"
-  if [ -n "$env_val" ]; then
-    REMOTE_RESTORE_ENV+=("$env_key='$env_val'")
-  fi
-done
 $SSH ubuntu@$REPLICA_SSH_HOST "sudo env ${REMOTE_RESTORE_ENV[*]} $SCRIPT_DIR/restore.sh" &
 REPLICA_PID=$!
 
@@ -178,8 +177,6 @@ if [ -z "$PID" ]; then
   exit 1
 fi
 log "  Dump PID: $PID"
-sudo gdb -p $PID -batch -ex "call close(12)" -ex "call close(13)" -ex detach -ex quit 2>/dev/null || true
-sudo taskset -pc 0 $PID >/dev/null 2>&1 || true
 sudo touch "$IMAGES_DIR/lazy-primary.log"
 sudo chmod 644 "$IMAGES_DIR/lazy-primary.log"
 # Run dump - cow-dump keeps running, we'll kill it after restore.
@@ -259,38 +256,29 @@ fi
 # Step 7: Wait for replica readiness without blocking on ssh wrapper process
 log "Step 7: Wait for replica readiness..."
 
-# In normal mode, count cutover only after the replica gate is lifted
-# (shared marker file path required so both hosts can write/read it).
-if [ "$FAST_CUTOVER" != "1" ] && [ -n "$CUTOVER_MARKER_FILE" ] && [[ "$CUTOVER_MARKER_FILE" == "$IMAGES_DIR/"* ]]; then
-  log "Step 7a: Waiting for replica gate removal marker..."
-  GATE_REMOVED=0
-  for _ in $(seq 1 $((CUTOVER_GATE_EVENT_WAIT_S * 20))); do
-    if grep -q "^REPLICA_GATE_REMOVED " "$CUTOVER_MARKER_FILE" 2>/dev/null; then
-      GATE_REMOVED=1
-      break
-    fi
-    sleep 0.05
-  done
-  if [ "$GATE_REMOVED" -eq 1 ]; then
-    log "  Replica gate removed marker detected"
-  else
-    log "  WARN: replica gate removal marker not observed before cutover timing"
-  fi
-fi
-
 # Step 8: Cutover/check
 REPLICA_UP=0
 mark_cutover_event "CUTOVER_START_MS"
 if [ "$FAST_CUTOVER" = "1" ]; then
+  REPLICA_WAIT_ATTEMPTS=$((FAST_CUTOVER_MAX_WAIT_S * 20))
+  REPLICA_PING_TIMEOUT_S="$FAST_CUTOVER_PING_TIMEOUT_S"
   log "Step 8: Fast cutover (pause ${CUTOVER_PAUSE_MS}ms writes, freeze source, resume replica)..."
   valkey_cmd CLIENT PAUSE "$CUTOVER_PAUSE_MS" WRITE >/dev/null 2>&1 || true
   sudo pkill -STOP -x valkey-server 2>/dev/null || true
   $SSH ubuntu@$REPLICA_SSH_HOST "sudo pkill -CONT -x valkey-server" >/dev/null 2>&1 || true
 else
+  REPLICA_WAIT_ATTEMPTS=120
+  REPLICA_PING_TIMEOUT_S="$VALKEY_CMD_TIMEOUT_S"
   log "Step 8: Check replica..."
 fi
-for i in $(seq 1 120); do
-  if $SSH ubuntu@$REPLICA_SSH_HOST "timeout ${VALKEY_CMD_TIMEOUT_S}s valkey-cli ping >/dev/null 2>&1"; then
+for i in $(seq 1 "$REPLICA_WAIT_ATTEMPTS"); do
+  if [ "$FAST_CUTOVER" = "1" ]; then
+    if $SSH ubuntu@$REPLICA_SSH_HOST "sudo pkill -CONT -x valkey-server >/dev/null 2>&1 || true; timeout ${REPLICA_PING_TIMEOUT_S}s valkey-cli ping >/dev/null 2>&1"; then
+      REPLICA_UP=1
+      mark_cutover_event "CUTOVER_END_MS"
+      break
+    fi
+  elif $SSH ubuntu@$REPLICA_SSH_HOST "timeout ${REPLICA_PING_TIMEOUT_S}s valkey-cli ping >/dev/null 2>&1"; then
     REPLICA_UP=1
     mark_cutover_event "CUTOVER_END_MS"
     break
@@ -300,7 +288,7 @@ done
 if [ "$REPLICA_UP" -ne 1 ]; then
   log "ERROR: replica valkey is not responding"
   log "Step 8b: Stop dump process..."
-  sudo pkill -9 -f "criu dump" 2>/dev/null || true
+  stop_dump
   sleep 1
   if [ -n "$WORKLOAD_PID" ]; then
     log "Step 8c: Stop workload traffic..."
@@ -318,39 +306,10 @@ if [ "$REPLICA_UP" -ne 1 ]; then
   exit 1
 fi
 
-REPLICA_SYNCED=0
-if [ "$POST_REPLICA_SYNC_CHECK" = "1" ]; then
-  for i in $(seq 1 120); do
-    if $SSH ubuntu@$REPLICA_SSH_HOST "timeout ${VALKEY_CMD_TIMEOUT_S}s valkey-cli info replication | awk -F: '/^role:/ {role=\$2} /^master_link_status:/ {link=\$2} END {gsub(/\r/, \"\", role); gsub(/\r/, \"\", link); if ((role == \"slave\" || role == \"replica\") && link == \"up\") exit 0; exit 1}'" >/dev/null 2>&1; then
-      REPLICA_SYNCED=1
-      break
-    fi
-    sleep 0.25
-  done
-  if [ "$REPLICA_SYNCED" -ne 1 ]; then
-    log "ERROR: replica did not reach role=replica/slave with master_link_status=up"
-    log "Step 8b: Stop dump process..."
-    sudo pkill -9 -f "criu dump" 2>/dev/null || true
-    sleep 1
-    stop_workload
-    if kill -0 "$REPLICA_PID" 2>/dev/null; then
-      kill "$REPLICA_PID" 2>/dev/null || true
-      wait "$REPLICA_PID" 2>/dev/null || true
-    fi
-    if [ "$FAST_CUTOVER" = "1" ]; then
-      log "Recovering source from STOP state"
-      sudo pkill -CONT -x valkey-server 2>/dev/null || true
-    fi
-    exit 1
-  fi
-else
-  log "Step 8a: Skip post-cutover replication-link check (POST_REPLICA_SYNC_CHECK=0)"
-fi
-
 # Step 8b: Optionally stop dump/page-server process
 if [ "$STOP_DUMP_ON_COMPLETE" = "1" ]; then
   log "Step 8b: Stop dump process..."
-  sudo pkill -9 -f "criu dump" 2>/dev/null || true
+  stop_dump
   sleep 1
 else
   log "Step 8b: Keep dump process running (STOP_DUMP_ON_COMPLETE=0)"
