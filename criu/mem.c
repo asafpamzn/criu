@@ -797,15 +797,25 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	gettimeofday(&t_start, NULL);
 	timing_start(TIME_MEMDUMP);
 
-	pr_debug("   Private vmas %lu/%lu pages\n", vma_area_list->nr_priv_pages_longest, vma_area_list->nr_priv_pages);
+	pr_err("TIMING: __parasite_dump_pages_seized ENTER at %ld.%06ld\n",
+	       t_start.tv_sec, t_start.tv_usec);
+	pr_err("   Private vmas %lu/%lu pages (longest/total)\n",
+	       vma_area_list->nr_priv_pages_longest, vma_area_list->nr_priv_pages);
 
 	/*
 	 * Step 0 -- prepare
 	 */
 
+	gettimeofday(&t_checkpoint, NULL);
 	pmc_size = max(vma_area_list->nr_priv_pages_longest, vma_area_list->nr_shared_pages_longest);
 	if (pmc_init(&pmc, item->pid->real, &vma_area_list->h, pmc_size * PAGE_SIZE))
 		return -1;
+	{
+		struct timeval t_now, t_delta;
+		gettimeofday(&t_now, NULL);
+		timersub(&t_now, &t_checkpoint, &t_delta);
+		pr_err("TIMING: pmc_init took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
+	}
 
 	if (!(mdc->pre_dump || mdc->lazy))
 		/*
@@ -824,9 +834,10 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 		struct timeval t_now, t_delta;
 		gettimeofday(&t_now, NULL);
 		timersub(&t_now, &t_checkpoint, &t_delta);
-		pr_info("TIMING: create_page_pipe took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
+		pr_err("TIMING: create_page_pipe took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
 	}
 
+	gettimeofday(&t_checkpoint, NULL);
 	if (!mdc->pre_dump) {
 		/*
 		 * Regular dump -- create xfer object and send pages to it
@@ -851,6 +862,12 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 		possible_pid_reuse = detect_pid_reuse(item, mdc->stat, mdc->parent_ie);
 		if (possible_pid_reuse == -1)
 			goto out_xfer;
+	}
+	{
+		struct timeval t_now, t_delta;
+		gettimeofday(&t_now, NULL);
+		timersub(&t_now, &t_checkpoint, &t_delta);
+		pr_err("TIMING: open_page_xfer took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
 	}
 
 	/*
@@ -878,8 +895,19 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 		timersub(&t_now, &t_checkpoint, &t_delta);
 		pr_err("TIMING: generate_vma_iovs loop took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
 	}
-	if (mdc->lazy)
-		memcpy(pargs_iovs(args), pp->iovs, sizeof(struct iovec) * pp->nr_iovs);
+	if (mdc->lazy) {
+		gettimeofday(&t_checkpoint, NULL);
+		pr_err("TIMING: lazy memcpy %u/%u iovs (used/alloc, %zu bytes)\n",
+		       pp->free_iov, pp->nr_iovs,
+		       sizeof(struct iovec) * pp->free_iov);
+		memcpy(pargs_iovs(args), pp->iovs, sizeof(struct iovec) * pp->free_iov);
+		{
+			struct timeval t_now, t_delta;
+			gettimeofday(&t_now, NULL);
+			timersub(&t_now, &t_checkpoint, &t_delta);
+			pr_err("TIMING: lazy_memcpy took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
+		}
+	}
 
 	/*
 	 * Faking drain_pages for pre-dump here. Actual drain_pages for pre-dump
@@ -897,7 +925,7 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 		struct timeval t_now, t_delta;
 		gettimeofday(&t_now, NULL);
 		timersub(&t_now, &t_checkpoint, &t_delta);
-		pr_info("TIMING: drain_pages took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
+		pr_err("TIMING: drain_pages took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
 	}
 	gettimeofday(&t_checkpoint, NULL);
 	if (!ret && !mdc->pre_dump)
@@ -907,7 +935,7 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 		struct timeval t_now, t_delta;
 		gettimeofday(&t_now, NULL);
 		timersub(&t_now, &t_checkpoint, &t_delta);
-		pr_info("TIMING: xfer_pages took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
+		pr_err("TIMING: xfer_pages took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
 	}
 	if (ret)
 		goto out_xfer;
@@ -917,22 +945,35 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	/*
 	 * Step 4 -- clean up
 	 */
-
+	gettimeofday(&t_checkpoint, NULL);
 	ret = task_reset_dirty_track(item->pid->real);
+	{
+		struct timeval t_now, t_delta;
+		gettimeofday(&t_now, NULL);
+		timersub(&t_now, &t_checkpoint, &t_delta);
+		pr_err("TIMING: task_reset_dirty_track took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
+	}
 	if (ret)
 		goto out_xfer;
 	exit_code = 0;
 out_xfer:
+	gettimeofday(&t_checkpoint, NULL);
 	if (!mdc->pre_dump)
 		xfer.close(&xfer);
 out_pp:
 	if (ret || !(mdc->pre_dump || mdc->lazy))
 		destroy_page_pipe(pp);
 	else {
-		dmpi(item)->mem_pp = pp;		
+		dmpi(item)->mem_pp = pp;
 	}
 out:
 	pmc_fini(&pmc);
+	{
+		struct timeval t_now, t_delta;
+		gettimeofday(&t_now, NULL);
+		timersub(&t_now, &t_checkpoint, &t_delta);
+		pr_err("TIMING: cleanup(xfer.close+pmc_fini) took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
+	}
 	pr_info("Dumping pages done ----------------------------------------\n");
 	return exit_code;
 }
@@ -986,8 +1027,14 @@ int parasite_dump_pages_seized(struct pstree_item *item, struct vm_area_list *vm
 	 */
 
 	if (!mdc->pre_dump || opts.pre_dump_mode == PRE_DUMP_SPLICE) {
+		struct timeval t1, t2, td;
+		gettimeofday(&t1, NULL);
 		pargs->add_prot = PROT_READ;
 		ret = compel_rpc_call_sync(PARASITE_CMD_MPROTECT_VMAS, ctl);
+		gettimeofday(&t2, NULL);
+		timersub(&t2, &t1, &td);
+		pr_err("TIMING: mprotect_vmas(+PROT_READ) took %ld.%06ld seconds (nr_vmas=%d)\n",
+		       td.tv_sec, td.tv_usec, pargs->nr_vmas);
 		if (ret) {
 			pr_err("Can't dump unprotect vmas with parasite\n");
 			return ret;
@@ -999,7 +1046,18 @@ int parasite_dump_pages_seized(struct pstree_item *item, struct vm_area_list *vm
 		return -1;
 	}
 
-	ret = __parasite_dump_pages_seized(item, pargs, vma_area_list, mdc, ctl);
+	{
+		struct timeval t1;
+		gettimeofday(&t1, NULL);
+		ret = __parasite_dump_pages_seized(item, pargs, vma_area_list, mdc, ctl);
+		{
+			struct timeval t2, td;
+			gettimeofday(&t2, NULL);
+			timersub(&t2, &t1, &td);
+			pr_err("TIMING: __parasite_dump_pages_seized took %ld.%06ld seconds\n",
+			       td.tv_sec, td.tv_usec);
+		}
+	}
 	if (ret) {
 		pr_err("Can't dump page with parasite\n");
 		/* Parasite will unprotect VMAs after fail in fini() */
@@ -1007,11 +1065,17 @@ int parasite_dump_pages_seized(struct pstree_item *item, struct vm_area_list *vm
 	}
 
 	if (!mdc->pre_dump || opts.pre_dump_mode == PRE_DUMP_SPLICE) {
+		struct timeval t1, t2, td;
+		gettimeofday(&t1, NULL);
 		pargs->add_prot = 0;
 		if (compel_rpc_call_sync(PARASITE_CMD_MPROTECT_VMAS, ctl)) {
 			pr_err("Can't rollback unprotected vmas with parasite\n");
 			ret = -1;
 		}
+		gettimeofday(&t2, NULL);
+		timersub(&t2, &t1, &td);
+		pr_err("TIMING: mprotect_vmas(-PROT_READ) took %ld.%06ld seconds\n",
+		       td.tv_sec, td.tv_usec);
 	}
 
 	return ret;

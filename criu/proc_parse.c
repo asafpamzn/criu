@@ -931,6 +931,158 @@ err_n:
 	return ret;
 }
 
+/*
+ * COW dump fast path: read /proc/pid/maps instead of /proc/pid/smaps.
+ *
+ * /proc/pid/smaps forces the kernel to walk page tables for every VMA
+ * to produce RSS/PSS/Referenced counters that CRIU never reads.  For a
+ * 40GB process this costs ~468ms.  /proc/pid/maps provides the same
+ * first-line VMA metadata in ~5ms with no page table walks.
+ *
+ * Trade-off: VmFlags are unavailable from maps, so mmap flags that only
+ * appear in VmFlags (MAP_LOCKED, MAP_DROPPABLE, MADV_*) are defaulted
+ * to zero.  MAP_GROWSDOWN is inferred for [stack] VMAs.  This is safe
+ * for COW live migration — see the safety analysis in the plan.
+ */
+int parse_maps_cow(pid_t pid, struct vm_area_list *vma_area_list,
+		   dump_filemap_t dump_filemap)
+{
+	struct vma_area *vma_area = NULL, *prev_vma_area = NULL;
+	unsigned long start, end, pgoff, prev_end = 0;
+	char r, w, x, s;
+	int ret = -1, vm_file_fd = -1;
+	struct vma_file_info vfi;
+	struct vma_file_info prev_vfi = {};
+
+	DIR *map_files_dir = NULL;
+	struct bfd f;
+
+	vm_area_list_init(vma_area_list);
+
+	f.fd = open_proc(pid, "maps");
+	if (f.fd < 0)
+		goto err_n;
+
+	if (bfdopenr(&f))
+		goto err_n;
+
+	map_files_dir = opendir_proc(pid, "map_files");
+	if (!map_files_dir) /* old kernel? */
+		goto err;
+
+	while (1) {
+		int num, path_off;
+		bool eof;
+		char *str;
+
+		str = breadline(&f);
+		if (IS_ERR(str))
+			goto err;
+		eof = (str == NULL);
+
+		/*
+		 * In /proc/pid/maps every line is a VMA range line.
+		 * Keep the defensive check for consistency with parse_smaps().
+		 */
+		if (!eof && !__is_vma_range_fmt(str))
+			continue;
+
+		if (vma_area && vma_area_is(vma_area, VMA_AREA_VVAR) &&
+		    prev_vma_area && vma_area_is(prev_vma_area, VMA_AREA_VVAR)) {
+			if (prev_vma_area->e->end != vma_area->e->start) {
+				pr_err("two nonconsecutive vvar vma-s: "
+				       "%" PRIx64 "-%" PRIx64 " %" PRIx64 "-%" PRIx64 "\n",
+				       prev_vma_area->e->start, prev_vma_area->e->end,
+				       vma_area->e->start, vma_area->e->end);
+				goto err;
+			}
+			/* Merge all vvar vma-s into one. */
+			prev_vma_area->e->end = vma_area->e->end;
+		} else {
+			if (vma_area && vma_list_add(vma_area, vma_area_list, &prev_end, &vfi, &prev_vfi))
+				goto err;
+			prev_vma_area = vma_area;
+		}
+
+		if (eof)
+			break;
+
+		vma_area = alloc_vma_area();
+		if (!vma_area)
+			goto err;
+
+		num = sscanf(str, "%lx-%lx %c%c%c%c %lx %x:%x %lu %n",
+			     &start, &end, &r, &w, &x, &s, &pgoff,
+			     &vfi.dev_maj, &vfi.dev_min, &vfi.ino, &path_off);
+		if (num < 10) {
+			pr_err("Can't parse: %s\n", str);
+			goto err;
+		}
+
+		vma_area->e->start = start;
+		vma_area->e->end = end;
+		vma_area->e->pgoff = pgoff;
+		vma_area->e->prot = PROT_NONE;
+
+		if (task_size_check(pid, vma_area->e))
+			goto err;
+
+		if (r == 'r')
+			vma_area->e->prot |= PROT_READ;
+		if (w == 'w')
+			vma_area->e->prot |= PROT_WRITE;
+		if (x == 'x')
+			vma_area->e->prot |= PROT_EXEC;
+
+		if (s == 's')
+			vma_area->e->flags = MAP_SHARED;
+		else if (s == 'p')
+			vma_area->e->flags = MAP_PRIVATE;
+		else {
+			pr_err("Unexpected VMA met (%c)\n", s);
+			goto err;
+		}
+
+		if (handle_vma(pid, vma_area, str + path_off, map_files_dir,
+			       &vfi, &prev_vfi, &vm_file_fd))
+			goto err;
+
+		/*
+		 * VmFlags defaults for COW mode:
+		 *
+		 * [stack] always has MAP_GROWSDOWN — set it explicitly since
+		 * we don't parse VmFlags.  Needed for guard gap calculation
+		 * on restore (mem.c).
+		 *
+		 * All other VmFlags (MAP_LOCKED, MAP_DROPPABLE, MADV_*,
+		 * VM_IO, shadow stack) default to 0.  This is safe for COW
+		 * live migration — see the plan's safety analysis.
+		 */
+		if (vma_area_is(vma_area, VMA_AREA_STACK))
+			vma_area->e->flags |= MAP_GROWSDOWN;
+
+		if (vma_entry_is(vma_area->e, VMA_FILE_PRIVATE) ||
+		    vma_entry_is(vma_area->e, VMA_FILE_SHARED)) {
+			if (dump_filemap && dump_filemap(vma_area, vm_file_fd))
+				goto err;
+		} else if (vma_entry_is(vma_area->e, VMA_AREA_AIORING))
+			vma_area_list->nr_aios++;
+	}
+
+	vma_area = NULL;
+	ret = 0;
+
+err:
+	bclose(&f);
+err_n:
+	close_safe(&vm_file_fd);
+	if (map_files_dir)
+		closedir(map_files_dir);
+
+	xfree(vma_area);
+	return ret;
+}
+
 int parse_pid_stat(pid_t pid, struct proc_pid_stat *s)
 {
 	char *tok, *p;
