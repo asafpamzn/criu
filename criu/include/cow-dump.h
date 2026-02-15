@@ -81,13 +81,34 @@ extern int cow_stop_monitor_thread(void);
  */
 extern int cow_get_uffd(void);
 
+/**
+ * cow_get_uffd_for_pid - Get the userfaultfd for a tracked source pid
+ * @source_pid: Source process pid from dump-time tree
+ *
+ * Returns: userfaultfd on success, -1 if not found
+ */
+extern int cow_get_uffd_for_pid(pid_t source_pid);
+
+/**
+ * cow_dump_is_vma_tracked - Check whether a VMA is COW-tracked
+ * @source_pid: Source process pid from dump-time tree
+ * @start: VMA start address
+ * @end: VMA end address
+ *
+ * Returns: true if this exact VMA was successfully registered for COW.
+ */
+extern bool cow_dump_is_vma_tracked(pid_t source_pid,
+				    unsigned long start,
+				    unsigned long end);
+
 struct cow_page_queue_entry;
 
 /**
  * cow_get_next_page - Get next COW page from the queue
  *
- * Thread-safe dequeue of the next COW page that needs to be sent.
- * The caller is responsible for freeing the returned entry.
+ * Lock-free dequeue of the next COW page. Checks the consumer-side
+ * putback list first, then the SPSC queue.
+ * The caller is responsible for freeing the returned entry and its data.
  *
  * Returns: cow_page_queue_entry on success, NULL if queue is empty
  */
@@ -96,27 +117,30 @@ extern struct cow_page_queue_entry *cow_get_next_page(void);
 /**
  * cow_has_pending_pages - Check if there are pending COW pages
  *
- * Thread-safe check for whether the COW page queue has any entries.
+ * Lock-free check for whether the putback list or SPSC queue
+ * has any entries.
  *
  * Returns: true if there are pending pages, false otherwise
  */
 extern bool cow_has_pending_pages(void);
 
 /**
- * cow_put_back_page - Put a COW page back in the queue
+ * cow_put_back_page - Put a COW page back for later consumption
  * @entry: Queue entry to re-queue
  *
- * Thread-safe re-insertion of a COW page at the head of the queue.
- * Used when a page doesn't belong to the current image being processed.
+ * Adds the entry to a consumer-side local list that is drained
+ * before the SPSC queue on the next cow_get_next_page() call.
+ * Must only be called from the consumer thread (Thread 3).
  */
 extern void cow_put_back_page(struct cow_page_queue_entry *entry);
 
 /**
- * cow_get_queue_size - Get the number of pending COW pages in the queue
+ * cow_get_queue_size - Get the approximate number of pending COW pages
  *
- * Thread-safe count of COW pages waiting to be sent.
+ * Returns the atomic queue size counter. May be slightly stale due to
+ * concurrent producer/consumer operations, but accurate for statistics.
  *
- * Returns: Number of entries in the COW page queue
+ * Returns: Number of entries in the COW page queue (approximate)
  */
 extern unsigned long cow_get_queue_size(void);
 
