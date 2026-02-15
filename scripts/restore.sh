@@ -48,6 +48,19 @@ mark_phase_event() {
 	printf "%s %s %s\n" "$event" "$ts_ms" "REPLICA_RESTORE" >>"$CUTOVER_MARKER_FILE" 2>/dev/null || true
 }
 
+reset_valkey_log_file() {
+	local path="$1"
+	local size
+
+	if [ ! -e "$path" ]; then
+		return 0
+	fi
+
+	sudo truncate -s 0 "$path" 2>/dev/null || true
+	size=$(sudo stat -c%s "$path" 2>/dev/null || echo "?")
+	echo "  $path size after truncate: $size"
+}
+
 # Block all remote TCP access to the valkey port via iptables.
 # Localhost is allowed so local health checks and replicaof still work.
 # Prevents external clients from hitting valkey before role transition.
@@ -76,6 +89,10 @@ mark_phase_event "REPLICA_RESTORE_SCRIPT_START"
 echo "Step 1: Killing valkey-server"
 sudo pkill -9 valkey-server 2>/dev/null || true
 echo "valkey-server killed"
+
+echo "Step 1a: Resetting valkey log files"
+reset_valkey_log_file /var/log/valkey/stderr.log
+reset_valkey_log_file /var/log/valkey/stdout.log
 
 # --- Step 1b: Network gate ---------------------------------------------------
 # Block remote clients immediately. The gate stays up until replicaof is

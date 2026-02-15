@@ -68,11 +68,53 @@ ensure_source_valkey_ready() {
 }
 
 HARNESS_PID=""
-cleanup() {
-	if [ -n "$HARNESS_PID" ] && kill -0 "$HARNESS_PID" 2>/dev/null; then
-		kill -INT "$HARNESS_PID" 2>/dev/null || true
-		wait "$HARNESS_PID" 2>/dev/null || true
+stop_harness() {
+	local rc=0
+	local waited=0
+
+	if [ -z "$HARNESS_PID" ]; then
+		return 0
 	fi
+
+	if kill -0 "$HARNESS_PID" 2>/dev/null; then
+		kill -INT "$HARNESS_PID" 2>/dev/null || true
+		for _ in $(seq 1 50); do
+			if ! kill -0 "$HARNESS_PID" 2>/dev/null; then
+				break
+			fi
+			sleep 0.1
+			waited=1
+		done
+	fi
+
+	if kill -0 "$HARNESS_PID" 2>/dev/null; then
+		kill -TERM "$HARNESS_PID" 2>/dev/null || true
+		for _ in $(seq 1 20); do
+			if ! kill -0 "$HARNESS_PID" 2>/dev/null; then
+				break
+			fi
+			sleep 0.1
+			waited=1
+		done
+	fi
+
+	if kill -0 "$HARNESS_PID" 2>/dev/null; then
+		kill -KILL "$HARNESS_PID" 2>/dev/null || true
+		waited=1
+	fi
+
+	wait "$HARNESS_PID" 2>/dev/null || rc=$?
+	HARNESS_PID=""
+
+	if [ "$waited" -eq 1 ] && [ "$rc" -eq 137 ]; then
+		return 0
+	fi
+
+	return "$rc"
+}
+
+cleanup() {
+	stop_harness || true
 	cleanup_dump
 }
 trap cleanup EXIT
@@ -123,16 +165,14 @@ log "Harness PID: $HARNESS_PID"
 sleep "$HARNESS_WARMUP_SECONDS"
 
 log "Running migration with ${DATA_SIZE_GB}GB dataset"
-RUN_WORKLOAD_DURING_MIGRATION=0 KEEP_SOURCE_RUNNING=1 SKIP_FILL=1 STOP_DUMP_ON_COMPLETE=0 CUTOVER_MARKER_FILE="$HARNESS_CUTOVER_MARKER" \
+FAST_CUTOVER=1 RUN_WORKLOAD_DURING_MIGRATION=0 KEEP_SOURCE_RUNNING=1 SKIP_FILL=1 STOP_DUMP_ON_COMPLETE=1 CUTOVER_MARKER_FILE="$HARNESS_CUTOVER_MARKER" \
 	"$SCRIPT_DIR/migrate.sh" "$DATA_SIZE_GB"
 
 sleep "$HARNESS_SETTLE_SECONDS"
 
 log "Stopping harness"
-kill -INT "$HARNESS_PID" 2>/dev/null || true
 HARNESS_RC=0
-wait "$HARNESS_PID" || HARNESS_RC=$?
-HARNESS_PID=""
+stop_harness || HARNESS_RC=$?
 
 log "Harness log tail:"
 tail -n 20 "$HARNESS_LOG" || true
