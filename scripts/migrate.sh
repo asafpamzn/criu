@@ -371,7 +371,7 @@ REPLICA_MEM=$($SSH ubuntu@$REPLICA_SSH_HOST "timeout ${VALKEY_CMD_TIMEOUT_S}s va
 # Extract CRIU timing from logs
 LOG_FILE="$IMAGES_DIR/lazy-primary.log"
 DUMP_TOTAL=$(sudo grep -a "dump_one_task TOTAL" "$LOG_FILE" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' || echo "?")
-PARSE_SMAPS=$(sudo grep -aE "parse_(maps_cow|smaps) took" "$LOG_FILE" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' || echo "?")
+PARSE_SMAPS=$(sudo grep -a "parse_smaps took" "$LOG_FILE" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' || echo "?")
 DUMP_PAGES=$(sudo grep -a "parasite_dump_pages_seized took" "$LOG_FILE" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' || echo "?")
 GEN_IOVS=$(sudo grep -a "generate_vma_iovs loop" "$LOG_FILE" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' || echo "?")
 
@@ -382,7 +382,7 @@ log "  Replica Memory:  $REPLICA_MEM"
 log "----------------------------------------------------------------"
 log "  CRIU Timing (dump):"
 log "    dump_one_task TOTAL:   ${DUMP_TOTAL}s"
-log "    parse_maps/smaps:      ${PARSE_SMAPS}s"
+log "    parse_smaps:           ${PARSE_SMAPS}s"
 log "    dump_pages_seized:     ${DUMP_PAGES}s"
 log "    generate_vma_iovs:     ${GEN_IOVS}s"
 log "================================================================"
