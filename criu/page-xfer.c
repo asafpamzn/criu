@@ -1671,6 +1671,12 @@ static int send_lazy_vma_page(int sk, unsigned long vaddr, u64 dst_id, pid_t sou
 		return -1;
 	}
 
+	if (cow_test_bitmap(vaddr)) {
+			pr_debug("P3: COW fault raced with readv for 0x%lx, discarding\n", vaddr);
+			xfree(buffer);
+			return 0;  
+		}
+
 	/* Compress and send */
 	ret = send_page_compressed(sk, buffer, dst_id, vaddr);
 	clock_gettime(CLOCK_MONOTONIC, &t_socket);
@@ -1682,7 +1688,7 @@ static int send_lazy_vma_page(int sk, unsigned long vaddr, u64 dst_id, pid_t sou
 	}
 
 	/* Unprotect page — it's been sent, no need to track writes anymore */
-	uffd = cow_get_uffd();
+	uffd = cow_get_uffd_for_pid(source_pid);
 	if (uffd >= 0) {
 		struct uffdio_writeprotect wp;
 		wp.range.start = vaddr;
@@ -1820,7 +1826,11 @@ static int send_request_page_lazy(struct page_request_entry *req, struct active_
 		ret = send_lazy_vma_page(req->sk, page_vaddr, req->dst_id, source_pid);
 		if (ret < 0)
 			return -1;
-		
+
+		/* ret == 0 means race detected — page discarded, let P1 handle it */
+		if (ret == 0)
+			continue;
+
 		/* Mark as sent */
 		lve->sent_bitmap[page_idx / 8] |= (1 << (page_idx % 8));
 		sent_count++;
@@ -1998,12 +2008,6 @@ static int send_single_lazy_page(struct active_image *img,
 		return 0;
 	}
 
-	/*
-	 * M3: Check cow_bitmap. If the page was write-faulted,
-	 * the original data is in the P1 queue. Skip it — P1 will
-	 * send the saved copy. drain_cow_pages runs before this
-	 * function in the main loop.
-	 */
 	if (cow_test_bitmap(vaddr)) {
 		pr_debug("P3: page 0x%lx is COW, skipping for P1\n", vaddr);
 		stats->priority3_skips++;
@@ -2014,6 +2018,12 @@ static int send_single_lazy_page(struct active_image *img,
 	if (ret < 0) {
 		pr_err("Failed to send lazy VMA page at %lx\n", vaddr);
 		return -1;
+	}
+
+	/* ret == 0 means race detected — page discarded, let P1 handle it */
+	if (ret == 0) {
+		stats->priority3_skips++;
+		return 0;
 	}
 
 	lve->sent_bitmap[page_idx / 8] |= (1 << (page_idx % 8));
