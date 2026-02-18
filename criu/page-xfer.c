@@ -1933,7 +1933,7 @@ static void print_thread_stats(struct unified_thread_stats *stats)
 	clock_gettime(CLOCK_REALTIME, &ts);
 	tm = localtime(&ts.tv_sec);
 
-	pr_debug("[UNIFIED_THREAD_STATS] [%02d:%02d:%02d.%03ld] P1(COW)=%lu P2(Req)=%lu P3(Reg)=%lu P3_Skips=%lu pages/sec | COW_Q=%lu Req_Q=%lu | Compress: %lu->%lu (%.1f%%)\n",
+	pr_warn("[UNIFIED_THREAD_STATS] [%02d:%02d:%02d.%03ld] P1(COW)=%lu P2(Req)=%lu P3(Reg)=%lu P3_Skips=%lu pages/sec | COW_Q=%lu Req_Q=%lu | Compress: %lu->%lu (%.1f%%)\n",
 		tm->tm_hour, tm->tm_min, tm->tm_sec, ts.tv_nsec / 1000000,
 		stats->priority1_pages, stats->priority2_pages,
 		stats->priority3_pages, stats->priority3_skips,
@@ -1941,13 +1941,13 @@ static void print_thread_stats(struct unified_thread_stats *stats)
 		g_compress_uncompressed_bytes, g_compress_compressed_bytes,
 		compress_ratio);
 
-	pr_debug("[COW_TIMING] Queue: %lu ns (%lu ops) | VMA_lookup: %lu ns (%lu ops) | Send: %lu ns (%lu ops)\n",
+	pr_warn("[COW_TIMING] Queue: %lu ns (%lu ops) | VMA_lookup: %lu ns (%lu ops) | Send: %lu ns (%lu ops)\n",
 		cow_timing.queue_dequeue_total_ns, cow_timing.queue_dequeue_count,
 		cow_timing.vma_lookup_total_ns, cow_timing.vma_lookup_count,
 		cow_timing.send_page_total_ns, cow_timing.send_page_count);
 
 	if (cow_timing.send_sub_count > 0) {
-		pr_debug("[SEND_BREAKDOWN] lock=%lu readv=%lu compress+send=%lu unprot=%lu unlock=%lu ns (avg per %lu ops)\n",
+		pr_warn("[SEND_BREAKDOWN] lock=%lu readv=%lu compress+send=%lu unprot=%lu unlock=%lu ns (avg per %lu ops)\n",
 			cow_timing.send_lock_ns / cow_timing.send_sub_count,
 			cow_timing.send_vm_readv_ns / cow_timing.send_sub_count,
 			cow_timing.send_compress_ns / cow_timing.send_sub_count,
