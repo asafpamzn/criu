@@ -691,6 +691,18 @@ int cow_dump_init(struct pstree_item *item, struct vm_area_list *vma_area_list, 
 			       ret, args->ret);
 			goto err;
 		}
+
+		pr_err("Parasite uffd features: 0x%llx (WP_ASYNC=%s)\n",
+		       args->uffd_features,
+		       (args->uffd_features & UFFD_FEATURE_WP_ASYNC) ?
+		       "YES" : "NO");
+
+		/* Override WP_ASYNC mode based on actual features */
+		if (g_wp_async_mode &&
+		    !(args->uffd_features & UFFD_FEATURE_WP_ASYNC)) {
+			pr_err("WP_ASYNC not granted by kernel, falling back to sync\n");
+			g_wp_async_mode = false;
+		}
 	}
 
 	/*

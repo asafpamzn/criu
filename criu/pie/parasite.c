@@ -898,6 +898,7 @@ static int parasite_cow_dump_init(struct parasite_cow_dump_args *args)
 		return -1;
 	}
 
+	args->uffd_features = api.features;
 	pr_info("UFFD created with features: 0x%llx\n", (unsigned long long)api.features);
 	if (!(api.features & UFFD_FEATURE_PAGEFAULT_FLAG_WP)) {
 		pr_err("Kernel userfaultfd does not support WP pagefault flag\n");
