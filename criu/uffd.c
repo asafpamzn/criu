@@ -2005,6 +2005,14 @@ static int handle_requests(int epollfd, struct epoll_event **events, int nr_fds)
 			    (!list_empty(&lpi->iovs) || !list_empty(&lpi->reqs)))
 				continue;
 
+			/*
+			 * COW mode: don't exit until bulk stream is done.
+			 * Convergence pages may still be arriving after
+			 * all IOVs are filled.
+			 */
+			if (opts.cow_dump && !page_server_bulk_stream_done())
+				continue;
+
 			lazy_pages_summary(lpi);
 			list_del(&lpi->l);
 			lpi_put(lpi);
