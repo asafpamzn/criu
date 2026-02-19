@@ -280,8 +280,13 @@ start_source_ping_monitor
 # 3. Max repl-backlog-size (prevents incrementalTrimReplicationBacklog assertion)
 # 4. Disable RDB/AOF saves to prevent BIO activity
 # 5. Sleep to let in-flight operations complete
+# Block new connections, then kill existing ones.
+# _writeToClient stack smash after restore if stale client buffers exist.
+valkey_cmd CONFIG SET maxclients 1 >/dev/null 2>&1 || true
+sleep 1
 valkey_cmd CLIENT KILL TYPE normal >/dev/null 2>&1 || true
 valkey_cmd CLIENT KILL TYPE pubsub >/dev/null 2>&1 || true
+sleep 1
 valkey_cmd CONFIG SET lazyfree-lazy-expire no >/dev/null 2>&1 || true
 valkey_cmd CONFIG SET lazyfree-lazy-server-del no >/dev/null 2>&1 || true
 valkey_cmd CONFIG SET lazyfree-lazy-user-del no >/dev/null 2>&1 || true
