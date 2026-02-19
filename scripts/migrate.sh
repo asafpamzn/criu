@@ -144,6 +144,21 @@ fi
 sudo pkill -9 -f "[v]alkey-benchmark" 2>/dev/null || true
 sudo pkill -9 criu 2>/dev/null || true
 $SSH ubuntu@$REPLICA_SSH_HOST "sudo pkill -9 valkey-server || true; sudo pkill -9 criu || true; sudo pkill -9 -f '[/]scripts/restore.sh' || true; sudo pkill -9 -f '[c]riu lazy-pages' || true; while sudo iptables -C INPUT -p tcp --dport $VALKEY_PORT ! -s 127.0.0.1 -j REJECT 2>/dev/null; do sudo iptables -D INPUT -p tcp --dport $VALKEY_PORT ! -s 127.0.0.1 -j REJECT || true; done" 2>/dev/null || true
+
+# Step 1a: Clean replica stale data to prevent disk-full issues
+log "Step 1a: Clean replica stale data..."
+$SSH ubuntu@$REPLICA_SSH_HOST "
+  # Remove leaked CRIU cgroup mounts
+  for m in /fsx/lazy/.criu.cgyard.*; do
+    sudo umount \"\$m\" 2>/dev/null; sudo rmdir \"\$m\" 2>/dev/null
+  done
+  # Remove stale RDB dumps (can be 200GB+)
+  sudo rm -f /var/lib/valkey/temp-*.rdb 2>/dev/null
+  # Report disk usage
+  AVAIL=\$(df --output=avail / 2>/dev/null | tail -1)
+  echo \"Replica disk available: \${AVAIL}K\"
+" 2>/dev/null || true
+
 sleep 1
 
 # Step 2: Wait for valkey to be running and responsive on master
@@ -750,5 +765,24 @@ if [ -f "$RUN_DIR/source_markers.log" ] && [ -f "$RUN_DIR/source-ping.log" ]; th
   log "  Source availability by phase (from artifacts markers):"
   python3 "$SCRIPT_DIR/analyze_phase_latency.py" "$RUN_DIR" 2>/dev/null | sed 's/^/    /' || true
 fi
+# Replica health check
+REPLICA_STATS=$($SSH ubuntu@$REPLICA_SSH_HOST "
+  # Disk
+  DISK_USED=\$(df --output=pcent / 2>/dev/null | tail -1 | tr -d ' %')
+  DISK_AVAIL=\$(df -h --output=avail / 2>/dev/null | tail -1 | tr -d ' ')
+  # Memory
+  MEM=\$(free -m 2>/dev/null | awk '/^Mem:/{printf \"%dM/%dM (%d%%)\", \$3, \$2, \$3*100/\$2}')
+  # Valkey
+  VPID=\$(pgrep -x valkey-server 2>/dev/null | head -1)
+  if [ -n \"\$VPID\" ]; then
+    VSTATE=\$(cat /proc/\$VPID/status 2>/dev/null | awk '/^State:/{print \$2}')
+    VRSS=\$(awk '{printf \"%.1fG\", \$2*4/1024/1024}' /proc/\$VPID/statm 2>/dev/null)
+    echo \"valkey=\$VSTATE(rss=\$VRSS) mem=\$MEM disk=\${DISK_USED}%(\${DISK_AVAIL}free)\"
+  else
+    echo \"valkey=NOT_RUNNING mem=\$MEM disk=\${DISK_USED}%(\${DISK_AVAIL}free)\"
+  fi
+" 2>/dev/null || echo "unreachable")
+log "----------------------------------------------------------------"
+log "  Replica health: $REPLICA_STATS"
 log "  Artifacts: $RUN_DIR"
 log "================================================================"
