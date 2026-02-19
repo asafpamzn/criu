@@ -2135,9 +2135,9 @@ static int process_vma_pages(struct active_image *img,
 	struct iovec *local_iovs;
 	int batch_alloc_ok = 0;
 
-	pr_err("Processing VMA: %lx-%lx len=%lu wp_async=%d\n",
-	       lve->start, lve->end, lve->end - lve->start,
-	       cow_is_wp_async());
+	pr_info("Processing VMA: %lx-%lx len=%lu wp_async=%d\n",
+		lve->start, lve->end, lve->end - lve->start,
+		cow_is_wp_async());
 
 	batch_buf = xmalloc(PAGE_BATCH_SIZE * PAGE_SIZE);
 	local_iovs = xmalloc(PAGE_BATCH_SIZE * sizeof(struct iovec));
@@ -2484,27 +2484,12 @@ err:
 	return -1;
 }
 
-static void segv_handler(int sig, siginfo_t *info, void *ctx)
-{
-	(void)ctx;
-	pr_err("SIGSEGV at address %p (sig=%d code=%d)\n",
-	       info->si_addr, sig, info->si_code);
-	_exit(139);
-}
-
 /* Unified background thread serving all images */
 static void *unified_page_server_thread(void *arg)
 {
 	struct unified_thread_stats stats = { 0 };
-	struct sigaction sa;
 
 	pthread_setname_np(pthread_self(), "criu-page-srv");
-
-	memset(&sa, 0, sizeof(sa));
-	sa.sa_sigaction = segv_handler;
-	sa.sa_flags = SA_SIGINFO;
-	sigaction(SIGSEGV, &sa, NULL);
-
 	pr_info("Unified page server thread started\n");
 
 	while (!g_unified_thread_stop) {
