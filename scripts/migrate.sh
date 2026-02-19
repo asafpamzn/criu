@@ -284,8 +284,10 @@ valkey_cmd CONFIG SET lazyfree-lazy-server-del no >/dev/null 2>&1 || true
 valkey_cmd CONFIG SET lazyfree-lazy-user-del no >/dev/null 2>&1 || true
 valkey_cmd CONFIG SET lazyfree-lazy-user-flush no >/dev/null 2>&1 || true
 valkey_cmd CONFIG SET save "" >/dev/null 2>&1 || true
+# Set repl-backlog-size to max so incrementalTrimReplicationBacklog()
+# never trims — prevents assertion on stale ref_repl_buf_node pointer.
+valkey_cmd CONFIG SET repl-backlog-size 9223372036854775807 >/dev/null 2>&1 || true
 valkey_cmd CONFIG SET repl-backlog-ttl 1 >/dev/null 2>&1 || true
-valkey_cmd CONFIG SET repl-backlog-size 1048576 >/dev/null 2>&1 || true
 sleep 5
 
 # Run dump - cow-dump keeps running, we'll kill it after restore.
