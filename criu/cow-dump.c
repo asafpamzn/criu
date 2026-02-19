@@ -26,6 +26,7 @@
 #include "vma.h"
 #include "util.h"
 #include "kerndat.h"
+#include "pagemap_scan.h"
 #include "criu-log.h"
 #include "parasite.h"
 
@@ -40,6 +41,7 @@ struct cow_tracked_vma {
 struct cow_tracked_task {
 	pid_t source_pid;
 	int uffd;
+	int pagemap_fd;		/* /proc/<pid>/pagemap for PAGEMAP_SCAN */
 	unsigned long total_pages;
 	unsigned int nr_tracked_vmas;
 	struct cow_tracked_vma *tracked_vmas;
@@ -263,6 +265,9 @@ static volatile bool g_stop_monitoring = false;
 static pthread_mutex_t g_monitor_state_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_tracked_tasks_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_monitor_eventfd = -1;
+
+/* WP_ASYNC mode: kernel auto-resolves WP faults, no thread parking */
+static bool g_wp_async_mode = false;
 static unsigned long g_tracked_tasks_generation;
 static unsigned long g_monitor_snapshot_generation;
 
@@ -439,6 +444,8 @@ static int uffd_open_proc(pid_t pid)
 	memset(&api, 0, sizeof(api));
 	api.api = UFFD_API;
 	api.features = UFFD_FEATURE_PAGEFAULT_FLAG_WP;
+	if (kdat.has_wp_async && kdat.has_pagemap_scan)
+		api.features |= UFFD_FEATURE_WP_ASYNC;
 
 	if (ioctl(fd, UFFDIO_API, &api)) {
 		pr_perror("UFFDIO_API on %s failed", path);
@@ -583,28 +590,40 @@ int cow_dump_init(struct pstree_item *item, struct vm_area_list *vma_area_list, 
 			return -1;
 
 		INIT_LIST_HEAD(&cdi->tracked_tasks);
-		for (i = 0; i < COW_HASH_SIZE; i++) {
-			INIT_HLIST_HEAD(&cdi->cow_hash[i]);
-			pthread_spin_init(&cdi->cow_hash_locks[i], PTHREAD_PROCESS_PRIVATE);
+
+		g_wp_async_mode = kdat.has_wp_async && kdat.has_pagemap_scan;
+		if (g_wp_async_mode)
+			pr_info("WP_ASYNC mode enabled (kernel resolves WP faults)\n");
+
+		if (!g_wp_async_mode) {
+			for (i = 0; i < COW_HASH_SIZE; i++) {
+				INIT_HLIST_HEAD(&cdi->cow_hash[i]);
+				pthread_spin_init(&cdi->cow_hash_locks[i],
+						  PTHREAD_PROCESS_PRIVATE);
+			}
+			INIT_LIST_HEAD(&cdi->cow_page_queue);
+			pthread_spin_init(&cdi->queue_lock,
+					  PTHREAD_PROCESS_PRIVATE);
 		}
-		INIT_LIST_HEAD(&cdi->cow_page_queue);
-		pthread_spin_init(&cdi->queue_lock, PTHREAD_PROCESS_PRIVATE);
+
 		g_cow_info = cdi;
 		created_session = true;
 
-		pthread_mutex_lock(&g_tracked_tasks_lock);
-		g_tracked_tasks_generation = 0;
-		g_monitor_snapshot_generation = 0;
-		pthread_mutex_unlock(&g_tracked_tasks_lock);
+		if (!g_wp_async_mode) {
+			pthread_mutex_lock(&g_tracked_tasks_lock);
+			g_tracked_tasks_generation = 0;
+			g_monitor_snapshot_generation = 0;
+			pthread_mutex_unlock(&g_tracked_tasks_lock);
 
-		if (g_monitor_eventfd >= 0) {
-			close(g_monitor_eventfd);
-			g_monitor_eventfd = -1;
-		}
-		g_monitor_eventfd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
-		if (g_monitor_eventfd < 0) {
-			pr_perror("Failed to create cow monitor eventfd");
-			goto err;
+			if (g_monitor_eventfd >= 0) {
+				close(g_monitor_eventfd);
+				g_monitor_eventfd = -1;
+			}
+			g_monitor_eventfd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+			if (g_monitor_eventfd < 0) {
+				pr_perror("Failed to create cow monitor eventfd");
+				goto err;
+			}
 		}
 	}
 
@@ -620,6 +639,7 @@ int cow_dump_init(struct pstree_item *item, struct vm_area_list *vma_area_list, 
 	INIT_LIST_HEAD(&task->list);
 	task->source_pid = item->pid->real;
 	task->uffd = -1;
+	task->pagemap_fd = -1;
 
 	if (kdat.has_uffd_proc) {
 		/*
@@ -687,28 +707,41 @@ int cow_dump_init(struct pstree_item *item, struct vm_area_list *vma_area_list, 
 	if (cow_task_apply_writeprotect(task))
 		goto err;
 
+	if (g_wp_async_mode) {
+		task->pagemap_fd = open_proc(item->pid->real, "pagemap");
+		if (task->pagemap_fd < 0) {
+			pr_warn("Cannot open /proc/%d/pagemap, falling back to sync WP\n",
+				item->pid->real);
+			g_wp_async_mode = false;
+		}
+	}
+
 	pthread_mutex_lock(&g_tracked_tasks_lock);
 	list_add_tail(&task->list, &cdi->tracked_tasks);
-	g_tracked_tasks_generation++;
-	want_generation = g_tracked_tasks_generation;
+	if (!g_wp_async_mode) {
+		g_tracked_tasks_generation++;
+		want_generation = g_tracked_tasks_generation;
+	}
 	pthread_mutex_unlock(&g_tracked_tasks_lock);
 	cdi->total_pages += task->total_pages;
 
-	if (cow_monitor_is_running()) {
+	if (!g_wp_async_mode && cow_monitor_is_running()) {
 		cow_monitor_wakeup();
 		if (cow_wait_monitor_snapshot(want_generation))
 			pr_warn("Timed out waiting for monitor to pick up pid %d\n",
 				item->pid->real);
 	}
 
-	pr_info("COW dump initialized for pid %d: tracked=%u pages=%lu uffd=%d\n",
+	pr_info("COW dump initialized for pid %d: tracked=%u pages=%lu uffd=%d wp_async=%d\n",
 		item->pid->real, task->nr_tracked_vmas,
-		task->total_pages, task->uffd);
+		task->total_pages, task->uffd, g_wp_async_mode);
 
 	return 0;
 
 err:
 	if (task) {
+		if (task->pagemap_fd >= 0)
+			close(task->pagemap_fd);
 		if (task->uffd >= 0)
 			close(task->uffd);
 		xfree(task->tracked_vmas);
@@ -731,7 +764,7 @@ err:
 }
 
 void cow_dump_fini(void)
-{	
+{
 	struct cow_page *cp;
 	struct cow_page_queue_entry *qe, *qe_tmp;
 	struct cow_tracked_task *task, *task_tmp;
@@ -741,54 +774,64 @@ void cow_dump_fini(void)
 	if (!g_cow_info)
 		return;
 
-	if (cow_stop_monitor_thread()) {
-		pr_err("Failed to stop COW monitor thread, skipping COW cleanup to avoid races\n");
-		return;
+	if (!g_wp_async_mode) {
+		if (cow_stop_monitor_thread()) {
+			pr_err("Failed to stop COW monitor thread, skipping COW cleanup to avoid races\n");
+			return;
+		}
 	}
 
-	pr_info("Cleaning up COW dump\n");
+	pr_info("Cleaning up COW dump (wp_async=%d)\n", g_wp_async_mode);
 
 	if (g_monitor_eventfd >= 0) {
 		close(g_monitor_eventfd);
 		g_monitor_eventfd = -1;
 	}
 
-	pthread_mutex_lock(&g_tracked_tasks_lock);
-	g_tracked_tasks_generation = 0;
-	g_monitor_snapshot_generation = 0;
-	pthread_mutex_unlock(&g_tracked_tasks_lock);
+	if (!g_wp_async_mode) {
+		pthread_mutex_lock(&g_tracked_tasks_lock);
+		g_tracked_tasks_generation = 0;
+		g_monitor_snapshot_generation = 0;
+		pthread_mutex_unlock(&g_tracked_tasks_lock);
 
-	/* Clean up any remaining queue entries */
-	pthread_spin_lock(&g_cow_info->queue_lock);
-	list_for_each_entry_safe(qe, qe_tmp, &g_cow_info->cow_page_queue, list) {
-		list_del(&qe->list);
-		xfree(qe);
-		queue_remaining++;
-	}
-	pthread_spin_unlock(&g_cow_info->queue_lock);
-	pthread_spin_destroy(&g_cow_info->queue_lock);
-
-	if (queue_remaining > 0)
-		pr_warn("Freed %d remaining queue entries\n", queue_remaining);
-
-	/* Clean up any remaining COW pages */
-	for (i = 0; i < COW_HASH_SIZE; i++) {
-		pthread_spin_lock(&g_cow_info->cow_hash_locks[i]);
-		hlist_for_each_entry_safe(cp, n, &g_cow_info->cow_hash[i], hash) {
-			hlist_del(&cp->hash);
-			xfree(cp->data);
-			xfree(cp);
-			remaining++;
+		/* Clean up any remaining queue entries */
+		pthread_spin_lock(&g_cow_info->queue_lock);
+		list_for_each_entry_safe(qe, qe_tmp,
+					 &g_cow_info->cow_page_queue, list) {
+			list_del(&qe->list);
+			xfree(qe);
+			queue_remaining++;
 		}
-		pthread_spin_unlock(&g_cow_info->cow_hash_locks[i]);
-		pthread_spin_destroy(&g_cow_info->cow_hash_locks[i]);
-	}
+		pthread_spin_unlock(&g_cow_info->queue_lock);
+		pthread_spin_destroy(&g_cow_info->queue_lock);
 
-	if (remaining > 0)
-		pr_warn("Freed %d remaining COW pages\n", remaining);
+		if (queue_remaining > 0)
+			pr_warn("Freed %d remaining queue entries\n",
+				queue_remaining);
+
+		/* Clean up any remaining COW pages */
+		for (i = 0; i < COW_HASH_SIZE; i++) {
+			pthread_spin_lock(&g_cow_info->cow_hash_locks[i]);
+			hlist_for_each_entry_safe(cp, n,
+						  &g_cow_info->cow_hash[i],
+						  hash) {
+				hlist_del(&cp->hash);
+				xfree(cp->data);
+				xfree(cp);
+				remaining++;
+			}
+			pthread_spin_unlock(&g_cow_info->cow_hash_locks[i]);
+			pthread_spin_destroy(&g_cow_info->cow_hash_locks[i]);
+		}
+
+		if (remaining > 0)
+			pr_warn("Freed %d remaining COW pages\n", remaining);
+	}
 
 	list_for_each_entry_safe(task, task_tmp, &g_cow_info->tracked_tasks, list) {
 		list_del(&task->list);
+		if (task->pagemap_fd >= 0)
+			close(task->pagemap_fd);
 		if (task->uffd >= 0)
 			close(task->uffd);
 		xfree(task->tracked_vmas);
@@ -797,6 +840,7 @@ void cow_dump_fini(void)
 
 	xfree(g_cow_info);
 	g_cow_info = NULL;
+	g_wp_async_mode = false;
 }
 
 /*
@@ -1431,6 +1475,61 @@ int cow_get_uffd_for_pid(pid_t source_pid)
 		return -1;
 
 	return task->uffd;
+}
+
+bool cow_is_wp_async(void)
+{
+	return g_wp_async_mode;
+}
+
+int cow_get_pagemap_fd_for_pid(pid_t source_pid)
+{
+	struct cow_tracked_task *task;
+
+	task = cow_find_task_by_pid(source_pid);
+	if (!task)
+		return -1;
+
+	return task->pagemap_fd;
+}
+
+int cow_scan_dirty_pages(pid_t source_pid,
+			 unsigned long start, unsigned long end,
+			 void *regions, unsigned long max_regions,
+			 unsigned long *walk_end)
+{
+	struct cow_tracked_task *task;
+	struct pm_scan_arg arg;
+	int ret;
+
+	if (!g_wp_async_mode)
+		return 0;
+
+	task = cow_find_task_by_pid(source_pid);
+	if (!task || task->pagemap_fd < 0)
+		return -1;
+
+	memset(&arg, 0, sizeof(arg));
+	arg.size = sizeof(arg);
+	arg.flags = PM_SCAN_WP_MATCHING;
+	arg.start = start;
+	arg.end = end;
+	arg.vec = (u64)(unsigned long)regions;
+	arg.vec_len = max_regions;
+	arg.max_pages = 0;
+	arg.category_anyof_mask = PAGE_IS_WRITTEN;
+	arg.return_mask = PAGE_IS_WRITTEN;
+
+	ret = ioctl(task->pagemap_fd, PAGEMAP_SCAN, &arg);
+	if (ret < 0) {
+		pr_perror("PAGEMAP_SCAN [%lx-%lx) failed", start, end);
+		return -1;
+	}
+
+	if (walk_end)
+		*walk_end = arg.walk_end;
+
+	return ret;
 }
 
 bool cow_dump_is_vma_tracked(pid_t source_pid, unsigned long start, unsigned long end)

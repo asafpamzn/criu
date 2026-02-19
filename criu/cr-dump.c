@@ -1789,7 +1789,7 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 		 * writes) while we are still in dump_one_task(), so start monitor
 		 * early to service those faults and avoid deadlock in RPC commands.
 		 */
-		if (opts.lazy_pages && cow_start_monitor_thread()) {
+		if (opts.lazy_pages && !cow_is_wp_async() && cow_start_monitor_thread()) {
 			pr_err("Failed to start COW monitor thread\n");
 			ret = -1;
 			goto err_cure;
@@ -2241,7 +2241,7 @@ static int cr_dump_finish(int ret)
 		pr_err("PAGE SERVER READY TO SERVE\n");
 		pr_info("Resuming process with COW protection active\n");
 
-		if (cow_start_monitor_thread()) {
+		if (!cow_is_wp_async() && cow_start_monitor_thread()) {
 			pr_err("Failed to start COW monitor thread\n");
 			ret = -1;
 			goto out_release_cow;

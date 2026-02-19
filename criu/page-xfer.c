@@ -1658,9 +1658,9 @@ static struct {
 static int send_lazy_vma_page(int sk, unsigned long vaddr, u64 dst_id,
 			      pid_t source_pid)
 {
-	struct cow_page *cow_pg;
+	struct cow_page *cow_pg = NULL;
 	const void *data;
-	pthread_spinlock_t *lock;
+	pthread_spinlock_t *lock = NULL;
 	char buffer[PAGE_SIZE];
 	int ret;
 	int uffd;
@@ -1673,17 +1673,17 @@ static int send_lazy_vma_page(int sk, unsigned long vaddr, u64 dst_id,
 
 	clock_gettime(CLOCK_MONOTONIC, &t_start);
 
-	/* Get hash bucket lock (may be NULL if COW session already destroyed). */
-	lock = cow_get_hash_lock(vaddr);
-	if (lock)
-		pthread_spin_lock(lock);
+	/* Sync mode: check COW hash for dump-time snapshot */
+	if (!cow_is_wp_async()) {
+		lock = cow_get_hash_lock(vaddr);
+		if (lock)
+			pthread_spin_lock(lock);
+		cow_pg = lock ? cow_lookup_page(vaddr) : NULL;
+		if (lock)
+			pthread_spin_unlock(lock);
+	}
 	clock_gettime(CLOCK_MONOTONIC, &t_lock);
-
-	cow_pg = lock ? cow_lookup_page(vaddr) : NULL;
 	clock_gettime(CLOCK_MONOTONIC, &t_cow);
-
-	if (lock)
-		pthread_spin_unlock(lock);
 
 	if (cow_pg) {
 		pr_debug("[SEND_PAGE] Sending COW page at vaddr=0x%lx\n", vaddr);
@@ -1725,17 +1725,18 @@ static int send_lazy_vma_page(int sk, unsigned long vaddr, u64 dst_id,
 		}
 
 		/*
-		 * Re-check the COW hash after the read: a concurrent write-fault
-		 * handler may have captured the pre-write snapshot for this page
-		 * and unprotected it while we were racing. If that happened,
-		 * always send the hash snapshot to preserve dump-time semantics.
+		 * Sync mode: re-check COW hash after the read.
+		 * A concurrent write-fault handler may have captured
+		 * the pre-write snapshot while we were racing.
 		 */
-		lock = cow_get_hash_lock(vaddr);
-		if (lock)
-			pthread_spin_lock(lock);
-		cow_pg = lock ? cow_lookup_page(vaddr) : NULL;
-		if (lock)
-			pthread_spin_unlock(lock);
+		if (!cow_is_wp_async()) {
+			lock = cow_get_hash_lock(vaddr);
+			if (lock)
+				pthread_spin_lock(lock);
+			cow_pg = lock ? cow_lookup_page(vaddr) : NULL;
+			if (lock)
+				pthread_spin_unlock(lock);
+		}
 
 		data = cow_pg ? cow_pg->data : buffer;
 	}
@@ -1758,7 +1759,8 @@ static int send_lazy_vma_page(int sk, unsigned long vaddr, u64 dst_id,
 			cow_remove_page(vaddr);
 			pthread_spin_unlock(lock);
 		}
-	} else {
+	} else if (!cow_is_wp_async()) {
+		/* Sync mode: clear WP and drop any racing snapshot */
 		uffd = cow_get_uffd_for_pid(source_pid);
 		if (uffd >= 0) {
 			struct uffdio_writeprotect wp;
@@ -1774,18 +1776,14 @@ static int send_lazy_vma_page(int sk, unsigned long vaddr, u64 dst_id,
 
 		clock_gettime(CLOCK_MONOTONIC, &t_unprot);
 
-		/*
-		 * A write-fault can race with our regular send: the page is still
-		 * write-protected until we clear WP, so the monitor may capture a
-		 * snapshot into the hash while we are sending. If that happens,
-		 * drop the snapshot since we've already sent the page.
-		 */
 		lock = cow_get_hash_lock(vaddr);
 		if (lock) {
 			pthread_spin_lock(lock);
 			cow_remove_page(vaddr);
 			pthread_spin_unlock(lock);
 		}
+	} else {
+		clock_gettime(CLOCK_MONOTONIC, &t_unprot);
 	}
 
 	clock_gettime(CLOCK_MONOTONIC, &t_end);
@@ -2153,9 +2151,11 @@ static int process_vma_pages(struct active_image *img,
 
 		maybe_print_stats(stats);
 
-		/* Priority 1: Drain COW pages */
-		if (drain_cow_pages(img, source_pid, 100, stats) < 0)
-			goto err;
+		/* Priority 1: Drain COW pages (sync mode only) */
+		if (!cow_is_wp_async()) {
+			if (drain_cow_pages(img, source_pid, 100, stats) < 0)
+				goto err;
+		}
 
 		/* Priority 2: Drain page requests */
 		if (drain_page_requests(img, source_pid, stats) < 0)
@@ -2224,8 +2224,8 @@ static int process_vma_pages(struct active_image *img,
 		for (i = 0; i < batch_pages; i++) {
 			unsigned long paddr = batch_start + i * PAGE_SIZE;
 			const void *data;
-			struct cow_page *cow_pg;
-			pthread_spinlock_t *lock;
+			struct cow_page *cow_pg = NULL;
+			pthread_spinlock_t *lock = NULL;
 
 			/* Skip if already sent */
 			if (lve->sent_bitmap[page_idx / 8] &
@@ -2237,15 +2237,18 @@ static int process_vma_pages(struct active_image *img,
 			}
 
 			/*
-			 * Check COW hash: a concurrent write fault
-			 * may have captured the dump-time snapshot.
+			 * Sync mode: check COW hash for dump-time
+			 * snapshot captured by the monitor thread.
+			 * WP_ASYNC: no hash, use readv data directly.
 			 */
-			lock = cow_get_hash_lock(paddr);
-			if (lock)
-				pthread_spin_lock(lock);
-			cow_pg = lock ? cow_lookup_page(paddr) : NULL;
-			if (lock)
-				pthread_spin_unlock(lock);
+			if (!cow_is_wp_async()) {
+				lock = cow_get_hash_lock(paddr);
+				if (lock)
+					pthread_spin_lock(lock);
+				cow_pg = lock ? cow_lookup_page(paddr) : NULL;
+				if (lock)
+					pthread_spin_unlock(lock);
+			}
 
 			data = cow_pg ? cow_pg->data :
 				batch_buf + i * PAGE_SIZE;
@@ -2276,12 +2279,12 @@ static int process_vma_pages(struct active_image *img,
 		}
 
 		/*
-		 * Clear write-protect for the entire batch in ONE
-		 * ioctl.  This triggers a single TLB shootdown IPI
-		 * instead of one per page, reducing the TLB
-		 * invalidation storm that stalls the application.
+		 * Sync mode: clear write-protect for the batch.
+		 * WP_ASYNC: kernel already cleared WP on writes,
+		 * and PAGEMAP_SCAN handles re-arming during
+		 * convergence rounds.
 		 */
-		{
+		if (!cow_is_wp_async()) {
 			int uffd = cow_get_uffd_for_pid(source_pid);
 
 			if (uffd >= 0) {
@@ -2333,6 +2336,149 @@ static int final_queue_drain(struct active_image *img, pid_t source_pid,
 	return 0;
 }
 
+/*
+ * WP_ASYNC convergence: after the initial linear transfer, scan for
+ * pages dirtied by the source process and re-send them.  Each scan
+ * atomically re-arms WP, so writes after the scan are tracked for
+ * the next iteration.
+ */
+#define CONVERGE_BATCH_PAGES	256
+#define CONVERGE_MAX_REGIONS	4096
+#define CONVERGE_MAX_ITERS	20
+#define CONVERGE_THRESHOLD_ABS	64
+
+struct converge_region {
+	u64 start;
+	u64 end;
+	u64 categories;
+};
+
+static int cow_converge_dirty_pages(struct active_image *img,
+				    pid_t source_pid)
+{
+	struct converge_region *regions;
+	char *batch_buf;
+	struct iovec *local_iovs;
+	unsigned long iteration;
+
+	if (!cow_is_wp_async())
+		return 0;
+
+	regions = xmalloc(CONVERGE_MAX_REGIONS * sizeof(*regions));
+	batch_buf = xmalloc(CONVERGE_BATCH_PAGES * PAGE_SIZE);
+	local_iovs = xmalloc(CONVERGE_BATCH_PAGES * sizeof(*local_iovs));
+	if (!regions || !batch_buf || !local_iovs) {
+		xfree(regions);
+		xfree(batch_buf);
+		xfree(local_iovs);
+		pr_err("COW converge: allocation failed\n");
+		return -1;
+	}
+
+	for (iteration = 0; iteration < CONVERGE_MAX_ITERS; iteration++) {
+		struct lazy_vma_entry *lve;
+		unsigned long total_dirty = 0;
+
+		list_for_each_entry(lve, get_global_lazy_vmas(), list) {
+			unsigned long scan_pos;
+
+			if (lve->dst_id != img->dst_id)
+				continue;
+
+			scan_pos = lve->start;
+			while (scan_pos < lve->end) {
+				unsigned long walk_end = 0;
+				int nr_regions, r;
+
+				nr_regions = cow_scan_dirty_pages(
+					source_pid, scan_pos, lve->end,
+					regions, CONVERGE_MAX_REGIONS,
+					&walk_end);
+				if (nr_regions < 0)
+					goto err;
+				if (nr_regions == 0) {
+					scan_pos = walk_end;
+					if (walk_end >= lve->end)
+						break;
+					continue;
+				}
+
+				for (r = 0; r < nr_regions; r++) {
+					unsigned long rstart = regions[r].start;
+					unsigned long rend = regions[r].end;
+					unsigned long pg;
+
+					for (pg = rstart; pg < rend; ) {
+						unsigned long batch_start = pg;
+						unsigned long nr, remain;
+						unsigned long i;
+						struct iovec remote_iov;
+						ssize_t ret;
+
+						remain = (rend - pg) / PAGE_SIZE;
+						nr = remain < CONVERGE_BATCH_PAGES ?
+						     remain : CONVERGE_BATCH_PAGES;
+
+						for (i = 0; i < nr; i++) {
+							local_iovs[i].iov_base =
+								batch_buf + i * PAGE_SIZE;
+							local_iovs[i].iov_len = PAGE_SIZE;
+						}
+						remote_iov.iov_base = (void *)batch_start;
+						remote_iov.iov_len = nr * PAGE_SIZE;
+
+						ret = process_vm_readv(source_pid,
+							local_iovs, nr,
+							&remote_iov, 1, 0);
+						if (ret < 0 && errno == ESRCH) {
+							pr_info("COW converge: process gone\n");
+							goto done;
+						}
+
+						for (i = 0; i < nr; i++) {
+							unsigned long paddr = batch_start + i * PAGE_SIZE;
+
+							if (send_page_compressed(
+								img->main_sk,
+								batch_buf + i * PAGE_SIZE,
+								img->dst_id,
+								paddr) < 0) {
+								pr_err("COW converge: send failed at %lx\n",
+								       paddr);
+								goto err;
+							}
+							total_dirty++;
+						}
+						pg += nr * PAGE_SIZE;
+					}
+				}
+
+				scan_pos = walk_end;
+				if (walk_end >= lve->end)
+					break;
+			}
+		}
+
+		pr_err("COW converge iter %lu: %lu dirty pages re-sent\n",
+		       iteration, total_dirty);
+
+		if (total_dirty <= CONVERGE_THRESHOLD_ABS)
+			break;
+	}
+
+done:
+	xfree(regions);
+	xfree(batch_buf);
+	xfree(local_iovs);
+	return 0;
+
+err:
+	xfree(regions);
+	xfree(batch_buf);
+	xfree(local_iovs);
+	return -1;
+}
+
 /* Unified background thread serving all images */
 static void *unified_page_server_thread(void *arg)
 {
@@ -2371,9 +2517,18 @@ static void *unified_page_server_thread(void *arg)
 				}
 			}
 
+			/* WP_ASYNC: run convergence rounds for dirty pages */
+			if (!image_failed && cow_is_wp_async() && source_pid > 0) {
+				if (cow_converge_dirty_pages(img, source_pid) < 0) {
+					pr_err("COW convergence failed\n");
+					image_failed = true;
+				}
+			}
+
 			/* Final drain of any remaining queued pages */
 			pthread_spin_lock(&active_images_lock);
-			if (!image_failed && final_queue_drain(img, source_pid, &stats) < 0) {
+			if (!image_failed && !cow_is_wp_async() &&
+			    final_queue_drain(img, source_pid, &stats) < 0) {
 				pr_err("Error in final queue drain\n");
 				image_failed = true;
 			}

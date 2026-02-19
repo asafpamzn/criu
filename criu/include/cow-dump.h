@@ -193,4 +193,43 @@ extern void cow_put_back_page(struct cow_page_queue_entry *entry);
  */
 extern unsigned long cow_get_queue_size(void);
 
+/**
+ * cow_is_wp_async - Check if WP_ASYNC mode is active
+ *
+ * When true, userfaultfd write-protect faults are resolved
+ * automatically by the kernel (no thread parking, no events).
+ * Dirty page tracking uses PAGEMAP_SCAN instead of uffd events.
+ *
+ * Returns: true if WP_ASYNC mode is active
+ */
+extern bool cow_is_wp_async(void);
+
+/**
+ * cow_get_pagemap_fd_for_pid - Get pagemap fd for PAGEMAP_SCAN
+ * @source_pid: Source process pid
+ *
+ * Returns: pagemap fd on success, -1 if not found or not WP_ASYNC
+ */
+extern int cow_get_pagemap_fd_for_pid(pid_t source_pid);
+
+/**
+ * cow_scan_dirty_pages - Scan for dirty pages via PAGEMAP_SCAN
+ * @source_pid: Source process pid
+ * @start: Start address of range to scan
+ * @end: End address of range to scan
+ * @regions: Output array of page_region structs
+ * @max_regions: Capacity of regions array
+ * @walk_end: Output: address where scan stopped
+ *
+ * Scans for pages written since WP was applied/re-armed.
+ * Atomically re-arms WP on dirty pages via PM_SCAN_WP_MATCHING.
+ * Only valid in WP_ASYNC mode.
+ *
+ * Returns: number of regions found, or -1 on error
+ */
+extern int cow_scan_dirty_pages(pid_t source_pid,
+				unsigned long start, unsigned long end,
+				void *regions, unsigned long max_regions,
+				unsigned long *walk_end);
+
 #endif /* __CR_COW_DUMP_H_ */
