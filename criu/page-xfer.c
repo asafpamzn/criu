@@ -2852,8 +2852,17 @@ static int page_server_serve(int sk)
 			break;
 
 		if (ret != sizeof(pi)) {
-			pr_perror("Can't read pagemap from socket");
-			ret = -1;
+			/*
+			 * After COW bulk transfer completes, the receiver
+			 * disconnects.  Treat this as success, not error.
+			 */
+			if (opts.cow_dump && !g_unified_thread_running) {
+				pr_info("Receiver disconnected after bulk transfer\n");
+				ret = 0;
+			} else {
+				pr_perror("Can't read pagemap from socket");
+				ret = -1;
+			}
 			break;
 		}
 
