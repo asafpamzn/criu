@@ -354,9 +354,14 @@ DUMP_PID=$!
 
 sleep 2
 if ! kill -0 "$DUMP_PID" 2>/dev/null; then
-  log "ERROR: criu dump exited early"
-  sudo tail -n 120 "$IMAGES_DIR/lazy-primary.log" || true
-  exit 1
+  # Dump process exited — check if page server was ready (success) or not (failure)
+  if sudo grep -a -q "PAGE SERVER READY TO SERVE" "$IMAGES_DIR/lazy-primary.log" 2>/dev/null; then
+    log "  Dump completed quickly (small dataset)"
+  else
+    log "ERROR: criu dump exited early"
+    sudo tail -n 120 "$IMAGES_DIR/lazy-primary.log" || true
+    exit 1
+  fi
 fi
 
 PAGE_SERVER_READY=0
