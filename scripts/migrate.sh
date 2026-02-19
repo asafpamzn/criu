@@ -275,6 +275,16 @@ start_source_ping_monitor
 
 # Run dump - cow-dump keeps running, we'll kill it after restore.
 # Optional syscall profiling can be enabled via CRIU_DUMP_STRACE_OUT.
+# Discover cgroup path for --freeze-cgroup (ensures clean thread freeze)
+CGROUP_PATH=""
+if [ -f "/proc/$PID/cgroup" ]; then
+  # cgroup v2: unified hierarchy (line starting with "0::")
+  CGROUP_REL=$(grep '^0::' "/proc/$PID/cgroup" | cut -d: -f3)
+  if [ -n "$CGROUP_REL" ] && [ -d "/sys/fs/cgroup${CGROUP_REL}" ]; then
+    CGROUP_PATH="/sys/fs/cgroup${CGROUP_REL}"
+  fi
+fi
+
 CRIU_DUMP_CMD=(
   sudo "$CRIU_BIN" dump
   --tree "$PID"
@@ -293,6 +303,10 @@ CRIU_DUMP_CMD=(
   --display-stats
   -v2 -o "$IMAGES_DIR/lazy-primary.log"
 )
+if [ -n "$CGROUP_PATH" ]; then
+  CRIU_DUMP_CMD+=(--freeze-cgroup "$CGROUP_PATH")
+  log "  Using --freeze-cgroup $CGROUP_PATH"
+fi
 
 if [ -n "$CRIU_DUMP_STRACE_OUT" ]; then
   log "  Enabling dump strace: $CRIU_DUMP_STRACE_OUT"
@@ -312,6 +326,9 @@ if [ -n "$CRIU_DUMP_STRACE_OUT" ]; then
     --display-stats
     -v2 -o "$IMAGES_DIR/lazy-primary.log"
   )
+  if [ -n "$CGROUP_PATH" ]; then
+    CRIU_DUMP_CMD+=(--freeze-cgroup "$CGROUP_PATH")
+  fi
 fi
 
 mark_local_event "DUMP_LAUNCH_MS"
