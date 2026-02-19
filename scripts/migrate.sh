@@ -299,13 +299,17 @@ sleep 5
 
 # Run dump - cow-dump keeps running, we'll kill it after restore.
 # Optional syscall profiling can be enabled via CRIU_DUMP_STRACE_OUT.
-# Discover cgroup path for --freeze-cgroup (ensures clean thread freeze)
+# Discover cgroup path for --freeze-cgroup (ensures clean thread freeze).
+# Only use it if the cgroup is a dedicated service scope (*.service),
+# NOT a session scope (*.scope) which would freeze CRIU itself.
 CGROUP_PATH=""
 if [ -f "/proc/$PID/cgroup" ]; then
-  # cgroup v2: unified hierarchy (line starting with "0::")
   CGROUP_REL=$(grep '^0::' "/proc/$PID/cgroup" | cut -d: -f3)
   if [ -n "$CGROUP_REL" ] && [ -d "/sys/fs/cgroup${CGROUP_REL}" ]; then
-    CGROUP_PATH="/sys/fs/cgroup${CGROUP_REL}"
+    case "$CGROUP_REL" in
+      *.service) CGROUP_PATH="/sys/fs/cgroup${CGROUP_REL}" ;;
+      *) log "  Skipping --freeze-cgroup (shared cgroup: $CGROUP_REL)" ;;
+    esac
   fi
 fi
 
