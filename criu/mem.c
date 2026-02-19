@@ -82,6 +82,27 @@ struct lazy_vma_entry *find_lazy_vma_for_addr(unsigned long vaddr, u64 dst_id)
 	return NULL;
 }
 
+/* Find lazy VMA entry by address only (no dst_id filter) */
+struct lazy_vma_entry *find_lazy_vma_by_addr(unsigned long vaddr)
+{
+	struct lazy_vma_entry *lve;
+
+	if (!lazy_vmas_lock_initialized)
+		return NULL;
+
+	pthread_spin_lock(&lazy_vmas_lock);
+
+	list_for_each_entry(lve, &global_lazy_vmas, list) {
+		if (vaddr >= lve->start && vaddr < lve->end) {
+			pthread_spin_unlock(&lazy_vmas_lock);
+			return lve;
+		}
+	}
+	pthread_spin_unlock(&lazy_vmas_lock);
+
+	return NULL;
+}
+
 /* Count total pages in lazy VMAs for a given dst_id (exported for page-xfer.c) */
 unsigned long count_lazy_vma_pages(u64 dst_id)
 {
@@ -359,10 +380,16 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 		lve->dst_id = vpid(item);
 		lve->source_pid = item->pid->real;
 
-		/* Allocate sent bitmap for this VMA */
+		/* Allocate sent bitmap and cow bitmap for this VMA */
 		bitmap_size = BITMAP_ALLOC_SIZE(nr_pages);
 		lve->sent_bitmap = xzalloc(bitmap_size);
 		if (!lve->sent_bitmap) {
+			xfree(lve);
+			return -1;
+		}
+		lve->cow_bitmap = xzalloc(bitmap_size);
+		if (!lve->cow_bitmap) {
+			xfree(lve->sent_bitmap);
 			xfree(lve);
 			return -1;
 		}
@@ -1880,6 +1907,8 @@ void free_global_lazy_vmas(void)
 		list_del(&lve->list);
 		if (lve->sent_bitmap)
 			xfree(lve->sent_bitmap);
+		if (lve->cow_bitmap)
+			xfree(lve->cow_bitmap);
 		xfree(lve);
 	}
 	pthread_spin_unlock(&lazy_vmas_lock);
