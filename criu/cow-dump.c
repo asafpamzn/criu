@@ -27,21 +27,14 @@
 #include "kerndat.h"
 #include "criu-log.h"
 #include "parasite.h"
+#include "atomic-bitmap.h"
+#include "spsc-queue.h"
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "cow-dump: "
 
-/*
- * M5: Lock-free SPSC queue wrapper node.
- *
- * Separates queue linkage from payload (cow_page_queue_entry) so that
- * the standard "consumed node becomes new dummy" pattern works without
- * use-after-free: the caller frees the entry, the queue frees the node.
- */
-struct cow_spsc_node {
-	struct cow_spsc_node *next;		/* Atomic: producer writes, consumer reads */
-	struct cow_page_queue_entry *entry;	/* Payload (NULL for dummy node) */
-};
+/* M5: SPSC queue node type for COW page entries */
+DECLARE_SPSC_NODE(cow_page, struct cow_page_queue_entry);
 
 /* From criu-cow: per-VMA tracking for multi-task support */
 struct cow_tracked_vma {
@@ -77,9 +70,9 @@ struct cow_dump_info {
 	 * M5: Lock-free SPSC queue (Thread 1 produces, Thread 3 consumes).
 	 * head and tail are on separate cache lines to prevent false sharing.
 	 */
-	struct cow_spsc_node *spsc_head;	/* Consumer side */
-	char _pad[64 - sizeof(struct cow_spsc_node *)];
-	struct cow_spsc_node *spsc_tail;	/* Producer side */
+	struct cow_page_spsc_node *spsc_head;	/* Consumer side */
+	char _pad[64 - sizeof(struct cow_page_spsc_node *)];
+	struct cow_page_spsc_node *spsc_tail;	/* Producer side */
 	unsigned long spsc_size;		/* Atomic: approximate queue size */
 
 	/* M1: Per-VMA bitmaps tracking write-faulted pages */
@@ -206,6 +199,14 @@ bool cow_check_kernel_support(void)
 	return true;
 }
 static int cow_bitmap_init_vmas(struct vm_area_list *vma_area_list);
+
+static void free_cow_page_entry(struct cow_page_queue_entry *entry)
+{
+	if (entry->data)
+		xfree(entry->data);
+	xfree(entry);
+}
+
 int cow_dump_init(struct pstree_item *item, struct vm_area_list *vma_area_list, struct parasite_ctl *ctl)
 {
 	struct cow_dump_info *cdi = g_cow_info;
@@ -248,17 +249,11 @@ int cow_dump_init(struct pstree_item *item, struct vm_area_list *vma_area_list, 
 		INIT_LIST_HEAD(&cdi->tracked_tasks);
 
 		/* M5: Initialize lock-free SPSC queue with dummy node */
-		{
-			struct cow_spsc_node *dummy = xzalloc(sizeof(*dummy));
-			if (!dummy) {
-				xfree(cdi);
-				return -1;
-			}
-			dummy->next = NULL;
-			dummy->entry = NULL;
-			cdi->spsc_head = dummy;
-			cdi->spsc_tail = dummy;
-			cdi->spsc_size = 0;
+		if (spsc_init(cdi->spsc_head, cdi->spsc_tail,
+			      cdi->spsc_size,
+			      struct cow_page_spsc_node)) {
+			xfree(cdi);
+			return -1;
 		}
 
 		g_cow_info = cdi;
@@ -448,8 +443,10 @@ err:
 
 	if (created_session) {
 		/* M5: Free SPSC dummy node */
-		if (cdi->spsc_head)
-			xfree(cdi->spsc_head);
+		if (cdi->spsc_head) {
+			spsc_drain(cdi->spsc_head, free_cow_page_entry);
+			cdi->spsc_tail = NULL;
+		}
 		xfree(cdi);
 		g_cow_info = NULL;
 	}
@@ -522,7 +519,7 @@ static int cow_bitmap_init_vmas(struct vm_area_list *vma_area_list)
 			continue;
 
 		nr_pages = (vma->e->end - vma->e->start) / PAGE_SIZE;
-		bitmap_bytes = (nr_pages + 7) / 8;
+		bitmap_bytes = BITMAP_ALLOC_SIZE(nr_pages);
 
 		g_cow_info->vma_bitmaps[idx].start = vma->e->start;
 		g_cow_info->vma_bitmaps[idx].end = vma->e->end;
@@ -603,8 +600,7 @@ void cow_set_bitmap(unsigned long vaddr)
 
 	page_idx = (page_addr - vb->start) / PAGE_SIZE;
 
-	__atomic_or_fetch(&vb->bitmap[page_idx / 8],
-			  (uint8_t)(1 << (page_idx % 8)), __ATOMIC_RELEASE);
+	atomic_bitmap_set(vb->bitmap, page_idx);
 }
 
 void cow_clear_bitmap(unsigned long vaddr)
@@ -619,8 +615,7 @@ void cow_clear_bitmap(unsigned long vaddr)
 
 	page_idx = (page_addr - vb->start) / PAGE_SIZE;
 
-	__atomic_and_fetch(&vb->bitmap[page_idx / 8],
-			   (uint8_t)~(1 << (page_idx % 8)), __ATOMIC_RELEASE);
+	atomic_bitmap_clear(vb->bitmap, page_idx);
 }
 
 bool cow_test_bitmap(unsigned long vaddr)
@@ -628,7 +623,6 @@ bool cow_test_bitmap(unsigned long vaddr)
 	unsigned long page_addr = vaddr & ~(PAGE_SIZE - 1);
 	struct cow_vma_bitmap *vb;
 	unsigned long page_idx;
-	uint8_t val;
 
 	vb = cow_find_vma_bitmap(page_addr);
 	if (!vb)
@@ -636,8 +630,7 @@ bool cow_test_bitmap(unsigned long vaddr)
 
 	page_idx = (page_addr - vb->start) / PAGE_SIZE;
 
-	val = __atomic_load_n(&vb->bitmap[page_idx / 8], __ATOMIC_ACQUIRE);
-	return (val & (1 << (page_idx % 8))) != 0;
+	return atomic_bitmap_test(vb->bitmap, page_idx);
 }
 
 void cow_dump_fini(void)
@@ -671,22 +664,7 @@ void cow_dump_fini(void)
 
 	/* M5: Drain SPSC queue */
 	if (g_cow_info->spsc_head) {
-		struct cow_spsc_node *node = g_cow_info->spsc_head;
-
-		while (node) {
-			struct cow_spsc_node *next = node->next;
-
-			/* Free payload if present (dummy has entry==NULL) */
-			if (node->entry) {
-				if (node->entry->data)
-					xfree(node->entry->data);
-				xfree(node->entry);
-				queue_remaining++;
-			}
-			xfree(node);
-			node = next;
-		}
-		g_cow_info->spsc_head = NULL;
+		spsc_drain(g_cow_info->spsc_head, free_cow_page_entry);
 		g_cow_info->spsc_tail = NULL;
 	}
 
@@ -821,25 +799,7 @@ static int cow_handle_write_fault(struct cow_dump_info *cdi,
 	}
 
 	{
-		struct cow_spsc_node *node;
 		int attempts;
-
-		for (attempts = 0; attempts < 3; attempts++) {
-			node = xmalloc(sizeof(*node));
-			if (node)
-				break;
-			pr_warn("Retry %d: alloc SPSC node for 0x%lx\n",
-				attempts + 1, page_addr);
-		}
-		if (!node) {
-			pr_err("Failed to allocate SPSC node for page 0x%lx "
-			       "after retries, clearing bitmap for P3 fallback\n",
-			       page_addr);
-			xfree(entry);
-			xfree(page_data);
-			cow_clear_bitmap(page_addr);
-			return 0;
-		}
 
 		entry->vaddr = page_addr;
 		entry->data = page_data;	/* Transfer ownership */
@@ -849,13 +809,22 @@ static int cow_handle_write_fault(struct cow_dump_info *cdi,
 		entry->page_idx_in_seg = 0;
 		entry->next = NULL;
 
-		node->entry = entry;
-		node->next = NULL;
-
-		/* Publish: consumer sees node only after this store */
-		__atomic_store_n(&cdi->spsc_tail->next, node, __ATOMIC_RELEASE);
-		cdi->spsc_tail = node;
-		__atomic_fetch_add(&cdi->spsc_size, 1, __ATOMIC_RELAXED);
+		for (attempts = 0; attempts < 3; attempts++) {
+			if (!spsc_enqueue(cdi->spsc_tail, cdi->spsc_size,
+					  entry, struct cow_page_spsc_node))
+				break;
+			pr_warn("Retry %d: alloc SPSC node for 0x%lx\n",
+				attempts + 1, page_addr);
+		}
+		if (attempts == 3) {
+			pr_err("Failed to allocate SPSC node for page 0x%lx "
+			       "after retries, clearing bitmap for P3 fallback\n",
+			       page_addr);
+			xfree(entry->data);
+			xfree(entry);
+			cow_clear_bitmap(page_addr);
+			return 0;
+		}
 	}
 
 	return 0;
@@ -1136,7 +1105,6 @@ bool cow_dump_is_vma_tracked(pid_t source_pid, unsigned long start, unsigned lon
 struct cow_page_queue_entry *cow_get_next_page(void)
 {
 	struct cow_page_queue_entry *entry;
-	struct cow_spsc_node *head, *next;
 
 	if (!g_cow_info)
 		return NULL;
@@ -1151,30 +1119,11 @@ struct cow_page_queue_entry *cow_get_next_page(void)
 	}
 
 	/* M5: Lock-free SPSC dequeue */
-	head = g_cow_info->spsc_head;
-	next = __atomic_load_n(&head->next, __ATOMIC_ACQUIRE);
-
-	if (!next)
-		return NULL;	/* Queue is empty */
-
-	/* Extract payload from the next node */
-	entry = next->entry;
-	next->entry = NULL;	/* next becomes the new dummy */
-
-	/* Advance head: next is now the dummy */
-	g_cow_info->spsc_head = next;
-
-	/* Free old dummy (no thread references it anymore) */
-	xfree(head);
-
-	__atomic_fetch_sub(&g_cow_info->spsc_size, 1, __ATOMIC_RELAXED);
-	return entry;
+	return spsc_dequeue(g_cow_info->spsc_head, g_cow_info->spsc_size);
 }
 
 bool cow_has_pending_pages(void)
 {
-	struct cow_spsc_node *next;
-
 	if (!g_cow_info)
 		return false;
 
@@ -1183,8 +1132,7 @@ bool cow_has_pending_pages(void)
 		return true;
 
 	/* Check SPSC queue */
-	next = __atomic_load_n(&g_cow_info->spsc_head->next, __ATOMIC_ACQUIRE);
-	return next != NULL;
+	return spsc_peek(g_cow_info->spsc_head);
 }
 
 void cow_put_back_page(struct cow_page_queue_entry *entry)
@@ -1209,5 +1157,5 @@ unsigned long cow_get_queue_size(void)
 	if (!g_cow_info)
 		return 0;
 
-	return __atomic_load_n(&g_cow_info->spsc_size, __ATOMIC_RELAXED);
+	return spsc_size(g_cow_info->spsc_size);
 }
