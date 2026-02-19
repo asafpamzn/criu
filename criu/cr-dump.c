@@ -2235,7 +2235,13 @@ static int cr_dump_finish(int ret)
 
 	/* Resume process early if using COW dump with lazy pages */
 	if (!ret && opts.lazy_pages && opts.cow_dump) {
-		pr_err("PAGE SERVER READY TO SERVE\n");
+		/*
+		 * NOTE: The "PAGE SERVER READY TO SERVE" marker has moved
+		 * into cr_page_server(), AFTER the TCP socket is actually
+		 * listening.  Writing it here was racy — the replica would
+		 * see the marker, try to connect, and get ECONNREFUSED
+		 * because the socket wasn't bound yet.
+		 */
 		pr_info("Resuming process with COW protection active\n");
 
 		if (cow_start_monitor_thread()) {

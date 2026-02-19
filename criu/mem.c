@@ -344,10 +344,19 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 		nr_pages = vma_entry_len(vma->e) / PAGE_SIZE;
 		lve->total_pages = nr_pages;
 		
-		/* Store dst_id and source_pid for this lazy VMA */
-		lve->dst_id = xfer ? xfer->dst_id : 0;
+		/*
+		 * Store dst_id to match what the REPLICA sends in
+		 * request_all_remote_pages(img_id).  That img_id is
+		 * vpid(item) — passed to open_page_xfer() at line 791.
+		 *
+		 * NOTE: do NOT use xfer->dst_id here.  In local mode
+		 * (no --page-server) the page_xfer union overlaps
+		 * dst_id with the pmi/pi pointers, so xfer->dst_id
+		 * contains a raw pointer value — garbage.
+		 */
+		lve->dst_id = vpid(item);
 		lve->source_pid = item->pid->real;
-		
+
 		/* Allocate sent bitmap for this VMA */
 		bitmap_size = (nr_pages + 7) / 8;
 		lve->sent_bitmap = xzalloc(bitmap_size);
@@ -358,14 +367,16 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 
 		lve->start = vma->e->start;
 		lve->end = vma->e->end;
-		
+
 		/* Add to global list (thread-safe) */
 		pthread_spin_lock(&lazy_vmas_lock);
 		list_add_tail(&lve->list, &global_lazy_vmas);
 		pthread_spin_unlock(&lazy_vmas_lock);
-		
-		pr_debug("Added lazy VMA 0x%llx-0x%llx to global list (%lu pages, %lu byte bitmap, dst_id=%lu, pid=%d)\n",
-			(unsigned long long)vma->e->start, (unsigned long long)vma->e->end, nr_pages, bitmap_size,
+
+		pr_debug("Added lazy VMA 0x%llx-0x%llx to global list "
+			"(%lu pages, dst_id=%lu, pid=%d)\n",
+			(unsigned long long)vma->e->start,
+			(unsigned long long)vma->e->end, nr_pages,
 			(unsigned long)lve->dst_id, lve->source_pid);
 		return 0;
 	}

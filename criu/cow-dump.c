@@ -607,6 +607,22 @@ void cow_set_bitmap(unsigned long vaddr)
 			  (uint8_t)(1 << (page_idx % 8)), __ATOMIC_RELEASE);
 }
 
+void cow_clear_bitmap(unsigned long vaddr)
+{
+	unsigned long page_addr = vaddr & ~(PAGE_SIZE - 1);
+	struct cow_vma_bitmap *vb;
+	unsigned long page_idx;
+
+	vb = cow_find_vma_bitmap(page_addr);
+	if (!vb)
+		return;
+
+	page_idx = (page_addr - vb->start) / PAGE_SIZE;
+
+	__atomic_and_fetch(&vb->bitmap[page_idx / 8],
+			   (uint8_t)~(1 << (page_idx % 8)), __ATOMIC_RELEASE);
+}
+
 bool cow_test_bitmap(unsigned long vaddr)
 {
 	unsigned long page_addr = vaddr & ~(PAGE_SIZE - 1);
@@ -766,7 +782,7 @@ static int cow_handle_write_fault(struct cow_dump_info *cdi,
 	}
 
 	cow_stats.pages_woken++;
-	cdi->total_pages--;
+	__atomic_fetch_sub(&cdi->total_pages, 1, __ATOMIC_RELAXED);
 
 	/*
 	 * M4: Enqueue with zero-copy — transfer page_data ownership
@@ -778,35 +794,68 @@ static int cow_handle_write_fault(struct cow_dump_info *cdi,
 	 * it at the tail. The release store on tail->next publishes both
 	 * the node and the entry data to the consumer (Thread 3).
 	 */
-	entry = xmalloc(sizeof(*entry));
-	if (entry) {
-		struct cow_spsc_node *node = xmalloc(sizeof(*node));
-		if (node) {
-			entry->vaddr = page_addr;
-			entry->data = page_data;	/* Transfer ownership */
-			page_data = NULL;		/* Prevent double-free */
-			entry->ppb = NULL;
-			entry->seg_idx = 0;
-			entry->page_idx_in_seg = 0;
-			entry->next = NULL;
+	/*
+	 * M5: Lock-free SPSC enqueue.  The entry and node are tiny
+	 * (~50 bytes each) — if allocation fails, retry a few times
+	 * before giving up.  We must not lose page_data: it holds the
+	 * pre-write snapshot that P1 will send to the destination.
+	 */
+	{
+		int attempts;
 
-			node->entry = entry;
-			node->next = NULL;
+		for (attempts = 0; attempts < 3; attempts++) {
+			entry = xmalloc(sizeof(*entry));
+			if (entry)
+				break;
+			pr_warn("Retry %d: alloc queue entry for 0x%lx\n",
+				attempts + 1, page_addr);
+		}
+		if (!entry) {
+			pr_err("Failed to allocate queue entry for page 0x%lx "
+			       "after retries, clearing bitmap for P3 fallback\n",
+			       page_addr);
+			xfree(page_data);
+			cow_clear_bitmap(page_addr);
+			return 0;
+		}
+	}
 
-			/* Publish: consumer sees node only after this store */
-			__atomic_store_n(&cdi->spsc_tail->next, node, __ATOMIC_RELEASE);
-			cdi->spsc_tail = node;
-			__atomic_fetch_add(&cdi->spsc_size, 1, __ATOMIC_RELAXED);
+	{
+		struct cow_spsc_node *node;
+		int attempts;
 
-			pr_debug("Added lazy VMA COW page 0x%lx to SPSC queue\n", page_addr);
-		} else {
-			pr_warn("Failed to allocate SPSC node for page 0x%lx\n", page_addr);
+		for (attempts = 0; attempts < 3; attempts++) {
+			node = xmalloc(sizeof(*node));
+			if (node)
+				break;
+			pr_warn("Retry %d: alloc SPSC node for 0x%lx\n",
+				attempts + 1, page_addr);
+		}
+		if (!node) {
+			pr_err("Failed to allocate SPSC node for page 0x%lx "
+			       "after retries, clearing bitmap for P3 fallback\n",
+			       page_addr);
 			xfree(entry);
 			xfree(page_data);
+			cow_clear_bitmap(page_addr);
+			return 0;
 		}
-	} else {
-		pr_warn("Failed to allocate queue entry for page 0x%lx\n", page_addr);
-		xfree(page_data);
+
+		entry->vaddr = page_addr;
+		entry->data = page_data;	/* Transfer ownership */
+		page_data = NULL;		/* Prevent double-free */
+		entry->ppb = NULL;
+		entry->seg_idx = 0;
+		entry->page_idx_in_seg = 0;
+		entry->next = NULL;
+
+		node->entry = entry;
+		node->next = NULL;
+
+		/* Publish: consumer sees node only after this store */
+		__atomic_store_n(&cdi->spsc_tail->next, node, __ATOMIC_RELEASE);
+		cdi->spsc_tail = node;
+		__atomic_fetch_add(&cdi->spsc_size, 1, __ATOMIC_RELAXED);
 	}
 
 	return 0;
@@ -952,7 +1001,8 @@ static void *cow_monitor_thread(void *arg)
 
 		list_for_each_entry(task, &cdi->tracked_tasks, list) {
 			if (cow_process_events(cdi, task, false) < 0) {
-				pr_err("Error processing COW events for pid %d\n", task->source_pid);
+				pr_err("Error processing COW events for pid %d\n",
+				       task->source_pid);
 				monitor_error = true;
 				break;
 			}
@@ -961,7 +1011,7 @@ static void *cow_monitor_thread(void *arg)
 		if (monitor_error)
 			break;
 	}
-	
+
 	if (monitor_error)
 		pr_err("COW monitor thread exiting on event-processing error\n");
 
@@ -991,17 +1041,18 @@ int cow_start_monitor_thread(void)
 		pthread_mutex_unlock(&g_monitor_state_lock);
 		return 0;
 	}
-	
+
 	g_stop_monitoring = false;
-	
+	g_monitor_thread_running = true;  /* Set BEFORE create to prevent race */
+
 	ret = pthread_create(&g_monitor_thread, NULL, cow_monitor_thread, g_cow_info);
 	if (ret) {
+		g_monitor_thread_running = false;  /* Rollback on failure */
 		pthread_mutex_unlock(&g_monitor_state_lock);
 		pr_err("Failed to create COW monitor thread: %s\n", strerror(ret));
 		return -1;
 	}
 
-	g_monitor_thread_running = true;
 	pthread_mutex_unlock(&g_monitor_state_lock);
 	
 	pr_info("COW monitor thread created successfully\n");
