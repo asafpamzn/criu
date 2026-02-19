@@ -269,6 +269,35 @@ if [ "$FAST_CUTOVER" = "1" ]; then
   fi
   mark_phase_event "REPLICA_LAZY_PAGES_DONE"
 
+  # Fix glibc main_arena lock deadlock after CRIU restore.
+  # The dump may capture a thread holding the glibc malloc arena lock
+  # (value=2 means "locked with waiters"). After restore, no thread
+  # releases it. Find the lock address and zero it out via /proc/PID/mem.
+  echo "Step 8b: Fixing glibc main_arena lock..."
+  if [ -n "$VALKEY_PID" ]; then
+    LIBC_RW=$(grep "libc.so" "/proc/$VALKEY_PID/maps" 2>/dev/null | grep "rw-p" | head -1 | cut -d- -f1)
+    if [ -n "$LIBC_RW" ]; then
+      LOCK_ADDR=$(printf "0x%x" $((16#$LIBC_RW + 0xa50)))
+      echo "  main_arena lock at $LOCK_ADDR (libc rw-p=$LIBC_RW)"
+      # Zero out the lock: write 4 zero bytes at the lock address
+      sudo python3 -c "
+import os, struct
+pid = $VALKEY_PID
+addr = $((16#$LIBC_RW + 0xa50))
+fd = os.open(f'/proc/{pid}/mem', os.O_RDWR)
+os.lseek(fd, addr, os.SEEK_SET)
+val = struct.unpack('i', os.read(fd, 4))[0]
+if val == 2:
+    os.lseek(fd, addr, os.SEEK_SET)
+    os.write(fd, struct.pack('i', 0))
+    print(f'  Reset main_arena lock from {val} to 0')
+else:
+    print(f'  main_arena lock value={val} (no fix needed)')
+os.close(fd)
+" 2>&1 || echo "  WARNING: Could not fix main_arena lock"
+    fi
+  fi
+
   echo "Step 9: Writing staged marker: $REPLICA_STAGED_FILE"
   echo "STAGED" | sudo tee "$REPLICA_STAGED_FILE" >/dev/null
   sudo chmod 644 "$REPLICA_STAGED_FILE" 2>/dev/null || true

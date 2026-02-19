@@ -273,18 +273,20 @@ mark_local_event "DUMP_PREP_MS"
 log "Step 6a: Start source availability monitor..."
 start_source_ping_monitor
 
-# Pre-dump preparation: put Valkey in a quiescent state to avoid
-# internal lock deadlocks after CRIU restore.
-# 1. Free the replication backlog (avoids assertion in replication.c:389)
-# 2. Disable lazyfree so BIO threads are idle (avoids glibc malloc arena
+# Pre-dump preparation: put Valkey in a quiescent state.
+# 1. Disable lazyfree so BIO threads are idle (avoids glibc malloc arena
 #    lock being held by a BIO thread at dump time)
-# 3. Brief sleep to let any in-flight BIO operations complete
-valkey_cmd CONFIG SET repl-backlog-ttl 1 >/dev/null 2>&1 || true
+# 2. Free the replication backlog (avoids assertion in replication.c:389)
+# 3. Disable RDB/AOF saves to prevent BIO activity
+# 4. Sleep to let in-flight BIO operations and backlog TTL expire
 valkey_cmd CONFIG SET lazyfree-lazy-expire no >/dev/null 2>&1 || true
 valkey_cmd CONFIG SET lazyfree-lazy-server-del no >/dev/null 2>&1 || true
 valkey_cmd CONFIG SET lazyfree-lazy-user-del no >/dev/null 2>&1 || true
 valkey_cmd CONFIG SET lazyfree-lazy-user-flush no >/dev/null 2>&1 || true
-sleep 3
+valkey_cmd CONFIG SET save "" >/dev/null 2>&1 || true
+valkey_cmd CONFIG SET repl-backlog-ttl 1 >/dev/null 2>&1 || true
+valkey_cmd CONFIG SET repl-backlog-size 1048576 >/dev/null 2>&1 || true
+sleep 5
 
 # Run dump - cow-dump keeps running, we'll kill it after restore.
 # Optional syscall profiling can be enabled via CRIU_DUMP_STRACE_OUT.
