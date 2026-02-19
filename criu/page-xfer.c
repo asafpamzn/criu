@@ -44,8 +44,11 @@
 static int page_server_sk = -1;
 static bool bulk_stream_done = false;
 
-/* Multi-TCP: number of parallel transfer connections */
-#define COW_TRANSFER_STREAMS	2
+/* Multi-TCP: number of parallel transfer connections.
+ * Set to 1 to disable (receiver bulk reader needs per-socket refactor).
+ * TODO: refactor page_server_read_bulk_stream to accept socket fd param.
+ */
+#define COW_TRANSFER_STREAMS	1
 static int g_listen_sk = -1;	/* kept open for additional accepts */
 static int g_bulk_streams_closed;	/* count of streams that sent close */
 
@@ -3534,7 +3537,8 @@ static int page_server_async_read_bulk(struct epoll_rfd *f)
 	check_and_print_bulk_stats();
 
 	if (list_empty(&async_reads)) {
-		if (opts.cow_dump && bulk_stream_done)
+		if (opts.cow_dump && (bulk_stream_done ||
+		    g_bulk_streams_closed > 0))
 			return 0;
 		pr_err("Bulk async read with empty queue\n");
 		return -1;
