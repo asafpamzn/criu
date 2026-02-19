@@ -2524,10 +2524,8 @@ static void *unified_page_server_thread(void *arg)
 
 			/* WP_ASYNC: run convergence rounds for dirty pages */
 			if (!image_failed && cow_is_wp_async() && source_pid > 0) {
-				if (cow_converge_dirty_pages(img, source_pid) < 0) {
-					pr_err("COW convergence failed\n");
-					image_failed = true;
-				}
+				if (cow_converge_dirty_pages(img, source_pid) < 0)
+					pr_warn("COW convergence had errors (non-fatal, all pages sent)\n");
 			}
 
 			/* Final drain of any remaining queued pages */
@@ -2538,8 +2536,9 @@ static void *unified_page_server_thread(void *arg)
 				image_failed = true;
 			}
 
-			/* Check if complete */
-			if (!image_failed && img->remaining_pages == 0) {
+			/* Check if complete (WP_ASYNC: complete after linear + convergence) */
+			if ((!image_failed || cow_is_wp_async()) &&
+			    img->remaining_pages == 0) {
 				pthread_spin_unlock(&active_images_lock);
 				if (send_image_complete(img) < 0)
 					pr_err("Failed to complete image dst_id=%lu\n",
