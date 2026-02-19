@@ -98,6 +98,8 @@ struct lazy_pages_info {
 
 	unsigned long buf_size;
 	void *buf;
+
+	int mem_fd;  /* /proc/pid/mem for convergence page overwrites */
 };
 
 /* global lazy-pages daemon state */
@@ -283,6 +285,7 @@ static struct lazy_pages_info *lpi_init(void)
 	lpi->lpfd.read_event = handle_uffd_event;
 	lpi->xfer_len = DEFAULT_XFER_LEN;
 	lpi->ref_cnt = 1;
+	lpi->mem_fd = -1;
 
 	return lpi;
 }
@@ -323,6 +326,8 @@ static void lpi_fini(struct lazy_pages_info *lpi)
 		return;
 	xfree(lpi->buf);
 	free_iovs(lpi);
+	if (lpi->mem_fd >= 0)
+		close(lpi->mem_fd);
 	if (lpi->lpfd.fd > 0)
 		close(lpi->lpfd.fd);
 	if (lpi->parent)
@@ -1016,6 +1021,12 @@ static int ud_open(int client, struct lazy_pages_info **_lpi)
 	if (opts.cow_dump) {
 		/* Bulk mode: pages arrive automatically from background thread */
 		lpi->pr.io_complete = uffd_io_complete_bulk;
+
+		/* Open /proc/pid/mem for convergence page overwrites */
+		lpi->mem_fd = open_proc_rw(lpi->pid, "mem");
+		if (lpi->mem_fd < 0)
+			pr_warn("Cannot open /proc/%d/mem for convergence overwrites\n",
+				lpi->pid);
 	} else {
 		/* On-demand mode: manage individual page requests */
 		lpi->pr.io_complete = uffd_io_complete;
@@ -1156,7 +1167,24 @@ static int uffd_copy(struct lazy_pages_info *lpi, __u64 address, unsigned long *
 		/* In COW dump mode, queue EAGAIN requests instead of blocking */
 		if (errno == EAGAIN && opts.cow_dump)
 			return queue_eagain_request(lpi, address, *nr_pages, lpi->buf, "copy");
-		
+
+		/*
+		 * EEXIST: page already present (convergence re-send).
+		 * Write updated data directly via /proc/pid/mem.
+		 */
+		if ((errno == EEXIST || uffdio_copy.copy == -EEXIST) &&
+		    opts.cow_dump && lpi->mem_fd >= 0) {
+			ssize_t wr = pwrite(lpi->mem_fd, lpi->buf, len, address);
+			if (wr == (ssize_t)len) {
+				lp_debug(lpi, "Convergence overwrite at 0x%llx (%lu pages)\n",
+					 (unsigned long long)address, *nr_pages);
+				lpi->copied_pages += *nr_pages;
+				return 0;
+			}
+			lp_err(lpi, "Failed to overwrite page at 0x%llx via mem_fd: %s\n",
+			       (unsigned long long)address, strerror(errno));
+		}
+
 		/* Non-COW mode or non-EAGAIN: check for other errors */
 		if (uffd_check_op_error(lpi, "copy", nr_pages, uffdio_copy.copy)) {
 			lp_err(lpi, "UFFDIO_COPY got error\n");
