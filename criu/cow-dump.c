@@ -799,33 +799,26 @@ void cow_dump_fini(void)
 	g_cow_info = NULL;
 }
 
-static int cow_handle_write_fault(struct cow_dump_info *cdi,
-				  struct cow_tracked_task *task,
-				  unsigned long addr)
+/*
+ * Snapshot a single page into the COW hash without clearing WP or
+ * waking the faulting thread.  Returns 0 on success, -1 on error.
+ */
+static int cow_snapshot_page(struct cow_dump_info *cdi,
+			     struct cow_tracked_task *task,
+			     unsigned long page_addr)
 {
 	struct cow_page *cp;
-	unsigned long page_addr = addr & ~(PAGE_SIZE - 1);
-	struct uffdio_writeprotect wp;
-	struct uffdio_range range;
-	ssize_t ret;
 	unsigned int hash;
 	struct iovec local_iov, remote_iov;
+	ssize_t ret;
 
-	pr_debug("Write fault at 0x%lx\n", page_addr);
-
-	cow_stats.write_faults++;	
-
-	/* Allocate cow_page structure */
 	cp = xmalloc(sizeof(*cp));
 	if (!cp) {
-		pr_err("Failed to allocate cow_page structure\n");
 		cow_stats.alloc_failures++;
 		return -1;
 	}
-
 	cp->data = xmalloc(PAGE_SIZE);
 	if (!cp->data) {
-		pr_err("Failed to allocate page data\n");
 		xfree(cp);
 		cow_stats.alloc_failures++;
 		return -1;
@@ -834,58 +827,92 @@ static int cow_handle_write_fault(struct cow_dump_info *cdi,
 	cp->vaddr = page_addr;
 	INIT_HLIST_NODE(&cp->hash);
 
-	/* Read original page content using process_vm_readv */
-	
 	local_iov.iov_base = cp->data;
 	local_iov.iov_len = PAGE_SIZE;
 	remote_iov.iov_base = (void *)page_addr;
 	remote_iov.iov_len = PAGE_SIZE;
-	
-	ret = process_vm_readv(task->source_pid, &local_iov, 1, &remote_iov, 1, 0);
+
+	ret = process_vm_readv(task->source_pid, &local_iov, 1,
+			       &remote_iov, 1, 0);
 	if (ret != PAGE_SIZE) {
-		pr_perror("Failed to read page at 0x%lx from pid %d (read %zd bytes)", 
-			  page_addr, task->source_pid, ret);
 		xfree(cp->data);
 		xfree(cp);
 		cow_stats.read_failures++;
 		return -1;
 	}
 
-	/* Add to hash table (thread-safe with per-bucket spinlock) */
 	hash = (page_addr >> PAGE_SHIFT) & (COW_HASH_SIZE - 1);
-	
 	pthread_spin_lock(&cdi->cow_hash_locks[hash]);
 	hlist_add_head(&cp->hash, &cdi->cow_hash[hash]);
 	pthread_spin_unlock(&cdi->cow_hash_locks[hash]);
 
 	cow_stats.pages_copied++;
-	pr_debug("Copied page at 0x%lx to hash bucket %u\n", page_addr, hash);
-
-	/* Unprotect the page so the process can continue */
-	wp.range.start = page_addr;
-	wp.range.len = PAGE_SIZE;
-	wp.mode = 0; /* Clear write-protect */
-
-	if (ioctl(task->uffd, UFFDIO_WRITEPROTECT, &wp)) {
-		pr_perror("Failed to unprotect page at 0x%lx", page_addr);
-		cow_stats.unprotect_failures++;
-		return -1;
-	}
-
-	cow_stats.pages_unprotected++;
-
-	/* Wake up the faulting thread */
-	range.start = page_addr;
-	range.len = PAGE_SIZE;
-	
-	if (ioctl(task->uffd, UFFDIO_WAKE, &range)) {
-		pr_perror("Failed to wake thread after unprotect");
-		cow_stats.wake_failures++;
-		return -1;
-	}
-	
-	cow_stats.pages_woken++;
 	cdi->total_pages--;
+	return 0;
+}
+
+static int addr_cmp(const void *a, const void *b)
+{
+	unsigned long va = *(const unsigned long *)a;
+	unsigned long vb = *(const unsigned long *)b;
+
+	return (va > vb) - (va < vb);
+}
+
+/*
+ * Maximum number of faults to batch before flushing.  Larger batches
+ * amortize TLB shootdown cost better but increase the time each
+ * faulting thread waits.
+ */
+#define COW_FAULT_BATCH_MAX 256
+
+/*
+ * Flush a batch of snapshotted fault addresses: merge contiguous
+ * ranges, issue one UFFDIO_WRITEPROTECT per range, then wake all
+ * faulting threads.
+ */
+static int cow_flush_fault_batch(struct cow_tracked_task *task,
+				 unsigned long *addrs, int count)
+{
+	struct uffdio_writeprotect wp;
+	struct uffdio_range wake;
+	int i, start;
+
+	if (count == 0)
+		return 0;
+
+	qsort(addrs, count, sizeof(addrs[0]), addr_cmp);
+
+	/* Merge contiguous pages into ranges and clear WP per range */
+	start = 0;
+	for (i = 1; i <= count; i++) {
+		if (i < count &&
+		    addrs[i] == addrs[i - 1] + PAGE_SIZE)
+			continue;
+
+		/* Range [start..i) is contiguous */
+		wp.range.start = addrs[start];
+		wp.range.len = (addrs[i - 1] - addrs[start]) + PAGE_SIZE;
+		wp.mode = 0;
+
+		if (ioctl(task->uffd, UFFDIO_WRITEPROTECT, &wp))
+			pr_pwarn("Batch unprotect [%lx +%lu] failed",
+				 (unsigned long)wp.range.start,
+				 (unsigned long)(wp.range.len / PAGE_SIZE));
+		else
+			cow_stats.pages_unprotected +=
+				wp.range.len / PAGE_SIZE;
+
+		start = i;
+	}
+
+	/* Wake each faulting thread individually */
+	for (i = 0; i < count; i++) {
+		wake.start = addrs[i];
+		wake.len = PAGE_SIZE;
+		if (ioctl(task->uffd, UFFDIO_WAKE, &wake) == 0)
+			cow_stats.pages_woken++;
+	}
 
 	return 0;
 }
@@ -897,47 +924,50 @@ static int cow_process_events(struct cow_dump_info *cdi,
 	struct uffd_msg msg;
 	struct pollfd pfd;
 	int ret, poll_ret;
+	unsigned long batch[COW_FAULT_BATCH_MAX];
+	int batch_count = 0;
 
 	while (1) {
-		/* Check and print stats */
 		check_and_print_cow_stats();
-		
-		/* Try reading directly first - avoids poll() overhead when data is ready */
+
 		ret = read(task->uffd, &msg, sizeof(msg));
-		
-		if (ret < 0 && errno == EAGAIN && blocking) {
-			/* No data available and we want to block - use poll() with timeout */
+
+		if (ret < 0 && errno == EAGAIN) {
+			/*
+			 * No more events available.  Flush any
+			 * accumulated batch before blocking or
+			 * returning.
+			 */
+			if (batch_count > 0) {
+				cow_flush_fault_batch(task, batch,
+						      batch_count);
+				batch_count = 0;
+			}
+
+			if (!blocking)
+				return 0;
+
 			pfd.fd = task->uffd;
 			pfd.events = POLLIN;
 			pfd.revents = 0;
-			
-			poll_ret = poll(&pfd, 1, 500);  /* 500ms timeout */
+
+			poll_ret = poll(&pfd, 1, 500);
 			if (poll_ret < 0) {
 				pr_perror("poll() failed on uffd");
 				cow_stats.read_errors++;
 				return -1;
 			}
-			
-			if (poll_ret == 0) {
-				/* Timeout - no events within 500ms */
+			if (poll_ret == 0)
 				return 0;
-			}
-			
-			/* Data ready after poll - retry read */
+
 			ret = read(task->uffd, &msg, sizeof(msg));
 		}
-		
+
 		if (ret < 0) {
-			if (errno == EAGAIN && !blocking) {
-				/* Non-blocking mode and no data */
-				cow_stats.eagain_errors++;
-				return 0;
-			}
 			pr_perror("Failed to read uffd event");
 			cow_stats.read_errors++;
 			return -1;
 		}
-
 		if (ret != sizeof(msg)) {
 			pr_err("Short read from uffd: %d\n", ret);
 			cow_stats.read_errors++;
@@ -947,9 +977,21 @@ static int cow_process_events(struct cow_dump_info *cdi,
 		switch (msg.event) {
 		case UFFD_EVENT_PAGEFAULT:
 			if (msg.arg.pagefault.flags & UFFD_PAGEFAULT_FLAG_WP) {
-				/* Write fault - track it */
-				if (cow_handle_write_fault(cdi, task, msg.arg.pagefault.address))
+				unsigned long pa = msg.arg.pagefault.address &
+						  ~(PAGE_SIZE - 1);
+
+				cow_stats.write_faults++;
+
+				if (cow_snapshot_page(cdi, task, pa))
 					return -1;
+
+				batch[batch_count++] = pa;
+
+				if (batch_count >= COW_FAULT_BATCH_MAX) {
+					cow_flush_fault_batch(task, batch,
+							      batch_count);
+					batch_count = 0;
+				}
 			}
 			break;
 
