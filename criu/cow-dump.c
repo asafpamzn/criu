@@ -867,6 +867,182 @@ static int addr_cmp(const void *a, const void *b)
 #define COW_FAULT_BATCH_MAX 256
 
 /*
+ * Parallel snapshot workers.  The monitor reads events from the uffd
+ * (single-threaded, fast) and dispatches page snapshots to a pool of
+ * workers that call process_vm_readv in parallel.  This parallelizes
+ * the expensive per-fault snapshot (~5us each) across multiple cores.
+ */
+#define COW_SNAPSHOT_WORKERS 8
+
+struct cow_snapshot_work {
+	struct cow_dump_info *cdi;
+	struct cow_tracked_task *task;
+	unsigned long addr;
+	int result;  /* 0 = success, -1 = error */
+};
+
+struct cow_snapshot_pool {
+	pthread_t threads[COW_SNAPSHOT_WORKERS];
+	int nr_workers;
+
+	/* Work queue: producer (monitor) → consumers (workers) */
+	struct cow_snapshot_work *queue;
+	int queue_cap;
+	int queue_head;   /* next slot to consume */
+	int queue_tail;   /* next slot to produce */
+	int queue_count;  /* items in queue */
+	pthread_mutex_t lock;
+	pthread_cond_t work_avail;  /* signal workers */
+	pthread_cond_t work_done;   /* signal monitor */
+
+	int pending;      /* snapshots dispatched but not completed */
+	volatile bool stop;
+};
+
+static struct cow_snapshot_pool *g_snapshot_pool;
+
+static void *cow_snapshot_worker(void *arg)
+{
+	struct cow_snapshot_pool *pool = arg;
+	char name[16];
+	int id;
+
+	pthread_mutex_lock(&pool->lock);
+	id = pool->nr_workers;  /* approximate */
+	pthread_mutex_unlock(&pool->lock);
+
+	snprintf(name, sizeof(name), "cow-snap-%d", id);
+	pthread_setname_np(pthread_self(), name);
+
+	while (1) {
+		struct cow_snapshot_work work;
+
+		pthread_mutex_lock(&pool->lock);
+		while (pool->queue_count == 0 && !pool->stop)
+			pthread_cond_wait(&pool->work_avail, &pool->lock);
+
+		if (pool->stop && pool->queue_count == 0) {
+			pthread_mutex_unlock(&pool->lock);
+			break;
+		}
+
+		work = pool->queue[pool->queue_head];
+		pool->queue_head = (pool->queue_head + 1) % pool->queue_cap;
+		pool->queue_count--;
+		pthread_mutex_unlock(&pool->lock);
+
+		/* Do the actual snapshot (the expensive part) */
+		work.result = cow_snapshot_page(work.cdi, work.task,
+						work.addr);
+
+		pthread_mutex_lock(&pool->lock);
+		pool->pending--;
+		pthread_cond_signal(&pool->work_done);
+		pthread_mutex_unlock(&pool->lock);
+	}
+
+	return NULL;
+}
+
+static struct cow_snapshot_pool *cow_snapshot_pool_create(void)
+{
+	struct cow_snapshot_pool *pool;
+	int i;
+
+	pool = xzalloc(sizeof(*pool));
+	if (!pool)
+		return NULL;
+
+	pool->queue_cap = COW_FAULT_BATCH_MAX * 4;
+	pool->queue = xmalloc(pool->queue_cap * sizeof(*pool->queue));
+	if (!pool->queue) {
+		xfree(pool);
+		return NULL;
+	}
+
+	pthread_mutex_init(&pool->lock, NULL);
+	pthread_cond_init(&pool->work_avail, NULL);
+	pthread_cond_init(&pool->work_done, NULL);
+
+	for (i = 0; i < COW_SNAPSHOT_WORKERS; i++) {
+		if (pthread_create(&pool->threads[i], NULL,
+				   cow_snapshot_worker, pool)) {
+			pr_warn("Created %d/%d snapshot workers\n",
+				i, COW_SNAPSHOT_WORKERS);
+			break;
+		}
+		pool->nr_workers++;
+	}
+
+	pr_info("Created snapshot pool with %d workers\n",
+		pool->nr_workers);
+	return pool;
+}
+
+static void cow_snapshot_pool_destroy(struct cow_snapshot_pool *pool)
+{
+	int i;
+
+	if (!pool)
+		return;
+
+	pthread_mutex_lock(&pool->lock);
+	pool->stop = true;
+	pthread_cond_broadcast(&pool->work_avail);
+	pthread_mutex_unlock(&pool->lock);
+
+	for (i = 0; i < pool->nr_workers; i++)
+		pthread_join(pool->threads[i], NULL);
+
+	pthread_mutex_destroy(&pool->lock);
+	pthread_cond_destroy(&pool->work_avail);
+	pthread_cond_destroy(&pool->work_done);
+	xfree(pool->queue);
+	xfree(pool);
+}
+
+/*
+ * Submit a page snapshot to the worker pool.  Returns immediately.
+ * The monitor must call cow_snapshot_pool_drain() to wait for
+ * all pending snapshots before flushing the WP batch.
+ */
+static void cow_snapshot_pool_submit(struct cow_snapshot_pool *pool,
+				     struct cow_dump_info *cdi,
+				     struct cow_tracked_task *task,
+				     unsigned long addr)
+{
+	struct cow_snapshot_work work = {
+		.cdi = cdi,
+		.task = task,
+		.addr = addr,
+		.result = 0,
+	};
+
+	pthread_mutex_lock(&pool->lock);
+
+	/* Wait if queue is full */
+	while (pool->queue_count >= pool->queue_cap)
+		pthread_cond_wait(&pool->work_done, &pool->lock);
+
+	pool->queue[pool->queue_tail] = work;
+	pool->queue_tail = (pool->queue_tail + 1) % pool->queue_cap;
+	pool->queue_count++;
+	pool->pending++;
+
+	pthread_cond_signal(&pool->work_avail);
+	pthread_mutex_unlock(&pool->lock);
+}
+
+/* Wait for all pending snapshots to complete */
+static void cow_snapshot_pool_drain(struct cow_snapshot_pool *pool)
+{
+	pthread_mutex_lock(&pool->lock);
+	while (pool->pending > 0)
+		pthread_cond_wait(&pool->work_done, &pool->lock);
+	pthread_mutex_unlock(&pool->lock);
+}
+
+/*
  * Flush a batch of snapshotted fault addresses: merge contiguous
  * ranges, issue one UFFDIO_WRITEPROTECT per range, then wake all
  * faulting threads.
@@ -939,6 +1115,9 @@ static int cow_process_events(struct cow_dump_info *cdi,
 			 * returning.
 			 */
 			if (batch_count > 0) {
+				if (g_snapshot_pool)
+					cow_snapshot_pool_drain(
+						g_snapshot_pool);
 				cow_flush_fault_batch(task, batch,
 						      batch_count);
 				batch_count = 0;
@@ -982,12 +1161,22 @@ static int cow_process_events(struct cow_dump_info *cdi,
 
 				cow_stats.write_faults++;
 
-				if (cow_snapshot_page(cdi, task, pa))
-					return -1;
+				if (g_snapshot_pool &&
+				    g_snapshot_pool->nr_workers > 0) {
+					cow_snapshot_pool_submit(
+						g_snapshot_pool,
+						cdi, task, pa);
+				} else {
+					if (cow_snapshot_page(cdi, task, pa))
+						return -1;
+				}
 
 				batch[batch_count++] = pa;
 
 				if (batch_count >= COW_FAULT_BATCH_MAX) {
+					if (g_snapshot_pool)
+						cow_snapshot_pool_drain(
+							g_snapshot_pool);
 					cow_flush_fault_batch(task, batch,
 							      batch_count);
 					batch_count = 0;
@@ -1150,7 +1339,14 @@ int cow_start_monitor_thread(void)
 	}
 	
 	g_stop_monitoring = false;
-	
+
+	/* Create parallel snapshot worker pool */
+	if (!g_snapshot_pool) {
+		g_snapshot_pool = cow_snapshot_pool_create();
+		if (!g_snapshot_pool)
+			pr_warn("Failed to create snapshot pool, falling back to single-threaded\n");
+	}
+
 	ret = pthread_create(&g_monitor_thread, NULL, cow_monitor_thread, g_cow_info);
 	if (ret) {
 		pthread_mutex_unlock(&g_monitor_state_lock);
@@ -1192,11 +1388,16 @@ int cow_stop_monitor_thread(void)
 		return -1;
 	}
 
+	if (g_snapshot_pool) {
+		cow_snapshot_pool_destroy(g_snapshot_pool);
+		g_snapshot_pool = NULL;
+	}
+
 	pthread_mutex_lock(&g_monitor_state_lock);
 	g_monitor_thread_running = false;
 	g_stop_monitoring = false;
 	pthread_mutex_unlock(&g_monitor_state_lock);
-	
+
 	pr_info("COW monitor thread stopped successfully\n");
 	return 0;
 }
