@@ -1311,7 +1311,8 @@ int run_tcp_server(bool daemon_mode, int *ask, int cfd, int sk)
 			goto err;
 		}
 		pr_info("Accepted connection from %s:%s\n", address, port);
-		close(sk);
+		if (!opts.cow_dump)
+			close(sk);
 	}
 
 	return 0;

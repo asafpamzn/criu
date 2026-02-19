@@ -44,6 +44,11 @@
 static int page_server_sk = -1;
 static bool bulk_stream_done = false;
 
+/* Multi-TCP: number of parallel transfer connections */
+#define COW_TRANSFER_STREAMS	2
+static int g_listen_sk = -1;	/* kept open for additional accepts */
+static int g_bulk_streams_closed;	/* count of streams that sent close */
+
 bool page_server_bulk_stream_done(void)
 {
 	return bulk_stream_done;
@@ -2125,10 +2130,11 @@ static int send_image_complete(struct active_image *img)
  */
 #define PAGE_BATCH_SIZE 256
 
-static int process_vma_pages(struct active_image *img,
-			     struct lazy_vma_entry *lve,
-			     pid_t source_pid,
-			     struct unified_thread_stats *stats)
+static int process_vma_pages_sk(struct active_image *img,
+				struct lazy_vma_entry *lve,
+				pid_t source_pid,
+				struct unified_thread_stats *stats,
+				int sk)
 {
 	unsigned long vaddr;
 	unsigned long page_idx = 0;
@@ -2259,7 +2265,7 @@ skip_requests:
 			data = cow_pg ? cow_pg->data :
 				batch_buf + i * PAGE_SIZE;
 
-			if (send_page_compressed(img->main_sk, data,
+			if (send_page_compressed(sk, data,
 						 img->dst_id, paddr)) {
 				pr_err("Failed to send page at %lx\n",
 				       paddr);
@@ -2268,7 +2274,7 @@ skip_requests:
 
 			lve->sent_bitmap[page_idx / 8] |=
 				(1 << (page_idx % 8));
-			img->remaining_pages--;
+			__sync_sub_and_fetch(&img->remaining_pages, 1);
 			stats->priority3_pages++;
 
 			if (cow_pg) {
@@ -2314,6 +2320,15 @@ err:
 	xfree(batch_buf);
 	xfree(local_iovs);
 	return -1;
+}
+
+static int process_vma_pages(struct active_image *img,
+			     struct lazy_vma_entry *lve,
+			     pid_t source_pid,
+			     struct unified_thread_stats *stats)
+{
+	return process_vma_pages_sk(img, lve, source_pid, stats,
+				    img->main_sk);
 }
 
 /*
@@ -2485,6 +2500,64 @@ err:
 	return -1;
 }
 
+/*
+ * Per-stream transfer worker.  Each worker has its own TCP socket
+ * and processes a subset of VMAs assigned to it.
+ */
+struct stream_worker {
+	int id;
+	int sk;
+	struct active_image *img;
+	pid_t source_pid;
+	struct lazy_vma_entry **vmas;
+	int nr_vmas;
+	bool failed;
+	unsigned long pages_sent;
+};
+
+static void *stream_worker_func(void *arg)
+{
+	struct stream_worker *w = arg;
+	struct unified_thread_stats stats = { 0 };
+	char name[16];
+	int i;
+
+	snprintf(name, sizeof(name), "cow-xfer-%d", w->id);
+	pthread_setname_np(pthread_self(), name);
+
+	for (i = 0; i < w->nr_vmas; i++) {
+		struct lazy_vma_entry *lve = w->vmas[i];
+
+		if (process_vma_pages_sk(w->img, lve, w->source_pid, &stats, w->sk) < 0) {
+			pr_err("Stream %d: error processing VMA %lx-%lx\n",
+			       w->id, lve->start, lve->end);
+			w->failed = true;
+			break;
+		}
+	}
+
+	w->pages_sent = stats.priority3_pages;
+
+	/* Send end-of-stream marker on this socket */
+	{
+		struct page_server_iov close_cmd = {
+			.cmd = PS_IOV_CLOSE,
+			.nr_pages = 0,
+			.vaddr = 0,
+			.dst_id = w->img->dst_id,
+		};
+		if (send_psi(w->sk, &close_cmd)) {
+			if (errno != EPIPE && errno != ECONNRESET &&
+			    errno != EBADF && errno != ENOTCONN)
+				pr_err("Stream %d: failed to send close\n", w->id);
+		}
+	}
+
+	pr_err("Stream %d: finished (%lu pages, failed=%d)\n",
+	       w->id, w->pages_sent, w->failed);
+	return NULL;
+}
+
 /* Unified background thread serving all images */
 static void *unified_page_server_thread(void *arg)
 {
@@ -2502,13 +2575,130 @@ static void *unified_page_server_thread(void *arg)
 			struct lazy_vma_entry *lve;
 			pid_t source_pid = 0;
 			bool image_failed = false;
+			int nr_streams = 1;
 
 			pthread_spin_unlock(&active_images_lock);
 
 			pr_info("Processing image dst_id=%lu remaining=%lu pages\n",
 				img->dst_id, img->remaining_pages);
 
-			/* Process each lazy VMA */
+			/*
+			 * Multi-TCP: in COW WP_ASYNC mode, accept
+			 * additional connections and use parallel
+			 * workers.
+			 */
+			if (cow_is_wp_async() && g_listen_sk >= 0)
+				nr_streams = COW_TRANSFER_STREAMS;
+
+			if (nr_streams > 1) {
+				struct stream_worker workers[COW_TRANSFER_STREAMS];
+				pthread_t threads[COW_TRANSFER_STREAMS];
+				struct lazy_vma_entry **all_vmas;
+				int nr_vmas = 0, vi = 0, s;
+				unsigned long total_pages = 0;
+				unsigned long pages_per_worker;
+
+				/* Count matching VMAs */
+				list_for_each_entry(lve, get_global_lazy_vmas(), list) {
+					if (lve->dst_id != img->dst_id)
+						continue;
+					nr_vmas++;
+					total_pages += lve->total_pages;
+					source_pid = lve->source_pid;
+				}
+
+				all_vmas = xmalloc(nr_vmas * sizeof(*all_vmas));
+				if (!all_vmas) {
+					nr_streams = 1;
+					goto single_stream;
+				}
+
+				vi = 0;
+				list_for_each_entry(lve, get_global_lazy_vmas(), list) {
+					if (lve->dst_id != img->dst_id)
+						continue;
+					all_vmas[vi++] = lve;
+				}
+
+				/* Accept additional connections */
+				memset(workers, 0, sizeof(workers));
+				workers[0].sk = img->main_sk;
+				for (s = 1; s < nr_streams; s++) {
+					struct sockaddr_storage ca;
+					socklen_t cl = sizeof(ca);
+
+					workers[s].sk = accept(g_listen_sk,
+							       (struct sockaddr *)&ca, &cl);
+					if (workers[s].sk < 0) {
+						pr_warn("Failed to accept stream %d, using %d streams\n",
+							s, s);
+						nr_streams = s;
+						break;
+					}
+					tcp_cork(workers[s].sk, true);
+				}
+
+				/* Partition VMAs across workers by page count */
+				pages_per_worker = (total_pages + nr_streams - 1) / nr_streams;
+				vi = 0;
+				for (s = 0; s < nr_streams; s++) {
+					unsigned long assigned = 0;
+
+					workers[s].id = s;
+					workers[s].img = img;
+					workers[s].source_pid = source_pid;
+					workers[s].vmas = all_vmas + vi;
+					workers[s].nr_vmas = 0;
+
+					while (vi < nr_vmas) {
+						workers[s].nr_vmas++;
+						assigned += all_vmas[vi]->total_pages;
+						vi++;
+						if (s < nr_streams - 1 &&
+						    assigned >= pages_per_worker)
+							break;
+					}
+				}
+
+				pr_err("Multi-TCP: %d streams, %d VMAs, %lu pages\n",
+				       nr_streams, nr_vmas, total_pages);
+
+				/* Launch worker threads */
+				for (s = 0; s < nr_streams; s++) {
+					if (pthread_create(&threads[s], NULL,
+							   stream_worker_func,
+							   &workers[s])) {
+						pr_err("Failed to create stream worker %d\n", s);
+						workers[s].failed = true;
+					}
+				}
+
+				/* Wait for all workers */
+				for (s = 0; s < nr_streams; s++)
+					pthread_join(threads[s], NULL);
+
+				/* Check results */
+				for (s = 0; s < nr_streams; s++) {
+					if (workers[s].failed)
+						image_failed = true;
+					/* Close extra sockets */
+					if (s > 0 && workers[s].sk >= 0)
+						close(workers[s].sk);
+				}
+
+				xfree(all_vmas);
+
+				/* WP_ASYNC convergence (uses stream 0's socket) */
+				if (!image_failed && cow_is_wp_async() && source_pid > 0) {
+					if (cow_converge_dirty_pages(img, source_pid) < 0)
+						pr_warn("COW convergence had errors (non-fatal)\n");
+				}
+
+				goto check_complete;
+			}
+
+single_stream:
+			/* Process each lazy VMA (single-stream fallback) */
 			list_for_each_entry(lve, get_global_lazy_vmas(), list) {
 				if (lve->dst_id != img->dst_id)
 					continue;
@@ -2529,6 +2719,7 @@ static void *unified_page_server_thread(void *arg)
 					pr_warn("COW convergence had errors (non-fatal, all pages sent)\n");
 			}
 
+check_complete:
 			/* Final drain of any remaining queued pages */
 			pthread_spin_lock(&active_images_lock);
 			if (!image_failed && !cow_is_wp_async() &&
@@ -2559,6 +2750,11 @@ static void *unified_page_server_thread(void *arg)
 
 		g_unified_thread_stop = list_empty(&active_images_queue);
 		pthread_spin_unlock(&active_images_lock);
+	}
+
+	if (g_listen_sk >= 0) {
+		close(g_listen_sk);
+		g_listen_sk = -1;
 	}
 
 	pr_err("Unified page server thread stopped\n");
@@ -2918,6 +3114,9 @@ int cr_page_server(bool daemon_mode, bool lazy_dump, int cfd)
 	sk = setup_tcp_server("page", opts.addr, &opts.port);
 	if (sk == -1)
 		return -1;
+	/* Keep listen socket for multi-TCP accepts in COW mode */
+	if (opts.cow_dump)
+		g_listen_sk = sk;
 no_server:
 
 	if (!daemon_mode && cfd >= 0) {
@@ -3128,10 +3327,12 @@ static int page_server_read_bulk_stream(struct ps_async_read *ar, int flags)
 			cmd = decode_ps_cmd(ar->pi.cmd);
 
 				if (ar->pi.nr_pages == 0) {
-					pr_info("Received end-of-transfer marker (cmd=%u dst_id=%lu)\n", cmd,
-						(unsigned long)ar->pi.dst_id);
-					bulk_stream_done = true;
-
+					g_bulk_streams_closed++;
+					pr_err("End-of-stream marker (%d/%d closed)\n",
+					       g_bulk_streams_closed,
+					       COW_TRANSFER_STREAMS);
+					if (g_bulk_streams_closed >= COW_TRANSFER_STREAMS)
+						bulk_stream_done = true;
 					return BULK_STREAM_COMPLETE;
 				}
 
@@ -3465,12 +3666,15 @@ static int page_server_hangup_event(struct epoll_rfd *rfd)
 }
 
 static struct epoll_rfd ps_rfd;
+static struct epoll_rfd ps_extra_rfds[COW_TRANSFER_STREAMS - 1];
+static int ps_extra_sks[COW_TRANSFER_STREAMS - 1];
 
 int connect_to_page_server_to_recv(int epfd)
 {
 	if (connect_to_page_server())
 		return -1;
 	bulk_stream_done = false;
+	g_bulk_streams_closed = 0;
 
 	ps_rfd.fd = page_server_sk;
 	/* Use bulk stream reader in bulk mode, regular reader in on-demand mode */
@@ -3480,7 +3684,32 @@ int connect_to_page_server_to_recv(int epfd)
 		ps_rfd.read_event = page_server_async_read;
 	ps_rfd.hangup_event = page_server_hangup_event;
 
-	return epoll_add_rfd(epfd, &ps_rfd);
+	if (epoll_add_rfd(epfd, &ps_rfd))
+		return -1;
+
+	/* Multi-TCP: create additional connections for COW bulk mode */
+	if (opts.cow_dump && COW_TRANSFER_STREAMS > 1) {
+		int i;
+
+		for (i = 0; i < COW_TRANSFER_STREAMS - 1; i++) {
+			ps_extra_sks[i] = setup_tcp_client(opts.addr);
+			if (ps_extra_sks[i] < 0) {
+				pr_warn("Multi-TCP: could not create stream %d\n",
+					i + 1);
+				break;
+			}
+			ps_extra_rfds[i].fd = ps_extra_sks[i];
+			ps_extra_rfds[i].read_event = page_server_async_read_bulk;
+			ps_extra_rfds[i].hangup_event = page_server_hangup_event;
+			if (epoll_add_rfd(epfd, &ps_extra_rfds[i])) {
+				close(ps_extra_sks[i]);
+				break;
+			}
+			pr_err("Multi-TCP: connected stream %d\n", i + 1);
+		}
+	}
+
+	return 0;
 }
 
 int request_remote_pages(unsigned long img_id, unsigned long addr, unsigned long nr_pages)
