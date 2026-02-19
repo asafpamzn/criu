@@ -273,6 +273,11 @@ mark_local_event "DUMP_PREP_MS"
 log "Step 6a: Start source availability monitor..."
 start_source_ping_monitor
 
+# Free the replication backlog before dump to avoid assertion failure
+# in replication.c:389 after restore (backlog pointers become stale).
+valkey_cmd CONFIG SET repl-backlog-ttl 1 >/dev/null 2>&1 || true
+sleep 2
+
 # Run dump - cow-dump keeps running, we'll kill it after restore.
 # Optional syscall profiling can be enabled via CRIU_DUMP_STRACE_OUT.
 # Discover cgroup path for --freeze-cgroup (ensures clean thread freeze)
