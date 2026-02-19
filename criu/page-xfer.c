@@ -2100,10 +2100,11 @@ static int send_image_complete(struct active_image *img)
 		img->dst_id, img->total_pages,
 		img->total_cow_pages, img->total_req_pages);
 
-	/* Send close command */
+	/* Send close command — receiver may have already disconnected */
 	if (send_psi(img->main_sk, &close_cmd)) {
-		if (errno == EPIPE || errno == ECONNRESET) {
-			pr_info("Receiver closed after close marker, treating as completion\n");
+		if (errno == EPIPE || errno == ECONNRESET ||
+		    errno == EBADF || errno == ENOTCONN) {
+			pr_info("Receiver already disconnected, treating as completion\n");
 			return 0;
 		}
 		pr_err("Failed to send close command\n");
