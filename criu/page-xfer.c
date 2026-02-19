@@ -2118,6 +2118,14 @@ static int send_image_complete(struct active_image *img)
  * Process all pages for a single VMA
  * Returns: 0 on success, -1 on error
  */
+/*
+ * Batch size for process_vm_readv.  Reading multiple pages in a single
+ * syscall reduces per-page overhead (syscall entry, mmap_read_lock,
+ * page table walk setup) and speeds up WP clearing — which directly
+ * reduces the duration of the application throughput stall.
+ */
+#define PAGE_BATCH_SIZE 256
+
 static int process_vma_pages(struct active_image *img,
 			     struct lazy_vma_entry *lve,
 			     pid_t source_pid,
@@ -2125,28 +2133,157 @@ static int process_vma_pages(struct active_image *img,
 {
 	unsigned long vaddr;
 	unsigned long page_idx = 0;
+	char *batch_buf;
+	struct iovec *local_iovs;
+	int batch_alloc_ok = 0;
 
 	pr_debug("Processing VMA: %lx-%lx len=%lu\n",
 		 lve->start, lve->end, lve->end - lve->start);
 
-	for (vaddr = lve->start; vaddr < lve->end; vaddr += PAGE_SIZE, page_idx++) {
+	batch_buf = xmalloc(PAGE_BATCH_SIZE * PAGE_SIZE);
+	local_iovs = xmalloc(PAGE_BATCH_SIZE * sizeof(struct iovec));
+	if (batch_buf && local_iovs)
+		batch_alloc_ok = 1;
+
+	for (vaddr = lve->start; vaddr < lve->end; ) {
+		unsigned long batch_start = vaddr;
+		unsigned long batch_pages;
+		unsigned long remaining;
+		unsigned long i;
+
 		maybe_print_stats(stats);
 
 		/* Priority 1: Drain COW pages */
 		if (drain_cow_pages(img, source_pid, 100, stats) < 0)
-			return -1;
+			goto err;
 
 		/* Priority 2: Drain page requests */
 		if (drain_page_requests(img, source_pid, stats) < 0)
-			return -1;
+			goto err;
 
-		/* Priority 3: Send this lazy VMA page */
-		if (send_single_lazy_page(img, lve, vaddr, page_idx,
-					  source_pid, stats) < 0)
-			return -1;
+		remaining = (lve->end - vaddr) / PAGE_SIZE;
+		batch_pages = remaining < PAGE_BATCH_SIZE ?
+				remaining : PAGE_BATCH_SIZE;
+
+		if (!batch_alloc_ok || batch_pages <= 1) {
+			/* Fallback: single page at a time */
+			if (send_single_lazy_page(img, lve, vaddr, page_idx,
+						  source_pid, stats) < 0)
+				goto err;
+			vaddr += PAGE_SIZE;
+			page_idx++;
+			continue;
+		}
+
+		/*
+		 * Batched read: one process_vm_readv for up to 256
+		 * contiguous pages.  This reduces syscall overhead by
+		 * ~256x and the kernel walks page tables in one pass.
+		 */
+		{
+			struct iovec remote_iov;
+			ssize_t ret;
+
+			for (i = 0; i < batch_pages; i++) {
+				local_iovs[i].iov_base = batch_buf + i * PAGE_SIZE;
+				local_iovs[i].iov_len = PAGE_SIZE;
+			}
+			remote_iov.iov_base = (void *)batch_start;
+			remote_iov.iov_len = batch_pages * PAGE_SIZE;
+
+			ret = process_vm_readv(source_pid,
+					       local_iovs, batch_pages,
+					       &remote_iov, 1, 0);
+			if (ret < 0 && errno == EFAULT) {
+				/*
+				 * Part of the range was unmapped.
+				 * Fall back to per-page for this batch.
+				 */
+				for (i = 0; i < batch_pages; i++) {
+					if (send_single_lazy_page(
+						img, lve, vaddr,
+						page_idx,
+						source_pid, stats) < 0)
+						goto err;
+					vaddr += PAGE_SIZE;
+					page_idx++;
+				}
+				continue;
+			}
+			if (ret < (ssize_t)(batch_pages * PAGE_SIZE)) {
+				unsigned long read_pages = ret > 0 ?
+					ret / PAGE_SIZE : 0;
+				/* Zero-fill unread */
+				for (i = read_pages; i < batch_pages; i++)
+					memset(batch_buf + i * PAGE_SIZE,
+					       0, PAGE_SIZE);
+			}
+		}
+
+		/* Send each page from the batch buffer */
+		for (i = 0; i < batch_pages; i++) {
+			unsigned long paddr = batch_start + i * PAGE_SIZE;
+			const void *data;
+			struct cow_page *cow_pg;
+			pthread_spinlock_t *lock;
+
+			/* Skip if already sent */
+			if (lve->sent_bitmap[page_idx / 8] &
+			    (1 << (page_idx % 8))) {
+				stats->priority3_skips++;
+				vaddr += PAGE_SIZE;
+				page_idx++;
+				continue;
+			}
+
+			/*
+			 * Check COW hash: a concurrent write fault
+			 * may have captured the dump-time snapshot.
+			 */
+			lock = cow_get_hash_lock(paddr);
+			if (lock)
+				pthread_spin_lock(lock);
+			cow_pg = lock ? cow_lookup_page(paddr) : NULL;
+			if (lock)
+				pthread_spin_unlock(lock);
+
+			data = cow_pg ? cow_pg->data :
+				batch_buf + i * PAGE_SIZE;
+
+			if (send_page_compressed(img->main_sk, data,
+						 img->dst_id, paddr)) {
+				pr_err("Failed to send page at %lx\n",
+				       paddr);
+				goto err;
+			}
+
+			lve->sent_bitmap[page_idx / 8] |=
+				(1 << (page_idx % 8));
+			img->remaining_pages--;
+			stats->priority3_pages++;
+
+			if (cow_pg) {
+				lock = cow_get_hash_lock(paddr);
+				if (lock) {
+					pthread_spin_lock(lock);
+					cow_remove_page(paddr);
+					pthread_spin_unlock(lock);
+				}
+			}
+
+			vaddr += PAGE_SIZE;
+			page_idx++;
+		}
 	}
 
+	xfree(batch_buf);
+	xfree(local_iovs);
 	return 0;
+
+err:
+	xfree(batch_buf);
+	xfree(local_iovs);
+	return -1;
 }
 
 /*
