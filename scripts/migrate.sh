@@ -274,18 +274,19 @@ log "Step 6a: Start source availability monitor..."
 start_source_ping_monitor
 
 # Pre-dump preparation: put Valkey in a quiescent state.
-# 1. Disable lazyfree so BIO threads are idle (avoids glibc malloc arena
-#    lock being held by a BIO thread at dump time)
-# 2. Free the replication backlog (avoids assertion in replication.c:389)
-# 3. Disable RDB/AOF saves to prevent BIO activity
-# 4. Sleep to let in-flight BIO operations and backlog TTL expire
+# 1. Kill all client connections (stale client buffers cause stack smash
+#    in _writeToClient after restore with --tcp-close)
+# 2. Disable lazyfree so BIO threads are idle
+# 3. Max repl-backlog-size (prevents incrementalTrimReplicationBacklog assertion)
+# 4. Disable RDB/AOF saves to prevent BIO activity
+# 5. Sleep to let in-flight operations complete
+valkey_cmd CLIENT KILL TYPE normal >/dev/null 2>&1 || true
+valkey_cmd CLIENT KILL TYPE pubsub >/dev/null 2>&1 || true
 valkey_cmd CONFIG SET lazyfree-lazy-expire no >/dev/null 2>&1 || true
 valkey_cmd CONFIG SET lazyfree-lazy-server-del no >/dev/null 2>&1 || true
 valkey_cmd CONFIG SET lazyfree-lazy-user-del no >/dev/null 2>&1 || true
 valkey_cmd CONFIG SET lazyfree-lazy-user-flush no >/dev/null 2>&1 || true
 valkey_cmd CONFIG SET save "" >/dev/null 2>&1 || true
-# Set repl-backlog-size to max so incrementalTrimReplicationBacklog()
-# never trims — prevents assertion on stale ref_repl_buf_node pointer.
 valkey_cmd CONFIG SET repl-backlog-size 9223372036854775807 >/dev/null 2>&1 || true
 valkey_cmd CONFIG SET repl-backlog-ttl 1 >/dev/null 2>&1 || true
 sleep 5
