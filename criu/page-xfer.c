@@ -2274,6 +2274,27 @@ static int process_vma_pages(struct active_image *img,
 			vaddr += PAGE_SIZE;
 			page_idx++;
 		}
+
+		/*
+		 * Clear write-protect for the entire batch in ONE
+		 * ioctl.  This triggers a single TLB shootdown IPI
+		 * instead of one per page, reducing the TLB
+		 * invalidation storm that stalls the application.
+		 */
+		{
+			int uffd = cow_get_uffd_for_pid(source_pid);
+
+			if (uffd >= 0) {
+				struct uffdio_writeprotect wp;
+
+				wp.range.start = batch_start;
+				wp.range.len = batch_pages * PAGE_SIZE;
+				wp.mode = 0;
+				if (ioctl(uffd, UFFDIO_WRITEPROTECT, &wp))
+					pr_pwarn("Batch unprotect [%lx +%lu] failed",
+						 batch_start, batch_pages);
+			}
+		}
 	}
 
 	xfree(batch_buf);
