@@ -40,6 +40,8 @@
 #include "plugin.h"
 #include "dump.h"
 #include "mem.h"
+#include "atomic-bitmap.h"
+#include "spsc-queue.h"
 
 static int page_server_sk = -1;
 static bool bulk_stream_done = false;
@@ -1461,14 +1463,8 @@ struct page_request_entry {
 	bool location_found;  /* Flag: have we looked up location yet? */
 };
 
-/*
- * M6: Lock-free SPSC queue for page requests (Thread 2 → Thread 3)
- * Same pattern as COW queue - producer/consumer on separate cache lines
- */
-struct page_request_spsc_node {
-	struct page_request_spsc_node *next;  /* Atomic */
-	struct page_request_entry *entry;     /* Payload */
-};
+/* M6: SPSC queue node type for page request entries */
+DECLARE_SPSC_NODE(page_request, struct page_request_entry);
 
 /* SPSC queue with cache-line padding to prevent false sharing */
 static struct page_request_spsc_node *page_request_head;  /* Consumer (Thread 3) */
@@ -1479,22 +1475,16 @@ static bool page_request_queue_initialized = false;
 
 static void init_page_request_queue(void)
 {
-	struct page_request_spsc_node *dummy;
-
 	if (page_request_queue_initialized)
 		return;
 
-	dummy = xzalloc(sizeof(*dummy));
-	if (!dummy) {
+	if (spsc_init(page_request_head, page_request_tail,
+		      page_request_queue_size,
+		      struct page_request_spsc_node)) {
 		pr_err("Failed to allocate dummy node for page request queue\n");
 		return;
 	}
 
-	dummy->next = NULL;
-	dummy->entry = NULL;
-	page_request_head = dummy;
-	page_request_tail = dummy;
-	page_request_queue_size = 0;
 	page_request_queue_initialized = true;
 }
 
@@ -1502,7 +1492,6 @@ static void init_page_request_queue(void)
 static void add_page_request(unsigned long vaddr, unsigned long nr_pages, int sk, u64 dst_id)
 {
 	struct page_request_entry *entry;
-	struct page_request_spsc_node *node;
 
 	entry = xmalloc(sizeof(*entry));
 	if (!entry) {
@@ -1523,59 +1512,29 @@ static void add_page_request(unsigned long vaddr, unsigned long nr_pages, int sk
 	entry->page_idx_in_seg = 0;
 	entry->location_found = false;
 
-	/* Allocate wrapper node */
-	node = xmalloc(sizeof(*node));
-	if (!node) {
+	if (spsc_enqueue(page_request_tail, page_request_queue_size,
+			 entry, struct page_request_spsc_node)) {
 		pr_err("Failed to allocate SPSC node for page request\n");
 		xfree(entry);
-		return;
 	}
-
-	node->entry = entry;
-	node->next = NULL;
-
-	/* Atomic publish: consumer sees node only after this store */
-	__atomic_store_n(&page_request_tail->next, node, __ATOMIC_RELEASE);
-	page_request_tail = node;  /* Producer-only update, no atomic needed */
-	__atomic_fetch_add(&page_request_queue_size, 1, __ATOMIC_RELAXED);
 }
 
 /* M6: Lock-free SPSC dequeue (Thread 3 consumes page requests) */
 static struct page_request_entry *get_next_page_request(void)
 {
-	struct page_request_spsc_node *head, *next;
-	struct page_request_entry *entry;
-
-	head = page_request_head;
-	next = __atomic_load_n(&head->next, __ATOMIC_ACQUIRE);
-
-	if (!next)
-		return NULL;  /* Queue is empty */
-
-	/* Extract payload from next node */
-	entry = next->entry;
-	next->entry = NULL;  /* next becomes the new dummy */
-	page_request_head = next;
-	xfree(head);  /* Free old dummy */
-
-	__atomic_fetch_sub(&page_request_queue_size, 1, __ATOMIC_RELAXED);
-
-	return entry;
+	return spsc_dequeue(page_request_head, page_request_queue_size);
 }
 
 /* M6: Lock-free check if queue has requests */
 static bool has_page_requests(void)
 {
-	struct page_request_spsc_node *next;
-
-	next = __atomic_load_n(&page_request_head->next, __ATOMIC_ACQUIRE);
-	return next != NULL;
+	return spsc_peek(page_request_head);
 }
 
 /* M6: Get approximate queue size (counter may lag due to RELAXED ordering) */
 static unsigned long get_page_request_queue_size(void)
 {
-	return __atomic_load_n(&page_request_queue_size, __ATOMIC_RELAXED);
+	return spsc_size(page_request_queue_size);
 }
 
 struct active_image {
@@ -1809,11 +1768,11 @@ static int send_cow_page_lazy(struct cow_page_queue_entry *entry, struct active_
 	page_idx = (entry->vaddr - lve->start) / PAGE_SIZE;
 	
 	/* Check if already sent */
-	if (lve->sent_bitmap[page_idx / 8] & (1 << (page_idx % 8))) {
+	if (bitmap_test_nonatomic(lve->sent_bitmap, page_idx)) {
 		pr_debug("COW page 0x%lx already sent\n", entry->vaddr);
 		return 0;
 	}
-	
+
 	/*
 	 * M2: Send directly from entry->data instead of hash lookup.
 	 * The queue entry carries the original page content captured
@@ -1823,26 +1782,24 @@ static int send_cow_page_lazy(struct cow_page_queue_entry *entry, struct active_
 		pr_err("COW queue entry 0x%lx has no data!\n", entry->vaddr);
 		return -1;
 	}
-	
+
 	/* Time page send */
 	clock_gettime(CLOCK_MONOTONIC, &t1);
-	
+
 	ret = send_page_compressed(img->main_sk, entry->data, img->dst_id,
 				   entry->vaddr);
-	
+
 	clock_gettime(CLOCK_MONOTONIC, &t2);
 	cow_timing.send_page_total_ns += (t2.tv_sec - t1.tv_sec) * 1000000000 + (t2.tv_nsec - t1.tv_nsec);
 	cow_timing.send_page_count++;
-	
+
 	if (ret < 0) {
 		pr_err("Failed to send COW page 0x%lx\n", entry->vaddr);
 		return -1;
 	}
-	
+
 	/* Mark as sent (atomic to prevent lost updates from concurrent P1/P2/P3) */
-	__atomic_fetch_or(&lve->sent_bitmap[page_idx / 8],
-			  (uint8_t)(1 << (page_idx % 8)),
-			  __ATOMIC_RELEASE);
+	atomic_bitmap_set(lve->sent_bitmap, page_idx);
 
 	return 1;  /* Successfully sent */
 }
@@ -1870,12 +1827,29 @@ static int send_request_page_lazy(struct page_request_entry *req, struct active_
 		page_idx = (page_vaddr - lve->start) / PAGE_SIZE;
 		
 		/* Check if already sent */
-		if (lve->sent_bitmap[page_idx / 8] & (1 << (page_idx % 8))) {
+		if (bitmap_test_nonatomic(lve->sent_bitmap, page_idx)) {
 			pr_debug("Request page 0x%lx already sent, skipping\n", page_vaddr);
 			continue;
 		}
-		
-		/* Send the page */
+
+		/*
+		 * M3: Check cow_bitmap. If the page was write-faulted,
+		 * the original data is in the P1 queue. We cannot read
+		 * live memory because it contains post-write data.
+		 * Skip and let P1 handle it — drain_cow_pages runs
+		 * before drain_page_requests in the main loop.
+		 *
+		 * If we get here with cow_bitmap=1, it means a fault
+		 * arrived AFTER the latest P1 drain. Next loop iteration
+		 * will drain it.
+		 */
+		if (cow_test_bitmap(page_vaddr)) {
+			pr_debug("P2: page 0x%lx is COW, skipping for P1\n",
+				 page_vaddr);
+			continue;
+		}
+
+		/* Page is not modified — send live data */
 		ret = send_lazy_vma_page(req->sk, page_vaddr, req->dst_id, source_pid);
 		if (ret < 0)
 			return -1;
@@ -1885,9 +1859,7 @@ static int send_request_page_lazy(struct page_request_entry *req, struct active_
 			continue;
 
 		/* Mark as sent (atomic to prevent lost updates from concurrent P1/P2/P3) */
-		__atomic_fetch_or(&lve->sent_bitmap[page_idx / 8],
-				  (uint8_t)(1 << (page_idx % 8)),
-				  __ATOMIC_RELEASE);
+		atomic_bitmap_set(lve->sent_bitmap, page_idx);
 		sent_count++;
 	}
 	
@@ -2064,7 +2036,7 @@ static int send_single_lazy_page(struct active_image *img,
 	int ret;
 
 	/* Check if already sent */
-	if (lve->sent_bitmap[page_idx / 8] & (1 << (page_idx % 8))) {
+	if (bitmap_test_nonatomic(lve->sent_bitmap, page_idx)) {
 		stats->skip_already_sent++;
 		return 0;
 	}
@@ -2087,9 +2059,7 @@ static int send_single_lazy_page(struct active_image *img,
 	}
 
 	/* Mark as sent (atomic to prevent lost updates from concurrent P1/P2/P3) */
-	__atomic_fetch_or(&lve->sent_bitmap[page_idx / 8],
-			  (uint8_t)(1 << (page_idx % 8)),
-			  __ATOMIC_RELEASE);
+	atomic_bitmap_set(lve->sent_bitmap, page_idx);
 	__atomic_fetch_sub(&img->remaining_pages, 1, __ATOMIC_ACQ_REL);
 	stats->priority3_pages++;
 

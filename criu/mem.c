@@ -35,6 +35,7 @@
 #include "prctl.h"
 #include "compel/infect-util.h"
 #include "pidfd-store.h"
+#include "atomic-bitmap.h"
 
 #include "protobuf.h"
 #include "images/pagemap.pb-c.h"
@@ -359,7 +360,7 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 		lve->source_pid = item->pid->real;
 
 		/* Allocate sent bitmap for this VMA */
-		bitmap_size = (nr_pages + 7) / 8;
+		bitmap_size = BITMAP_ALLOC_SIZE(nr_pages);
 		lve->sent_bitmap = xzalloc(bitmap_size);
 		if (!lve->sent_bitmap) {
 			xfree(lve);
