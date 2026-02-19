@@ -592,8 +592,8 @@ int cow_dump_init(struct pstree_item *item, struct vm_area_list *vma_area_list, 
 		INIT_LIST_HEAD(&cdi->tracked_tasks);
 
 		g_wp_async_mode = kdat.has_wp_async && kdat.has_pagemap_scan;
-		if (g_wp_async_mode)
-			pr_info("WP_ASYNC mode enabled (kernel resolves WP faults)\n");
+		pr_err("COW mode: wp_async=%d (has_wp_async=%d has_pagemap_scan=%d)\n",
+		       g_wp_async_mode, kdat.has_wp_async, kdat.has_pagemap_scan);
 
 		if (!g_wp_async_mode) {
 			for (i = 0; i < COW_HASH_SIZE; i++) {
@@ -1555,7 +1555,7 @@ pthread_spinlock_t *cow_get_hash_lock(unsigned long vaddr)
 	unsigned long page_addr = vaddr & ~(PAGE_SIZE - 1);
 	unsigned int hash;
 
-	if (!g_cow_info)
+	if (!g_cow_info || g_wp_async_mode)
 		return NULL;
 
 	hash = (page_addr >> PAGE_SHIFT) & (COW_HASH_SIZE - 1);
@@ -1639,7 +1639,7 @@ struct cow_page_queue_entry *cow_get_next_page(void)
 {
 	struct cow_page_queue_entry *entry = NULL;
 
-	if (!g_cow_info)
+	if (!g_cow_info || g_wp_async_mode)
 		return NULL;
 
 	pthread_spin_lock(&g_cow_info->queue_lock);
@@ -1657,7 +1657,7 @@ bool cow_has_pending_pages(void)
 {
 	bool has_pages;
 
-	if (!g_cow_info)
+	if (!g_cow_info || g_wp_async_mode)
 		return false;
 
 	pthread_spin_lock(&g_cow_info->queue_lock);
@@ -1669,7 +1669,7 @@ bool cow_has_pending_pages(void)
 
 void cow_put_back_page(struct cow_page_queue_entry *entry)
 {
-	if (!g_cow_info || !entry)
+	if (!g_cow_info || !entry || g_wp_async_mode)
 		return;
 
 	pthread_spin_lock(&g_cow_info->queue_lock);
@@ -1684,7 +1684,7 @@ unsigned long cow_get_queue_size(void)
 	unsigned long count = 0;
 	struct cow_page_queue_entry *entry;
 
-	if (!g_cow_info)
+	if (!g_cow_info || g_wp_async_mode)
 		return 0;
 
 	pthread_spin_lock(&g_cow_info->queue_lock);
