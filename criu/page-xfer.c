@@ -2490,6 +2490,69 @@ static int cow_converge_dirty_pages(struct active_image *img,
 			break;
 	}
 
+	/*
+	 * Final freeze: if convergence didn't fully converge (active
+	 * writes keep dirtying pages), briefly SIGSTOP the source to
+	 * guarantee one clean scan with zero new writes.
+	 */
+	if (source_pid > 0) {
+		struct lazy_vma_entry *lve;
+		unsigned long final_dirty = 0;
+
+		kill(source_pid, SIGSTOP);
+		usleep(1000);  /* let kernel finish in-flight faults */
+
+		list_for_each_entry(lve, get_global_lazy_vmas(), list) {
+			unsigned long scan_pos;
+
+			if (lve->dst_id != img->dst_id)
+				continue;
+
+			scan_pos = lve->start;
+			while (scan_pos < lve->end) {
+				unsigned long walk_end = 0;
+				int nr_regions, r;
+
+				nr_regions = cow_scan_dirty_pages(
+					source_pid, scan_pos, lve->end,
+					regions, CONVERGE_MAX_REGIONS,
+					&walk_end);
+				if (nr_regions <= 0)
+					break;
+
+				for (r = 0; r < nr_regions; r++) {
+					unsigned long pg;
+
+					for (pg = regions[r].start;
+					     pg < regions[r].end;
+					     pg += PAGE_SIZE) {
+						char page[PAGE_SIZE];
+						struct iovec li = {page, PAGE_SIZE};
+						struct iovec ri = {(void *)pg, PAGE_SIZE};
+
+						if (process_vm_readv(source_pid,
+								     &li, 1, &ri, 1, 0)
+						    == PAGE_SIZE) {
+							send_page_compressed(
+								img->main_sk,
+								page, img->dst_id,
+								pg);
+							final_dirty++;
+						}
+					}
+				}
+
+				scan_pos = walk_end;
+				if (walk_end >= lve->end)
+					break;
+			}
+		}
+
+		kill(source_pid, SIGCONT);
+		pr_err("COW converge final-freeze: %lu dirty pages\n",
+		       final_dirty);
+	}
+
 done:
 	xfree(regions);
 	xfree(batch_buf);
