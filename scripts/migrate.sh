@@ -280,6 +280,12 @@ start_source_ping_monitor
 # 3. Max repl-backlog-size (prevents incrementalTrimReplicationBacklog assertion)
 # 4. Disable RDB/AOF saves to prevent BIO activity
 # 5. Sleep to let in-flight operations complete
+# Kill external benchmark/workload processes to ensure no writes during transfer.
+# With WP_ASYNC, writes during transfer create dirty pages that need convergence.
+# If convergence fails (receiver disconnect), the dirty pages have stale data,
+# corrupting glibc heap metadata and crashing the restored process.
+sudo pkill -f "bench_loop\|valkey-benchmark" 2>/dev/null || true
+sleep 1
 valkey_cmd CLIENT KILL TYPE normal >/dev/null 2>&1 || true
 valkey_cmd CLIENT KILL TYPE pubsub >/dev/null 2>&1 || true
 valkey_cmd CONFIG SET lazyfree-lazy-expire no >/dev/null 2>&1 || true
