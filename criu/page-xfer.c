@@ -3657,9 +3657,17 @@ static int page_server_async_read(struct epoll_rfd *f)
 
 static int page_server_hangup_event(struct epoll_rfd *rfd)
 {
-	if (opts.cow_dump && bulk_stream_done) {
-		pr_info("Page server closed connection after bulk transfer\n");
-		return 0;
+	if (opts.cow_dump) {
+		/*
+		 * In multi-TCP COW mode, individual streams close
+		 * after sending their close marker.  Accept hangups
+		 * as long as we've received at least one close marker.
+		 */
+		if (g_bulk_streams_closed > 0) {
+			pr_info("Page server stream closed (%d/%d)\n",
+				g_bulk_streams_closed, COW_TRANSFER_STREAMS);
+			return 0;
+		}
 	}
 	pr_err("Remote side closed connection\n");
 	return -1;
