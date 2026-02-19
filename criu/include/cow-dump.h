@@ -157,6 +157,16 @@ extern void cow_bitmap_fini(void);
 extern void cow_set_bitmap(unsigned long vaddr);
 
 /**
+ * cow_clear_bitmap - Clear the write-faulted bit for a page
+ * @vaddr: Virtual address of the page
+ *
+ * Used as fallback when the COW queue entry allocation fails.
+ * Clearing the bit allows P3 (sequential scan) to send the page
+ * from live memory instead of silently losing it.
+ */
+extern void cow_clear_bitmap(unsigned long vaddr);
+
+/**
  * cow_test_bitmap - Check if a page was write-faulted
  * @vaddr: Virtual address to check
  *
