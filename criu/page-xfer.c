@@ -1812,7 +1812,8 @@ static int send_request_page_lazy(struct page_request_entry *req, struct active_
 		 * arrived AFTER the latest P1 drain. Next loop iteration
 		 * will drain it.
 		 */
-		if (cow_test_bitmap(page_vaddr)) {
+		if (lve->cow_bitmap &&
+		    atomic_bitmap_test(lve->cow_bitmap, page_idx)) {
 			pr_debug("P2: page 0x%lx is COW, skipping for P1\n",
 				 page_vaddr);
 			continue;
@@ -2010,7 +2011,8 @@ static int send_single_lazy_page(struct active_image *img,
 		return 0;
 	}
 
-	if (cow_test_bitmap(vaddr)) {
+	if (lve->cow_bitmap &&
+	    atomic_bitmap_test(lve->cow_bitmap, page_idx)) {
 		stats->skip_cow_bitmap++;
 		return 0;
 	}

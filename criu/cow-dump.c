@@ -52,14 +52,6 @@ struct cow_tracked_task {
 	struct list_head list;
 };
 
-/* M1: Per-VMA bitmap for tracking write-faulted pages */
-struct cow_vma_bitmap {
-	unsigned long start;		/* VMA start address (page-aligned) */
-	unsigned long end;		/* VMA end address (page-aligned) */
-	uint8_t *bitmap;		/* 1 bit per page in this VMA */
-	unsigned long bitmap_bytes;	/* Size of bitmap in bytes */
-};
-
 /* COW dump state for one dump session */
 struct cow_dump_info {
 	struct list_head tracked_tasks;		/* criu-cow: multi-task support */
@@ -74,10 +66,6 @@ struct cow_dump_info {
 	char _pad[64 - sizeof(struct cow_page_spsc_node *)];
 	struct cow_page_spsc_node *spsc_tail;	/* Producer side */
 	unsigned long spsc_size;		/* Atomic: approximate queue size */
-
-	/* M1: Per-VMA bitmaps tracking write-faulted pages */
-	struct cow_vma_bitmap *vma_bitmaps;	/* Array of per-VMA bitmaps */
-	unsigned int nr_vma_bitmaps;		/* Number of entries in array */
 };
 
 
@@ -198,8 +186,6 @@ bool cow_check_kernel_support(void)
 	pr_info("COW dump kernel support detected\n");
 	return true;
 }
-static int cow_bitmap_init_vmas(struct vm_area_list *vma_area_list);
-
 static void free_cow_page_entry(struct cow_page_queue_entry *entry)
 {
 	if (entry->data)
@@ -423,11 +409,6 @@ int cow_dump_init(struct pstree_item *item, struct vm_area_list *vma_area_list, 
 		task->total_pages, task->uffd);
 	pr_info("COW dump tracking armed\n");
 
-	/* M1: Allocate per-VMA bitmaps */
-	if (cow_bitmap_init_vmas(vma_area_list)) {
-		pr_err("Failed to initialize COW bitmaps (non-fatal)\n");
-	}
-
 	xfree(failed_map);
 	return 0;
 
@@ -454,183 +435,60 @@ err:
 	return -1;
 }
 
-/*
- * cow_bitmap_init_vmas - Allocate per-VMA bitmaps from the VMA list
- * that was already iterated during cow_dump_init.
- *
- * Must be called after cow_dump_init sets g_cow_info.
- */
-static int cow_bitmap_init_vmas(struct vm_area_list *vma_area_list)
-{
-	struct vma_area *vma;
-	unsigned int count = 0;
-	unsigned int idx = 0;
-	unsigned long total_bitmap_bytes = 0;
-
-	if (!g_cow_info)
-		return -1;
-
-	/* First pass: count writable lazy VMAs (same filters as cow_dump_init) */
-	list_for_each_entry(vma, &vma_area_list->h, list) {
-		if (!vma_entry_can_be_lazy(vma->e))
-			continue;
-		if (vma_area_is(vma, VMA_AREA_GUARD))
-			continue;
-		if (!(vma->e->prot & PROT_WRITE))
-			continue;
-		if (!vma_area_is_private(vma, kdat.task_size) &&
-		    !vma_area_is(vma, VMA_ANON_SHARED))
-			continue;
-		if (vma_entry_is(vma->e, VMA_AREA_VVAR))
-			continue;
-		if (vma->e->flags & MAP_DROPPABLE)
-			continue;
-		count++;
-	}
-
-	if (count == 0) {
-		pr_warn("cow_bitmap_init_vmas: no writable lazy VMAs found\n");
-		g_cow_info->vma_bitmaps = NULL;
-		g_cow_info->nr_vma_bitmaps = 0;
-		return 0;
-	}
-
-	g_cow_info->vma_bitmaps = xzalloc(count * sizeof(struct cow_vma_bitmap));
-	if (!g_cow_info->vma_bitmaps)
-		return -1;
-	g_cow_info->nr_vma_bitmaps = count;
-
-	/* Second pass: allocate bitmap per VMA */
-	list_for_each_entry(vma, &vma_area_list->h, list) {
-		unsigned long nr_pages, bitmap_bytes;
-
-		if (!vma_entry_can_be_lazy(vma->e))
-			continue;
-		if (vma_area_is(vma, VMA_AREA_GUARD))
-			continue;
-		if (!(vma->e->prot & PROT_WRITE))
-			continue;
-		if (!vma_area_is_private(vma, kdat.task_size) &&
-		    !vma_area_is(vma, VMA_ANON_SHARED))
-			continue;
-		if (vma_entry_is(vma->e, VMA_AREA_VVAR))
-			continue;
-		if (vma->e->flags & MAP_DROPPABLE)
-			continue;
-
-		nr_pages = (vma->e->end - vma->e->start) / PAGE_SIZE;
-		bitmap_bytes = BITMAP_ALLOC_SIZE(nr_pages);
-
-		g_cow_info->vma_bitmaps[idx].start = vma->e->start;
-		g_cow_info->vma_bitmaps[idx].end = vma->e->end;
-		g_cow_info->vma_bitmaps[idx].bitmap = xzalloc(bitmap_bytes);
-		if (!g_cow_info->vma_bitmaps[idx].bitmap) {
-			pr_err("Failed to allocate bitmap for VMA 0x%lx-0x%lx\n",
-			       (unsigned long)vma->e->start,
-			       (unsigned long)vma->e->end);
-			goto err;
-		}
-		g_cow_info->vma_bitmaps[idx].bitmap_bytes = bitmap_bytes;
-		total_bitmap_bytes += bitmap_bytes;
-		idx++;
-	}
-
-	pr_warn("COW bitmap initialized: %u VMAs, total bitmap %lu bytes\n",
-		count, total_bitmap_bytes);
-	return 0;
-
-err:
-	/* Free already allocated bitmaps */
-	for (unsigned int i = 0; i < idx; i++)
-		xfree(g_cow_info->vma_bitmaps[i].bitmap);
-	xfree(g_cow_info->vma_bitmaps);
-	g_cow_info->vma_bitmaps = NULL;
-	g_cow_info->nr_vma_bitmaps = 0;
-	return -1;
-}
-
 void cow_bitmap_fini(void)
 {
-	unsigned int i;
-
-	if (!g_cow_info)
-		return;
-
-	if (g_cow_info->vma_bitmaps) {
-		for (i = 0; i < g_cow_info->nr_vma_bitmaps; i++)
-			xfree(g_cow_info->vma_bitmaps[i].bitmap);
-		xfree(g_cow_info->vma_bitmaps);
-		g_cow_info->vma_bitmaps = NULL;
-	}
-	g_cow_info->nr_vma_bitmaps = 0;
-}
-
-/*
- * Find the per-VMA bitmap that contains vaddr.
- * Returns NULL if vaddr is not in any tracked VMA.
- */
-static struct cow_vma_bitmap *cow_find_vma_bitmap(unsigned long vaddr)
-{
-	unsigned int i;
-
-	if (!g_cow_info || !g_cow_info->vma_bitmaps)
-		return NULL;
-
-	for (i = 0; i < g_cow_info->nr_vma_bitmaps; i++) {
-		struct cow_vma_bitmap *vb = &g_cow_info->vma_bitmaps[i];
-		if (vaddr >= vb->start && vaddr < vb->end)
-			return vb;
-	}
-
-	return NULL;
+	/*
+	 * cow_bitmaps now live inside lazy_vma_entry and are freed
+	 * by free_global_lazy_vmas() in mem.c.  Nothing to do here.
+	 */
 }
 
 void cow_set_bitmap(unsigned long vaddr)
 {
 	unsigned long page_addr = vaddr & ~(PAGE_SIZE - 1);
-	struct cow_vma_bitmap *vb;
+	struct lazy_vma_entry *lve;
 	unsigned long page_idx;
 
-	vb = cow_find_vma_bitmap(page_addr);
-	if (!vb) {
+	lve = find_lazy_vma_by_addr(page_addr);
+	if (!lve || !lve->cow_bitmap) {
 		pr_warn("cow_set_bitmap: addr 0x%lx not in any tracked VMA\n",
 			page_addr);
 		return;
 	}
 
-	page_idx = (page_addr - vb->start) / PAGE_SIZE;
+	page_idx = (page_addr - lve->start) / PAGE_SIZE;
 
-	atomic_bitmap_set(vb->bitmap, page_idx);
+	atomic_bitmap_set(lve->cow_bitmap, page_idx);
 }
 
 void cow_clear_bitmap(unsigned long vaddr)
 {
 	unsigned long page_addr = vaddr & ~(PAGE_SIZE - 1);
-	struct cow_vma_bitmap *vb;
+	struct lazy_vma_entry *lve;
 	unsigned long page_idx;
 
-	vb = cow_find_vma_bitmap(page_addr);
-	if (!vb)
+	lve = find_lazy_vma_by_addr(page_addr);
+	if (!lve || !lve->cow_bitmap)
 		return;
 
-	page_idx = (page_addr - vb->start) / PAGE_SIZE;
+	page_idx = (page_addr - lve->start) / PAGE_SIZE;
 
-	atomic_bitmap_clear(vb->bitmap, page_idx);
+	atomic_bitmap_clear(lve->cow_bitmap, page_idx);
 }
 
 bool cow_test_bitmap(unsigned long vaddr)
 {
 	unsigned long page_addr = vaddr & ~(PAGE_SIZE - 1);
-	struct cow_vma_bitmap *vb;
+	struct lazy_vma_entry *lve;
 	unsigned long page_idx;
 
-	vb = cow_find_vma_bitmap(page_addr);
-	if (!vb)
+	lve = find_lazy_vma_by_addr(page_addr);
+	if (!lve || !lve->cow_bitmap)
 		return false;
 
-	page_idx = (page_addr - vb->start) / PAGE_SIZE;
+	page_idx = (page_addr - lve->start) / PAGE_SIZE;
 
-	return atomic_bitmap_test(vb->bitmap, page_idx);
+	return atomic_bitmap_test(lve->cow_bitmap, page_idx);
 }
 
 void cow_dump_fini(void)
@@ -648,9 +506,6 @@ void cow_dump_fini(void)
 	}
 
 	pr_info("Cleaning up COW dump\n");
-
-	/* M1: Free bitmap */
-	cow_bitmap_fini();
 
 	/* M5: Drain consumer-side putback list */
 	while (g_putback_list) {
