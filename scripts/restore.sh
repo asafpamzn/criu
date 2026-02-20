@@ -28,6 +28,7 @@ START_TOTAL=$(date +%s)
 LOG_FILE="$IMAGES_DIR/lazy-primary.log"
 CUTOVER_MARKER_FILE=${CUTOVER_MARKER_FILE:-}
 REPLICA_STAGED_FILE=${REPLICA_STAGED_FILE:-$IMAGES_DIR/replica_staged.log}
+CUTOVER_PORT=${CUTOVER_PORT:-9003}
 RESTORE_VERIFY_DELAY_S=${RESTORE_VERIFY_DELAY_S:-0}
 RESTORE_MAX_PING_ATTEMPTS=${RESTORE_MAX_PING_ATTEMPTS:-600}
 RESTORE_PING_INTERVAL_S=${RESTORE_PING_INTERVAL_S:-0.05}
@@ -279,10 +280,29 @@ if [ "$FAST_CUTOVER" = "1" ]; then
     -p "$VALKEY_PID" 2>/dev/null || echo "  WARNING: gdb fixup failed"
   echo "  Applied"
 
-  echo "Step 9: Writing staged marker: $REPLICA_STAGED_FILE"
+  # TCP cutover: start nc listener FIRST so it's ready when
+  # migrate.sh connects, then write the STAGED marker to signal
+  # that the listener is up.
+  echo "Step 9: Starting cutover listener on port $CUTOVER_PORT..."
+  (timeout 600 nc -l -p "$CUTOVER_PORT" 2>/dev/null || true) > /tmp/cutover_msg &
+  CUTOVER_LISTEN_PID=$!
+  sleep 0.05  # give nc time to bind
+
+  echo "Step 9b: Writing staged marker: $REPLICA_STAGED_FILE"
   echo "STAGED" | sudo tee "$REPLICA_STAGED_FILE" >/dev/null
   sudo chmod 644 "$REPLICA_STAGED_FILE" 2>/dev/null || true
   mark_phase_event "REPLICA_STAGED_FOR_CUTOVER"
+
+  echo "Step 9c: Waiting for cutover signal..."
+  wait "$CUTOVER_LISTEN_PID" 2>/dev/null || true
+  CUTOVER_MSG=$(cat /tmp/cutover_msg 2>/dev/null || true)
+  rm -f /tmp/cutover_msg
+  if [ "$CUTOVER_MSG" = "GO" ]; then
+    echo "  Cutover signal received, sending SIGCONT"
+  else
+    echo "  WARN: cutover msg='$CUTOVER_MSG', sending SIGCONT anyway"
+  fi
+  sudo kill -CONT "$VALKEY_PID" 2>/dev/null || true
 
   echo "Step 10: Waiting for Valkey to be responsive after SIGCONT..."
   for i in $(seq 1 6000); do

@@ -28,6 +28,7 @@ WORKLOAD_LOG_FILE=${WORKLOAD_LOG_FILE:-}
 CRIU_DUMP_STRACE_OUT=${CRIU_DUMP_STRACE_OUT:-}
 CUTOVER_MARKER_FILE=${CUTOVER_MARKER_FILE:-}
 REPLICA_STAGED_FILE=${REPLICA_STAGED_FILE:-$IMAGES_DIR/replica_staged.log}
+CUTOVER_PORT=${CUTOVER_PORT:-9003}
 REPLICA_PING_POLL_INTERVAL_S=${REPLICA_PING_POLL_INTERVAL_S:-0.01}
 VALKEY_CMD_TIMEOUT_S=${VALKEY_CMD_TIMEOUT_S:-2}
 MEASURE_SOURCE_AVAILABILITY=${MEASURE_SOURCE_AVAILABILITY:-1}
@@ -526,11 +527,18 @@ if [ "$FAST_CUTOVER" = "1" ]; then
   FREEZE_T0=$(date +%s%3N)
   sudo pkill -STOP -x valkey-server 2>/dev/null || true
   SOURCE_FROZEN=1
-  # Atomic cutover: SIGCONT via pre-established ControlMaster (~7ms).
-  ssh -i $SSH_KEY -o ControlPath="$SSH_CONTROL_PATH" ubuntu@$REPLICA_SSH_HOST \
-    "sudo kill -CONT \$(pgrep -x valkey-server)" 2>/dev/null
-  FREEZE_T1=$(date +%s%3N)
-  log "Step 8: Fast cutover — source frozen for $((FREEZE_T1 - FREEZE_T0))ms"
+  # TCP cutover: send "GO" to replica nc listener.  The nc port
+  # being open IS the staging signal, so connect + send is atomic.
+  if echo "GO" | nc -q 0 -w 1 "$REPLICA_SSH_HOST" "$CUTOVER_PORT" 2>/dev/null; then
+    FREEZE_T1=$(date +%s%3N)
+    log "Step 8: TCP cutover — source frozen for $((FREEZE_T1 - FREEZE_T0))ms"
+  else
+    log "  WARN: nc cutover failed, falling back to SSH"
+    ssh -i $SSH_KEY -o ControlPath="$SSH_CONTROL_PATH" ubuntu@$REPLICA_SSH_HOST \
+      "sudo kill -CONT \$(pgrep -x valkey-server)" 2>/dev/null
+    FREEZE_T1=$(date +%s%3N)
+    log "Step 8: SSH cutover (fallback) — source frozen for $((FREEZE_T1 - FREEZE_T0))ms"
+  fi
   mark_cutover_event "CUTOVER_END_MS"
   mark_local_event "CUTOVER_END_MS"
   REPLICA_UP=1
