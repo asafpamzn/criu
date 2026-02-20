@@ -44,14 +44,9 @@
 static int page_server_sk = -1;
 static bool bulk_stream_done = false;
 
-/* Multi-TCP: number of parallel transfer connections.
- * Set to 1 to disable (receiver bulk reader needs per-socket refactor).
- * TODO: refactor page_server_read_bulk_stream to accept socket fd param.
- */
-#define COW_TRANSFER_STREAMS	1
+/* COW_TRANSFER_STREAMS defined in include/page-xfer.h */
 static int g_listen_sk = -1;	/* kept open for additional accepts */
 static int g_bulk_streams_closed;	/* count of streams that sent close */
-
 bool page_server_bulk_stream_done(void)
 {
 	return bulk_stream_done;
@@ -3320,6 +3315,20 @@ struct ps_async_read {
 
 static LIST_HEAD(async_reads);
 
+/*
+ * Per-stream state for multi-TCP bulk transfers.  Each stream has its
+ * own epoll_rfd, socket, and compression state machine so that the
+ * receiver can process N parallel TCP streams independently.
+ */
+struct bulk_stream {
+	struct epoll_rfd rfd;      /* embedded for container_of */
+	struct ps_async_read ar;   /* per-stream reader state */
+	int sk;                    /* socket fd */
+	int id;                    /* stream index for logging */
+};
+
+static struct bulk_stream bulk_streams[COW_TRANSFER_STREAMS];
+
 static inline void async_read_set_goal(struct ps_async_read *ar, unsigned long nr_pages)
 {
 	ar->goal = sizeof(ar->pi) + nr_pages * PAGE_SIZE;
@@ -3366,7 +3375,7 @@ static struct {
  * The server's background thread sends pages continuously.
  * Supports compressed pages (PS_IOV_ADD_F_COMPRESS).
  */
-static int page_server_read_bulk_stream(struct ps_async_read *ar, int flags)
+static int page_server_read_bulk_stream(struct ps_async_read *ar, int flags, int sk)
 {
 	int ret, need;
 	void *buf;
@@ -3382,7 +3391,7 @@ static int page_server_read_bulk_stream(struct ps_async_read *ar, int flags)
 
 			clock_gettime(CLOCK_MONOTONIC, &t_recv_start);
 			bulk_stats.recv_calls++;
-			ret = __recv(page_server_sk, buf, need, flags);
+			ret = __recv(sk, buf, need, flags);
 			clock_gettime(CLOCK_MONOTONIC, &t_recv_end);
 			bulk_stats.recv_wait_time_ns += (t_recv_end.tv_sec - t_recv_start.tv_sec) * 1000000000 +
 						       (t_recv_end.tv_nsec - t_recv_start.tv_nsec);
@@ -3433,7 +3442,7 @@ static int page_server_read_bulk_stream(struct ps_async_read *ar, int flags)
 
 		clock_gettime(CLOCK_MONOTONIC, &t_recv_start);
 		bulk_stats.recv_calls++;
-		ret = __recv(page_server_sk, buf, need, flags);
+		ret = __recv(sk, buf, need, flags);
 		clock_gettime(CLOCK_MONOTONIC, &t_recv_end);
 		bulk_stats.recv_wait_time_ns += (t_recv_end.tv_sec - t_recv_start.tv_sec) * 1000000000 +
 					       (t_recv_end.tv_nsec - t_recv_start.tv_nsec);
@@ -3476,7 +3485,7 @@ static int page_server_read_bulk_stream(struct ps_async_read *ar, int flags)
 
 		clock_gettime(CLOCK_MONOTONIC, &t_recv_start);
 		bulk_stats.recv_calls++;
-		ret = __recv(page_server_sk, buf, need, flags);
+		ret = __recv(sk, buf, need, flags);
 		clock_gettime(CLOCK_MONOTONIC, &t_recv_end);
 		bulk_stats.recv_wait_time_ns += (t_recv_end.tv_sec - t_recv_start.tv_sec) * 1000000000 +
 					       (t_recv_end.tv_nsec - t_recv_start.tv_nsec);
@@ -3538,7 +3547,7 @@ static int page_server_read_bulk_stream(struct ps_async_read *ar, int flags)
 
 		clock_gettime(CLOCK_MONOTONIC, &t_recv_start);
 		bulk_stats.recv_calls++;
-		ret = __recv(page_server_sk, buf, need, flags);
+		ret = __recv(sk, buf, need, flags);
 		clock_gettime(CLOCK_MONOTONIC, &t_recv_end);
 		bulk_stats.recv_wait_time_ns += (t_recv_end.tv_sec - t_recv_start.tv_sec) * 1000000000 +
 					       (t_recv_end.tv_nsec - t_recv_start.tv_nsec);
@@ -3602,65 +3611,40 @@ static void check_and_print_bulk_stats(void)
 
 static int page_server_async_read_bulk(struct epoll_rfd *f)
 {
-	struct ps_async_read *ar;
+	struct bulk_stream *bs = container_of(f, struct bulk_stream, rfd);
 	int ret;
-	pr_debug("page_server_async_read_bulk\n");
-	
+
 	check_and_print_bulk_stats();
+	ret = page_server_read_bulk_stream(&bs->ar, MSG_DONTWAIT, bs->sk);
 
-	if (list_empty(&async_reads)) {
-		if (opts.cow_dump && (bulk_stream_done ||
-		    g_bulk_streams_closed > 0))
-			return 0;
-		pr_err("Bulk async read with empty queue\n");
-		return -1;
-	}
-
-	ar = list_first_entry(&async_reads, struct ps_async_read, l);
-	ret = page_server_read_bulk_stream(ar, MSG_DONTWAIT);
-
-	if (ret == BULK_STREAM_COMPLETE) {
-		/* End marker - cleanup stream reader */
-		list_del(&ar->l);
-		xfree(ar);
+	if (ret == BULK_STREAM_COMPLETE)
 		return 0;
-	}
-	if (ret < 0)
-		return -1;
-
-	/* ret == BULK_STREAM_WOULD_BLOCK or BULK_STREAM_PROGRESS - keep going */
-	return 0;
+	return (ret < 0) ? -1 : 0;
 }
 
-int page_server_start_async_read_bulk(void *buf, unsigned long nr_pages, 
-					      ps_async_read_complete complete, void *priv)
+int page_server_init_bulk_readers(void *buf, unsigned long nr_pages,
+				  ps_async_read_complete complete, void *priv)
 {
-	struct ps_async_read *ar;
+	int i;
 
-	/* In bulk mode, only create reader once - it processes continuous stream */
-	if (!list_empty(&async_reads)) {
-		/* Already have a stream reader */
-		return 0;
+	for (i = 0; i < COW_TRANSFER_STREAMS; i++) {
+		struct ps_async_read *ar = &bulk_streams[i].ar;
+
+		if (bulk_streams[i].sk <= 0)
+			break;
+
+		ar->pages = buf;
+		ar->rb = 0;
+		ar->goal = 0;
+		ar->nr_pages = nr_pages;
+		ar->complete = complete;
+		ar->priv = priv;
+		ar->compress_state = COMPRESS_STATE_READING_HEADER;
+		ar->compressed_size = 0;
+		ar->compressed_rb = 0;
+		ar->compressed_buf = NULL;
 	}
 
-	ar = xmalloc(sizeof(*ar));
-	if (ar == NULL)
-		return -1;
-
-	ar->pages = buf;
-	ar->rb = 0;
-	ar->goal = 0; /* Will be set when header arrives */
-	ar->nr_pages = nr_pages; /* Max buffer size */
-	ar->complete = complete;
-	ar->priv = priv;
-	
-	/* Initialize compression state */
-	ar->compress_state = COMPRESS_STATE_READING_HEADER;
-	ar->compressed_size = 0;
-	ar->compressed_rb = 0;
-	ar->compressed_buf = NULL;
-	
-	list_add_tail(&ar->l, &async_reads);
 	return 0;
 }
 
@@ -3749,47 +3733,50 @@ static int page_server_hangup_event(struct epoll_rfd *rfd)
 	return -1;
 }
 
-static struct epoll_rfd ps_rfd;
-static struct epoll_rfd ps_extra_rfds[COW_TRANSFER_STREAMS - 1];
-static int ps_extra_sks[COW_TRANSFER_STREAMS - 1];
-
 int connect_to_page_server_to_recv(int epfd)
 {
+	int i;
+
 	if (connect_to_page_server())
 		return -1;
 	bulk_stream_done = false;
 	g_bulk_streams_closed = 0;
 
-	ps_rfd.fd = page_server_sk;
-	/* Use bulk stream reader in bulk mode, regular reader in on-demand mode */
-	if (opts.cow_dump)
-		ps_rfd.read_event = page_server_async_read_bulk;
-	else
-		ps_rfd.read_event = page_server_async_read;
-	ps_rfd.hangup_event = page_server_hangup_event;
+	memset(bulk_streams, 0, sizeof(bulk_streams));
 
-	if (epoll_add_rfd(epfd, &ps_rfd))
+	/* Stream 0: the main page_server_sk */
+	bulk_streams[0].sk = page_server_sk;
+	bulk_streams[0].id = 0;
+	bulk_streams[0].rfd.fd = page_server_sk;
+	if (opts.cow_dump)
+		bulk_streams[0].rfd.read_event = page_server_async_read_bulk;
+	else
+		bulk_streams[0].rfd.read_event = page_server_async_read;
+	bulk_streams[0].rfd.hangup_event = page_server_hangup_event;
+
+	if (epoll_add_rfd(epfd, &bulk_streams[0].rfd))
 		return -1;
 
-	/* Multi-TCP: create additional connections for COW bulk mode */
+	/* Multi-TCP: additional connections for COW bulk mode */
 	if (opts.cow_dump && COW_TRANSFER_STREAMS > 1) {
-		int i;
+		for (i = 1; i < COW_TRANSFER_STREAMS; i++) {
+			int sk = setup_tcp_client(opts.addr);
 
-		for (i = 0; i < COW_TRANSFER_STREAMS - 1; i++) {
-			ps_extra_sks[i] = setup_tcp_client(opts.addr);
-			if (ps_extra_sks[i] < 0) {
-				pr_warn("Multi-TCP: could not create stream %d\n",
-					i + 1);
+			if (sk < 0) {
+				pr_warn("Multi-TCP: stream %d connect failed\n", i);
 				break;
 			}
-			ps_extra_rfds[i].fd = ps_extra_sks[i];
-			ps_extra_rfds[i].read_event = page_server_async_read_bulk;
-			ps_extra_rfds[i].hangup_event = page_server_hangup_event;
-			if (epoll_add_rfd(epfd, &ps_extra_rfds[i])) {
-				close(ps_extra_sks[i]);
+			bulk_streams[i].sk = sk;
+			bulk_streams[i].id = i;
+			bulk_streams[i].rfd.fd = sk;
+			bulk_streams[i].rfd.read_event = page_server_async_read_bulk;
+			bulk_streams[i].rfd.hangup_event = page_server_hangup_event;
+			if (epoll_add_rfd(epfd, &bulk_streams[i].rfd)) {
+				close(sk);
+				bulk_streams[i].sk = 0;
 				break;
 			}
-			pr_err("Multi-TCP: connected stream %d\n", i + 1);
+			pr_info("Multi-TCP: connected stream %d\n", i);
 		}
 	}
 
@@ -3849,7 +3836,7 @@ int page_server_start_read(void *buf, unsigned long nr, ps_async_read_complete c
 
 	if (opts.cow_dump) {
 		if (flags & PR_ASYNC)
-			return page_server_start_async_read_bulk(buf, nr, complete, priv);
+			return page_server_init_bulk_readers(buf, nr, complete, priv);
 		else {
 			pr_err("Bulk mode doesn't support synchronous reads\n");
 			return -1;

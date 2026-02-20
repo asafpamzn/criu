@@ -2151,8 +2151,8 @@ close_uffd:
 	close(listen);
 	return -1;
 }
-extern int page_server_start_async_read_bulk(void *buf, unsigned long nr_pages, 
-					      ps_async_read_complete complete, void *priv);
+extern int page_server_init_bulk_readers(void *buf, unsigned long nr_pages,
+					 ps_async_read_complete complete, void *priv);
 int cr_lazy_pages(bool daemon)
 {
 	struct epoll_event *events = NULL;
@@ -2198,7 +2198,8 @@ int cr_lazy_pages(bool daemon)
 	 * daemon and the cr-restore, and, optionally TCP socket for
 	 * remote pages
 	 */
-	nr_fds = task_entries->nr_tasks + (opts.use_page_server ? 2 : 1);
+	nr_fds = task_entries->nr_tasks + (opts.use_page_server ? 2 : 1)
+		 + (opts.cow_dump ? COW_TRANSFER_STREAMS - 1 : 0);
 	epollfd = epoll_prepare(nr_fds, &events);
 	if (epollfd < 0)
 		return -1;
