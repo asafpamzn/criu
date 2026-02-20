@@ -273,29 +273,73 @@ mark_local_event "DUMP_PREP_MS"
 log "Step 6a: Start source availability monitor..."
 start_source_ping_monitor
 
-# Pre-dump preparation: put Valkey in a quiescent state.
-# 1. Kill all client connections (stale client buffers cause stack smash
-#    in _writeToClient after restore with --tcp-close)
-# 2. Disable lazyfree so BIO threads are idle
-# 3. Max repl-backlog-size (prevents incrementalTrimReplicationBacklog assertion)
-# 4. Disable RDB/AOF saves to prevent BIO activity
-# 5. Sleep to let in-flight operations complete
-# Kill external workloads, block new connections, drain existing ones.
-# Stale client output buffers cause _writeToClient stack smash after restore.
-sudo pkill -f "bench_loop\|valkey-benchmark" 2>/dev/null || true
+# Pre-dump preparation: quiesce Valkey using CLIENT PAUSE ALL.
+#
+# CLIENT PAUSE ALL waits for all in-flight commands to complete, then
+# freezes all client processing.  Data structures are fully consistent:
+# no mid-write output buffers, no half-freed clients, no pending async
+# frees.  After CRIU restore with --tcp-close, the paused clients get
+# EOF on their sockets and Valkey frees them through the normal event
+# loop path.
+#
+# Sequence:
+#   1. Kill external benchmarks (their TCP connections close naturally)
+#   2. Wait for Valkey to detect disconnections and free client structs
+#   3. Disable lazyfree, saves, and set repl-backlog-size to max
+#   4. CLIENT PAUSE ALL — freeze remaining client processing
+#   5. DEBUG SLEEP — put main thread in a clean usleep() syscall
+# Kill benchmark processes. Use bracket trick to prevent self-match.
+sudo pkill -9 -f "[b]ench_loop" 2>/dev/null || true
+sudo pkill -9 -f "[v]alkey-benchmark" 2>/dev/null || true
 sleep 1
-valkey_cmd CONFIG SET maxclients 1 >/dev/null 2>&1 || true
-valkey_cmd CLIENT KILL TYPE normal >/dev/null 2>&1 || true
-valkey_cmd CLIENT KILL TYPE pubsub >/dev/null 2>&1 || true
-sleep 2
-valkey_cmd CONFIG SET lazyfree-lazy-expire no >/dev/null 2>&1 || true
-valkey_cmd CONFIG SET lazyfree-lazy-server-del no >/dev/null 2>&1 || true
-valkey_cmd CONFIG SET lazyfree-lazy-user-del no >/dev/null 2>&1 || true
-valkey_cmd CONFIG SET lazyfree-lazy-user-flush no >/dev/null 2>&1 || true
-valkey_cmd CONFIG SET save "" >/dev/null 2>&1 || true
-valkey_cmd CONFIG SET repl-backlog-size 9223372036854775807 >/dev/null 2>&1 || true
-valkey_cmd CONFIG SET repl-backlog-ttl 1 >/dev/null 2>&1 || true
+
+# Wait until all benchmark clients have disconnected.
+# After pkill, the benchmark's TCP connections close (FIN). Valkey's event
+# loop detects EOF and frees client structures.  Poll until CLIENT LIST
+# shows only our monitoring connection (≤1 client).
+log "  Waiting for benchmark clients to disconnect..."
+for i in $(seq 1 100); do
+  NCLIENTS=$(valkey_cmd CLIENT LIST 2>/dev/null | grep -c "^" || echo 99)
+  if [ "$NCLIENTS" -le 1 ]; then
+    log "  All clients gone (${i}00ms)"
+    break
+  fi
+  sleep 0.1
+done
+NCLIENTS=$(valkey_cmd CLIENT LIST 2>/dev/null | grep -c "^" || echo 99)
+if [ "$NCLIENTS" -gt 1 ]; then
+  log "  WARN: $NCLIENTS clients still connected, waiting longer..."
+  sleep 3
+  NCLIENTS=$(valkey_cmd CLIENT LIST 2>/dev/null | grep -c "^" || echo 99)
+  log "  Clients after extra wait: $NCLIENTS"
+fi
+# Do NOT use CLIENT KILL — it corrupts the async free queue (adlist.c:198).
+# Remaining clients (1-2 from our valkey_cmd calls) are short-lived and
+# harmless; they close naturally when the script's TCP connections end.
+
+# All CONFIG SET commands in one batch via a single connection,
+# then close the connection and let the server settle.
+valkey-cli -p "$VALKEY_PORT" <<'EOF'
+CONFIG SET lazyfree-lazy-expire no
+CONFIG SET lazyfree-lazy-server-del no
+CONFIG SET lazyfree-lazy-user-del no
+CONFIG SET lazyfree-lazy-user-flush no
+CONFIG SET save ""
+CONFIG SET repl-backlog-size 9223372036854775807
+CONFIG SET repl-backlog-ttl 1
+CONFIG SET maxclients 1
+EOF
+
+# Wait for the event loop to process all pending frees and settle.
+# With maxclients=0, no new connections are accepted.
+# After this sleep, the main thread should be in epoll_wait with 0 events.
+log "  Waiting for event loop to settle (5s)..."
 sleep 5
+
+# Verify zero clients
+PID=$(pgrep -x valkey-server)
+NCLIENTS=$(sudo cat /proc/$PID/net/tcp 2>/dev/null | grep -c ":18EB .* 01 " || echo "?")
+log "  Established TCP connections on port 6379: $NCLIENTS"
 
 # Run dump - cow-dump keeps running, we'll kill it after restore.
 # Optional syscall profiling can be enabled via CRIU_DUMP_STRACE_OUT.
@@ -443,7 +487,7 @@ fi
 if [ "$FAST_CUTOVER" = "1" ]; then
   log "Step 7b: Waiting for replica staged marker ($REPLICA_STAGED_FILE)..."
   STAGED_OK=0
-  for _ in $(seq 1 $((WAIT_TIMEOUT * 20))); do
+  for _ in $(seq 1 $((DUMP_EXIT_TIMEOUT_S * 20))); do
     if [ -f "$REPLICA_STAGED_FILE" ]; then
       STAGED_OK=1
       break

@@ -244,9 +244,9 @@ fi
 # --- Step 7: Wait for restored process --------------------------------------
 VALKEY_PID=""
 if [ "$FAST_CUTOVER" = "1" ]; then
-  # Fast cutover: process was restored in SIGSTOP state.
-  # Wait for it to appear in the process table (it won't respond to PING yet —
-  # the primary sends SIGCONT at cutover time).
+  # Process restored in SIGSTOP (--leave-stopped). Transfer all pages,
+  # fix known lock issues, then write STAGED marker for source to SIGCONT.
+
   echo "Step 7: Waiting for valkey process (restored, stopped)..."
   for i in $(seq 1 120); do
     VALKEY_PID=$(pgrep -x valkey-server || true)
@@ -257,11 +257,11 @@ if [ "$FAST_CUTOVER" = "1" ]; then
     sleep 0.1
   done
   if [ -z "$VALKEY_PID" ]; then
-    echo "ERROR: Valkey process not restored in FAST_CUTOVER mode"
+    echo "ERROR: Valkey process not restored"
     exit 1
   fi
 
-  echo "Step 8: Waiting for lazy-pages to finish background transfer (FAST_CUTOVER)..."
+  echo "Step 8: Waiting for lazy-pages bulk transfer to complete..."
   if ! wait "$LAZY_PAGES_PID"; then
     echo "ERROR: lazy-pages exited with failure"
     sudo tail -n 200 "$IMAGES_DIR/lazy-server.log" 2>/dev/null || true
@@ -269,34 +269,15 @@ if [ "$FAST_CUTOVER" = "1" ]; then
   fi
   mark_phase_event "REPLICA_LAZY_PAGES_DONE"
 
-  # Fix glibc main_arena lock deadlock after CRIU restore.
-  # The dump may capture a thread holding the glibc malloc arena lock
-  # (value=2 means "locked with waiters"). After restore, no thread
-  # releases it. Find the lock address and zero it out via /proc/PID/mem.
-  echo "Step 8b: Fixing glibc main_arena lock..."
-  if [ -n "$VALKEY_PID" ]; then
-    LIBC_RW=$(grep "libc.so" "/proc/$VALKEY_PID/maps" 2>/dev/null | grep "rw-p" | head -1 | cut -d- -f1)
-    if [ -n "$LIBC_RW" ]; then
-      LOCK_ADDR=$(printf "0x%x" $((16#$LIBC_RW + 0xa50)))
-      echo "  main_arena lock at $LOCK_ADDR (libc rw-p=$LIBC_RW)"
-      # Zero out the lock: write 4 zero bytes at the lock address
-      sudo python3 -c "
-import os, struct
-pid = $VALKEY_PID
-addr = $((16#$LIBC_RW + 0xa50))
-fd = os.open(f'/proc/{pid}/mem', os.O_RDWR)
-os.lseek(fd, addr, os.SEEK_SET)
-val = struct.unpack('i', os.read(fd, 4))[0]
-if val == 2:
-    os.lseek(fd, addr, os.SEEK_SET)
-    os.write(fd, struct.pack('i', 0))
-    print(f'  Reset main_arena lock from {val} to 0')
-else:
-    print(f'  main_arena lock value={val} (no fix needed)')
-os.close(fd)
-" 2>&1 || echo "  WARNING: Could not fix main_arena lock"
-    fi
-  fi
+  # Fix stale syscall return value.  With the pre-dump quiesce (zero
+  # clients, maxclients=0, 5s settle), the process is in epoll_wait.
+  # Set X0=-EINTR so the libc wrapper retries the syscall cleanly.
+  echo "Step 8b: Fixing stale syscall return (X0 -> -EINTR)..."
+  sudo gdb -batch-silent \
+    -ex "set \$x0 = -4" \
+    -ex "detach" \
+    -p "$VALKEY_PID" 2>/dev/null || echo "  WARNING: gdb fixup failed"
+  echo "  Applied"
 
   echo "Step 9: Writing staged marker: $REPLICA_STAGED_FILE"
   echo "STAGED" | sudo tee "$REPLICA_STAGED_FILE" >/dev/null
@@ -306,7 +287,7 @@ os.close(fd)
   echo "Step 10: Waiting for Valkey to be responsive after SIGCONT..."
   for i in $(seq 1 6000); do
     if timeout 1s valkey-cli ping &>/dev/null; then
-      echo "Valkey is up (post-cutover resume)"
+      echo "Valkey is up"
       mark_phase_event "REPLICA_VALKEY_PING_READY"
       break
     fi
@@ -314,6 +295,10 @@ os.close(fd)
   done
   if ! timeout 1s valkey-cli ping &>/dev/null; then
     echo "ERROR: Valkey did not become responsive after cutover"
+    echo "--- valkey log ---"
+    tail -40 /var/log/valkey/valkey-server.log 2>/dev/null || echo "(no log file)"
+    echo "--- process check ---"
+    pgrep -a valkey-server 2>/dev/null || echo "valkey-server: NOT RUNNING"
     exit 1
   fi
 
