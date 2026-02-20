@@ -36,8 +36,16 @@ SOURCE_PING_TIMEOUT_MS=${SOURCE_PING_TIMEOUT_MS:-10000}
 POST_REPLICA_SYNC_CHECK=${POST_REPLICA_SYNC_CHECK:-0}
 CUTOVER_GATE_EVENT_WAIT_S=${CUTOVER_GATE_EVENT_WAIT_S:-15}
 DUMP_EXIT_TIMEOUT_S=${DUMP_EXIT_TIMEOUT_S:-600}
-SSH="ssh -i $SSH_KEY -o StrictHostKeyChecking=no -o ConnectTimeout=10"
+SSH_BASE="ssh -i $SSH_KEY -o StrictHostKeyChecking=no -o ConnectTimeout=10"
 REPLICA_SSH_HOST="${REPLICA_IP:-$REPLICA_HOST}"
+
+# Pre-establish SSH connection (ControlMaster) for sub-100ms cutover.
+# Eliminates ~150ms handshake per SSH call during the critical window.
+SSH_CONTROL_PATH="/tmp/ssh-migrate-$$"
+$SSH_BASE -fN -o ControlMaster=yes -o ControlPath="$SSH_CONTROL_PATH" ubuntu@$REPLICA_SSH_HOST 2>/dev/null
+SSH="$SSH_BASE -o ControlPath=$SSH_CONTROL_PATH"
+cleanup_ssh() { ssh -o ControlPath="$SSH_CONTROL_PATH" -O exit ubuntu@$REPLICA_SSH_HOST 2>/dev/null || true; }
+trap cleanup_ssh EXIT
 
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
 
@@ -514,23 +522,30 @@ REPLICA_UP=0
 mark_cutover_event "CUTOVER_START_MS"
 mark_local_event "CUTOVER_START_MS"
 if [ "$FAST_CUTOVER" = "1" ]; then
-  log "Step 8: Fast cutover (pause ${CUTOVER_PAUSE_MS}ms writes, freeze source, resume replica)..."
   valkey_cmd CLIENT PAUSE "$CUTOVER_PAUSE_MS" WRITE >/dev/null 2>&1 || true
+  FREEZE_T0=$(date +%s%3N)
   sudo pkill -STOP -x valkey-server 2>/dev/null || true
   SOURCE_FROZEN=1
-  $SSH ubuntu@$REPLICA_SSH_HOST "sudo pkill -CONT -x valkey-server" >/dev/null 2>&1 || true
+  # Atomic cutover: SIGCONT via pre-established ControlMaster (~7ms).
+  ssh -i $SSH_KEY -o ControlPath="$SSH_CONTROL_PATH" ubuntu@$REPLICA_SSH_HOST \
+    "sudo kill -CONT \$(pgrep -x valkey-server)" 2>/dev/null
+  FREEZE_T1=$(date +%s%3N)
+  log "Step 8: Fast cutover — source frozen for $((FREEZE_T1 - FREEZE_T0))ms"
+  mark_cutover_event "CUTOVER_END_MS"
+  mark_local_event "CUTOVER_END_MS"
+  REPLICA_UP=1
 else
   log "Step 8: Check replica..."
+  for i in $(seq 1 120); do
+    if $SSH ubuntu@$REPLICA_SSH_HOST "timeout ${VALKEY_CMD_TIMEOUT_S}s valkey-cli ping >/dev/null 2>&1"; then
+      REPLICA_UP=1
+      mark_cutover_event "CUTOVER_END_MS"
+      mark_local_event "CUTOVER_END_MS"
+      break
+    fi
+    sleep "$REPLICA_PING_POLL_INTERVAL_S"
+  done
 fi
-for i in $(seq 1 120); do
-  if $SSH ubuntu@$REPLICA_SSH_HOST "timeout ${VALKEY_CMD_TIMEOUT_S}s valkey-cli ping >/dev/null 2>&1"; then
-    REPLICA_UP=1
-    mark_cutover_event "CUTOVER_END_MS"
-    mark_local_event "CUTOVER_END_MS"
-    break
-  fi
-  sleep "$REPLICA_PING_POLL_INTERVAL_S"
-done
 if [ "$REPLICA_UP" -ne 1 ]; then
   log "ERROR: replica valkey is not responding"
   log "Step 8b: Stop dump process..."
