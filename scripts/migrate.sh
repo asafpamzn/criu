@@ -288,6 +288,10 @@ start_source_ping_monitor
 #   3. Disable lazyfree, saves, and set repl-backlog-size to max
 #   4. CLIENT PAUSE ALL — freeze remaining client processing
 #   5. DEBUG SLEEP — put main thread in a clean usleep() syscall
+# Stop the source ping monitor — its connections would be captured in the
+# dump and cause stale client state after restore with --tcp-close.
+stop_source_ping_monitor
+
 # Kill benchmark processes. Use bracket trick to prevent self-match.
 sudo pkill -9 -f "[b]ench_loop" 2>/dev/null || true
 sudo pkill -9 -f "[v]alkey-benchmark" 2>/dev/null || true
@@ -327,19 +331,23 @@ CONFIG SET lazyfree-lazy-user-flush no
 CONFIG SET save ""
 CONFIG SET repl-backlog-size 9223372036854775807
 CONFIG SET repl-backlog-ttl 1
-CONFIG SET maxclients 1
 EOF
 
 # Wait for the event loop to process all pending frees and settle.
 # With maxclients=0, no new connections are accepted.
 # After this sleep, the main thread should be in epoll_wait with 0 events.
-log "  Waiting for event loop to settle (5s)..."
-sleep 5
-
-# Verify zero clients
+log "  Waiting for main thread to reach epoll_wait..."
 PID=$(pgrep -x valkey-server)
-NCLIENTS=$(sudo cat /proc/$PID/net/tcp 2>/dev/null | grep -c ":18EB .* 01 " || echo "?")
-log "  Established TCP connections on port 6379: $NCLIENTS"
+for attempt in $(seq 1 200); do
+  SYSCALL=$(sudo cat /proc/$PID/syscall 2>/dev/null | awk '{print $1}')
+  # ARM64: epoll_pwait=22, nanosleep=101, ppoll=73, clock_nanosleep=115
+  if [ "$SYSCALL" = "22" ] || [ "$SYSCALL" = "73" ]; then
+    log "  Main thread in epoll_wait (syscall=$SYSCALL) after ${attempt} checks"
+    break
+  fi
+  sleep 0.01
+done
+sleep 0.1  # Brief extra margin
 
 # Run dump - cow-dump keeps running, we'll kill it after restore.
 # Optional syscall profiling can be enabled via CRIU_DUMP_STRACE_OUT.
