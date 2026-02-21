@@ -2552,6 +2552,31 @@ static int cow_converge_dirty_pages(struct active_image *img,
 	}
 
 	/*
+	 * Unpause writes before the final freeze so the dump captures
+	 * an unpaused state.  The restored replica would otherwise come
+	 * up with writes blocked, unable to respond to clients.
+	 */
+	if (writes_paused) {
+		struct sockaddr_in uaddr = {
+			.sin_family = AF_INET,
+			.sin_port = htons(6379),
+			.sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+		};
+		char ucmd[] = "*2\r\n$6\r\nCLIENT\r\n$7\r\nUNPAUSE\r\n";
+		char ureply[64];
+		int usk = socket(AF_INET, SOCK_STREAM, 0);
+
+		if (usk >= 0 && connect(usk, (struct sockaddr *)&uaddr,
+					sizeof(uaddr)) == 0) {
+			send(usk, ucmd, sizeof(ucmd) - 1, 0);
+			recv(usk, ureply, sizeof(ureply), 0);
+			pr_err("COW converge: CLIENT UNPAUSE -> %.5s\n", ureply);
+		}
+		if (usk >= 0)
+			close(usk);
+	}
+
+	/*
 	 * Final freeze: if convergence didn't fully converge (active
 	 * writes keep dirtying pages), briefly SIGSTOP the source to
 	 * guarantee one clean scan with zero new writes.
