@@ -2747,13 +2747,23 @@ static void *unified_page_server_thread(void *arg)
 					all_vmas[vi++] = lve;
 				}
 
-				/* Accept additional connections */
+				/* Accept additional connections with timeout */
 				memset(workers, 0, sizeof(workers));
 				workers[0].sk = img->main_sk;
 				for (s = 1; s < nr_streams; s++) {
 					struct sockaddr_storage ca;
 					socklen_t cl = sizeof(ca);
+					struct pollfd pfd = {
+						.fd = g_listen_sk,
+						.events = POLLIN,
+					};
 
+					if (poll(&pfd, 1, 5000) <= 0) {
+						pr_warn("Stream %d: no connection within 5s, using %d streams\n",
+							s, s);
+						nr_streams = s;
+						break;
+					}
 					workers[s].sk = accept(g_listen_sk,
 							       (struct sockaddr *)&ca, &cl);
 					if (workers[s].sk < 0) {
@@ -3826,10 +3836,16 @@ int connect_to_page_server_to_recv(int epfd)
 	/* Multi-TCP: additional connections for COW bulk mode */
 	if (opts.cow_dump && COW_TRANSFER_STREAMS > 1) {
 		for (i = 1; i < COW_TRANSFER_STREAMS; i++) {
-			int sk = setup_tcp_client(opts.addr);
+			int sk = -1, retry;
 
+			for (retry = 0; retry < 10 && sk < 0; retry++) {
+				sk = setup_tcp_client(opts.addr);
+				if (sk < 0)
+					usleep(100000); /* 100ms */
+			}
 			if (sk < 0) {
-				pr_warn("Multi-TCP: stream %d connect failed\n", i);
+				pr_warn("Multi-TCP: stream %d connect failed after %d retries\n",
+					i, retry);
 				break;
 			}
 			bulk_streams[i].sk = sk;

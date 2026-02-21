@@ -1239,7 +1239,7 @@ int setup_tcp_server(char *type, char *addr, unsigned short *port)
 		goto out;
 	}
 
-	if (listen(sk, 1)) {
+	if (listen(sk, 8)) {
 		pr_perror("Can't listen on %s server socket", type);
 		goto out;
 	}
