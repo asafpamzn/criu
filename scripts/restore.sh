@@ -270,19 +270,11 @@ if [ "$FAST_CUTOVER" = "1" ]; then
   fi
   mark_phase_event "REPLICA_LAZY_PAGES_DONE"
 
-  # Fix stale syscall return value.  With the pre-dump quiesce (zero
-  # clients, maxclients=0, 5s settle), the process is in epoll_wait.
-  # Set X0=-EINTR so the libc wrapper retries the syscall cleanly.
-  echo "Step 8b: Fixing stale syscall return (X0 -> -EINTR)..."
-  sudo gdb -batch-silent \
-    -ex "set \$x0 = -4" \
-    -ex "detach" \
-    -p "$VALKEY_PID" 2>/dev/null || echo "  WARNING: gdb fixup failed"
-  echo "  Applied"
-
-  # TCP cutover: start nc listener FIRST so it's ready when
-  # migrate.sh connects, then write the STAGED marker to signal
-  # that the listener is up.
+  # Start nc listener FIRST, then write STAGED marker.  The GDB X0
+  # fix is deferred until AFTER we receive "GO" — at that point all
+  # pages have been transferred and it's safe to ptrace the process.
+  # Running GDB earlier causes crashes because ptrace interferes with
+  # the kernel's userfaultfd page delivery during bulk transfer.
   echo "Step 9: Starting cutover listener on port $CUTOVER_PORT..."
   (timeout 600 nc -l -p "$CUTOVER_PORT" 2>/dev/null || true) > /tmp/cutover_msg &
   CUTOVER_LISTEN_PID=$!
@@ -298,10 +290,20 @@ if [ "$FAST_CUTOVER" = "1" ]; then
   CUTOVER_MSG=$(cat /tmp/cutover_msg 2>/dev/null || true)
   rm -f /tmp/cutover_msg
   if [ "$CUTOVER_MSG" = "GO" ]; then
-    echo "  Cutover signal received, sending SIGCONT"
+    echo "  Cutover signal received"
   else
-    echo "  WARN: cutover msg='$CUTOVER_MSG', sending SIGCONT anyway"
+    echo "  WARN: cutover msg='$CUTOVER_MSG', proceeding anyway"
   fi
+
+  # Wait for UFFDIO_COPY to drain before ptrace (avoids crash)
+  sleep 2
+  # NOW apply the X0=-EINTR fix — all pages transferred, safe to ptrace
+  echo "Step 9d: Fixing stale syscall return (X0 -> -EINTR)..."
+  sudo gdb -batch-silent \
+    -ex "set \$x0 = -4" \
+    -ex "detach" \
+    -p "$VALKEY_PID" 2>/dev/null || echo "  WARNING: gdb fixup failed"
+  echo "  Applied, sending SIGCONT"
   sudo kill -CONT "$VALKEY_PID" 2>/dev/null || true
 
   echo "Step 10: Waiting for Valkey to be responsive after SIGCONT..."

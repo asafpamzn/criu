@@ -2140,13 +2140,24 @@ static int process_vma_pages_sk(struct active_image *img,
 	struct iovec *local_iovs;
 	int batch_alloc_ok = 0;
 
+	/*
+	 * Send batch buffer: accumulate compressed pages and flush
+	 * with a single send() to reduce syscall overhead.
+	 * Max size: 256 pages × (28-byte header + 4-byte size + 4KB worst-case)
+	 */
+	char *send_batch = NULL;
+	int send_batch_len = 0;
+	int send_batch_cap = PAGE_BATCH_SIZE * (sizeof(struct page_server_iov) +
+						sizeof(int) + LZ4_compressBound(PAGE_SIZE));
+
 	pr_info("Processing VMA: %lx-%lx len=%lu wp_async=%d\n",
 		lve->start, lve->end, lve->end - lve->start,
 		cow_is_wp_async());
 
 	batch_buf = xmalloc(PAGE_BATCH_SIZE * PAGE_SIZE);
 	local_iovs = xmalloc(PAGE_BATCH_SIZE * sizeof(struct iovec));
-	if (batch_buf && local_iovs)
+	send_batch = xmalloc(send_batch_cap);
+	if (batch_buf && local_iovs && send_batch)
 		batch_alloc_ok = 1;
 
 	for (vaddr = lve->start; vaddr < lve->end; ) {
@@ -2230,12 +2241,17 @@ skip_requests:
 			}
 		}
 
-		/* Send each page from the batch buffer */
+		/* Compress pages into send batch, then flush once */
+		send_batch_len = 0;
 		for (i = 0; i < batch_pages; i++) {
 			unsigned long paddr = batch_start + i * PAGE_SIZE;
 			const void *data;
 			struct cow_page *cow_pg = NULL;
 			pthread_spinlock_t *lock = NULL;
+			struct page_server_iov *pi;
+			int *compressed_size;
+			char *compressed_data;
+			int clen;
 
 			/* Skip if already sent */
 			if (lve->sent_bitmap[page_idx / 8] &
@@ -2246,11 +2262,6 @@ skip_requests:
 				continue;
 			}
 
-			/*
-			 * Sync mode: check COW hash for dump-time
-			 * snapshot captured by the monitor thread.
-			 * WP_ASYNC: no hash, use readv data directly.
-			 */
 			if (!cow_is_wp_async()) {
 				lock = cow_get_hash_lock(paddr);
 				if (lock)
@@ -2263,12 +2274,28 @@ skip_requests:
 			data = cow_pg ? cow_pg->data :
 				batch_buf + i * PAGE_SIZE;
 
-			if (send_page_compressed(sk, data,
-						 img->dst_id, paddr)) {
-				pr_err("Failed to send page at %lx\n",
-				       paddr);
+			/* Compress directly into send_batch */
+			pi = (struct page_server_iov *)(send_batch + send_batch_len);
+			compressed_size = (int *)(send_batch + send_batch_len + sizeof(*pi));
+			compressed_data = send_batch + send_batch_len + sizeof(*pi) + sizeof(int);
+
+			clen = LZ4_compress_default(data, compressed_data,
+						    PAGE_SIZE, LZ4_compressBound(PAGE_SIZE));
+			if (clen <= 0) {
+				pr_err("LZ4 failed at %lx\n", paddr);
 				goto err;
 			}
+
+			*compressed_size = clen;
+			pi->cmd = encode_ps_cmd(PS_IOV_ADD_F_COMPRESS, PE_PRESENT);
+			pi->nr_pages = 1;
+			pi->vaddr = paddr;
+			pi->dst_id = img->dst_id;
+
+			send_batch_len += sizeof(*pi) + sizeof(int) + clen;
+
+			g_compress_uncompressed_bytes += PAGE_SIZE;
+			g_compress_compressed_bytes += clen;
 
 			lve->sent_bitmap[page_idx / 8] |=
 				(1 << (page_idx % 8));
@@ -2286,6 +2313,16 @@ skip_requests:
 
 			vaddr += PAGE_SIZE;
 			page_idx++;
+		}
+
+		/* Flush entire batch in one send() */
+		if (send_batch_len > 0) {
+			int ret = __send(sk, send_batch, send_batch_len, 0);
+			if (ret != send_batch_len) {
+				pr_perror("Batch send failed (%d/%d)",
+					  ret, send_batch_len);
+				goto err;
+			}
 		}
 
 		/*
@@ -2312,11 +2349,13 @@ skip_requests:
 
 	xfree(batch_buf);
 	xfree(local_iovs);
+	xfree(send_batch);
 	return 0;
 
 err:
 	xfree(batch_buf);
 	xfree(local_iovs);
+	xfree(send_batch);
 	return -1;
 }
 
@@ -3306,6 +3345,12 @@ no_server:
 	if (ret != 0)
 		return ret > 0 ? 0 : -1;
 
+	/* Enlarge socket buffers for throughput */
+	if (ask >= 0) {
+		int bufsize = 4 * 1024 * 1024;
+		setsockopt(ask, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
+	}
+
 	if (tls_x509_init(ask, true)) {
 		close_safe(&sk);
 		return -1;
@@ -3334,6 +3379,12 @@ static int connect_to_page_server(void)
 	page_server_sk = setup_tcp_client(opts.addr);
 	if (page_server_sk == -1)
 		return -1;
+
+	/* Enlarge receive buffer for throughput */
+	{
+		int bufsize = 4 * 1024 * 1024;
+		setsockopt(page_server_sk, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
+	}
 
 	if (tls_x509_init(page_server_sk, false)) {
 		close(page_server_sk);
