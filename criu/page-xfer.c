@@ -2356,6 +2356,48 @@ static int final_queue_drain(struct active_image *img, pid_t source_pid,
 }
 
 /*
+ * Send a raw RESP command to the local Valkey server to pause
+ * or unpause client writes.  Used during convergence to stop
+ * the write storm so dirty pages drop to zero.
+ */
+static int valkey_client_pause_write(int port, int timeout_ms)
+{
+	struct sockaddr_in addr = {
+		.sin_family = AF_INET,
+		.sin_port = htons(port),
+		.sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+	};
+	char cmd[128], reply[64];
+	int sk, n;
+
+	sk = socket(AF_INET, SOCK_STREAM, 0);
+	if (sk < 0)
+		return -1;
+
+	if (connect(sk, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+		close(sk);
+		return -1;
+	}
+
+	{
+		char ms_str[16];
+		int ms_len = snprintf(ms_str, sizeof(ms_str), "%d", timeout_ms);
+
+		n = snprintf(cmd, sizeof(cmd),
+			"*4\r\n$6\r\nCLIENT\r\n$5\r\nPAUSE\r\n"
+			"$%d\r\n%s\r\n$5\r\nWRITE\r\n",
+			ms_len, ms_str);
+	}
+	send(sk, cmd, n, 0);
+	recv(sk, reply, sizeof(reply), 0);
+	close(sk);
+
+	pr_err("COW converge: CLIENT PAUSE WRITE %dms -> %.5s\n",
+	       timeout_ms, reply);
+	return 0;
+}
+
+/*
  * WP_ASYNC convergence: after the initial linear transfer, scan for
  * pages dirtied by the source process and re-send them.  Each scan
  * atomically re-arms WP, so writes after the scan are tracked for
@@ -2365,6 +2407,7 @@ static int final_queue_drain(struct active_image *img, pid_t source_pid,
 #define CONVERGE_MAX_REGIONS	4096
 #define CONVERGE_MAX_ITERS	20
 #define CONVERGE_THRESHOLD_ABS	64
+#define CONVERGE_PLATEAU_ITERS	3  /* iterations with < 10% improvement */
 
 struct converge_region {
 	u64 start;
@@ -2379,6 +2422,9 @@ static int cow_converge_dirty_pages(struct active_image *img,
 	char *batch_buf;
 	struct iovec *local_iovs;
 	unsigned long iteration;
+	unsigned long prev_dirty = 0;
+	int plateau_count = 0;
+	int writes_paused = 0;
 
 	if (!cow_is_wp_async())
 		return 0;
@@ -2483,6 +2529,26 @@ static int cow_converge_dirty_pages(struct active_image *img,
 
 		if (total_dirty <= CONVERGE_THRESHOLD_ABS)
 			break;
+
+		/*
+		 * Plateau detection: if dirty count isn't dropping
+		 * (< 10% improvement for CONVERGE_PLATEAU_ITERS
+		 * consecutive iterations), pause client writes so
+		 * the next iteration converges to zero.
+		 */
+		if (!writes_paused && prev_dirty > 0) {
+			if (total_dirty > prev_dirty * 9 / 10)
+				plateau_count++;
+			else
+				plateau_count = 0;
+
+			if (plateau_count >= CONVERGE_PLATEAU_ITERS) {
+				pr_err("COW converge: plateau detected, pausing writes\n");
+				valkey_client_pause_write(6379, 300000);
+				writes_paused = 1;
+			}
+		}
+		prev_dirty = total_dirty;
 	}
 
 	/*
