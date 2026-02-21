@@ -2190,6 +2190,23 @@ int cr_lazy_pages(bool daemon)
 		}
 	}
 
+	/* Debug: write to images dir which we know is writable */
+	if (opts.imgs_dir) {
+		char _p[PATH_MAX];
+		int _fd;
+
+		snprintf(_p, sizeof(_p), "%s/uffd_early_debug", opts.imgs_dir);
+		_fd = open(_p, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+		if (_fd >= 0) {
+			char _m[128];
+			int _n = snprintf(_m, sizeof(_m),
+				"pid=%d use_ps=%d cow=%d\n",
+				getpid(), opts.use_page_server, opts.cow_dump);
+			if (write(_fd, _m, _n) < 0) { /* ignore */ }
+			close(_fd);
+		}
+	}
+
 	if (status_ready())
 		return -1;
 

@@ -19,7 +19,10 @@ source "$SCRIPT_DIR/.env"
 # --- Configuration defaults (all overridable via environment) ----------------
 FAST_CUTOVER=${FAST_CUTOVER:-0}
 DEFAULT_CRIU_BIN="$SCRIPT_DIR/../criu/criu"
-if [ -x "$DEFAULT_CRIU_BIN" ]; then
+# Prefer /usr/local/sbin/criu to avoid stale FSx cache on replica
+if [ -x "/usr/local/sbin/criu" ]; then
+	CRIU_BIN=${CRIU_BIN:-/usr/local/sbin/criu}
+elif [ -x "$DEFAULT_CRIU_BIN" ]; then
 	CRIU_BIN=${CRIU_BIN:-$DEFAULT_CRIU_BIN}
 else
 	CRIU_BIN=${CRIU_BIN:-criu}

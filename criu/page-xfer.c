@@ -2315,13 +2315,19 @@ skip_requests:
 			page_idx++;
 		}
 
-		/* Flush entire batch in one send() */
+		/* Flush entire batch — loop for partial writes */
 		if (send_batch_len > 0) {
-			int ret = __send(sk, send_batch, send_batch_len, 0);
-			if (ret != send_batch_len) {
-				pr_perror("Batch send failed (%d/%d)",
-					  ret, send_batch_len);
-				goto err;
+			int sent = 0;
+
+			while (sent < send_batch_len) {
+				int ret = __send(sk, send_batch + sent,
+						send_batch_len - sent, 0);
+				if (ret <= 0) {
+					pr_perror("Batch send failed (%d/%d)",
+						  sent, send_batch_len);
+					goto err;
+				}
+				sent += ret;
 			}
 		}
 
@@ -3917,7 +3923,7 @@ int connect_to_page_server_to_recv(int epfd)
 			for (retry = 0; retry < 10 && sk < 0; retry++) {
 				sk = setup_tcp_client(opts.addr);
 				if (sk < 0)
-					usleep(100000); /* 100ms */
+					usleep(100000);
 			}
 			if (sk < 0) {
 				pr_warn("Multi-TCP: stream %d connect failed after %d retries\n",
