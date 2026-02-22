@@ -75,15 +75,6 @@ extern int cow_start_monitor_thread(void);
 extern int cow_stop_monitor_thread(void);
 
 /**
- * cow_get_uffd - Get the userfaultfd file descriptor
- *
- * Returns the userfaultfd associated with the current COW dump session.
- *
- * Returns: userfaultfd on success, -1 if COW dump not initialized
- */
-extern int cow_get_uffd(void);
-
-/**
  * cow_get_uffd_for_pid - Get the userfaultfd for a tracked source pid
  * @source_pid: Source process pid from dump-time tree
  *

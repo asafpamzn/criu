@@ -1794,8 +1794,9 @@ static int send_cow_page_lazy(struct cow_page_queue_entry *entry, struct active_
 	cow_timing.send_page_count++;
 
 	if (ret < 0) {
-		pr_err("Failed to send COW page 0x%lx\n", entry->vaddr);
-		return -1;
+		pr_warn("Failed to send COW page 0x%lx, re-queueing for retry\n", entry->vaddr);
+		cow_put_back_page(entry);
+		return -2;  /* Special: entry put back for retry, caller must NOT free it */
 	}
 
 	/* Mark as sent (atomic to prevent lost updates from concurrent P1/P2/P3) */
@@ -1967,12 +1968,21 @@ static int drain_cow_pages(struct active_image *img, pid_t source_pid,
 			break;
 
 		ret = send_cow_page_lazy(entry, img, source_pid);
+
+		/* Check return code BEFORE freeing entry */
+		if (ret == -2) {
+			/* Entry was put back for retry, don't free it */
+			max_pages--;
+			continue;
+		}
+
+		/* Free entry for all other cases (success, skip, or fatal error) */
 		if (entry->data)	/* M2: free page data */
 			xfree(entry->data);
 		xfree(entry);
 
 		if (ret < 0) {
-			pr_err("Failed to send COW page\n");
+			pr_err("Failed to send COW page (fatal error)\n");
 			return -1;
 		}
 

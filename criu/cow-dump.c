@@ -1003,13 +1003,15 @@ static int cow_handle_write_fault(struct cow_dump_info *cdi,
 				attempts + 1, page_addr);
 		}
 		if (attempts == 3) {
-			pr_err("Failed to allocate SPSC node for page 0x%lx "
-			       "after retries, clearing bitmap for P3 fallback\n",
+			pr_err("FATAL: Failed to enqueue COW page 0x%lx after retries\n",
 			       page_addr);
+			pr_err("  Snapshot data will be lost - cannot continue migration\n");
 			xfree(entry->data);
 			xfree(entry);
-			cow_clear_bitmap(page_addr);
-			return 0;
+			/* Do NOT clear bitmap - P3 cannot read correct data from live memory
+			 * because the page was already modified. Keep bitmap set so we know
+			 * this page is tracked but lost. Migration will hang with remaining_pages > 0. */
+			return -1;  /* Fail immediately to prevent corruption */
 		}
 	}
 
@@ -1299,26 +1301,6 @@ int cow_stop_monitor_thread(void)
 	
 	pr_info("COW monitor thread stopped successfully\n");
 	return 0;
-}
-
-int cow_get_uffd(void)
-{
-	struct cow_tracked_task *task;
-	int uffd;
-
-	if (!g_cow_info)
-		return -1;
-
-	pthread_mutex_lock(&g_tracked_tasks_lock);
-	if (list_empty(&g_cow_info->tracked_tasks)) {
-		pthread_mutex_unlock(&g_tracked_tasks_lock);
-		return -1;
-	}
-	task = list_first_entry(&g_cow_info->tracked_tasks, struct cow_tracked_task, list);
-	uffd = task->uffd;
-	pthread_mutex_unlock(&g_tracked_tasks_lock);
-
-	return uffd;
 }
 
 int cow_get_uffd_for_pid(pid_t source_pid)
