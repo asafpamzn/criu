@@ -1647,13 +1647,9 @@ static struct {
 	unsigned long queue_dequeue_total_ns;
 	unsigned long queue_dequeue_count;
 	/* Sub-timing within send_lazy_vma_page (nanoseconds) */
-	unsigned long send_lock_ns;
-	unsigned long send_cow_lookup_ns;
 	unsigned long send_vm_readv_ns;
 	unsigned long send_compress_ns;
-	unsigned long send_socket_ns;
 	unsigned long send_unprotect_ns;
-	unsigned long send_unlock_ns;
 	unsigned long send_sub_count;
 } cow_timing;
 
@@ -1911,12 +1907,10 @@ static void print_thread_stats(struct unified_thread_stats *stats)
 		cow_timing.send_page_total_ns, cow_timing.send_page_count);
 
 	if (cow_timing.send_sub_count > 0) {
-		pr_debug("[SEND_BREAKDOWN] lock=%lu readv=%lu compress+send=%lu unprot=%lu unlock=%lu ns (avg per %lu ops)\n",
-			cow_timing.send_lock_ns / cow_timing.send_sub_count,
+		pr_debug("[SEND_BREAKDOWN] readv=%lu compress+send=%lu unprot=%lu ns (avg per %lu ops)\n",
 			cow_timing.send_vm_readv_ns / cow_timing.send_sub_count,
 			cow_timing.send_compress_ns / cow_timing.send_sub_count,
 			cow_timing.send_unprotect_ns / cow_timing.send_sub_count,
-			cow_timing.send_unlock_ns / cow_timing.send_sub_count,
 			cow_timing.send_sub_count);
 	}
 

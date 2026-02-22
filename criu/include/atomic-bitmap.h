@@ -7,9 +7,17 @@
 /*
  * Inline helpers for per-page bitmaps (1 bit per page).
  *
- * Two flavours:
- *   atomic_bitmap_{set,test,clear}  – use gcc atomics, safe across threads
- *   bitmap_test_nonatomic           – plain read, for single-thread contexts
+ * Memory ordering and thread safety:
+ *   atomic_bitmap_set/clear    – RMW with RELEASE ordering, safe for concurrent writers
+ *   atomic_bitmap_test         – Load with ACQUIRE ordering, safe for concurrent readers
+ *   bitmap_test_nonatomic      – Plain read, safe when:
+ *                                 (a) Single-threaded reader of single-threaded writer, OR
+ *                                 (b) Single-threaded reader with atomic writers (sent_bitmap pattern)
+ *                                     where false negatives are acceptable (idempotent sentinel bits)
+ *
+ * Typical usage:
+ *   cow_bitmap:   Thread 1 sets atomically, Thread 3 tests atomically (full sync)
+ *   sent_bitmap:  Thread 3 sets atomically, Thread 3 tests non-atomically (same thread)
  *
  * All functions take a byte-array bitmap and a zero-based page index.
  */
@@ -39,8 +47,8 @@ static inline void atomic_bitmap_clear(uint8_t *bitmap, unsigned long page_idx)
 }
 
 /*
- * Non-atomic test for single-threaded contexts (e.g. the sent_bitmap
- * is only tested by the same Thread 3 that sets it).
+ * Non-atomic test - plain memory load without ordering guarantees.
+ * Safe for single-threaded reader contexts where false negatives are acceptable.
  */
 static inline bool bitmap_test_nonatomic(const unsigned char *bitmap,
 					 unsigned long page_idx)

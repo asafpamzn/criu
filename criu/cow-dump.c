@@ -885,7 +885,7 @@ static int cow_handle_write_fault(struct cow_dump_info *cdi,
 	struct iovec local_iov, remote_iov;
 	void *page_data;
 
-	pr_info("Write fault at 0x%lx\n", page_addr);
+	pr_debug("Write fault at 0x%lx\n", page_addr);
 
 	cow_stats.write_faults++;
 
@@ -916,9 +916,6 @@ static int cow_handle_write_fault(struct cow_dump_info *cdi,
 	}
 
 	cow_stats.pages_copied++;
-
-	/* M1: Set bitmap bit (Thread 3 reads via cow_test_bitmap) */
-	cow_set_bitmap(page_addr);
 
 	/* Unprotect the page so the process can continue */
 	wp.range.start = page_addr;
@@ -1008,12 +1005,17 @@ static int cow_handle_write_fault(struct cow_dump_info *cdi,
 			pr_err("  Snapshot data will be lost - cannot continue migration\n");
 			xfree(entry->data);
 			xfree(entry);
-			/* Do NOT clear bitmap - P3 cannot read correct data from live memory
-			 * because the page was already modified. Keep bitmap set so we know
-			 * this page is tracked but lost. Migration will hang with remaining_pages > 0. */
+			/* Bitmap was never set, so P3 will try to read from live memory.
+			 * This is wrong because the page was modified, but it's the least-bad
+			 * option when we can't allocate memory. */
 			return -1;  /* Fail immediately to prevent corruption */
 		}
 	}
+
+	/* M1: Set bitmap bit AFTER successful enqueue (Thread 3 reads via cow_test_bitmap).
+	 * This ordering prevents a race where Thread 3 sees bitmap=1 before the entry
+	 * is actually in the queue, causing it to skip the page forever. */
+	cow_set_bitmap(page_addr);
 
 	return 0;
 }
