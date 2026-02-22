@@ -730,7 +730,6 @@ int cow_dump_init(struct pstree_item *item, struct vm_area_list *vma_area_list, 
 		item->pid->real, task->nr_tracked_vmas,
 		task->total_pages, task->uffd);
 
-	xfree(failed_map);
 	return 0;
 
 err:
