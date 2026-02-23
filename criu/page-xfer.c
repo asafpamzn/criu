@@ -1550,12 +1550,15 @@ struct active_image {
 
 static LIST_HEAD(active_images_queue);
 static pthread_spinlock_t active_images_lock;
-static bool active_images_lock_initialized = false;
+static pthread_once_t active_images_lock_once = PTHREAD_ONCE_INIT;
 
 /* Single global background thread */
 static pthread_t g_unified_thread;
-static volatile bool g_unified_thread_running = false;
-static volatile bool g_unified_thread_stop = false;
+static _Atomic bool g_unified_thread_running = false;
+static _Atomic bool g_unified_thread_stop = false;
+
+/* Forward declaration */
+static void cleanup_active_images_queue(void);
 
 void wait_for_page_server_thread(void)
 {
@@ -1565,17 +1568,45 @@ void wait_for_page_server_thread(void)
 	pthread_join(g_unified_thread, NULL);
 	g_unified_thread_running = false;
 	pr_info("Page server thread finished\n");
+
+	/* Clean up any remaining active images to prevent memory leak */
+	cleanup_active_images_queue();
 }
 
 /* Active image tracking for unified background thread */
 
 
+static void init_active_images_lock_once(void)
+{
+	pthread_spin_init(&active_images_lock, PTHREAD_PROCESS_PRIVATE);
+}
+
 static void init_active_images_queue(void)
 {
-	if (!active_images_lock_initialized) {
-		pthread_spin_init(&active_images_lock, PTHREAD_PROCESS_PRIVATE);
-		active_images_lock_initialized = true;
+	pthread_once(&active_images_lock_once, init_active_images_lock_once);
+}
+
+static void cleanup_active_images_queue(void)
+{
+	struct active_image *img, *tmp;
+
+	/* If list is empty, nothing to free and lock may not be initialized */
+	if (list_empty(&active_images_queue))
+		return;
+
+	/* Init ensures lock is ready (pthread_once guarantees single init) */
+	init_active_images_queue();
+
+	pthread_spin_lock(&active_images_lock);
+	list_for_each_entry_safe(img, tmp, &active_images_queue, list) {
+		list_del(&img->list);
+		if (img->main_sk >= 0)
+			close(img->main_sk);
+		xfree(img);
 	}
+	pthread_spin_unlock(&active_images_lock);
+
+	pthread_spin_destroy(&active_images_lock);
 }
 
 static struct active_image *find_active_image(u64 dst_id)
@@ -1981,7 +2012,7 @@ static int drain_cow_pages(struct active_image *img, pid_t source_pid,
 		}
 
 		if (ret > 0) {
-			img->total_cow_pages++;
+			__atomic_fetch_add(&img->total_cow_pages, 1, __ATOMIC_RELAXED);
 			__atomic_fetch_sub(&img->remaining_pages, 1, __ATOMIC_ACQ_REL);
 			stats->priority1_pages++;
 			sent++;
@@ -2011,7 +2042,7 @@ static int drain_page_requests(struct active_image *img, pid_t source_pid,
 		ret = send_request_page_lazy(req, img, source_pid);
 
 		if (ret > 0) {
-			img->total_req_pages += ret;
+			__atomic_fetch_add(&img->total_req_pages, ret, __ATOMIC_RELAXED);
 			__atomic_fetch_sub(&img->remaining_pages, ret, __ATOMIC_ACQ_REL);
 			stats->priority2_pages += ret;
 			sent += ret;

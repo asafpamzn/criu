@@ -268,8 +268,8 @@ out:
 
 static struct cow_dump_info *g_cow_info = NULL;
 static pthread_t g_monitor_thread;
-static volatile bool g_monitor_thread_running = false;
-static volatile bool g_stop_monitoring = false;
+static _Atomic bool g_monitor_thread_running = false;
+static _Atomic bool g_stop_monitoring = false;
 static pthread_mutex_t g_monitor_state_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_tracked_tasks_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_monitor_eventfd = -1;
@@ -717,7 +717,7 @@ int cow_dump_init(struct pstree_item *item, struct vm_area_list *vma_area_list, 
 	g_tracked_tasks_generation++;
 	want_generation = g_tracked_tasks_generation;
 	pthread_mutex_unlock(&g_tracked_tasks_lock);
-	cdi->total_pages += task->total_pages;
+	__atomic_fetch_add(&cdi->total_pages, task->total_pages, __ATOMIC_RELAXED);
 
 	if (cow_monitor_is_running()) {
 		cow_monitor_wakeup();
@@ -827,6 +827,10 @@ void cow_dump_fini(void)
 		return;
 	}
 
+	/* Wait for unified page server thread to stop before cleaning up
+	 * g_putback_list to avoid use-after-free (Thread 3 accesses it) */
+	wait_for_page_server_thread();
+
 	pr_info("Cleaning up COW dump\n");
 
 	/* M1: Free bitmap */
@@ -842,7 +846,7 @@ void cow_dump_fini(void)
 	g_monitor_snapshot_generation = 0;
 	pthread_mutex_unlock(&g_tracked_tasks_lock);
 
-	/* M5: Drain consumer-side putback list */
+	/* M5: Drain consumer-side putback list (safe now - Thread 3 stopped) */
 	while (g_putback_list) {
 		qe = g_putback_list;
 		g_putback_list = qe->next;
@@ -1185,7 +1189,7 @@ static void *cow_monitor_thread(void *arg)
 	pthread_setname_np(pthread_self(), "criu-cow-mon");
 	pr_info("COW monitor thread started\n");
 
-	while (!g_stop_monitoring) {
+	while (!__atomic_load_n(&g_stop_monitoring, __ATOMIC_ACQUIRE)) {
 		int ret;
 
 		ret = cow_wait_for_events(cdi, 500);
@@ -1281,9 +1285,9 @@ int cow_stop_monitor_thread(void)
 		pthread_mutex_unlock(&g_monitor_state_lock);
 		return 0;
 	}
-	
+
 	pr_info("Stopping COW monitor thread\n");
-	g_stop_monitoring = true;
+	__atomic_store_n(&g_stop_monitoring, true, __ATOMIC_RELEASE);
 	monitor_thread = g_monitor_thread;
 	pthread_mutex_unlock(&g_monitor_state_lock);
 

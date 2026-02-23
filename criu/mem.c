@@ -43,14 +43,16 @@
 /* Global lazy VMA list for COW dump */
 static LIST_HEAD(global_lazy_vmas);
 static pthread_spinlock_t lazy_vmas_lock;
-static bool lazy_vmas_lock_initialized = false;
+static pthread_once_t lazy_vmas_lock_once = PTHREAD_ONCE_INIT;
+
+static void init_lazy_vmas_lock_once(void)
+{
+	pthread_spin_init(&lazy_vmas_lock, PTHREAD_PROCESS_PRIVATE);
+}
 
 static void init_global_lazy_vmas(void)
 {
-	if (!lazy_vmas_lock_initialized) {
-		pthread_spin_init(&lazy_vmas_lock, PTHREAD_PROCESS_PRIVATE);
-		lazy_vmas_lock_initialized = true;
-	}
+	pthread_once(&lazy_vmas_lock_once, init_lazy_vmas_lock_once);
 }
 
 struct list_head *get_global_lazy_vmas(void)
@@ -62,9 +64,9 @@ struct list_head *get_global_lazy_vmas(void)
 struct lazy_vma_entry *find_lazy_vma_for_addr(unsigned long vaddr, u64 dst_id)
 {
 	struct lazy_vma_entry *lve;
-	
-	if (!lazy_vmas_lock_initialized)
-		return NULL;
+
+	/* Ensure lock is initialized (pthread_once guarantees single init) */
+	init_global_lazy_vmas();
 
 	pthread_spin_lock(&lazy_vmas_lock);
 
@@ -87,8 +89,8 @@ struct lazy_vma_entry *find_lazy_vma_by_addr(unsigned long vaddr)
 {
 	struct lazy_vma_entry *lve;
 
-	if (!lazy_vmas_lock_initialized)
-		return NULL;
+	/* Ensure lock is initialized (pthread_once guarantees single init) */
+	init_global_lazy_vmas();
 
 	pthread_spin_lock(&lazy_vmas_lock);
 
@@ -108,10 +110,10 @@ unsigned long count_lazy_vma_pages(u64 dst_id)
 {
 	struct lazy_vma_entry *lve;
 	unsigned long total_pages = 0;
-	
-	if (!lazy_vmas_lock_initialized)
-		return 0;
-	
+
+	/* Ensure lock is initialized (pthread_once guarantees single init) */
+	init_global_lazy_vmas();
+
 	pthread_spin_lock(&lazy_vmas_lock);
 	list_for_each_entry(lve, &global_lazy_vmas, list) {
 		if (lve->dst_id == dst_id)
@@ -1898,10 +1900,14 @@ int prepare_vmas(struct pstree_item *t, struct task_restore_args *ta)
 void free_global_lazy_vmas(void)
 {
 	struct lazy_vma_entry *lve, *tmp;
-	
-	if (!lazy_vmas_lock_initialized)
+
+	/* If list is empty, nothing to free and lock may not be initialized */
+	if (list_empty(&global_lazy_vmas))
 		return;
-	
+
+	/* Init ensures lock is ready (pthread_once guarantees single init) */
+	init_global_lazy_vmas();
+
 	pthread_spin_lock(&lazy_vmas_lock);
 	list_for_each_entry_safe(lve, tmp, &global_lazy_vmas, list) {
 		list_del(&lve->list);
