@@ -770,7 +770,6 @@ void cow_dump_fini(void)
 
 	pr_info("Cleaning up COW dump\n");
 
-	cow_bitmap_fini();
 
 	if (g_monitor_eventfd >= 0) {
 		close(g_monitor_eventfd);

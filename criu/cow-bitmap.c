@@ -5,14 +5,6 @@
 #include "atomic-bitmap.h"
 #include "criu-log.h"
 
-void cow_bitmap_fini(void)
-{
-	/*
-	 * cow_bitmaps now live inside lazy_vma_entry and are freed
-	 * by free_global_lazy_vmas() in mem.c.  Nothing to do here.
-	 */
-}
-
 void cow_set_bitmap(unsigned long vaddr)
 {
 	unsigned long page_addr = vaddr & ~(PAGE_SIZE - 1);

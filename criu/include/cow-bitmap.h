@@ -4,7 +4,6 @@
 #include <stdbool.h>
 
 /* COW bitmap operations for tracking write-faulted pages */
-extern void cow_bitmap_fini(void);
 extern void cow_set_bitmap(unsigned long vaddr);
 extern void cow_clear_bitmap(unsigned long vaddr);
 extern bool cow_test_bitmap(unsigned long vaddr);
