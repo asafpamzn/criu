@@ -41,6 +41,7 @@
 #include "dump.h"
 #include "mem.h"
 #include "atomic-bitmap.h"
+#include "cow-bitmap.h"
 #include "spsc-queue.h"
 
 static int page_server_sk = -1;
@@ -1463,7 +1464,7 @@ struct page_request_entry {
 	bool location_found;  /* Flag: have we looked up location yet? */
 };
 
-/* M6: SPSC queue node type for page request entries */
+/* SPSC queue node type for page request entries */
 DECLARE_SPSC_NODE(page_request, struct page_request_entry);
 
 /* SPSC queue with cache-line padding to prevent false sharing */
@@ -1488,7 +1489,7 @@ static void init_page_request_queue(void)
 	page_request_queue_initialized = true;
 }
 
-/* M6: Lock-free SPSC enqueue (Thread 2 produces page requests) */
+/* Lock-free SPSC enqueue (Thread 2 produces page requests) */
 static void add_page_request(unsigned long vaddr, unsigned long nr_pages, int sk, u64 dst_id)
 {
 	struct page_request_entry *entry;
@@ -1519,19 +1520,19 @@ static void add_page_request(unsigned long vaddr, unsigned long nr_pages, int sk
 	}
 }
 
-/* M6: Lock-free SPSC dequeue (Thread 3 consumes page requests) */
+/* Lock-free SPSC dequeue (Thread 3 consumes page requests) */
 static struct page_request_entry *get_next_page_request(void)
 {
 	return spsc_dequeue(page_request_head, page_request_queue_size);
 }
 
-/* M6: Lock-free check if queue has requests */
+/* Lock-free check if queue has requests */
 static bool has_page_requests(void)
 {
 	return spsc_peek(page_request_head);
 }
 
-/* M6: Get approximate queue size (counter may lag due to RELAXED ordering) */
+/* Get approximate queue size (counter may lag due to RELAXED ordering) */
 static unsigned long get_page_request_queue_size(void)
 {
 	return spsc_size(page_request_queue_size);
@@ -1687,10 +1688,9 @@ static struct {
 /*
  * Helper to send a non-COW lazy VMA page using process_vm_readv.
  *
- * M3: This function is now only called for pages where cow_bitmap=0,
+ * This function is now only called for pages where cow_bitmap=0,
  * meaning the source process has NOT written to this page. The live
  * memory still contains the original snapshot-consistent data.
- * Hash lookup is no longer needed here.
  */
 static int send_lazy_vma_page(int sk, unsigned long vaddr, u64 dst_id, pid_t source_pid)
 {
@@ -1705,12 +1705,6 @@ static int send_lazy_vma_page(int sk, unsigned long vaddr, u64 dst_id, pid_t sou
 
 	clock_gettime(CLOCK_MONOTONIC, &t_start);
 
-	/* M3: Sanity check — caller should have verified bitmap */
-	if (cow_test_bitmap(vaddr)) {
-		pr_err("M3 BUG: send_lazy_vma_page called for COW page 0x%lx!\n",
-		       vaddr);
-		return -1;
-	}
 
 	buffer = xmalloc(PAGE_SIZE);
 	if (!buffer)
@@ -1800,11 +1794,6 @@ static int send_cow_page_lazy(struct cow_page_queue_entry *entry, struct active_
 		return 0;
 	}
 
-	/*
-	 * M2: Send directly from entry->data instead of hash lookup.
-	 * The queue entry carries the original page content captured
-	 * by Thread 1 before the write was allowed to proceed.
-	 */
 	if (!entry->data) {
 		pr_err("COW queue entry 0x%lx has no data!\n", entry->vaddr);
 		return -1;
@@ -1826,8 +1815,8 @@ static int send_cow_page_lazy(struct cow_page_queue_entry *entry, struct active_
 		return -2;  /* Special: entry put back for retry, caller must NOT free it */
 	}
 
-	/* Mark as sent (atomic to prevent lost updates from concurrent P1/P2/P3) */
-	atomic_bitmap_set(lve->sent_bitmap, page_idx);
+	/* Mark as sent */
+	bitmap_set_nonatomic(lve->sent_bitmap, page_idx);
 
 	return 1;  /* Successfully sent */
 }
@@ -1861,7 +1850,7 @@ static int send_request_page_lazy(struct page_request_entry *req, struct active_
 		}
 
 		/*
-		 * M3: Check cow_bitmap. If the page was write-faulted,
+		 * Check cow_bitmap. If the page was write-faulted,
 		 * the original data is in the P1 queue. We cannot read
 		 * live memory because it contains post-write data.
 		 * Skip and let P1 handle it — drain_cow_pages runs
@@ -1883,12 +1872,8 @@ static int send_request_page_lazy(struct page_request_entry *req, struct active_
 		if (ret < 0)
 			return -1;
 
-		/* ret == 0 means race detected — page discarded, let P1 handle it */
-		if (ret == 0)
-			continue;
-
-		/* Mark as sent (atomic to prevent lost updates from concurrent P1/P2/P3) */
-		atomic_bitmap_set(lve->sent_bitmap, page_idx);
+		/* Mark as sent (ret == 1 means success) */
+		bitmap_set_nonatomic(lve->sent_bitmap, page_idx);
 		sent_count++;
 	}
 	
@@ -1904,12 +1889,11 @@ struct unified_thread_stats {
 	unsigned long priority3_pages;  /* Regular pages sent by P3 */
 	unsigned long skip_already_sent; /* P3 skipped: already in sent_bitmap */
 	unsigned long skip_cow_bitmap;   /* P3 skipped: marked COW, waiting for P1 */
-	unsigned long skip_cow_race;     /* P3 skipped: COW race in send_lazy_vma_page */
 };
 
 static void print_thread_stats(struct unified_thread_stats *stats)
 {
-	unsigned long cow_queue = cow_get_queue_size();
+	unsigned long cow_queue = cow_get_pages_queue_size();
 	unsigned long req_queue = get_page_request_queue_size();
 	float compress_ratio = 0.0;
 	struct timespec ts;
@@ -1922,12 +1906,11 @@ static void print_thread_stats(struct unified_thread_stats *stats)
 	clock_gettime(CLOCK_REALTIME, &ts);
 	tm = localtime(&ts.tv_sec);
 
-	pr_err("[UNIFIED_THREAD_STATS] [%02d:%02d:%02d.%03ld] P1(COW)=%lu P2(Req)=%lu P3(Reg)=%lu | Skip: sent=%lu cow=%lu race=%lu | COW_Q=%lu Req_Q=%lu | Compress: %lu->%lu (%.1f%%)\n",
+	pr_err("[UNIFIED_THREAD_STATS] [%02d:%02d:%02d.%03ld] P1(COW)=%lu P2(Req)=%lu P3(Reg)=%lu | Skip: sent=%lu cow=%lu | COW_Q=%lu Req_Q=%lu | Compress: %lu->%lu (%.1f%%)\n",
 		tm->tm_hour, tm->tm_min, tm->tm_sec, ts.tv_nsec / 1000000,
 		stats->priority1_pages, stats->priority2_pages,
 		stats->priority3_pages,
 		stats->skip_already_sent, stats->skip_cow_bitmap,
-		stats->skip_cow_race,
 		cow_queue, req_queue,
 		g_compress_uncompressed_bytes, g_compress_compressed_bytes,
 		compress_ratio);
@@ -1954,7 +1937,6 @@ static void print_thread_stats(struct unified_thread_stats *stats)
 	stats->priority3_pages = 0;
 	stats->skip_already_sent = 0;
 	stats->skip_cow_bitmap = 0;
-	stats->skip_cow_race = 0;
 }
 
 static void maybe_print_stats(struct unified_thread_stats *stats)
@@ -2002,7 +1984,7 @@ static int drain_cow_pages(struct active_image *img, pid_t source_pid,
 		}
 
 		/* Free entry for all other cases (success, skip, or fatal error) */
-		if (entry->data)	/* M2: free page data */
+		if (entry->data)
 			xfree(entry->data);
 		xfree(entry);
 
@@ -2012,8 +1994,8 @@ static int drain_cow_pages(struct active_image *img, pid_t source_pid,
 		}
 
 		if (ret > 0) {
-			__atomic_fetch_add(&img->total_cow_pages, 1, __ATOMIC_RELAXED);
-			__atomic_fetch_sub(&img->remaining_pages, 1, __ATOMIC_ACQ_REL);
+			img->total_cow_pages++;
+			img->remaining_pages--;
 			stats->priority1_pages++;
 			sent++;
 		}
@@ -2042,8 +2024,8 @@ static int drain_page_requests(struct active_image *img, pid_t source_pid,
 		ret = send_request_page_lazy(req, img, source_pid);
 
 		if (ret > 0) {
-			__atomic_fetch_add(&img->total_req_pages, ret, __ATOMIC_RELAXED);
-			__atomic_fetch_sub(&img->remaining_pages, ret, __ATOMIC_ACQ_REL);
+			img->total_req_pages += ret;
+			img->remaining_pages -= ret;
 			stats->priority2_pages += ret;
 			sent += ret;
 		}
@@ -2089,15 +2071,9 @@ static int send_single_lazy_page(struct active_image *img,
 		return -1;
 	}
 
-	/* ret == 0 means race detected — page discarded, let P1 handle it */
-	if (ret == 0) {
-		stats->skip_cow_race++;
-		return 0;
-	}
-
-	/* Mark as sent (atomic to prevent lost updates from concurrent P1/P2/P3) */
-	atomic_bitmap_set(lve->sent_bitmap, page_idx);
-	__atomic_fetch_sub(&img->remaining_pages, 1, __ATOMIC_ACQ_REL);
+	/* Mark as sent (ret == 1 means success) */
+	bitmap_set_nonatomic(lve->sent_bitmap, page_idx);
+	img->remaining_pages--;
 	stats->priority3_pages++;
 
 	return 1;

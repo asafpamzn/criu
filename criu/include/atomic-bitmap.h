@@ -56,4 +56,14 @@ static inline bool bitmap_test_nonatomic(const unsigned char *bitmap,
 	return (bitmap[page_idx / 8] & (1 << (page_idx % 8))) != 0;
 }
 
+/*
+ * Non-atomic set - plain memory store without ordering guarantees.
+ * Safe for single-threaded contexts only (no concurrent writers).
+ */
+static inline void bitmap_set_nonatomic(unsigned char *bitmap,
+					unsigned long page_idx)
+{
+	bitmap[page_idx / 8] |= (1 << (page_idx % 8));
+}
+
 #endif /* __CR_ATOMIC_BITMAP_H__ */

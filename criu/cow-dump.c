@@ -29,6 +29,7 @@
 #include "criu-log.h"
 #include "parasite.h"
 #include "atomic-bitmap.h"
+#include "cow-bitmap.h"
 #include "spsc-queue.h"
 
 #undef LOG_PREFIX
@@ -48,8 +49,14 @@ struct cow_tracked_task {
 	struct list_head list;
 };
 
-/* M5: SPSC queue node type for COW page entries */
+/* SPSC queue node type for COW page entries */
 DECLARE_SPSC_NODE(cow_page, struct cow_page_queue_entry);
+struct cow_page_queue {
+	struct cow_page_spsc_node *head;
+	char _pad[64 - sizeof(struct cow_page_spsc_node *)];
+	struct cow_page_spsc_node *tail;
+	unsigned long size;
+};
 
 /* COW dump state for one dump session */
 struct cow_dump_info {
@@ -57,14 +64,7 @@ struct cow_dump_info {
 	unsigned long total_pages;
 	unsigned long iteration;
 
-	/*
-	 * M5: Lock-free SPSC queue (Thread 1 produces, Thread 3 consumes).
-	 * head and tail are on separate cache lines to prevent false sharing.
-	 */
-	struct cow_page_spsc_node *spsc_head;	/* Consumer side */
-	char _pad[64 - sizeof(struct cow_page_spsc_node *)];
-	struct cow_page_spsc_node *spsc_tail;	/* Producer side */
-	unsigned long spsc_size;		/* Atomic: approximate queue size */
+	struct cow_page_queue page_queue;
 };
 
 /*
@@ -275,11 +275,7 @@ static pthread_mutex_t g_tracked_tasks_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_monitor_eventfd = -1;
 static unsigned long g_tracked_tasks_generation;
 static unsigned long g_monitor_snapshot_generation;
-/*
- * M5: Consumer-side putback list. Only Thread 3 accesses this,
- * so no synchronization is needed. cow_get_next_page() drains
- * this list before checking the SPSC queue.
- */
+/* Consumer-side putback list */
 static struct cow_page_queue_entry *g_putback_list = NULL;
 
 #define COW_CONVERGENCE_THRESHOLD 100  /* Stop if < 100 pages dirty per iteration */
@@ -606,9 +602,8 @@ int cow_dump_init(struct pstree_item *item, struct vm_area_list *vma_area_list, 
 
 		INIT_LIST_HEAD(&cdi->tracked_tasks);
 
-		/* M5: Initialize lock-free SPSC queue with dummy node */
-		if (spsc_init(cdi->spsc_head, cdi->spsc_tail,
-			      cdi->spsc_size,
+		if (spsc_init(cdi->page_queue.head, cdi->page_queue.tail,
+			      cdi->page_queue.size,
 			      struct cow_page_spsc_node)) {
 			xfree(cdi);
 			return -1;
@@ -741,10 +736,9 @@ err:
 	}
 
 	if (created_session) {
-		/* M5: Free SPSC dummy node */
-		if (cdi->spsc_head) {
-			spsc_drain(cdi->spsc_head, free_cow_page_entry);
-			cdi->spsc_tail = NULL;
+		if (cdi->page_queue.head) {
+			spsc_drain(cdi->page_queue.head, free_cow_page_entry);
+			cdi->page_queue.tail = NULL;
 		}
 		xfree(cdi);
 		g_cow_info = NULL;
@@ -755,62 +749,6 @@ err:
 	}
 
 	return -1;
-}
-
-void cow_bitmap_fini(void)
-{
-	/*
-	 * cow_bitmaps now live inside lazy_vma_entry and are freed
-	 * by free_global_lazy_vmas() in mem.c.  Nothing to do here.
-	 */
-}
-
-void cow_set_bitmap(unsigned long vaddr)
-{
-	unsigned long page_addr = vaddr & ~(PAGE_SIZE - 1);
-	struct lazy_vma_entry *lve;
-	unsigned long page_idx;
-
-	lve = find_lazy_vma_by_addr(page_addr);
-	if (!lve || !lve->cow_bitmap) {
-		pr_warn("cow_set_bitmap: addr 0x%lx not in any tracked VMA\n",
-			page_addr);
-		return;
-	}
-
-	page_idx = (page_addr - lve->start) / PAGE_SIZE;
-
-	atomic_bitmap_set(lve->cow_bitmap, page_idx);
-}
-
-void cow_clear_bitmap(unsigned long vaddr)
-{
-	unsigned long page_addr = vaddr & ~(PAGE_SIZE - 1);
-	struct lazy_vma_entry *lve;
-	unsigned long page_idx;
-
-	lve = find_lazy_vma_by_addr(page_addr);
-	if (!lve || !lve->cow_bitmap)
-		return;
-
-	page_idx = (page_addr - lve->start) / PAGE_SIZE;
-
-	atomic_bitmap_clear(lve->cow_bitmap, page_idx);
-}
-
-bool cow_test_bitmap(unsigned long vaddr)
-{
-	unsigned long page_addr = vaddr & ~(PAGE_SIZE - 1);
-	struct lazy_vma_entry *lve;
-	unsigned long page_idx;
-
-	lve = find_lazy_vma_by_addr(page_addr);
-	if (!lve || !lve->cow_bitmap)
-		return false;
-
-	page_idx = (page_addr - lve->start) / PAGE_SIZE;
-
-	return atomic_bitmap_test(lve->cow_bitmap, page_idx);
 }
 
 void cow_dump_fini(void)
@@ -827,13 +765,11 @@ void cow_dump_fini(void)
 		return;
 	}
 
-	/* Wait for unified page server thread to stop before cleaning up
-	 * g_putback_list to avoid use-after-free (Thread 3 accesses it) */
+	/* Wait for unified page server thread to stop before cleaning up */
 	wait_for_page_server_thread();
 
 	pr_info("Cleaning up COW dump\n");
 
-	/* M1: Free bitmap */
 	cow_bitmap_fini();
 
 	if (g_monitor_eventfd >= 0) {
@@ -846,7 +782,6 @@ void cow_dump_fini(void)
 	g_monitor_snapshot_generation = 0;
 	pthread_mutex_unlock(&g_tracked_tasks_lock);
 
-	/* M5: Drain consumer-side putback list (safe now - Thread 3 stopped) */
 	while (g_putback_list) {
 		qe = g_putback_list;
 		g_putback_list = qe->next;
@@ -856,10 +791,9 @@ void cow_dump_fini(void)
 		queue_remaining++;
 	}
 
-	/* M5: Drain SPSC queue */
-	if (g_cow_info->spsc_head) {
-		spsc_drain(g_cow_info->spsc_head, free_cow_page_entry);
-		g_cow_info->spsc_tail = NULL;
+	if (g_cow_info->page_queue.head) {
+		spsc_drain(g_cow_info->page_queue.head, free_cow_page_entry);
+		g_cow_info->page_queue.tail = NULL;
 	}
 
 	if (queue_remaining > 0)
@@ -893,10 +827,6 @@ static int cow_handle_write_fault(struct cow_dump_info *cdi,
 
 	cow_stats.write_faults++;
 
-	/*
-	 * M4: Allocate a single page buffer. This will be transferred
-	 * directly to the queue entry (zero-copy within the fault handler).
-	 */
 	page_data = xmalloc(PAGE_SIZE);
 	if (!page_data) {
 		pr_err("Failed to allocate page data buffer\n");
@@ -949,76 +879,34 @@ static int cow_handle_write_fault(struct cow_dump_info *cdi,
 	cow_stats.pages_woken++;
 	__atomic_fetch_sub(&cdi->total_pages, 1, __ATOMIC_RELAXED);
 
-	/*
-	 * M4: Enqueue with zero-copy — transfer page_data ownership
-	 * to the queue entry. No memcpy, no intermediate cow_page struct.
-	 * P1 (send_cow_page_lazy) will send from entry->data and free it.
-	 */
-	/*
-	 * M5: Lock-free SPSC enqueue. Allocate a wrapper node and link
-	 * it at the tail. The release store on tail->next publishes both
-	 * the node and the entry data to the consumer (Thread 3).
-	 */
-	/*
-	 * M5: Lock-free SPSC enqueue.  The entry and node are tiny
-	 * (~50 bytes each) — if allocation fails, retry a few times
-	 * before giving up.  We must not lose page_data: it holds the
-	 * pre-write snapshot that P1 will send to the destination.
-	 */
-	{
-		int attempts;
-
-		for (attempts = 0; attempts < 3; attempts++) {
-			entry = xmalloc(sizeof(*entry));
-			if (entry)
-				break;
-			pr_warn("Retry %d: alloc queue entry for 0x%lx\n",
-				attempts + 1, page_addr);
-		}
-		if (!entry) {
-			pr_err("Failed to allocate queue entry for page 0x%lx "
-			       "after retries, clearing bitmap for P3 fallback\n",
-			       page_addr);
-			xfree(page_data);
-			cow_clear_bitmap(page_addr);
-			return 0;
-		}
+	/* Allocate queue entry for this page */
+	entry = xmalloc(sizeof(*entry));
+	if (!entry) {
+		pr_err("Failed to allocate queue entry for page 0x%lx, "
+		       "clearing bitmap for P3 fallback\n", page_addr);
+		xfree(page_data);
+		cow_clear_bitmap(page_addr);
+		return 0;
 	}
 
-	{
-		int attempts;
+	entry->vaddr = page_addr;
+	entry->data = page_data;
+	page_data = NULL;
+	entry->ppb = NULL;
+	entry->seg_idx = 0;
+	entry->page_idx_in_seg = 0;
+	entry->next = NULL;
 
-		entry->vaddr = page_addr;
-		entry->data = page_data;	/* Transfer ownership */
-		page_data = NULL;		/* Prevent double-free */
-		entry->ppb = NULL;
-		entry->seg_idx = 0;
-		entry->page_idx_in_seg = 0;
-		entry->next = NULL;
-
-		for (attempts = 0; attempts < 3; attempts++) {
-			if (!spsc_enqueue(cdi->spsc_tail, cdi->spsc_size,
-					  entry, struct cow_page_spsc_node))
-				break;
-			pr_warn("Retry %d: alloc SPSC node for 0x%lx\n",
-				attempts + 1, page_addr);
-		}
-		if (attempts == 3) {
-			pr_err("FATAL: Failed to enqueue COW page 0x%lx after retries\n",
-			       page_addr);
-			pr_err("  Snapshot data will be lost - cannot continue migration\n");
-			xfree(entry->data);
-			xfree(entry);
-			/* Bitmap was never set, so P3 will try to read from live memory.
-			 * This is wrong because the page was modified, but it's the least-bad
-			 * option when we can't allocate memory. */
-			return -1;  /* Fail immediately to prevent corruption */
-		}
+	/* Enqueue the COW page */
+	if (spsc_enqueue(cdi->page_queue.tail, cdi->page_queue.size,
+			 entry, struct cow_page_spsc_node)) {
+		pr_err("FATAL: Failed to enqueue COW page 0x%lx\n", page_addr);
+		pr_err("  Snapshot data will be lost - cannot continue migration\n");
+		xfree(entry->data);
+		xfree(entry);
+		return -1;  /* Fail immediately to prevent corruption */
 	}
 
-	/* M1: Set bitmap bit AFTER successful enqueue (Thread 3 reads via cow_test_bitmap).
-	 * This ordering prevents a race where Thread 3 sees bitmap=1 before the entry
-	 * is actually in the queue, causing it to skip the page forever. */
 	cow_set_bitmap(page_addr);
 
 	return 0;
@@ -1345,17 +1233,15 @@ struct cow_page_queue_entry *cow_get_next_page(void)
 	if (!g_cow_info)
 		return NULL;
 
-	/* M5: Check consumer-side putback list first (no atomics needed) */
 	if (g_putback_list) {
 		entry = g_putback_list;
 		g_putback_list = entry->next;
 		entry->next = NULL;
-		__atomic_fetch_sub(&g_cow_info->spsc_size, 1, __ATOMIC_RELAXED);
+		__atomic_fetch_sub(&g_cow_info->page_queue.size, 1, __ATOMIC_RELAXED);
 		return entry;
 	}
 
-	/* M5: Lock-free SPSC dequeue */
-	return spsc_dequeue(g_cow_info->spsc_head, g_cow_info->spsc_size);
+	return spsc_dequeue(g_cow_info->page_queue.head, g_cow_info->page_queue.size);
 }
 
 bool cow_has_pending_pages(void)
@@ -1368,7 +1254,7 @@ bool cow_has_pending_pages(void)
 		return true;
 
 	/* Check SPSC queue */
-	return spsc_peek(g_cow_info->spsc_head);
+	return spsc_peek(g_cow_info->page_queue.head);
 }
 
 void cow_put_back_page(struct cow_page_queue_entry *entry)
@@ -1376,22 +1262,16 @@ void cow_put_back_page(struct cow_page_queue_entry *entry)
 	if (!g_cow_info || !entry)
 		return;
 
-	/*
-	 * M5: Push onto consumer-side putback list. Only Thread 3 calls
-	 * this, so no synchronization needed. cow_get_next_page() drains
-	 * this list before the SPSC queue, preserving FIFO-ish ordering.
-	 */
 	entry->next = g_putback_list;
 	g_putback_list = entry;
 
-	/* Don't increment spsc_size — it was already counted when enqueued */
 	pr_debug("Re-queued COW page 0x%lx to putback list\n", entry->vaddr);
 }
 
-unsigned long cow_get_queue_size(void)
+unsigned long cow_get_pages_queue_size(void)
 {
 	if (!g_cow_info)
 		return 0;
 
-	return spsc_size(g_cow_info->spsc_size);
+	return spsc_size(g_cow_info->page_queue.size);
 }

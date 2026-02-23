@@ -14,7 +14,7 @@ struct page_pipe_buf;
 /* Queue entry for COW pages waiting to be sent */
 struct cow_page_queue_entry {
 	unsigned long vaddr;
-	void *data;                      /* M2: Original page content (4KB) */
+	void *data;                      /* Original page content (4KB) */
 	struct page_pipe_buf *ppb;      /* Buffer containing this page */
 	unsigned int seg_idx;            /* Segment index within buffer */
 	unsigned long page_idx_in_seg;   /* Page index within segment */
@@ -125,46 +125,12 @@ extern bool cow_has_pending_pages(void);
 extern void cow_put_back_page(struct cow_page_queue_entry *entry);
 
 /**
- * cow_get_queue_size - Get the number of pending COW pages in the queue
+ * cow_get_pages_queue_size - Get the number of pending COW pages in the queue
  *
  * Thread-safe count of COW pages waiting to be sent.
  *
  * Returns: Number of entries in the COW page queue
  */
-extern unsigned long cow_get_queue_size(void);
-
-/**
- * cow_bitmap_fini - Free the COW tracking bitmap
- */
-extern void cow_bitmap_fini(void);
-
-/**
- * cow_set_bitmap - Mark a page as write-faulted in the bitmap
- * @vaddr: Virtual address of the faulted page
- *
- * Atomically sets the bit for this page. Called by Thread 1 (write fault
- * monitor). Thread 3 reads these bits via cow_test_bitmap().
- */
-extern void cow_set_bitmap(unsigned long vaddr);
-
-/**
- * cow_clear_bitmap - Clear the write-faulted bit for a page
- * @vaddr: Virtual address of the page
- *
- * Used as fallback when the COW queue entry allocation fails.
- * Clearing the bit allows P3 (sequential scan) to send the page
- * from live memory instead of silently losing it.
- */
-extern void cow_clear_bitmap(unsigned long vaddr);
-
-/**
- * cow_test_bitmap - Check if a page was write-faulted
- * @vaddr: Virtual address to check
- *
- * Atomically reads the bit for this page. Safe to call from any thread.
- *
- * Returns: true if the page was write-faulted, false otherwise
- */
-extern bool cow_test_bitmap(unsigned long vaddr);
+extern unsigned long cow_get_pages_queue_size(void);
 
 #endif /* __CR_COW_DUMP_H_ */
