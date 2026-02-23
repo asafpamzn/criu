@@ -1232,14 +1232,15 @@ struct cow_page_queue_entry *cow_get_next_page(void)
 	if (!g_cow_info)
 		return NULL;
 
+	/* Check putback list first - entries here were already decremented from size */
 	if (g_putback_list) {
 		entry = g_putback_list;
 		g_putback_list = entry->next;
 		entry->next = NULL;
-		__atomic_fetch_sub(&g_cow_info->page_queue.size, 1, __ATOMIC_RELAXED);
 		return entry;
 	}
 
+	/* SPSC dequeue will decrement size */
 	return spsc_dequeue(g_cow_info->page_queue.head, g_cow_info->page_queue.size);
 }
 
