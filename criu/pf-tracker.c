@@ -12,7 +12,7 @@
 
 struct pf_tracker_entry {
 	struct list_head l;
-	__u64 address;
+	unsigned long long address;
 	unsigned long nr_pages;
 	int pid;
 	enum pf_state state;
@@ -22,7 +22,7 @@ struct pf_tracker_entry {
 
 static LIST_HEAD(pf_tracker);
 
-static struct pf_tracker_entry *pf_tracker_find(__u64 address)
+static struct pf_tracker_entry *pf_tracker_find(unsigned long long address)
 {
 	struct pf_tracker_entry *entry;
 
@@ -34,7 +34,7 @@ static struct pf_tracker_entry *pf_tracker_find(__u64 address)
 	return NULL;
 }
 
-void pf_tracker_add(__u64 address, unsigned long nr_pages, int pid, bool is_pf)
+void pf_tracker_add(unsigned long long address, unsigned long nr_pages, int pid, bool is_pf)
 {
 	struct pf_tracker_entry *entry;
 
@@ -55,7 +55,7 @@ void pf_tracker_add(__u64 address, unsigned long nr_pages, int pid, bool is_pf)
 	list_add_tail(&entry->l, &pf_tracker);
 }
 
-void pf_tracker_set_state(__u64 address, enum pf_state state)
+void pf_tracker_set_state(unsigned long long address, enum pf_state state)
 {
 	struct pf_tracker_entry *entry;
 
