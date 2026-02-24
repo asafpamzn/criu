@@ -1677,6 +1677,33 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 	address = msg->arg.pagefault.address & ~(page_size() - 1);
 	lp_warn(lpi, "#PF at 0x%llx\n", address);
 
+	if (opts.cow_dump) {
+		/*
+		 * In COW/bulk mode, pages arrive via the bulk stream,
+		 * but we still need to send an urgent request so the
+		 * server prioritizes this page. We do NOT split the IOV
+		 * or move it to the reqs list to avoid fragmenting the
+		 * IOV list.
+		 */
+		__u64 img_addr;
+
+		iov = find_iov(lpi, address);
+		if (!iov)
+			return uffd_zero(lpi, address, 1);
+
+		img_addr = iov->img_start + (address - iov->start);
+
+		uffd_stats.total_pf_reqs++;
+		pf_tracker_add(address, 1, lpi->pid, true);
+
+		ret = uffd_handle_pages(lpi, img_addr, 1, PR_ASYNC | PR_ASAP);
+		if (ret < 0) {
+			lp_err(lpi, "Error during COW page fault request\n");
+			return -1;
+		}
+		return 0;
+	}
+
 	if (is_page_queued(lpi, address)) {
 		lp_warn(lpi, "#PF at 0x%llx queued\n", address);
 		return 0;
