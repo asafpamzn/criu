@@ -1573,7 +1573,7 @@ static int handle_remove(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 		return -1;
 	}
 
-	return drop_iovs(lpi, unreg.start, unreg.len);
+	return 0;//drop_iovs(lpi, unreg.start, unreg.len);
 
 }
 
@@ -1583,7 +1583,7 @@ static int handle_remap(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 	unsigned long to = msg->arg.remap.to;
 	unsigned long len = msg->arg.remap.len;
 
-	lp_debug(lpi, "REMAP: %lx -> %lx (%ld)\n", from, to, len);
+	lp_err(lpi, "REMAP: %lx -> %lx (%ld)\n", from, to, len);
 
 	return remap_iovs(lpi, from, to, len);
 }
@@ -1593,7 +1593,7 @@ static int handle_fork(struct lazy_pages_info *parent_lpi, struct uffd_msg *msg)
 	struct lazy_pages_info *lpi;
 	int uffd = msg->arg.fork.ufd;
 
-	lp_debug(parent_lpi, "FORK: child with ufd=%d\n", uffd);
+	lp_err(parent_lpi, "FORK: child with ufd=%d\n", uffd);
 
 	lpi = lpi_init();
 	if (!lpi)
