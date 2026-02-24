@@ -102,7 +102,7 @@ void pf_tracker_print_stats(void)
 	}
 
 	if (pending_server > 0 || pending_eagain > 0) {
-		pr_debug("  PF_TRACKER: pending_server=%lu (oldest=%lu ms) pending_eagain=%lu (oldest=%lu ms) completed=%lu\n",
+		pr_err("  PF_TRACKER: pending_server=%lu (oldest=%lu ms) pending_eagain=%lu (oldest=%lu ms) completed=%lu\n",
 			pending_server, oldest_server_ms,
 			pending_eagain, oldest_eagain_ms,
 			completed);
@@ -113,7 +113,7 @@ void pf_tracker_print_stats(void)
 				(ts_now.tv_nsec - pft->created.tv_nsec) / 1000000;
 
 			if (age_ms > 2000 && pft->state != PF_STATE_COMPLETED) {
-				pr_debug("    HUNG: pid=%d addr=0x%llx pages=%lu state=%s age=%lu ms %s\n",
+				pr_err("    HUNG: pid=%d addr=0x%llx pages=%lu state=%s age=%lu ms %s\n",
 					pft->pid, pft->address, pft->nr_pages,
 					pft->state == PF_STATE_PENDING_SERVER ? "PENDING_SERVER" : "PENDING_EAGAIN",
 					age_ms,
