@@ -149,6 +149,11 @@ static struct {
 	unsigned long eagain_total_ns;
 	unsigned long eagain_calls;
 
+	/* find_iov timing statistics */
+	unsigned long find_iov_total_ns;
+	unsigned long find_iov_count;
+	unsigned long find_iov_nr_iovs_total;
+
 	time_t last_print_time;
 } uffd_stats;
 
@@ -236,6 +241,14 @@ void check_and_print_uffd_stats(void)
 				pr_debug(" %s=%lu", get_bucket_label(i), uffd_stats.bg_hist[i]);
 		}
 		pr_debug("\n");
+
+		/* Print find_iov stats */
+		if (uffd_stats.find_iov_count > 0) {
+			pr_err("  FIND_IOV: avg=%lu ns (%lu ops) avg_iovs=%lu\n",
+				uffd_stats.find_iov_total_ns / uffd_stats.find_iov_count,
+				uffd_stats.find_iov_count,
+				uffd_stats.find_iov_nr_iovs_total / uffd_stats.find_iov_count);
+		}
 
 		/* Print timing stats */
 		if (uffd_stats.io_complete_bulk_count_start > 0) {
@@ -1284,7 +1297,23 @@ static int uffd_io_complete_bulk(struct page_read *pr, unsigned long vaddr, unsi
 
 	/* Check if this address is still tracked (not removed/unmapped) */
 	/* First check main IOVs list */
-	iov = find_iov(lpi, vaddr);
+	{
+		struct timespec t_find_start, t_find_end;
+		struct lazy_iov *tmp;
+		unsigned long nr_iovs = 0;
+
+		list_for_each_entry(tmp, &lpi->iovs, l)
+			nr_iovs++;
+
+		clock_gettime(CLOCK_MONOTONIC, &t_find_start);
+		iov = find_iov(lpi, vaddr);
+		clock_gettime(CLOCK_MONOTONIC, &t_find_end);
+
+		uffd_stats.find_iov_total_ns += (t_find_end.tv_sec - t_find_start.tv_sec) * 1000000000 +
+			(t_find_end.tv_nsec - t_find_start.tv_nsec);
+		uffd_stats.find_iov_count++;
+		uffd_stats.find_iov_nr_iovs_total += nr_iovs;
+	}
 
 	/* If not found in main list, check requests list (may have been queued by page fault) */
 	if (!iov) {
@@ -1521,7 +1550,7 @@ static int handle_remove(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 	unreg.start = msg->arg.remove.start;
 	unreg.len = msg->arg.remove.end - msg->arg.remove.start;
 
-	lp_debug(lpi, "%s: %llx(%llx)\n", msg->event == UFFD_EVENT_REMOVE ? "REMOVE" : "UNMAP",
+	lp_err(lpi, "%s: %llx(%llx)\n", msg->event == UFFD_EVENT_REMOVE ? "REMOVE" : "UNMAP",
 		 unreg.start, unreg.len);
 
 	/*
@@ -1873,19 +1902,6 @@ int process_eagain_requests(void)
 
 		/* Success! */
 		uffd_stats.eagain_succeeded++;
-
-		/*
-		 * Mark the range as complete in our tracking lists. Even
-		 * though the original UFFD operation was delayed, the
-		 * destination page is now populated (or zeroed).
-		 */
-		if (drop_iovs(req->lpi, req->address,
-			      req->nr_pages * page_size())) {
-			lp_err(req->lpi,
-			       "Failed to drop IOVs for EAGAIN retry at 0x%llx/%lu\n",
-			       req->address, req->nr_pages);
-			return -1;
-		}
 
 		/* Clean up and remove from queue */
 		list_del(&req->l);
