@@ -42,6 +42,7 @@
 #include "util.h"
 #include "namespaces.h"
 #include "pagemap.h"
+#include "pf-tracker.h"
 #undef LOG_PREFIX
 #define LOG_PREFIX "uffd: "
 
@@ -259,6 +260,9 @@ void check_and_print_uffd_stats(void)
 				uffd_stats.eagain_calls > 0 ? uffd_stats.eagain_total_ns / uffd_stats.eagain_calls : 0,
 				uffd_stats.eagain_calls);
 		}
+
+		/* Print page fault tracker stats and clean up completed entries */
+		pf_tracker_print_stats();
 
 		/* Reset all counters */
 		memset(&uffd_stats, 0, sizeof(uffd_stats));
@@ -1154,8 +1158,10 @@ static int uffd_copy(struct lazy_pages_info *lpi, __u64 address, unsigned long *
 
 	if (ioctl(lpi->lpfd.fd, UFFDIO_COPY, &uffdio_copy) == -1) {
 		/* In COW dump mode, queue EAGAIN requests instead of blocking */
-		if (errno == EAGAIN && opts.cow_dump)
+		if (errno == EAGAIN && opts.cow_dump) {
+			pf_tracker_set_state(address, PF_STATE_PENDING_EAGAIN);
 			return queue_eagain_request(lpi, address, *nr_pages, lpi->buf, "copy");
+		}
 		
 		/* Non-COW mode or non-EAGAIN: check for other errors */
 		if (uffd_check_op_error(lpi, "copy", nr_pages, uffdio_copy.copy)) {
@@ -1172,8 +1178,10 @@ static int uffd_copy(struct lazy_pages_info *lpi, __u64 address, unsigned long *
 		errno = -uffdio_copy.copy;
 
 		/* In COW dump mode, queue EAGAIN requests */
-		if (errno == EAGAIN && opts.cow_dump)
+		if (errno == EAGAIN && opts.cow_dump) {
+			pf_tracker_set_state(address, PF_STATE_PENDING_EAGAIN);
 			return queue_eagain_request(lpi, address, *nr_pages, lpi->buf, "copy");
+		}
 
 		if (uffd_check_op_error(lpi, "copy", nr_pages, uffdio_copy.copy)) {
 			lp_err(lpi, "UFFDIO_COPY err \n");
@@ -1189,6 +1197,10 @@ static int uffd_copy(struct lazy_pages_info *lpi, __u64 address, unsigned long *
 	}
 
 	lpi->copied_pages += *nr_pages;
+
+	/* Mark as completed in the tracker */
+	pf_tracker_set_state(address, PF_STATE_COMPLETED);
+
 	return 0;
 }
 
@@ -1496,6 +1508,9 @@ static int xfer_pages(struct lazy_pages_info *lpi)
 		return -1;
 	}
 
+	/* Track this background transfer as waiting for server response */
+	pf_tracker_add(iov->start, nr_pages, lpi->pid, false);
+
 	return 0;
 }
 
@@ -1668,6 +1683,9 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 		return -1;
 	}
 
+	/* Track this page fault as waiting for server response */
+	pf_tracker_add(address, nr_pages, lpi->pid, true);
+
 	return 0;
 }
 
@@ -1765,6 +1783,7 @@ static int retry_uffd_copy(struct uffd_eagain_request *req)
 
 	/* Success */
 	req->lpi->copied_pages += req->nr_pages;
+	pf_tracker_set_state(req->address, PF_STATE_COMPLETED);
 	lp_debug(req->lpi, "EAGAIN copy retry succeeded for 0x%llx\n", req->address);
 	return 0;
 }
