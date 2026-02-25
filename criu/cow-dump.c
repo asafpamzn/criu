@@ -61,13 +61,14 @@ struct cow_dump_info {
 
 /* Forward declarations for statics used by WP functions */
 static struct cow_dump_info *g_cow_info;
+static bool g_wp_async_mode;
 
 /*
  * Applying UFFD write-protect over a large address space can dominate the
  * initial stall. We can apply it in parallel from the CRIU process after
  * receiving the userfaultfd from the parasite.
  */
-#define COW_WP_CHUNK_SIZE	(64UL * 1024 * 1024)
+#define COW_WP_CHUNK_SIZE	(512UL * 1024 * 1024)
 /* Use all available CPUs — more threads reduce WP ioctl serialization */
 #define COW_WP_MAX_THREADS	0	/* 0 = use nproc (set in cow_wp_nr_threads) */
 
@@ -89,6 +90,10 @@ static void *cow_wp_worker(void *arg)
 	struct cow_wp_job *job = arg;
 	struct uffdio_writeprotect wp;
 	unsigned int i;
+
+	/* Lower priority so main dump thread gets CPU first */
+	if (nice(10) == -1 && errno != 0)
+		pr_debug("nice(10) failed: %s\n", strerror(errno));
 
 	for (i = job->start_idx; i < job->end_idx; i++) {
 		wp.range.start = job->ranges[i].start;
@@ -188,6 +193,7 @@ static unsigned int g_wp_created;
 static unsigned int g_wp_nr_ranges;
 static struct timespec g_wp_t_start;
 
+
 int cow_dump_start_wp(void)
 {
 	struct cow_tracked_task *task;
@@ -205,6 +211,8 @@ int cow_dump_start_wp(void)
 				struct cow_tracked_task, list);
 	if (!task->nr_tracked_vmas)
 		return 0;
+
+	clock_gettime(CLOCK_MONOTONIC, &g_wp_t_start);
 
 	g_wp_ranges = cow_wp_build_ranges(task, &g_wp_nr_ranges);
 	if (!g_wp_ranges) {
@@ -229,8 +237,6 @@ int cow_dump_start_wp(void)
 			g_wp_jobs[i].end_idx = g_wp_nr_ranges;
 	}
 
-	clock_gettime(CLOCK_MONOTONIC, &g_wp_t_start);
-
 	for (i = 0; i < nr_threads; i++) {
 		if (g_wp_jobs[i].start_idx >= g_wp_jobs[i].end_idx)
 			break;
@@ -247,7 +253,6 @@ int cow_dump_start_wp(void)
 	return 0;
 
 err:
-	/* Join any already-launched threads */
 	for (i = 0; i < g_wp_created; i++)
 		pthread_join(g_wp_threads[i], NULL);
 	xfree(g_wp_threads);
@@ -267,23 +272,22 @@ int cow_dump_finish_wp(void)
 	unsigned int i;
 	int ret = 0;
 
-	if (!g_wp_created)
-		return 0;
+	if (g_wp_created) {
+		for (i = 0; i < g_wp_created; i++)
+			pthread_join(g_wp_threads[i], NULL);
 
-	for (i = 0; i < g_wp_created; i++)
-		pthread_join(g_wp_threads[i], NULL);
-
-	clock_gettime(CLOCK_MONOTONIC, &t_end);
-
-	for (i = 0; i < g_wp_created; i++) {
-		if (g_wp_jobs[i].err) {
-			pr_err("UFFD write-protect failed: %s (%d)\n",
-			       strerror(-g_wp_jobs[i].err),
-			       -g_wp_jobs[i].err);
-			ret = -1;
-			break;
+		for (i = 0; i < g_wp_created; i++) {
+			if (g_wp_jobs[i].err) {
+				pr_err("UFFD write-protect failed: %s (%d)\n",
+				       strerror(-g_wp_jobs[i].err),
+				       -g_wp_jobs[i].err);
+				ret = -1;
+				break;
+			}
 		}
 	}
+
+	clock_gettime(CLOCK_MONOTONIC, &t_end);
 
 	sec = t_end.tv_sec - g_wp_t_start.tv_sec;
 	if (t_end.tv_nsec < g_wp_t_start.tv_nsec) {
@@ -316,7 +320,7 @@ static pthread_mutex_t g_tracked_tasks_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_monitor_eventfd = -1;
 
 /* WP_ASYNC mode: kernel auto-resolves WP faults, no thread parking */
-static bool g_wp_async_mode = false;
+/* g_wp_async_mode declared above with other forward declarations */
 static unsigned long g_tracked_tasks_generation;
 static unsigned long g_monitor_snapshot_generation;
 

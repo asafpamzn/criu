@@ -1804,6 +1804,12 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 			ret = -1;
 			goto err_cure;
 		}
+
+		gettimeofday(&t_now, NULL);
+		timersub(&t_now, &t_checkpoint, &t_delta);
+		pr_err("TIMING: cow_dump_start_wp took %ld.%06ld seconds\n",
+		       t_delta.tv_sec, t_delta.tv_usec);
+		t_checkpoint = t_now;
 	}
 
 	/* These run in parallel with WP threads */
