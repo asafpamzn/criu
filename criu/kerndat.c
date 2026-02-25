@@ -1352,12 +1352,27 @@ static int kerndat_uffd(void)
 	}
 
 	kdat.has_uffd = true;
+	kdat.has_wp_async = !!(kdat.uffd_features & UFFD_FEATURE_WP_ASYNC);
 
 	/*
 	 * we have to close the uffd and reopen in later in restorer
 	 * to enable non-cooperative features
 	 */
 	close(uffd);
+
+	/*
+	 * Detect /proc/<pid>/userfaultfd support (kernel 6.11+).
+	 * This allows creating a userfaultfd bound to another process's
+	 * mm_struct from an external process, eliminating the need for
+	 * parasite RPC in COW dump.
+	 */
+	kdat.has_uffd_proc = false;
+	uffd = open("/proc/self/userfaultfd", O_RDWR | O_CLOEXEC);
+	if (uffd >= 0) {
+		kdat.has_uffd_proc = true;
+		close(uffd);
+		pr_info("/proc/<pid>/userfaultfd interface available\n");
+	}
 
 	return 0;
 }
@@ -2116,6 +2131,7 @@ int kerndat_init(void)
 	}
 	if (!ret && kerndat_has_timer_cr_ids()) {
 		pr_err("kerndat_has_timer_cr_ids has failed when initializing kerndat.\n");
+		ret = -1;
 	}
 	if (!ret && kerndat_breakpoints()) {
 		pr_err("kerndat_breakpoints has failed when initializing kerndat.\n");

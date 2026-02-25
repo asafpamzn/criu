@@ -265,6 +265,7 @@ struct parasite_cow_dump_args {
 	unsigned long total_pages;	/* Output: total pages registered */
 	unsigned int nr_failed_vmas;	/* Output: number of VMAs that couldn't be registered */
 	int ret;			/* Output: return code */
+	unsigned long long uffd_features; /* Output: negotiated uffd features */
 };
 
 static inline struct parasite_vma_entry *cow_dump_vmas(struct parasite_cow_dump_args *a)

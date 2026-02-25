@@ -52,9 +52,14 @@ extern int open_page_xfer(struct page_xfer *xfer, int fd_type, unsigned long id)
 struct page_pipe;
 extern int page_xfer_dump_pages(struct page_xfer *, struct page_pipe *);
 extern int page_xfer_predump_pages(int pid, struct page_xfer *, struct page_pipe *);
+/* Multi-TCP: number of parallel transfer connections for COW bulk mode */
+#define COW_TRANSFER_STREAMS	4
+
 extern int connect_to_page_server_to_send(void);
 extern int connect_to_page_server_to_recv(int epfd);
 extern int disconnect_from_page_server(void);
+extern void wait_for_page_server_thread(void);
+extern bool page_server_bulk_stream_done(void);
 
 extern int check_parent_page_xfer(int fd_type, unsigned long id);
 
@@ -70,6 +75,7 @@ extern int check_parent_page_xfer(int fd_type, unsigned long id);
 
 /* async request/receive of remote pages */
 extern int request_remote_pages(unsigned long img_id, unsigned long addr, unsigned long nr_pages);
+extern int request_all_remote_pages(unsigned long img_id);
 
 typedef int (*ps_async_read_complete)(unsigned long img_id, unsigned long vaddr, unsigned long nr_pages, void *);
 extern int page_server_start_read(void *buf, unsigned long nr_pages, ps_async_read_complete complete, void *priv, unsigned flags);

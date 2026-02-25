@@ -859,7 +859,6 @@ static int parasite_cow_dump_init(struct parasite_cow_dump_args *args)
 {
 	struct parasite_vma_entry *vmas, *vma;
 	struct uffdio_register reg;
-	struct uffdio_writeprotect wp;
 	struct uffdio_api api;
 	int uffd, tsock, i;
 	int ret = 0;
@@ -887,7 +886,7 @@ static int parasite_cow_dump_init(struct parasite_cow_dump_args *args)
 	/* Initialize userfaultfd API with WP features */
 	memset(&api, 0, sizeof(api));
 	api.api = UFFD_API;
-	api.features = 0;
+	api.features = UFFD_FEATURE_PAGEFAULT_FLAG_WP | UFFD_FEATURE_WP_ASYNC;
 	api.ioctls = 0;
 
 	ret = sys_ioctl(uffd, UFFDIO_API, (unsigned long)&api);
@@ -899,7 +898,13 @@ static int parasite_cow_dump_init(struct parasite_cow_dump_args *args)
 		return -1;
 	}
 
+	args->uffd_features = api.features;
 	pr_info("UFFD created with features: 0x%llx\n", (unsigned long long)api.features);
+	if (!(api.features & UFFD_FEATURE_PAGEFAULT_FLAG_WP)) {
+		pr_err("Kernel userfaultfd does not support WP pagefault flag\n");
+		sys_close(uffd);
+		return -1;
+	}
 
 	vmas = cow_dump_vmas(args);
 
@@ -908,13 +913,20 @@ static int parasite_cow_dump_init(struct parasite_cow_dump_args *args)
 		vma = vmas + i;
 		addr = vma->start;
 		len = vma->len;
+#if 0
+		if (!vma_entry_can_be_lazy(vma->e))
+		{
+			pr_err("Skipping VMEs that cannot be lazy VMA: %lx-%lx len=%lu\n", addr, addr + len, len);
+			continue;
+		}
+#endif
 
-		pr_info("Registering VMA %d: %lx-%lx prot=%x len=%lu\n",
+		pr_err("Registering VMA %d: %lx-%lx prot=%x len=%lu\n",
 			i, addr, addr + len, vma->prot, len);
 
 		/* Skip non-writable VMAs */
 		if (!(vma->prot & PROT_WRITE)) {
-			pr_info("Skipping non-writable VMA: %lx-%lx len=%lu\n", addr, addr + len, len);
+			pr_err("Skipping non-writable VMA: %lx-%lx len=%lu\n", addr, addr + len, len);
 			
 			/* Mark for later dump by CRIU */
     		failed_indices[args->nr_failed_vmas++] = i;
@@ -951,20 +963,8 @@ static int parasite_cow_dump_init(struct parasite_cow_dump_args *args)
 
 		}
 
-		/* Apply write-protection */
-		wp.range.start = addr;
-		wp.range.len = len;
-		wp.mode = UFFDIO_WRITEPROTECT_MODE_WP;
-		ret = sys_ioctl(uffd, UFFDIO_WRITEPROTECT, (unsigned long)&wp);
-		if (ret) {
-			pr_err("Failed to write-protect VMA %lx-%lx: ret=%d\n",
-			       addr, addr + len, ret);
-			sys_close(uffd);
-			return -1;
-		}
-
 		total_pages += len / PAGE_SIZE;
-		pr_info("Successfully registered and WP'd VMA: %lx-%lx (%lu pages)\n",
+		pr_info("Successfully registered VMA for WP tracking: %lx-%lx (%lu pages)\n",
 			addr, addr + len, len / PAGE_SIZE);
 	}
 
@@ -986,7 +986,14 @@ static int parasite_cow_dump_init(struct parasite_cow_dump_args *args)
 	args->total_pages = total_pages;
 	args->ret = 0;
 
-	/* Don't close uffd - it will remain open for the process */
+	/*
+	 * Close the parasite's copy of uffd.
+	 *
+	 * CRIU keeps a duplicated reference received via SCM_RIGHTS, so
+	 * leaving it open in the target would leak an fd and make future
+	 * dumps fail on anon_inode:[userfaultfd].
+	 */
+	sys_close(uffd);
 	return 0;
 }
 

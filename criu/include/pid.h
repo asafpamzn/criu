@@ -17,6 +17,7 @@ enum __criu_task_state {
 	/* Own internal states */
 	TASK_HELPER = COMPEL_TASK_MAX + 1,
 	TASK_THREAD,
+	TASK_STOPPED_DETACH,
 	/* new values are to be added before this line */
 	TASK_UNDEF = 0xff
 };
