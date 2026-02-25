@@ -1178,3 +1178,107 @@ for unmapped memory, fork for consistency, arena reset for
 allocator resilience.  No fork-at-dump (no bgsave).  No shared
 filesystem.  Source freeze 30ms (our code) + 100ms (CRIU
 baseline).  The machine works.*
+
+---
+
+## Act XX: The Optimization Sprint (Feb 25)
+
+The machine works, but it's too slow.  `dump_one_task` takes
+**3.01 seconds** at 100GB.  Source freeze **160ms** total.  The
+constraint: both windows combined under 100ms.
+
+### The WP_ASYNC registration bug
+
+First discovery: `UFFDIO_REGISTER` fails with `EBUSY` in WP_ASYNC
+mode for **every VMA**, including the 100GB heap.  But
+`cow_dump_is_vma_tracked()` gates on registration success.
+Result: the entire 100GB is pagemap-scanned page-by-page in the
+traditional `generate_vma_iovs` path.  `generate_vma_iovs` loop:
+**1.26 seconds**.  `dump_one_task`: **3.01 seconds**.
+
+Fix: track VMAs regardless of registration result in WP_ASYNC mode.
+PAGEMAP_SCAN handles write-protection without UFFDIO_REGISTER.
+
+Result: `generate_vma_iovs`: 1.26s to **0.17ms**.  `dump_one_task`:
+3.01s to **96ms**.  7,300x faster on the hot path.
+
+### The ioctl count problem
+
+WP still takes 101ms.  1608 `UFFDIO_WRITEPROTECT` ioctls
+(64MB chunks) across 32 threads.  Profiling reveals the real
+bottleneck: **kernel CPU contention**.  32 WP threads in kernel mode
+walking page tables starve the main dump thread.  Inner
+`parasite_dump_pages_seized` takes 5ms of CPU time but 78ms of
+wall time.
+
+Fix: increase `COW_WP_CHUNK_SIZE` from 64MB to 512MB.  Reduces
+ioctls from 1608 to 196.  Less kernel entry/exit overhead, less
+contention.  WP: 101ms to **72ms**.  `dump_one_task`: 112ms to
+**81ms**.
+
+### The scheduling fix
+
+WP threads at same priority as main thread.  `nice(19)` +
+`SCHED_BATCH` on WP workers so the kernel prefers the main
+dump thread.
+
+### The cutover revelation
+
+`pkill -STOP -x valkey-server` + `nc` for TCP signaling = **41ms**
+of fork+exec overhead.  Replace with:
+- `kill -STOP $PID` (direct signal, no proc scan)
+- `/dev/tcp` bash builtin (no fork)
+- `${EPOCHREALTIME}` (no date fork)
+
+Cutover: 41ms to **9ms**.
+
+### The FSx metadata wall
+
+`frozen_time` is 112ms but `dump_one_task` is only 81ms.  The
+24ms pre-dump overhead is dominated by `collect_namespaces`
+(13ms) and `collect_and_suspend_lsm` (5.5ms) — both opening
+image files on FSx Lustre with ~3-5ms metadata RPCs per file.
+
+Fix: write CRIU images to `/tmp/criu-dump-imgs` (local tmpfs)
+during the frozen window.  Copy to FSx after early resume.
+`frozen_time`: 112ms to **70ms**.
+
+### The early resume
+
+Standard CRIU writes pstree, mount info, file locks, namespace
+images after `dump_one_task` — all within the frozen window.
+In COW mode, this data is already collected.  Move
+`pstree_switch_state(TASK_ALIVE)` to right after `dump_one_task`,
+before image writing.
+
+### Final numbers (90GB, quiesced)
+
+```
+frozen_time:          70ms
+  dump_one_task:      56ms
+  pre-dump overhead:  14ms
+cutover:               9ms
+────────────────────────
+TOTAL UNRESPONSIVE:   79ms   < 100ms target
+```
+
+The optimization journey:
+```
+Start:  3.01s dump + 41ms cutover = 3.05s total
+  -> Fix WP_ASYNC VMA tracking:      96ms dump
+  -> 512MB WP chunks:                81ms dump
+  -> Bash builtins cutover:          9ms cutover
+  -> tmpfs images + early resume:    70ms frozen
+End:    70ms frozen + 9ms cutover = 79ms total
+```
+
+38x improvement.  Every millisecond earned by profiling,
+understanding kernel scheduling, and eliminating syscall
+overhead.  No algorithmic breakthroughs — just relentless
+measurement and the discipline to chase nanoseconds when
+the budget is 100 milliseconds.
+
+---
+
+*Day 30.  90GB Valkey.  79ms total source downtime.  Two-digit
+milliseconds.  The constraint is met.*
