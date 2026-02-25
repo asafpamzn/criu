@@ -583,11 +583,16 @@ static int cow_register_vmas(int uffd, struct cow_tracked_task *task,
 		reg.mode = UFFDIO_REGISTER_MODE_WP;
 
 		ret = ioctl(uffd, UFFDIO_REGISTER, &reg);
-		if (ret) {
+		if (ret && !g_wp_async_mode) {
 			pr_warn("UFFDIO_REGISTER WP %lx-%lx failed: %s\n",
 				start, start + len, strerror(errno));
 			nr_failed++;
 			continue;
+		}
+		if (ret && g_wp_async_mode) {
+			pr_info("UFFDIO_REGISTER WP %lx-%lx skipped in WP_ASYNC "
+				"(tracking via PAGEMAP_SCAN)\n",
+				start, start + len);
 		}
 
 		tvmas[i].start = start;

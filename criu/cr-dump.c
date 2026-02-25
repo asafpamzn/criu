@@ -1865,20 +1865,12 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 		goto err_cure;
 	}
 
-	/* Wait for async WP threads to complete */
-	if (opts.cow_dump) {
-		ret = cow_dump_finish_wp();
-		gettimeofday(&t_now, NULL);
-		timersub(&t_now, &t_checkpoint, &t_delta);
-		pr_err("TIMING: cow_dump_finish_wp took %ld.%06ld seconds\n",
-		       t_delta.tv_sec, t_delta.tv_usec);
-		t_checkpoint = t_now;
-		if (ret) {
-			pr_err("Async write-protect failed\n");
-			goto err_cure;
-		}
-	}
-
+	/*
+	 * compel_stop_daemon and dump_task_threads use ptrace, which is
+	 * independent of the UFFDIO_WRITEPROTECT ioctls still running
+	 * in the WP worker threads.  Run them in parallel so the ~25ms
+	 * of ptrace work overlaps with any remaining WP time.
+	 */
 	ret = compel_stop_daemon(parasite_ctl);
 	gettimeofday(&t_now, NULL);
 	timersub(&t_now, &t_checkpoint, &t_delta);
@@ -1897,6 +1889,20 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	if (ret) {
 		pr_err("Can't dump threads\n");
 		goto err_cure;
+	}
+
+	/* Join WP threads after ptrace work — overlapped with above */
+	if (opts.cow_dump) {
+		ret = cow_dump_finish_wp();
+		gettimeofday(&t_now, NULL);
+		timersub(&t_now, &t_checkpoint, &t_delta);
+		pr_err("TIMING: cow_dump_finish_wp took %ld.%06ld seconds\n",
+		       t_delta.tv_sec, t_delta.tv_usec);
+		t_checkpoint = t_now;
+		if (ret) {
+			pr_err("Async write-protect failed\n");
+			goto err_cure;
+		}
 	}
 
 	/*

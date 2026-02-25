@@ -43,10 +43,10 @@ int sigreturn_prep_regs_plain(struct rt_sigframe *sigframe, user_regs_struct_t *
 	sigframe->uc.uc_mcontext.pc = regs->pc;
 	sigframe->uc.uc_mcontext.pstate = regs->pstate;
 
-	memcpy(fpsimd->vregs, fpregs->vregs, 32 * sizeof(__uint128_t));
+	memcpy(fpsimd->vregs, fpregs->fpstate.vregs, 32 * sizeof(__uint128_t));
 
-	fpsimd->fpsr = fpregs->fpsr;
-	fpsimd->fpcr = fpregs->fpcr;
+	fpsimd->fpsr = fpregs->fpstate.fpsr;
+	fpsimd->fpcr = fpregs->fpstate.fpcr;
 
 	fpsimd->head.magic = FPSIMD_MAGIC;
 	fpsimd->head.size = sizeof(*fpsimd);

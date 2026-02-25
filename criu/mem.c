@@ -1016,7 +1016,8 @@ int parasite_dump_pages_seized(struct pstree_item *item, struct vm_area_list *vm
 	 *    data from M
 	 */
 
-	if (!mdc->pre_dump || opts.pre_dump_mode == PRE_DUMP_SPLICE) {
+	if ((!mdc->pre_dump || opts.pre_dump_mode == PRE_DUMP_SPLICE) &&
+	    pargs->nr_vmas > 0) {
 		pargs->add_prot = PROT_READ;
 		ret = compel_rpc_call_sync(PARASITE_CMD_MPROTECT_VMAS, ctl);
 		if (ret) {
@@ -1037,7 +1038,8 @@ int parasite_dump_pages_seized(struct pstree_item *item, struct vm_area_list *vm
 		return ret;
 	}
 
-	if (!mdc->pre_dump || opts.pre_dump_mode == PRE_DUMP_SPLICE) {
+	if ((!mdc->pre_dump || opts.pre_dump_mode == PRE_DUMP_SPLICE) &&
+	    pargs->nr_vmas > 0) {
 		pargs->add_prot = 0;
 		if (compel_rpc_call_sync(PARASITE_CMD_MPROTECT_VMAS, ctl)) {
 			pr_err("Can't rollback unprotected vmas with parasite\n");
