@@ -1668,7 +1668,7 @@ static bool is_page_queued(struct lazy_pages_info *lpi, unsigned long addr)
 static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 {
 	struct lazy_iov *iov;
-	__u64 address;
+	unsigned long long address;
 	int ret;
 	unsigned long nr_pages;
 	int bucket;
@@ -1685,7 +1685,7 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 		 * or move it to the reqs list to avoid fragmenting the
 		 * IOV list.
 		 */
-		__u64 img_addr;
+		unsigned long long img_addr;
 
 		iov = find_iov(lpi, address);
 		if (!iov)
