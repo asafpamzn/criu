@@ -70,12 +70,13 @@ struct prefix##_mpsc_node {				\
 #define mpsc_enqueue(tail, size, entry_ptr, node_type)			\
 ({									\
 	node_type *_node = xmalloc(sizeof(*_node));			\
+	node_type *_prev;						\
 	int _rc = -1;							\
 	if (_node) {							\
 		_node->entry = (entry_ptr);				\
 		_node->next  = NULL;					\
-		node_type *_prev = __atomic_exchange_n(&(tail), _node,	\
-						       __ATOMIC_ACQ_REL); \
+		_prev = __atomic_exchange_n(&(tail), _node,		\
+					    __ATOMIC_ACQ_REL);		\
 		__atomic_store_n(&_prev->next, _node, __ATOMIC_RELEASE);\
 		__atomic_fetch_add(&(size), 1, __ATOMIC_RELAXED);	\
 		_rc = 0;						\

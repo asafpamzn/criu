@@ -328,6 +328,7 @@ static void check_and_print_cow_stats(void)
 {
 	time_t now = time(NULL);
 	time_t last = __atomic_load_n(&cow_stats.last_print_time, __ATOMIC_RELAXED);
+	unsigned long wr, fk, rm, un, cp, up, wk, af, rf, uf, wf, re, ea;
 
 	if (now - last < 1)
 		return;
@@ -341,19 +342,19 @@ static void check_and_print_cow_stats(void)
 		return;
 
 	/* Atomically read-and-reset each counter */
-	unsigned long wr = __atomic_exchange_n(&cow_stats.write_faults, 0, __ATOMIC_RELAXED);
-	unsigned long fk = __atomic_exchange_n(&cow_stats.fork_events, 0, __ATOMIC_RELAXED);
-	unsigned long rm = __atomic_exchange_n(&cow_stats.remap_events, 0, __ATOMIC_RELAXED);
-	unsigned long un = __atomic_exchange_n(&cow_stats.unknown_events, 0, __ATOMIC_RELAXED);
-	unsigned long cp = __atomic_exchange_n(&cow_stats.pages_copied, 0, __ATOMIC_RELAXED);
-	unsigned long up = __atomic_exchange_n(&cow_stats.pages_unprotected, 0, __ATOMIC_RELAXED);
-	unsigned long wk = __atomic_exchange_n(&cow_stats.pages_woken, 0, __ATOMIC_RELAXED);
-	unsigned long af = __atomic_exchange_n(&cow_stats.alloc_failures, 0, __ATOMIC_RELAXED);
-	unsigned long rf = __atomic_exchange_n(&cow_stats.read_failures, 0, __ATOMIC_RELAXED);
-	unsigned long uf = __atomic_exchange_n(&cow_stats.unprotect_failures, 0, __ATOMIC_RELAXED);
-	unsigned long wf = __atomic_exchange_n(&cow_stats.wake_failures, 0, __ATOMIC_RELAXED);
-	unsigned long re = __atomic_exchange_n(&cow_stats.read_errors, 0, __ATOMIC_RELAXED);
-	unsigned long ea = __atomic_exchange_n(&cow_stats.eagain_errors, 0, __ATOMIC_RELAXED);
+	wr = __atomic_exchange_n(&cow_stats.write_faults, 0, __ATOMIC_RELAXED);
+	fk = __atomic_exchange_n(&cow_stats.fork_events, 0, __ATOMIC_RELAXED);
+	rm = __atomic_exchange_n(&cow_stats.remap_events, 0, __ATOMIC_RELAXED);
+	un = __atomic_exchange_n(&cow_stats.unknown_events, 0, __ATOMIC_RELAXED);
+	cp = __atomic_exchange_n(&cow_stats.pages_copied, 0, __ATOMIC_RELAXED);
+	up = __atomic_exchange_n(&cow_stats.pages_unprotected, 0, __ATOMIC_RELAXED);
+	wk = __atomic_exchange_n(&cow_stats.pages_woken, 0, __ATOMIC_RELAXED);
+	af = __atomic_exchange_n(&cow_stats.alloc_failures, 0, __ATOMIC_RELAXED);
+	rf = __atomic_exchange_n(&cow_stats.read_failures, 0, __ATOMIC_RELAXED);
+	uf = __atomic_exchange_n(&cow_stats.unprotect_failures, 0, __ATOMIC_RELAXED);
+	wf = __atomic_exchange_n(&cow_stats.wake_failures, 0, __ATOMIC_RELAXED);
+	re = __atomic_exchange_n(&cow_stats.read_errors, 0, __ATOMIC_RELAXED);
+	ea = __atomic_exchange_n(&cow_stats.eagain_errors, 0, __ATOMIC_RELAXED);
 
 	pr_err("[COW_STATS] events: wr=%lu fork=%lu remap=%lu unk=%lu | ops: copied=%lu unprot=%lu woken=%lu | errs: alloc=%lu read=%lu unprot_err=%lu wake_err=%lu read_err=%lu eagain_err=%lu\n",
 		wr, fk, rm, un, cp, up, wk, af, rf, uf, wf, re, ea);
@@ -1105,8 +1106,9 @@ static void *cow_fault_worker_fn(void *arg)
 	pr_info("COW fault worker %d started\n", w->id);
 
 	while (!__atomic_load_n(&g_stop_monitoring, __ATOMIC_ACQUIRE)) {
-		int ret = cow_wait_for_events(cdi, 500);
+		int ret;
 
+		ret = cow_wait_for_events(cdi, 500);
 		if (ret < 0) {
 			pr_err("COW fault worker %d: event error, exiting\n",
 			       w->id);
