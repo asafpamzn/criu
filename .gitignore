@@ -1,4 +1,5 @@
 .config
+.claude
 *.o
 *.d
 *.a
@@ -33,3 +34,8 @@ compel/include/asm
 include/common/asm
 include/common/config.h
 build/**
+scripts/.env
+artifacts/
+
+# Compiled page-recv binary
+tools/page-recv
