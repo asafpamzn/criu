@@ -1121,13 +1121,11 @@ static void *cow_fault_worker_fn(void *arg)
 	return NULL;
 }
 
+#define COW_FAULT_WORKERS	4
+
 static unsigned int cow_nr_fault_workers(void)
 {
-	long nproc = sysconf(_SC_NPROCESSORS_ONLN);
-
-	if (nproc < 1)
-		nproc = 1;
-	return (unsigned int)nproc;
+	return COW_FAULT_WORKERS;
 }
 
 int cow_start_monitor_thread(void)
