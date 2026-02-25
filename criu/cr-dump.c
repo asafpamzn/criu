@@ -2412,43 +2412,50 @@ int cr_dump_tasks(pid_t pid)
 		goto err;
 
 	{
-		struct timeval t_pre_s, t_pre_e, t_pre_d;
+		struct timeval t_pre_s, t_pre_e, t_pre_d, t_fn_s, t_fn_e, t_fn_d;
 		gettimeofday(&t_pre_s, NULL);
 
-		if (checkpoint_devices())
-			goto err;
+#define TIME_FN(call, label) do { \
+	gettimeofday(&t_fn_s, NULL); \
+	call; \
+	gettimeofday(&t_fn_e, NULL); \
+	timersub(&t_fn_e, &t_fn_s, &t_fn_d); \
+	pr_err("TIMING: pre-dump " label " took %ld.%06ld seconds\n", \
+	       t_fn_d.tv_sec, t_fn_d.tv_usec); \
+} while (0)
 
-		if (collect_pstree_ids())
-			goto err;
+		TIME_FN(ret = checkpoint_devices() ? -1 : 0, "checkpoint_devices");
+		if (ret) goto err;
 
-		/*
-		 * Skip network lock in COW mode — the source must
-		 * continue serving clients during migration.
-		 */
-		if (!opts.cow_dump && network_lock())
-			goto err;
+		TIME_FN(ret = collect_pstree_ids() ? -1 : 0, "collect_pstree_ids");
+		if (ret) goto err;
 
-		if (rpc_query_external_files())
-			goto err;
+		if (!opts.cow_dump) {
+			TIME_FN(ret = network_lock() ? -1 : 0, "network_lock");
+			if (ret) goto err;
+		}
 
-		if (collect_file_locks())
-			goto err;
+		TIME_FN(ret = rpc_query_external_files() ? -1 : 0, "rpc_query_ext");
+		if (ret) goto err;
 
-		if (collect_namespaces(true) < 0)
-			goto err;
+		TIME_FN(ret = collect_file_locks() ? -1 : 0, "collect_file_locks");
+		if (ret) goto err;
 
-		glob_imgset = cr_glob_imgset_open(O_DUMP);
-		if (!glob_imgset)
-			goto err;
+		TIME_FN(ret = (collect_namespaces(true) < 0) ? -1 : 0, "collect_namespaces");
+		if (ret) goto err;
 
-		if (seccomp_collect_dump_filters() < 0)
-			goto err;
+		TIME_FN(glob_imgset = cr_glob_imgset_open(O_DUMP), "cr_glob_imgset_open");
+		if (!glob_imgset) goto err;
 
-		/* Errors handled later in detect_pid_reuse */
-		parent_ie = get_parent_inventory();
+		TIME_FN(ret = (seccomp_collect_dump_filters() < 0) ? -1 : 0, "seccomp_filters");
+		if (ret) goto err;
 
-		if (collect_and_suspend_lsm() < 0)
-			goto err;
+		TIME_FN(parent_ie = get_parent_inventory(), "get_parent_inventory");
+
+		TIME_FN(ret = (collect_and_suspend_lsm() < 0) ? -1 : 0, "collect_lsm");
+		if (ret) goto err;
+
+#undef TIME_FN
 
 		gettimeofday(&t_pre_e, NULL);
 		timersub(&t_pre_e, &t_pre_s, &t_pre_d);

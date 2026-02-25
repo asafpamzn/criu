@@ -92,8 +92,12 @@ static void *cow_wp_worker(void *arg)
 	unsigned int i;
 
 	/* Lower priority so main dump thread gets CPU first */
-	if (nice(10) == -1 && errno != 0)
-		pr_debug("nice(10) failed: %s\n", strerror(errno));
+	if (nice(19) == -1 && errno != 0)
+		pr_debug("nice(19) failed: %s\n", strerror(errno));
+	{
+		struct sched_param sp = { .sched_priority = 0 };
+		sched_setscheduler(0, SCHED_BATCH, &sp);
+	}
 
 	for (i = job->start_idx; i < job->end_idx; i++) {
 		wp.range.start = job->ranges[i].start;

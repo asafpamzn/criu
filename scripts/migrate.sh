@@ -308,8 +308,11 @@ if [ -z "$PID" ]; then
 fi
 log "  Valkey PID: $PID"
 log "  Artifacts dir: $RUN_DIR"
-sudo touch "$IMAGES_DIR/lazy-primary.log"
-sudo chmod 644 "$IMAGES_DIR/lazy-primary.log"
+# Use tmpfs for CRIU images during dump to avoid FSx metadata latency
+LOCAL_IMGS="/tmp/criu-dump-imgs"
+sudo rm -rf "$LOCAL_IMGS" && sudo mkdir -p "$LOCAL_IMGS"
+sudo touch "$LOCAL_IMGS/lazy-primary.log"
+sudo chmod 644 "$LOCAL_IMGS/lazy-primary.log"
 mark_local_event "DUMP_PREP_MS"
 
 log "Step 6a: Start source availability monitor..."
@@ -435,7 +438,7 @@ fi
 CRIU_DUMP_CMD=(
   sudo env COW_PRE_FREEZE_CMD="valkey-cli -p $VALKEY_PORT CLIENT PAUSE 5000 ALL >/dev/null 2>&1" "$CRIU_BIN" dump
   --tree "$PID"
-  --images-dir "$IMAGES_DIR"
+  --images-dir "$LOCAL_IMGS"
   --cow-dump
   --lazy-pages
   --address "$PRIMARY_IP"
@@ -448,7 +451,7 @@ CRIU_DUMP_CMD=(
   --ext-unix-sk
   --leave-running
   --display-stats
-  -v2 -o "$IMAGES_DIR/lazy-primary.log"
+  -v2 -o "$LOCAL_IMGS/lazy-primary.log"
 )
 if [ -n "$CGROUP_PATH" ]; then
   CRIU_DUMP_CMD+=(--freeze-cgroup "$CGROUP_PATH")
@@ -485,18 +488,20 @@ DUMP_PID=$!
 sleep 2
 if ! kill -0 "$DUMP_PID" 2>/dev/null; then
   # Dump process exited — check if page server was ready (success) or not (failure)
-  if sudo grep -a -q "PAGE SERVER READY TO SERVE" "$IMAGES_DIR/lazy-primary.log" 2>/dev/null; then
+  DUMP_LOG="${LOCAL_IMGS:-$IMAGES_DIR}/lazy-primary.log"
+  if sudo grep -a -q "PAGE SERVER READY TO SERVE" "$DUMP_LOG" 2>/dev/null; then
     log "  Dump completed quickly (small dataset)"
   else
     log "ERROR: criu dump exited early"
-    sudo tail -n 120 "$IMAGES_DIR/lazy-primary.log" || true
+    sudo tail -n 120 "$DUMP_LOG" || true
     exit 1
   fi
 fi
 
+DUMP_LOG="${LOCAL_IMGS:-$IMAGES_DIR}/lazy-primary.log"
 PAGE_SERVER_READY=0
 for _ in $(seq 1 600); do
-  if sudo grep -a -q "PAGE SERVER READY TO SERVE" "$IMAGES_DIR/lazy-primary.log" 2>/dev/null; then
+  if sudo grep -a -q "PAGE SERVER READY TO SERVE" "$DUMP_LOG" 2>/dev/null; then
     PAGE_SERVER_READY=1
     mark_local_event "PAGE_SERVER_READY_MS"
     break
@@ -505,6 +510,12 @@ for _ in $(seq 1 600); do
 done
 if [ "$PAGE_SERVER_READY" -ne 1 ]; then
   log "WARN: did not observe 'PAGE SERVER READY TO SERVE' in lazy-primary.log within 30s"
+fi
+
+# Copy CRIU images from tmpfs to FSx so the replica can access them.
+# Process is already resumed at this point (COW early resume).
+if [ -n "$LOCAL_IMGS" ] && [ -d "$LOCAL_IMGS" ]; then
+  sudo cp -a "$LOCAL_IMGS"/* "$IMAGES_DIR"/ 2>/dev/null
 fi
 
 WORKLOAD_PID=""
