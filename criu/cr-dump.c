@@ -2276,7 +2276,6 @@ static int cr_dump_finish(int ret)
 	/* Resume process early if using COW dump with lazy pages */
 	if (!ret && opts.lazy_pages && opts.cow_dump) {
 		pr_err("PAGE SERVER READY TO SERVE\n");
-		pr_info("Resuming process with COW protection active\n");
 
 		if (!cow_is_wp_async() && cow_start_monitor_thread()) {
 			pr_err("Failed to start COW monitor thread\n");
@@ -2284,17 +2283,10 @@ static int cr_dump_finish(int ret)
 			goto out_release_cow;
 		}
 
-		if (arch_set_thread_regs(root_item, true) < 0) {
-			ret = -1;
-			goto out_release_cow;
-		}
-
-		cr_plugin_fini(CR_PLUGIN_STAGE__DUMP, ret);
-
-		pstree_switch_state(root_item, TASK_ALIVE);
-		timing_stop(TIME_FROZEN);
-		
-		/* Now start lazy page transfer with process running */
+		/*
+		 * Process was already resumed in cr_dump_tasks() right
+		 * after dump_one_task.  Just start the page transfer.
+		 */
 		ret = cr_lazy_mem_dump();
 	} else {
 		/* Standard path: transfer pages then resume */
@@ -2419,40 +2411,70 @@ int cr_dump_tasks(pid_t pid)
 	if (collect_pstree())
 		goto err;
 
-	if (checkpoint_devices())
-		goto err;
+	{
+		struct timeval t_pre_s, t_pre_e, t_pre_d;
+		gettimeofday(&t_pre_s, NULL);
 
-	if (collect_pstree_ids())
-		goto err;
+		if (checkpoint_devices())
+			goto err;
 
-	if (network_lock())
-		goto err;
+		if (collect_pstree_ids())
+			goto err;
 
-	if (rpc_query_external_files())
-		goto err;
+		/*
+		 * Skip network lock in COW mode — the source must
+		 * continue serving clients during migration.
+		 */
+		if (!opts.cow_dump && network_lock())
+			goto err;
 
-	if (collect_file_locks())
-		goto err;
+		if (rpc_query_external_files())
+			goto err;
 
-	if (collect_namespaces(true) < 0)
-		goto err;
+		if (collect_file_locks())
+			goto err;
 
-	glob_imgset = cr_glob_imgset_open(O_DUMP);
-	if (!glob_imgset)
-		goto err;
+		if (collect_namespaces(true) < 0)
+			goto err;
 
-	if (seccomp_collect_dump_filters() < 0)
-		goto err;
+		glob_imgset = cr_glob_imgset_open(O_DUMP);
+		if (!glob_imgset)
+			goto err;
 
-	/* Errors handled later in detect_pid_reuse */
-	parent_ie = get_parent_inventory();
+		if (seccomp_collect_dump_filters() < 0)
+			goto err;
 
-	if (collect_and_suspend_lsm() < 0)
-		goto err;
+		/* Errors handled later in detect_pid_reuse */
+		parent_ie = get_parent_inventory();
+
+		if (collect_and_suspend_lsm() < 0)
+			goto err;
+
+		gettimeofday(&t_pre_e, NULL);
+		timersub(&t_pre_e, &t_pre_s, &t_pre_d);
+		pr_err("TIMING: pre_dump_one_task overhead took %ld.%06ld seconds\n",
+		       t_pre_d.tv_sec, t_pre_d.tv_usec);
+	}
 
 	for_each_pstree_item(item) {
 		if (dump_one_task(item, parent_ie))
 			goto err;
+	}
+
+	/*
+	 * COW early resume: the process tree dump, mount info, file locks,
+	 * and other image writes below use already-collected data and don't
+	 * need the process frozen.  Resume now to minimize unresponsive time.
+	 * The page server starts after resume in cr_dump_finish().
+	 */
+	if (opts.lazy_pages && opts.cow_dump) {
+		if (arch_set_thread_regs(root_item, true) < 0)
+			goto err;
+
+		cr_plugin_fini(CR_PLUGIN_STAGE__DUMP, 0);
+		pstree_switch_state(root_item, TASK_ALIVE);
+		timing_stop(TIME_FROZEN);
+		pr_err("COW early resume: process unfrozen after dump_one_task\n");
 	}
 
 	ret = run_plugins(DUMP_DEVICES_LATE, pid);
