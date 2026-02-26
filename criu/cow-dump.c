@@ -335,14 +335,6 @@ static void check_and_print_cow_stats(void)
 	       wr, fk, rm, un, cp, up, wk, af, rf, uf, wf, re, ea);
 }
 
-/* ------------------------------------------------------------------ */
-/*  Helpers                                                            */
-/* ------------------------------------------------------------------ */
-
-static bool cow_workers_are_running(void)
-{
-	return __atomic_load_n(&g_workers_running, __ATOMIC_ACQUIRE);
-}
 
 static void cow_monitor_wakeup(void)
 {
