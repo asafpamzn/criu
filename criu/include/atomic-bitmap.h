@@ -47,6 +47,19 @@ static inline void atomic_bitmap_clear(uint8_t *bitmap, unsigned long page_idx)
 }
 
 /*
+ * Atomic test-and-set: atomically set a bit and return its previous value.
+ * Returns true if the bit was already set (i.e. page already captured).
+ */
+static inline bool atomic_bitmap_test_and_set(uint8_t *bitmap,
+					      unsigned long page_idx)
+{
+	uint8_t mask = (uint8_t)(1 << (page_idx % 8));
+	uint8_t old = __atomic_fetch_or(&bitmap[page_idx / 8], mask,
+					__ATOMIC_ACQ_REL);
+	return (old & mask) != 0;
+}
+
+/*
  * Non-atomic test - plain memory load without ordering guarantees.
  * Safe for single-threaded reader contexts where false negatives are acceptable.
  */

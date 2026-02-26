@@ -258,8 +258,13 @@ static int g_monitor_eventfd = -1;
 static struct cow_page_queue_entry *g_putback_list = NULL;
 
 /* Per-worker page buffer pool — avoids malloc(PAGE_SIZE) on the hot path */
-#define COW_PAGE_POOL_SIZE	64	/* 64 x 4 KB = 256 KB per worker */
+#define COW_PAGE_POOL_SIZE	256	/* 256 x 4 KB = 1 MB per worker */
 #define COW_FAULT_WORKERS	4
+
+/* Pre-read window: 8 pages before + faulting page + 7 pages after = 16 pages = 64KB */
+#define COW_PREREAD_BEFORE	8
+#define COW_PREREAD_AFTER	7
+#define COW_PREREAD_TOTAL	(COW_PREREAD_BEFORE + 1 + COW_PREREAD_AFTER)
 
 struct cow_fault_worker {
 	pthread_t thread;
@@ -693,92 +698,175 @@ void cow_dump_fini(void)
 /*  Fault handling (hot path)                                          */
 /* ------------------------------------------------------------------ */
 
+/*
+ * cow_handle_write_fault — pre-read 16 pages (64KB) around the faulting address.
+ *
+ * For each fault we read 8 pages before + the faulting page + 7 pages after,
+ * clamped to VMA boundaries.  This amortizes the per-fault overhead:
+ *   - 1 process_vm_readv  (was 1 per page)
+ *   - 1 UFFDIO_WRITEPROTECT  (was 1 per page)
+ *   - 1 UFFDIO_WAKE  (faulting page only)
+ *
+ * Neighboring pages that were already captured by another worker are
+ * detected via atomic test-and-set on the COW bitmap and skipped.
+ */
 static int cow_handle_write_fault(struct cow_dump_info *cdi,
 				  unsigned long addr,
 				  struct cow_fault_worker *worker)
 {
 	unsigned long page_addr = addr & ~(PAGE_SIZE - 1);
+	unsigned long vma_start = 0, vma_end = 0;
+	unsigned long range_start, range_end;
+	unsigned int nr_pages, i, enqueued = 0;
+	struct iovec local_iov[COW_PREREAD_TOTAL];
+	struct iovec remote_iov;
+	void *page_bufs[COW_PREREAD_TOTAL];
 	struct uffdio_writeprotect wp;
-	struct uffdio_range range;
+	struct uffdio_range wake_range;
 	ssize_t ret;
-	struct cow_page_queue_entry *entry;
-	struct iovec local_iov, remote_iov;
-	void *page_data;
+	bool found_vma = false;
 
 	pr_debug("Write fault at 0x%lx\n", page_addr);
 	COW_STAT_INC(write_faults);
 
-	page_data = worker ? cow_worker_pool_get(worker) : xmalloc(PAGE_SIZE);
-	if (!page_data) {
-		pr_err("Failed to allocate page data buffer\n");
-		COW_STAT_INC(alloc_failures);
+	/* Find the VMA containing this fault */
+	for (i = 0; i < cdi->nr_tracked_vmas; i++) {
+		if (page_addr >= cdi->tracked_vmas[i].start &&
+		    page_addr < cdi->tracked_vmas[i].end) {
+			vma_start = cdi->tracked_vmas[i].start;
+			vma_end = cdi->tracked_vmas[i].end;
+			found_vma = true;
+			break;
+		}
+	}
+
+	if (!found_vma) {
+		pr_err("Write fault at 0x%lx not in any tracked VMA\n",
+		       page_addr);
 		return -1;
 	}
 
-	local_iov.iov_base = page_data;
-	local_iov.iov_len = PAGE_SIZE;
-	remote_iov.iov_base = (void *)page_addr;
-	remote_iov.iov_len = PAGE_SIZE;
+	/* Calculate pre-read range, clamped to VMA boundaries */
+	range_start = page_addr - (unsigned long)COW_PREREAD_BEFORE * PAGE_SIZE;
+	if (range_start < vma_start || range_start > page_addr) /* underflow */
+		range_start = vma_start;
 
-	ret = process_vm_readv(cdi->source_pid, &local_iov, 1, &remote_iov, 1, 0);
-	if (ret != PAGE_SIZE) {
-		pr_perror("Failed to read page at 0x%lx from pid %d (read %zd bytes)",
-			  page_addr, cdi->source_pid, ret);
-		xfree(page_data);
+	range_end = page_addr + (unsigned long)(COW_PREREAD_AFTER + 1) * PAGE_SIZE;
+	if (range_end > vma_end)
+		range_end = vma_end;
+
+	nr_pages = (unsigned int)((range_end - range_start) / PAGE_SIZE);
+	if (nr_pages > COW_PREREAD_TOTAL)
+		nr_pages = COW_PREREAD_TOTAL;
+
+	/* Allocate page buffers from worker pool (or malloc fallback) */
+	for (i = 0; i < nr_pages; i++) {
+		page_bufs[i] = worker ? cow_worker_pool_get(worker)
+				      : xmalloc(PAGE_SIZE);
+		if (!page_bufs[i]) {
+			unsigned int j;
+
+			for (j = 0; j < i; j++)
+				xfree(page_bufs[j]);
+			COW_STAT_INC(alloc_failures);
+			return -1;
+		}
+		local_iov[i].iov_base = page_bufs[i];
+		local_iov[i].iov_len = PAGE_SIZE;
+	}
+
+	/* Single process_vm_readv for the entire range (scatter local iovecs) */
+	remote_iov.iov_base = (void *)range_start;
+	remote_iov.iov_len = (size_t)nr_pages * PAGE_SIZE;
+
+	ret = process_vm_readv(cdi->source_pid, local_iov, nr_pages,
+			       &remote_iov, 1, 0);
+	if (ret != (ssize_t)((size_t)nr_pages * PAGE_SIZE)) {
+		pr_perror("Pre-read %u pages at 0x%lx from pid %d failed "
+			  "(got %zd bytes)", nr_pages, range_start,
+			  cdi->source_pid, ret);
+		for (i = 0; i < nr_pages; i++)
+			xfree(page_bufs[i]);
 		COW_STAT_INC(read_failures);
 		return -1;
 	}
-	COW_STAT_INC(pages_copied);
+	__atomic_fetch_add(&cow_stats.pages_copied, nr_pages, __ATOMIC_RELAXED);
 
-	wp.range.start = page_addr;
-	wp.range.len = PAGE_SIZE;
+	/* Unprotect the entire range in one ioctl */
+	wp.range.start = range_start;
+	wp.range.len = (unsigned long)nr_pages * PAGE_SIZE;
 	wp.mode = 0;
 
 	if (ioctl(cdi->uffd, UFFDIO_WRITEPROTECT, &wp)) {
-		pr_perror("Failed to unprotect page at 0x%lx", page_addr);
-		xfree(page_data);
+		pr_perror("Failed to unprotect range 0x%lx-%lx",
+			  range_start, range_end);
+		for (i = 0; i < nr_pages; i++)
+			xfree(page_bufs[i]);
 		COW_STAT_INC(unprotect_failures);
 		return -1;
 	}
-	COW_STAT_INC(pages_unprotected);
+	__atomic_fetch_add(&cow_stats.pages_unprotected, nr_pages,
+			   __ATOMIC_RELAXED);
 
-	range.start = page_addr;
-	range.len = PAGE_SIZE;
+	/* Wake only the faulting page (neighbors weren't blocked) */
+	wake_range.start = page_addr;
+	wake_range.len = PAGE_SIZE;
 
-	if (ioctl(cdi->uffd, UFFDIO_WAKE, &range)) {
-		pr_perror("Failed to wake thread after unprotect");
-		xfree(page_data);
+	if (ioctl(cdi->uffd, UFFDIO_WAKE, &wake_range)) {
+		pr_perror("Failed to wake faulting thread at 0x%lx", page_addr);
+		for (i = 0; i < nr_pages; i++)
+			xfree(page_bufs[i]);
 		COW_STAT_INC(wake_failures);
 		return -1;
 	}
 	COW_STAT_INC(pages_woken);
-	__atomic_fetch_sub(&cdi->total_pages, 1, __ATOMIC_RELAXED);
+	__atomic_fetch_sub(&cdi->total_pages, nr_pages, __ATOMIC_RELAXED);
 
-	entry = xmalloc(sizeof(*entry));
-	if (!entry) {
-		pr_err("Failed to allocate queue entry for page 0x%lx, "
-		       "clearing bitmap for P3 fallback\n", page_addr);
-		xfree(page_data);
-		cow_clear_bitmap(page_addr);
-		return 0;
+	/* Enqueue each page that isn't already captured */
+	for (i = 0; i < nr_pages; i++) {
+		unsigned long pa = range_start + (unsigned long)i * PAGE_SIZE;
+		struct cow_page_queue_entry *entry;
+
+		/*
+		 * Atomic test-and-set: if another worker already captured
+		 * this page (e.g. from an overlapping pre-read window),
+		 * skip the enqueue to avoid duplicates.
+		 */
+		if (cow_test_and_set_bitmap(pa)) {
+			xfree(page_bufs[i]);
+			continue;
+		}
+
+		entry = xmalloc(sizeof(*entry));
+		if (!entry) {
+			pr_err("Failed to allocate queue entry for page 0x%lx, "
+			       "clearing bitmap for P3 fallback\n", pa);
+			xfree(page_bufs[i]);
+			cow_clear_bitmap(pa);
+			continue;
+		}
+
+		entry->vaddr = pa;
+		entry->data = page_bufs[i];
+		entry->ppb = NULL;
+		entry->seg_idx = 0;
+		entry->page_idx_in_seg = 0;
+		entry->next = NULL;
+
+		if (mpsc_enqueue(cdi->page_queue.tail, cdi->page_queue.size,
+				 entry, struct cow_page_mpsc_node)) {
+			pr_err("Failed to enqueue COW page 0x%lx\n", pa);
+			xfree(entry->data);
+			xfree(entry);
+			cow_clear_bitmap(pa);
+			continue;
+		}
+		enqueued++;
 	}
 
-	entry->vaddr = page_addr;
-	entry->data = page_data;
-	entry->ppb = NULL;
-	entry->seg_idx = 0;
-	entry->page_idx_in_seg = 0;
-	entry->next = NULL;
+	pr_debug("Pre-read fault 0x%lx: range 0x%lx-%lx (%u pages, %u new)\n",
+		 page_addr, range_start, range_end, nr_pages, enqueued);
 
-	if (mpsc_enqueue(cdi->page_queue.tail, cdi->page_queue.size,
-			 entry, struct cow_page_mpsc_node)) {
-		pr_err("FATAL: Failed to enqueue COW page 0x%lx\n", page_addr);
-		xfree(entry->data);
-		xfree(entry);
-		return -1;
-	}
-
-	cow_set_bitmap(page_addr);
 	return 0;
 }
 

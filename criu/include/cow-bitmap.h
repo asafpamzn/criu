@@ -7,5 +7,6 @@
 extern void cow_set_bitmap(unsigned long vaddr);
 extern void cow_clear_bitmap(unsigned long vaddr);
 extern bool cow_test_bitmap(unsigned long vaddr);
+extern bool cow_test_and_set_bitmap(unsigned long vaddr);
 
 #endif /* __CR_COW_BITMAP_H__ */

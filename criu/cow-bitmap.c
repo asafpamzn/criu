@@ -52,3 +52,18 @@ bool cow_test_bitmap(unsigned long vaddr)
 
 	return atomic_bitmap_test(lve->cow_bitmap, page_idx);
 }
+
+bool cow_test_and_set_bitmap(unsigned long vaddr)
+{
+	unsigned long page_addr = vaddr & ~(PAGE_SIZE - 1);
+	struct lazy_vma_entry *lve;
+	unsigned long page_idx;
+
+	lve = find_lazy_vma_by_addr(page_addr);
+	if (!lve || !lve->cow_bitmap)
+		return false;
+
+	page_idx = (page_addr - lve->start) / PAGE_SIZE;
+
+	return atomic_bitmap_test_and_set(lve->cow_bitmap, page_idx);
+}
