@@ -3662,6 +3662,7 @@ static int collect_net_ns(struct ns_id *ns, void *oarg)
 	if (!for_dump)
 		return 0;
 
+
 	return collect_sockets(ns);
 }
 

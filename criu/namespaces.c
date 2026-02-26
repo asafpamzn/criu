@@ -1597,20 +1597,33 @@ int prepare_userns(struct pstree_item *item)
 int collect_namespaces(bool for_dump)
 {
 	int ret;
+	struct timeval t1, t2, td;
 
+	gettimeofday(&t1, NULL);
 	ret = collect_user_namespaces(for_dump);
+	gettimeofday(&t2, NULL); timersub(&t2, &t1, &td);
+	pr_err("TIMING: collect_user_ns took %ld.%06ld s\n", td.tv_sec, td.tv_usec);
 	if (ret < 0)
 		return ret;
 
+	gettimeofday(&t1, NULL);
 	ret = collect_mnt_namespaces(for_dump);
+	gettimeofday(&t2, NULL); timersub(&t2, &t1, &td);
+	pr_err("TIMING: collect_mnt_ns took %ld.%06ld s\n", td.tv_sec, td.tv_usec);
 	if (ret < 0)
 		return ret;
 
+	gettimeofday(&t1, NULL);
 	ret = collect_net_namespaces(for_dump);
+	gettimeofday(&t2, NULL); timersub(&t2, &t1, &td);
+	pr_err("TIMING: collect_net_ns took %ld.%06ld s\n", td.tv_sec, td.tv_usec);
 	if (ret < 0)
 		return ret;
 
+	gettimeofday(&t1, NULL);
 	ret = collect_pid_namespaces(for_dump);
+	gettimeofday(&t2, NULL); timersub(&t2, &t1, &td);
+	pr_err("TIMING: collect_pid_ns took %ld.%06ld s\n", td.tv_sec, td.tv_usec);
 	if (ret < 0)
 		return ret;
 
