@@ -69,7 +69,7 @@ static struct cow_tracked_task *g_cow_pre_task;
  * initial stall. We can apply it in parallel from the CRIU process after
  * receiving the userfaultfd from the parasite.
  */
-#define COW_WP_CHUNK_SIZE	(512UL * 1024 * 1024)
+#define COW_WP_CHUNK_SIZE	(2048UL * 1024 * 1024)
 /* Use all available CPUs — more threads reduce WP ioctl serialization */
 #define COW_WP_MAX_THREADS	0	/* 0 = use nproc (set in cow_wp_nr_threads) */
 
@@ -92,7 +92,7 @@ static void *cow_wp_worker(void *arg)
 	struct uffdio_writeprotect wp;
 	unsigned int i;
 
-	/* Lower priority + avoid core 0 so main dump thread gets CPU */
+	/* Lower priority so main dump thread gets CPU first */
 	if (nice(19) == -1 && errno != 0)
 		pr_debug("nice(19) failed: %s\n", strerror(errno));
 	{
