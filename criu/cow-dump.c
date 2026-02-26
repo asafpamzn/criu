@@ -62,6 +62,7 @@ struct cow_dump_info {
 /* Forward declarations for statics used by WP functions */
 static struct cow_dump_info *g_cow_info;
 static bool g_wp_async_mode;
+static struct cow_tracked_task *g_cow_pre_task;
 
 /*
  * Applying UFFD write-protect over a large address space can dominate the
@@ -638,6 +639,95 @@ static int cow_register_vmas(int uffd, struct cow_tracked_task *task,
 	return 0;
 }
 
+int cow_dump_pre_init(pid_t pid)
+{
+	struct cow_dump_info *cdi = g_cow_info;
+	struct cow_tracked_task *task;
+	unsigned int i;
+
+	pr_info("COW pre-init for pid %d\n", pid);
+
+	if (!cdi) {
+		if (!cow_check_kernel_support()) {
+			pr_err("Kernel doesn't support COW dump\n");
+			return -1;
+		}
+
+		cdi = xzalloc(sizeof(*cdi));
+		if (!cdi)
+			return -1;
+
+		INIT_LIST_HEAD(&cdi->tracked_tasks);
+
+		g_wp_async_mode = kdat.has_wp_async && kdat.has_pagemap_scan;
+		pr_err("COW mode: wp_async=%d (has_wp_async=%d has_pagemap_scan=%d)\n",
+		       g_wp_async_mode, kdat.has_wp_async, kdat.has_pagemap_scan);
+
+		if (!g_wp_async_mode) {
+			for (i = 0; i < COW_HASH_SIZE; i++) {
+				INIT_HLIST_HEAD(&cdi->cow_hash[i]);
+				pthread_spin_init(&cdi->cow_hash_locks[i],
+						  PTHREAD_PROCESS_PRIVATE);
+			}
+			INIT_LIST_HEAD(&cdi->cow_page_queue);
+			pthread_spin_init(&cdi->queue_lock,
+					  PTHREAD_PROCESS_PRIVATE);
+		}
+
+		g_cow_info = cdi;
+
+		if (!g_wp_async_mode) {
+			pthread_mutex_lock(&g_tracked_tasks_lock);
+			g_tracked_tasks_generation = 0;
+			g_monitor_snapshot_generation = 0;
+			pthread_mutex_unlock(&g_tracked_tasks_lock);
+
+			if (g_monitor_eventfd >= 0) {
+				close(g_monitor_eventfd);
+				g_monitor_eventfd = -1;
+			}
+			g_monitor_eventfd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+			if (g_monitor_eventfd < 0) {
+				pr_perror("Failed to create cow monitor eventfd");
+				return -1;
+			}
+		}
+	}
+
+	task = xzalloc(sizeof(*task));
+	if (!task)
+		return -1;
+
+	INIT_LIST_HEAD(&task->list);
+	task->source_pid = pid;
+	task->uffd = -1;
+	task->pagemap_fd = -1;
+
+	if (kdat.has_uffd_proc) {
+		task->uffd = uffd_open_proc(pid);
+		if (task->uffd < 0) {
+			xfree(task);
+			return -1;
+		}
+	}
+	/* If no /proc/<pid>/userfaultfd, skip — cow_dump_init will
+	 * use parasite RPC fallback when it sees task->uffd == -1. */
+
+	if (g_wp_async_mode) {
+		task->pagemap_fd = open_proc(pid, "pagemap");
+		if (task->pagemap_fd < 0) {
+			pr_warn("Cannot open /proc/%d/pagemap in pre-init, "
+				"will fall back to sync WP\n", pid);
+			g_wp_async_mode = false;
+		}
+	}
+
+	g_cow_pre_task = task;
+	pr_info("COW pre-init done: uffd=%d pagemap_fd=%d wp_async=%d\n",
+		task->uffd, task->pagemap_fd, g_wp_async_mode);
+	return 0;
+}
+
 int cow_dump_init(struct pstree_item *item, struct vm_area_list *vma_area_list, struct parasite_ctl *ctl)
 {
 	struct cow_dump_info *cdi = g_cow_info;
@@ -704,76 +794,90 @@ int cow_dump_init(struct pstree_item *item, struct vm_area_list *vma_area_list, 
 		return 0;
 	}
 
-	task = xzalloc(sizeof(*task));
-	if (!task)
-		goto err;
-
-	INIT_LIST_HEAD(&task->list);
-	task->source_pid = item->pid->real;
-	task->uffd = -1;
-	task->pagemap_fd = -1;
-
-	if (kdat.has_uffd_proc) {
-		/*
-		 * Fast path: open userfaultfd via /proc/<pid>/userfaultfd
-		 * and register VMAs directly from CRIU, no parasite RPC.
-		 */
-		pr_info("Using /proc/%d/userfaultfd (direct path)\n",
-			item->pid->real);
-
-		task->uffd = uffd_open_proc(item->pid->real);
-		if (task->uffd < 0)
-			goto err;
+	/*
+	 * Use pre-created task from cow_dump_pre_init() if available.
+	 * This avoids uffd creation and pagemap_fd open during the
+	 * frozen window — only VMA registration remains.
+	 */
+	if (g_cow_pre_task && g_cow_pre_task->source_pid == item->pid->real
+	    && g_cow_pre_task->uffd >= 0) {
+		task = g_cow_pre_task;
+		g_cow_pre_task = NULL;
+		pr_info("Using pre-created COW task for pid %d (uffd=%d)\n",
+			item->pid->real, task->uffd);
 	} else {
-		/*
-		 * Use parasite only to create the userfaultfd and
-		 * negotiate UFFDIO_API inside the target process.
-		 * Pass nr_vmas=0 so the parasite skips VMA registration;
-		 * we do that from CRIU below since UFFDIO_REGISTER
-		 * operates on the uffd's mm_struct, not current->mm.
-		 */
-		args_size = sizeof(*args);
-		args = compel_parasite_args_s(ctl, args_size);
-		if (!args) {
-			pr_err("Failed to allocate parasite args\n");
-			goto err;
+		if (g_cow_pre_task) {
+			/* Pre-task exists but didn't match or lacks uffd */
+			pr_info("Pre-created task mismatch, creating inline\n");
 		}
 
-		args->nr_vmas = 0;
-		args->total_pages = 0;
-		args->nr_failed_vmas = 0;
-		args->ret = -1;
-
-		ret = compel_rpc_call(PARASITE_CMD_COW_DUMP_INIT, ctl);
-		if (ret < 0) {
-			pr_err("Failed to initiate COW dump RPC\n");
+		task = xzalloc(sizeof(*task));
+		if (!task)
 			goto err;
-		}
 
-		compel_util_recv_fd(ctl, &task->uffd);
-		if (task->uffd < 0) {
-			pr_err("Failed to receive uffd from parasite: %d\n",
-			       task->uffd);
-			goto err;
-		}
+		INIT_LIST_HEAD(&task->list);
+		task->source_pid = item->pid->real;
+		task->uffd = -1;
+		task->pagemap_fd = -1;
 
-		ret = compel_rpc_sync(PARASITE_CMD_COW_DUMP_INIT, ctl);
-		if (ret < 0 || args->ret != 0) {
-			pr_err("Parasite COW dump init failed: %d (ret=%d)\n",
-			       ret, args->ret);
-			goto err;
-		}
+		if (kdat.has_uffd_proc) {
+			pr_info("Using /proc/%d/userfaultfd (direct path)\n",
+				item->pid->real);
 
-		pr_err("Parasite uffd features: 0x%llx (WP_ASYNC=%s)\n",
-		       args->uffd_features,
-		       (args->uffd_features & UFFD_FEATURE_WP_ASYNC) ?
-		       "YES" : "NO");
+			task->uffd = uffd_open_proc(item->pid->real);
+			if (task->uffd < 0)
+				goto err;
+		} else {
+			/*
+			 * Use parasite only to create the userfaultfd and
+			 * negotiate UFFDIO_API inside the target process.
+			 * Pass nr_vmas=0 so the parasite skips VMA registration;
+			 * we do that from CRIU below since UFFDIO_REGISTER
+			 * operates on the uffd's mm_struct, not current->mm.
+			 */
+			args_size = sizeof(*args);
+			args = compel_parasite_args_s(ctl, args_size);
+			if (!args) {
+				pr_err("Failed to allocate parasite args\n");
+				goto err;
+			}
 
-		/* Override WP_ASYNC mode based on actual features */
-		if (g_wp_async_mode &&
-		    !(args->uffd_features & UFFD_FEATURE_WP_ASYNC)) {
-			pr_err("WP_ASYNC not granted by kernel, falling back to sync\n");
-			g_wp_async_mode = false;
+			args->nr_vmas = 0;
+			args->total_pages = 0;
+			args->nr_failed_vmas = 0;
+			args->ret = -1;
+
+			ret = compel_rpc_call(PARASITE_CMD_COW_DUMP_INIT, ctl);
+			if (ret < 0) {
+				pr_err("Failed to initiate COW dump RPC\n");
+				goto err;
+			}
+
+			compel_util_recv_fd(ctl, &task->uffd);
+			if (task->uffd < 0) {
+				pr_err("Failed to receive uffd from parasite: %d\n",
+				       task->uffd);
+				goto err;
+			}
+
+			ret = compel_rpc_sync(PARASITE_CMD_COW_DUMP_INIT, ctl);
+			if (ret < 0 || args->ret != 0) {
+				pr_err("Parasite COW dump init failed: %d (ret=%d)\n",
+				       ret, args->ret);
+				goto err;
+			}
+
+			pr_err("Parasite uffd features: 0x%llx (WP_ASYNC=%s)\n",
+			       args->uffd_features,
+			       (args->uffd_features & UFFD_FEATURE_WP_ASYNC) ?
+			       "YES" : "NO");
+
+			/* Override WP_ASYNC mode based on actual features */
+			if (g_wp_async_mode &&
+			    !(args->uffd_features & UFFD_FEATURE_WP_ASYNC)) {
+				pr_err("WP_ASYNC not granted by kernel, falling back to sync\n");
+				g_wp_async_mode = false;
+			}
 		}
 	}
 
@@ -794,7 +898,7 @@ int cow_dump_init(struct pstree_item *item, struct vm_area_list *vma_area_list, 
 	 * allows overlapping WP with other dump work.
 	 */
 
-	if (g_wp_async_mode) {
+	if (g_wp_async_mode && task->pagemap_fd < 0) {
 		task->pagemap_fd = open_proc(item->pid->real, "pagemap");
 		if (task->pagemap_fd < 0) {
 			pr_warn("Cannot open /proc/%d/pagemap, falling back to sync WP\n",

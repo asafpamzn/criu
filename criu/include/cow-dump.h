@@ -30,6 +30,19 @@ struct cow_page_queue_entry {
 };
 
 /**
+ * cow_dump_pre_init - Pre-create uffd and pagemap_fd before freeze
+ * @pid: Target process PID
+ *
+ * Creates the COW session, userfaultfd, and pagemap_fd before the
+ * process is ptrace-seized.  These operations don't require the
+ * process to be frozen.  The pre-created resources are consumed by
+ * cow_dump_init() during the frozen window.
+ *
+ * Returns: 0 on success, -1 on error
+ */
+extern int cow_dump_pre_init(pid_t pid);
+
+/**
  * cow_dump_init - Initialize COW dump for a process
  * @item: Process tree item to set up COW tracking for
  * @vma_area_list: List of VMAs to track

@@ -3653,6 +3653,18 @@ static int collect_net_ns(struct ns_id *ns, void *oarg)
 		ns->ext_key = val;
 	}
 
+	if (ns->net.sockets_collected) {
+		/*
+		 * Sockets pre-collected before freeze (COW mode).
+		 * Still need seqsk for parasite communication.
+		 */
+		ret = prep_ns_sockets(ns, false);
+		if (ret)
+			return ret;
+		/* netns_nr already incremented during pre-collection */
+		return 0;
+	}
+
 	ret = prep_ns_sockets(ns, for_dump);
 	if (ret)
 		return ret;
@@ -3669,6 +3681,37 @@ static int collect_net_ns(struct ns_id *ns, void *oarg)
 int collect_net_namespaces(bool for_dump)
 {
 	return walk_namespaces(&net_ns_desc, collect_net_ns, (void *)(for_dump ? 1UL : 0));
+}
+
+int cow_pre_collect_net_sockets(void)
+{
+	struct ns_id *ns;
+	int ret;
+
+	ns = pre_create_self_ns(&net_ns_desc);
+	if (!ns) {
+		pr_err("Failed to pre-create net namespace entry\n");
+		return -1;
+	}
+
+	/* Create netlink diag socket — same as prep_ns_sockets for_dump path.
+	 * NS_CRIU: no switch_ns needed, we're in our own namespace. */
+	ns->net.nlsk = socket(PF_NETLINK, SOCK_RAW, NETLINK_SOCK_DIAG);
+	if (ns->net.nlsk < 0) {
+		pr_perror("Can't create sock diag socket for pre-collection");
+		return -1;
+	}
+
+	ret = collect_sockets(ns);
+	/* collect_sockets() closes nlsk internally */
+
+	if (!ret) {
+		ns->net.sockets_collected = true;
+		netns_nr++;
+		pr_info("Pre-collected sockets for CRIU net namespace\n");
+	}
+
+	return ret;
 }
 
 struct ns_desc net_ns_desc = NS_DESC_ENTRY(CLONE_NEWNET, "net");

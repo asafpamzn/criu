@@ -1630,6 +1630,15 @@ int collect_namespaces(bool for_dump)
 	return 0;
 }
 
+struct ns_id *pre_create_self_ns(struct ns_desc *nd)
+{
+	struct ns_id *ns = NULL;
+
+	if (!__get_ns_id(getpid(), nd, NULL, &ns))
+		return NULL;
+	return ns;
+}
+
 int prepare_userns_creds(void)
 {
 	if (!opts.unprivileged || has_cap_setuid(opts.cap_eff)) {

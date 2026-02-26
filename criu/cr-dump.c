@@ -2449,6 +2449,18 @@ int cr_dump_tasks(pid_t pid)
 		goto err;
 
 	/*
+	 * COW pre-freeze: collect sockets and create uffd before the
+	 * process is ptrace-seized.  These operations don't need the
+	 * process frozen and save ~12ms from the frozen window.
+	 */
+	if (opts.cow_dump) {
+		if (cow_pre_collect_net_sockets())
+			goto err;
+		if (cow_dump_pre_init(pid))
+			goto err;
+	}
+
+	/*
 	 * The collect_pstree will also stop (PTRACE_SEIZE) the tasks
 	 * thus ensuring that they don't modify anything we collect
 	 * afterwards.
