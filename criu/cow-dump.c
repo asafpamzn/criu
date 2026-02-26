@@ -40,15 +40,6 @@ struct cow_tracked_vma {
 	unsigned long end;
 };
 
-struct cow_tracked_task {
-	pid_t source_pid;
-	int uffd;
-	unsigned long total_pages;
-	unsigned int nr_tracked_vmas;
-	struct cow_tracked_vma *tracked_vmas;
-	struct list_head list;
-};
-
 /* MPSC queue node type for COW page entries (multi-producer safe) */
 DECLARE_MPSC_NODE(cow_page, struct cow_page_queue_entry);
 struct cow_page_queue {
@@ -58,23 +49,23 @@ struct cow_page_queue {
 	unsigned long size;
 };
 
-/* COW dump state for one dump session */
+/* COW dump state for one dump session — single tracked process */
 struct cow_dump_info {
-	struct list_head tracked_tasks;
+	pid_t source_pid;
+	int uffd;
 	unsigned long total_pages;
 	unsigned long iteration;
+	unsigned int nr_tracked_vmas;
+	struct cow_tracked_vma *tracked_vmas;
 
 	struct cow_page_queue page_queue;
 };
 
 /*
  * Applying UFFD write-protect over a large address space can dominate the
- * initial stall. We can apply it in parallel from the CRIU process after
- * receiving the userfaultfd from the parasite.
+ * initial stall.  We apply it in parallel from the CRIU process.
  */
 #define COW_WP_CHUNK_SIZE	(64UL * 1024 * 1024)
-/* Use all available CPUs — more threads reduce WP ioctl serialization */
-#define COW_WP_MAX_THREADS	0	/* 0 = use nproc (set in cow_wp_nr_threads) */
 
 struct cow_wp_range {
 	unsigned long start;
@@ -127,21 +118,18 @@ static unsigned int cow_wp_nr_threads(unsigned int nr_ranges)
 	return nr_threads;
 }
 
-static struct cow_wp_range *cow_wp_build_ranges(struct cow_tracked_task *task,
+static struct cow_wp_range *cow_wp_build_ranges(struct cow_dump_info *cdi,
 						unsigned int *nr_ranges)
 {
 	struct cow_wp_range *ranges;
-	unsigned long start, end, pos;
-	unsigned long len;
-	unsigned int nr = 0;
-	unsigned int i, idx = 0;
+	unsigned long start, end, pos, len;
+	unsigned int nr = 0, i, idx = 0;
 
-	for (i = 0; i < task->nr_tracked_vmas; i++) {
-		start = task->tracked_vmas[i].start;
-		end = task->tracked_vmas[i].end;
+	for (i = 0; i < cdi->nr_tracked_vmas; i++) {
+		start = cdi->tracked_vmas[i].start;
+		end = cdi->tracked_vmas[i].end;
 		if (end <= start)
 			continue;
-
 		len = end - start;
 		nr += (len + COW_WP_CHUNK_SIZE - 1) / COW_WP_CHUNK_SIZE;
 	}
@@ -152,27 +140,23 @@ static struct cow_wp_range *cow_wp_build_ranges(struct cow_tracked_task *task,
 	}
 
 	*nr_ranges = nr;
-
 	ranges = xmalloc(nr * sizeof(*ranges));
 	if (!ranges)
 		return NULL;
 
-	for (i = 0; i < task->nr_tracked_vmas; i++) {
-		start = task->tracked_vmas[i].start;
-		end = task->tracked_vmas[i].end;
+	for (i = 0; i < cdi->nr_tracked_vmas; i++) {
+		start = cdi->tracked_vmas[i].start;
+		end = cdi->tracked_vmas[i].end;
 		if (end <= start)
 			continue;
-
 		pos = start;
 		while (pos < end) {
 			len = end - pos;
 			if (len > COW_WP_CHUNK_SIZE)
 				len = COW_WP_CHUNK_SIZE;
-
 			ranges[idx].start = pos;
 			ranges[idx].len = len;
 			idx++;
-
 			pos += len;
 		}
 	}
@@ -181,22 +165,20 @@ static struct cow_wp_range *cow_wp_build_ranges(struct cow_tracked_task *task,
 	return ranges;
 }
 
-static int cow_task_apply_writeprotect(struct cow_tracked_task *task)
+static int cow_apply_writeprotect(struct cow_dump_info *cdi)
 {
 	struct cow_wp_range *ranges;
 	struct cow_wp_job *jobs;
 	pthread_t *threads;
 	struct timespec t_start, t_end;
-	unsigned int nr_ranges, nr_threads;
-	unsigned int i, created = 0;
-	unsigned int per;
+	unsigned int nr_ranges, nr_threads, i, created = 0, per;
 	unsigned long sec, nsec;
 	int ret = 0;
 
-	if (!task->nr_tracked_vmas)
+	if (!cdi->nr_tracked_vmas)
 		return 0;
 
-	ranges = cow_wp_build_ranges(task, &nr_ranges);
+	ranges = cow_wp_build_ranges(cdi, &nr_ranges);
 	if (!ranges) {
 		if (nr_ranges)
 			return -1;
@@ -213,7 +195,7 @@ static int cow_task_apply_writeprotect(struct cow_tracked_task *task)
 
 	per = (nr_ranges + nr_threads - 1) / nr_threads;
 	for (i = 0; i < nr_threads; i++) {
-		jobs[i].uffd = task->uffd;
+		jobs[i].uffd = cdi->uffd;
 		jobs[i].ranges = ranges;
 		jobs[i].start_idx = i * per;
 		jobs[i].end_idx = jobs[i].start_idx + per;
@@ -265,62 +247,58 @@ out:
 	return ret;
 }
 
+/* ------------------------------------------------------------------ */
+/*  Global state                                                       */
+/* ------------------------------------------------------------------ */
 
 static struct cow_dump_info *g_cow_info = NULL;
 static _Atomic bool g_stop_monitoring = false;
 static pthread_mutex_t g_monitor_state_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t g_tracked_tasks_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_monitor_eventfd = -1;
-static unsigned long g_tracked_tasks_generation;
-static unsigned long g_monitor_snapshot_generation;
-/* Consumer-side putback list */
 static struct cow_page_queue_entry *g_putback_list = NULL;
 
-/*
- * Multi-threaded fault worker pool.
- * All workers poll+read the same set of uffds; the kernel delivers each
- * fault message to exactly one reader, providing natural load balancing.
- */
+/* Per-worker page buffer pool — avoids malloc(PAGE_SIZE) on the hot path */
+#define COW_PAGE_POOL_SIZE	64	/* 64 x 4 KB = 256 KB per worker */
+#define COW_FAULT_WORKERS	4
+
 struct cow_fault_worker {
 	pthread_t thread;
 	int id;
 	struct cow_dump_info *cdi;
+	void *page_pool[COW_PAGE_POOL_SIZE];
+	unsigned int pool_count;
 };
 
 static struct cow_fault_worker *g_workers = NULL;
 static unsigned int g_nr_workers = 0;
 static _Atomic bool g_workers_running = false;
 
-#define COW_CONVERGENCE_THRESHOLD 100  /* Stop if < 100 pages dirty per iteration */
-#define COW_FLUSH_THRESHOLD 1000       /* Flush to disk every 1000 pages */
+/* Forward declarations */
+static void cow_worker_pool_init(struct cow_fault_worker *w);
+static void cow_worker_pool_fini(struct cow_fault_worker *w);
+static void *cow_worker_pool_get(struct cow_fault_worker *w);
 
-/* Statistics tracking structure — all fields are atomically updated */
+/* ------------------------------------------------------------------ */
+/*  Statistics (atomically updated, safe from any thread)              */
+/* ------------------------------------------------------------------ */
+
 static struct {
-	/* Event counters */
 	unsigned long write_faults;
 	unsigned long fork_events;
 	unsigned long remap_events;
 	unsigned long unknown_events;
-
-	/* Operation counters */
 	unsigned long pages_copied;
 	unsigned long pages_unprotected;
 	unsigned long pages_woken;
-
-	/* Error counters */
 	unsigned long alloc_failures;
 	unsigned long read_failures;
 	unsigned long unprotect_failures;
 	unsigned long wake_failures;
 	unsigned long eagain_errors;
 	unsigned long read_errors;
-
 	time_t last_print_time;
 } cow_stats;
 
-/*
- * Atomic helper for cow_stats — safe to call from any worker thread.
- */
 #define COW_STAT_INC(field) \
 	__atomic_fetch_add(&cow_stats.field, 1, __ATOMIC_RELAXED)
 
@@ -332,16 +310,10 @@ static void check_and_print_cow_stats(void)
 
 	if (now - last < 1)
 		return;
-
-	/*
-	 * Use compare-and-swap so only one worker thread prints per interval.
-	 * If another thread already bumped the timestamp, bail out.
-	 */
 	if (!__atomic_compare_exchange_n(&cow_stats.last_print_time, &last, now,
 					 false, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
 		return;
 
-	/* Atomically read-and-reset each counter */
 	wr = __atomic_exchange_n(&cow_stats.write_faults, 0, __ATOMIC_RELAXED);
 	fk = __atomic_exchange_n(&cow_stats.fork_events, 0, __ATOMIC_RELAXED);
 	rm = __atomic_exchange_n(&cow_stats.remap_events, 0, __ATOMIC_RELAXED);
@@ -356,28 +328,16 @@ static void check_and_print_cow_stats(void)
 	re = __atomic_exchange_n(&cow_stats.read_errors, 0, __ATOMIC_RELAXED);
 	ea = __atomic_exchange_n(&cow_stats.eagain_errors, 0, __ATOMIC_RELAXED);
 
-	pr_err("[COW_STATS] events: wr=%lu fork=%lu remap=%lu unk=%lu | ops: copied=%lu unprot=%lu woken=%lu | errs: alloc=%lu read=%lu unprot_err=%lu wake_err=%lu read_err=%lu eagain_err=%lu\n",
-		wr, fk, rm, un, cp, up, wk, af, rf, uf, wf, re, ea);
+	pr_err("[COW_STATS] events: wr=%lu fork=%lu remap=%lu unk=%lu | "
+	       "ops: copied=%lu unprot=%lu woken=%lu | "
+	       "errs: alloc=%lu read=%lu unprot_err=%lu wake_err=%lu "
+	       "read_err=%lu eagain_err=%lu\n",
+	       wr, fk, rm, un, cp, up, wk, af, rf, uf, wf, re, ea);
 }
 
-static struct cow_tracked_task *cow_find_task_by_pid(pid_t source_pid)
-{
-	struct cow_tracked_task *task;
-
-	if (!g_cow_info)
-		return NULL;
-
-	pthread_mutex_lock(&g_tracked_tasks_lock);
-	list_for_each_entry(task, &g_cow_info->tracked_tasks, list) {
-		if (task->source_pid == source_pid) {
-			pthread_mutex_unlock(&g_tracked_tasks_lock);
-			return task;
-		}
-	}
-	pthread_mutex_unlock(&g_tracked_tasks_lock);
-
-	return NULL;
-}
+/* ------------------------------------------------------------------ */
+/*  Helpers                                                            */
+/* ------------------------------------------------------------------ */
 
 static bool cow_workers_are_running(void)
 {
@@ -391,7 +351,6 @@ static void cow_monitor_wakeup(void)
 
 	if (g_monitor_eventfd < 0)
 		return;
-
 	ret = write(g_monitor_eventfd, &one, sizeof(one));
 	(void)ret;
 }
@@ -402,29 +361,13 @@ static void cow_monitor_drain_eventfd(void)
 
 	if (g_monitor_eventfd < 0)
 		return;
-
 	while (read(g_monitor_eventfd, &v, sizeof(v)) == sizeof(v))
 		;
 }
 
-static int cow_wait_monitor_snapshot(unsigned long want_generation)
-{
-	unsigned long seen;
-	int i;
-
-	for (i = 0; i < 1000; i++) {
-		pthread_mutex_lock(&g_tracked_tasks_lock);
-		seen = g_monitor_snapshot_generation;
-		pthread_mutex_unlock(&g_tracked_tasks_lock);
-
-		if (seen >= want_generation)
-			return 0;
-
-		usleep(1000);
-	}
-
-	return -1;
-}
+/* ------------------------------------------------------------------ */
+/*  Kernel support check + /proc uffd opener                           */
+/* ------------------------------------------------------------------ */
 
 bool cow_check_kernel_support(void)
 {
@@ -433,30 +376,22 @@ bool cow_check_kernel_support(void)
 
 	uffd = uffd_open(0, &features, &err);
 	if (uffd < 0) {
-		if (err == ENOSYS) {
+		if (err == ENOSYS)
 			pr_info("userfaultfd not supported by kernel\n");
-		} else if (err == EPERM) {
+		else if (err == EPERM)
 			pr_info("userfaultfd requires CAP_SYS_PTRACE or sysctl vm.unprivileged_userfaultfd=1\n");
-		}
 		return false;
 	}
-
 	if (!(features & UFFD_FEATURE_PAGEFAULT_FLAG_WP)) {
 		pr_info("userfaultfd WP pagefault flag not supported (need kernel 5.7+)\n");
 		close(uffd);
 		return false;
 	}
-
 	close(uffd);
 	pr_info("COW dump kernel support detected\n");
 	return true;
 }
 
-/*
- * Open a userfaultfd bound to another process's mm_struct via
- * /proc/<pid>/userfaultfd (kernel 6.11+).  Returns the fd with
- * UFFDIO_API already negotiated, or -1 on failure.
- */
 static int uffd_open_proc(pid_t pid)
 {
 	char path[64];
@@ -464,7 +399,6 @@ static int uffd_open_proc(pid_t pid)
 	int fd;
 
 	snprintf(path, sizeof(path), "/proc/%d/userfaultfd", pid);
-
 	fd = open(path, O_RDWR | O_CLOEXEC | O_NONBLOCK);
 	if (fd < 0) {
 		pr_perror("Cannot open %s", path);
@@ -480,7 +414,6 @@ static int uffd_open_proc(pid_t pid)
 		close(fd);
 		return -1;
 	}
-
 	if (!(api.features & UFFD_FEATURE_PAGEFAULT_FLAG_WP)) {
 		pr_err("userfaultfd from %s lacks WP pagefault flag\n", path);
 		close(fd);
@@ -492,13 +425,11 @@ static int uffd_open_proc(pid_t pid)
 	return fd;
 }
 
-/*
- * Register eligible VMAs for UFFDIO_REGISTER_MODE_WP directly from
- * CRIU's process context (requires uffd from /proc/<pid>/userfaultfd).
- * Populates task->tracked_vmas with the successfully registered VMAs.
- * Returns 0 on success, -1 on fatal error.
- */
-static int cow_register_vmas(int uffd, struct cow_tracked_task *task,
+/* ------------------------------------------------------------------ */
+/*  VMA registration                                                   */
+/* ------------------------------------------------------------------ */
+
+static int cow_register_vmas(struct cow_dump_info *cdi,
 			     struct vm_area_list *vma_area_list,
 			     unsigned long *out_total_pages)
 {
@@ -509,7 +440,6 @@ static int cow_register_vmas(int uffd, struct cow_tracked_task *task,
 	struct cow_tracked_vma *tvmas;
 	unsigned int i;
 
-	/* First pass: count eligible VMAs */
 	list_for_each_entry(vma, &vma_area_list->h, list) {
 		if (!vma_entry_can_be_lazy(vma->e))
 			continue;
@@ -536,7 +466,6 @@ static int cow_register_vmas(int uffd, struct cow_tracked_task *task,
 	if (!tvmas)
 		return -1;
 
-	/* Second pass: register and track */
 	i = 0;
 	list_for_each_entry(vma, &vma_area_list->h, list) {
 		unsigned long start = vma->e->start;
@@ -561,7 +490,7 @@ static int cow_register_vmas(int uffd, struct cow_tracked_task *task,
 		reg.range.len = len;
 		reg.mode = UFFDIO_REGISTER_MODE_WP;
 
-		ret = ioctl(uffd, UFFDIO_REGISTER, &reg);
+		ret = ioctl(cdi->uffd, UFFDIO_REGISTER, &reg);
 		if (ret) {
 			pr_warn("UFFDIO_REGISTER WP %lx-%lx failed: %s\n",
 				start, start + len, strerror(errno));
@@ -578,21 +507,24 @@ static int cow_register_vmas(int uffd, struct cow_tracked_task *task,
 	nr_tracked = i;
 	if (nr_tracked > 0) {
 		void *tmp = xrealloc(tvmas, sizeof(*tvmas) * nr_tracked);
-
 		if (tmp)
 			tvmas = tmp;
-		task->tracked_vmas = tvmas;
+		cdi->tracked_vmas = tvmas;
 	} else {
 		xfree(tvmas);
-		task->tracked_vmas = NULL;
+		cdi->tracked_vmas = NULL;
 	}
-	task->nr_tracked_vmas = nr_tracked;
+	cdi->nr_tracked_vmas = nr_tracked;
 	*out_total_pages = total_pages;
 
 	pr_info("Registered %u/%u VMAs (%u failed) via /proc: %lu pages\n",
 		nr_tracked, nr_eligible, nr_failed, total_pages);
 	return 0;
 }
+
+/* ------------------------------------------------------------------ */
+/*  Init / Fini                                                        */
+/* ------------------------------------------------------------------ */
 
 static void free_cow_page_entry(struct cow_page_queue_entry *entry)
 {
@@ -601,88 +533,61 @@ static void free_cow_page_entry(struct cow_page_queue_entry *entry)
 	xfree(entry);
 }
 
-int cow_dump_init(struct pstree_item *item, struct vm_area_list *vma_area_list, struct parasite_ctl *ctl)
+int cow_dump_init(struct pstree_item *item, struct vm_area_list *vma_area_list,
+		  struct parasite_ctl *ctl)
 {
 	struct cow_dump_info *cdi = g_cow_info;
-	struct cow_tracked_task *task = NULL;
 	struct parasite_cow_dump_args *args = NULL;
 	bool created_session = false;
 	int ret;
 	unsigned long args_size;
-	unsigned long want_generation = 0;
 
 	pr_info("Initializing COW dump for pid %d\n", item->pid->real);
 
-	if (!cdi) {
-		if (!cow_check_kernel_support()) {
-			pr_err("Kernel doesn't support COW dump\n");
-			return -1;
-		}
-
-		cdi = xzalloc(sizeof(*cdi));
-		if (!cdi)
-			return -1;
-
-		INIT_LIST_HEAD(&cdi->tracked_tasks);
-
-		if (mpsc_init(cdi->page_queue.head, cdi->page_queue.tail,
-			      cdi->page_queue.size,
-			      struct cow_page_mpsc_node)) {
-			xfree(cdi);
-			return -1;
-		}
-
-		g_cow_info = cdi;
-		created_session = true;
-
-		pthread_mutex_lock(&g_tracked_tasks_lock);
-		g_tracked_tasks_generation = 0;
-		g_monitor_snapshot_generation = 0;
-		pthread_mutex_unlock(&g_tracked_tasks_lock);
-
-		if (g_monitor_eventfd >= 0) {
-			close(g_monitor_eventfd);
-			g_monitor_eventfd = -1;
-		}
-		g_monitor_eventfd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
-		if (g_monitor_eventfd < 0) {
-			pr_perror("Failed to create cow monitor eventfd");
-			goto err;
-		}
-	}
-
-	if (cow_find_task_by_pid(item->pid->real)) {
-		pr_warn("COW tracking already initialized for pid %d, skipping\n", item->pid->real);
+	if (cdi) {
+		pr_warn("COW tracking already initialized for pid %d, skipping\n",
+			cdi->source_pid);
 		return 0;
 	}
 
-	task = xzalloc(sizeof(*task));
-	if (!task)
-		goto err;
+	if (!cow_check_kernel_support()) {
+		pr_err("Kernel doesn't support COW dump\n");
+		return -1;
+	}
 
-	INIT_LIST_HEAD(&task->list);
-	task->source_pid = item->pid->real;
-	task->uffd = -1;
+	cdi = xzalloc(sizeof(*cdi));
+	if (!cdi)
+		return -1;
+
+	cdi->source_pid = item->pid->real;
+	cdi->uffd = -1;
+
+	if (mpsc_init(cdi->page_queue.head, cdi->page_queue.tail,
+		      cdi->page_queue.size, struct cow_page_mpsc_node)) {
+		xfree(cdi);
+		return -1;
+	}
+
+	g_cow_info = cdi;
+	created_session = true;
+
+	if (g_monitor_eventfd >= 0) {
+		close(g_monitor_eventfd);
+		g_monitor_eventfd = -1;
+	}
+	g_monitor_eventfd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+	if (g_monitor_eventfd < 0) {
+		pr_perror("Failed to create cow monitor eventfd");
+		goto err;
+	}
 
 	if (kdat.has_uffd_proc) {
-		/*
-		 * Fast path: open userfaultfd via /proc/<pid>/userfaultfd
-		 * and register VMAs directly from CRIU, no parasite RPC.
-		 */
 		pr_info("Using /proc/%d/userfaultfd (direct path)\n",
 			item->pid->real);
-
-		task->uffd = uffd_open_proc(item->pid->real);
-		if (task->uffd < 0)
+		cdi->uffd = uffd_open_proc(item->pid->real);
+		if (cdi->uffd < 0)
 			goto err;
 	} else {
-		/*
-		 * Use parasite only to create the userfaultfd and
-		 * negotiate UFFDIO_API inside the target process.
-		 * Pass nr_vmas=0 so the parasite skips VMA registration;
-		 * we do that from CRIU below since UFFDIO_REGISTER
-		 * operates on the uffd's mm_struct, not current->mm.
-		 */
 		args_size = sizeof(*args);
 		args = compel_parasite_args_s(ctl, args_size);
 		if (!args) {
@@ -701,10 +606,10 @@ int cow_dump_init(struct pstree_item *item, struct vm_area_list *vma_area_list, 
 			goto err;
 		}
 
-		compel_util_recv_fd(ctl, &task->uffd);
-		if (task->uffd < 0) {
+		compel_util_recv_fd(ctl, &cdi->uffd);
+		if (cdi->uffd < 0) {
 			pr_err("Failed to receive uffd from parasite: %d\n",
-			       task->uffd);
+			       cdi->uffd);
 			goto err;
 		}
 
@@ -716,49 +621,23 @@ int cow_dump_init(struct pstree_item *item, struct vm_area_list *vma_area_list, 
 		}
 	}
 
-	/*
-	 * Register VMAs for write-protect tracking directly from CRIU.
-	 * UFFDIO_REGISTER operates on the uffd's associated mm_struct
-	 * (set during userfaultfd() syscall in the target), so this
-	 * works from any process holding the fd.
-	 */
-	ret = cow_register_vmas(task->uffd, task, vma_area_list,
-				&task->total_pages);
+	ret = cow_register_vmas(cdi, vma_area_list, &cdi->total_pages);
 	if (ret)
 		goto err;
 
-	if (cow_task_apply_writeprotect(task))
+	if (cow_apply_writeprotect(cdi))
 		goto err;
 
-	pthread_mutex_lock(&g_tracked_tasks_lock);
-	list_add_tail(&task->list, &cdi->tracked_tasks);
-	g_tracked_tasks_generation++;
-	want_generation = g_tracked_tasks_generation;
-	pthread_mutex_unlock(&g_tracked_tasks_lock);
-	__atomic_fetch_add(&cdi->total_pages, task->total_pages, __ATOMIC_RELAXED);
-
-	if (cow_workers_are_running()) {
-		cow_monitor_wakeup();
-		if (cow_wait_monitor_snapshot(want_generation))
-			pr_warn("Timed out waiting for monitor to pick up pid %d\n",
-				item->pid->real);
-	}
-
 	pr_info("COW dump initialized for pid %d: tracked=%u pages=%lu uffd=%d\n",
-		item->pid->real, task->nr_tracked_vmas,
-		task->total_pages, task->uffd);
-
+		item->pid->real, cdi->nr_tracked_vmas,
+		cdi->total_pages, cdi->uffd);
 	return 0;
 
 err:
-	if (task) {
-		if (task->uffd >= 0)
-			close(task->uffd);
-		xfree(task->tracked_vmas);
-		xfree(task);
-	}
-
 	if (created_session) {
+		if (cdi->uffd >= 0)
+			close(cdi->uffd);
+		xfree(cdi->tracked_vmas);
 		if (cdi->page_queue.head) {
 			mpsc_drain(cdi->page_queue.head, free_cow_page_entry);
 			cdi->page_queue.tail = NULL;
@@ -770,39 +649,29 @@ err:
 			g_monitor_eventfd = -1;
 		}
 	}
-
 	return -1;
 }
 
 void cow_dump_fini(void)
 {
 	struct cow_page_queue_entry *qe;
-	struct cow_tracked_task *task, *task_tmp;
 	int queue_remaining = 0;
 
 	if (!g_cow_info)
 		return;
 
 	if (cow_stop_monitor_thread()) {
-		pr_err("Failed to stop COW monitor thread, skipping COW cleanup to avoid races\n");
+		pr_err("Failed to stop COW workers, skipping cleanup to avoid races\n");
 		return;
 	}
 
-	/* Wait for unified page server thread to stop before cleaning up */
 	wait_for_page_server_thread();
-
 	pr_info("Cleaning up COW dump\n");
-
 
 	if (g_monitor_eventfd >= 0) {
 		close(g_monitor_eventfd);
 		g_monitor_eventfd = -1;
 	}
-
-	pthread_mutex_lock(&g_tracked_tasks_lock);
-	g_tracked_tasks_generation = 0;
-	g_monitor_snapshot_generation = 0;
-	pthread_mutex_unlock(&g_tracked_tasks_lock);
 
 	while (g_putback_list) {
 		qe = g_putback_list;
@@ -821,21 +690,20 @@ void cow_dump_fini(void)
 	if (queue_remaining > 0)
 		pr_warn("Freed %d remaining queue entries\n", queue_remaining);
 
-	list_for_each_entry_safe(task, task_tmp, &g_cow_info->tracked_tasks, list) {
-		list_del(&task->list);
-		if (task->uffd >= 0)
-			close(task->uffd);
-		xfree(task->tracked_vmas);
-		xfree(task);
-	}
-
+	if (g_cow_info->uffd >= 0)
+		close(g_cow_info->uffd);
+	xfree(g_cow_info->tracked_vmas);
 	xfree(g_cow_info);
 	g_cow_info = NULL;
 }
 
+/* ------------------------------------------------------------------ */
+/*  Fault handling (hot path)                                          */
+/* ------------------------------------------------------------------ */
+
 static int cow_handle_write_fault(struct cow_dump_info *cdi,
-				  struct cow_tracked_task *task,
-				  unsigned long addr)
+				  unsigned long addr,
+				  struct cow_fault_worker *worker)
 {
 	unsigned long page_addr = addr & ~(PAGE_SIZE - 1);
 	struct uffdio_writeprotect wp;
@@ -846,62 +714,54 @@ static int cow_handle_write_fault(struct cow_dump_info *cdi,
 	void *page_data;
 
 	pr_debug("Write fault at 0x%lx\n", page_addr);
-
 	COW_STAT_INC(write_faults);
 
-	page_data = xmalloc(PAGE_SIZE);
+	page_data = worker ? cow_worker_pool_get(worker) : xmalloc(PAGE_SIZE);
 	if (!page_data) {
 		pr_err("Failed to allocate page data buffer\n");
 		COW_STAT_INC(alloc_failures);
 		return -1;
 	}
 
-	/* Read original page content using process_vm_readv */
 	local_iov.iov_base = page_data;
 	local_iov.iov_len = PAGE_SIZE;
 	remote_iov.iov_base = (void *)page_addr;
 	remote_iov.iov_len = PAGE_SIZE;
 
-	ret = process_vm_readv(task->source_pid, &local_iov, 1, &remote_iov, 1, 0);
+	ret = process_vm_readv(cdi->source_pid, &local_iov, 1, &remote_iov, 1, 0);
 	if (ret != PAGE_SIZE) {
 		pr_perror("Failed to read page at 0x%lx from pid %d (read %zd bytes)",
-			  page_addr, task->source_pid, ret);
+			  page_addr, cdi->source_pid, ret);
 		xfree(page_data);
 		COW_STAT_INC(read_failures);
 		return -1;
 	}
-
 	COW_STAT_INC(pages_copied);
 
-	/* Unprotect the page so the process can continue */
 	wp.range.start = page_addr;
 	wp.range.len = PAGE_SIZE;
-	wp.mode = 0; /* Clear write-protect */
+	wp.mode = 0;
 
-	if (ioctl(task->uffd, UFFDIO_WRITEPROTECT, &wp)) {
+	if (ioctl(cdi->uffd, UFFDIO_WRITEPROTECT, &wp)) {
 		pr_perror("Failed to unprotect page at 0x%lx", page_addr);
 		xfree(page_data);
 		COW_STAT_INC(unprotect_failures);
 		return -1;
 	}
-
 	COW_STAT_INC(pages_unprotected);
 
-	/* Wake up the faulting thread */
 	range.start = page_addr;
 	range.len = PAGE_SIZE;
 
-	if (ioctl(task->uffd, UFFDIO_WAKE, &range)) {
+	if (ioctl(cdi->uffd, UFFDIO_WAKE, &range)) {
 		pr_perror("Failed to wake thread after unprotect");
 		xfree(page_data);
 		COW_STAT_INC(wake_failures);
 		return -1;
 	}
-
 	COW_STAT_INC(pages_woken);
 	__atomic_fetch_sub(&cdi->total_pages, 1, __ATOMIC_RELAXED);
 
-	/* Allocate queue entry for this page */
 	entry = xmalloc(sizeof(*entry));
 	if (!entry) {
 		pr_err("Failed to allocate queue entry for page 0x%lx, "
@@ -913,67 +773,58 @@ static int cow_handle_write_fault(struct cow_dump_info *cdi,
 
 	entry->vaddr = page_addr;
 	entry->data = page_data;
-	page_data = NULL;
 	entry->ppb = NULL;
 	entry->seg_idx = 0;
 	entry->page_idx_in_seg = 0;
 	entry->next = NULL;
 
-	/* Enqueue the COW page (MPSC — safe from multiple worker threads) */
 	if (mpsc_enqueue(cdi->page_queue.tail, cdi->page_queue.size,
 			 entry, struct cow_page_mpsc_node)) {
 		pr_err("FATAL: Failed to enqueue COW page 0x%lx\n", page_addr);
-		pr_err("  Snapshot data will be lost - cannot continue migration\n");
 		xfree(entry->data);
 		xfree(entry);
-		return -1;  /* Fail immediately to prevent corruption */
+		return -1;
 	}
 
 	cow_set_bitmap(page_addr);
-
 	return 0;
 }
 
-static int cow_process_events(struct cow_dump_info *cdi,
-			      struct cow_tracked_task *task,
-			      bool blocking)
+/* ------------------------------------------------------------------ */
+/*  Event processing + poll loop                                       */
+/* ------------------------------------------------------------------ */
+
+static int cow_process_events(struct cow_dump_info *cdi, bool blocking,
+			      struct cow_fault_worker *worker)
 {
 	struct uffd_msg msg;
 	struct pollfd pfd;
 	int ret, poll_ret;
 
 	while (1) {
-		/* Check and print stats */
 		check_and_print_cow_stats();
-		
-		/* Try reading directly first - avoids poll() overhead when data is ready */
-		ret = read(task->uffd, &msg, sizeof(msg));
-		
+
+		ret = read(cdi->uffd, &msg, sizeof(msg));
+
 		if (ret < 0 && errno == EAGAIN && blocking) {
-			/* No data available and we want to block - use poll() with timeout */
-			pfd.fd = task->uffd;
+			pfd.fd = cdi->uffd;
 			pfd.events = POLLIN;
 			pfd.revents = 0;
-			
-			poll_ret = poll(&pfd, 1, 500);  /* 500ms timeout */
+
+			poll_ret = poll(&pfd, 1, 500);
 			if (poll_ret < 0) {
 				pr_perror("poll() failed on uffd");
 				COW_STAT_INC(read_errors);
 				return -1;
 			}
-			
-			if (poll_ret == 0) {
-				/* Timeout - no events within 500ms */
+			if (poll_ret == 0)
 				return 0;
-			}
-			
-			/* Data ready after poll - retry read */
-			ret = read(task->uffd, &msg, sizeof(msg));
+
+			ret = read(cdi->uffd, &msg, sizeof(msg));
 		}
-		
+
 		if (ret < 0) {
 			if (errno == EAGAIN && !blocking) {
-				/* Non-blocking mode and no data */
 				COW_STAT_INC(eagain_errors);
 				return 0;
 			}
@@ -991,22 +842,18 @@ static int cow_process_events(struct cow_dump_info *cdi,
 		switch (msg.event) {
 		case UFFD_EVENT_PAGEFAULT:
 			if (msg.arg.pagefault.flags & UFFD_PAGEFAULT_FLAG_WP) {
-				/* Write fault - track it */
-				if (cow_handle_write_fault(cdi, task, msg.arg.pagefault.address))
+				if (cow_handle_write_fault(cdi, msg.arg.pagefault.address, worker))
 					return -1;
 			}
 			break;
-
 		case UFFD_EVENT_FORK:
 			COW_STAT_INC(fork_events);
 			pr_warn("Process forked during COW dump (not fully supported)\n");
 			break;
-
 		case UFFD_EVENT_REMAP:
 			COW_STAT_INC(remap_events);
 			pr_info("Memory remap event\n");
 			break;
-
 		default:
 			COW_STAT_INC(unknown_events);
 			pr_err("Unexpected uffd event: %u\n", msg.event);
@@ -1017,84 +864,83 @@ static int cow_process_events(struct cow_dump_info *cdi,
 	return 0;
 }
 
-static int cow_wait_for_events(struct cow_dump_info *cdi, int timeout_ms)
+/*
+ * cow_wait_for_events — poll the single uffd + eventfd, then dispatch.
+ * Stack-allocated 2-element pollfd — zero malloc, zero lock.
+ */
+static int cow_wait_for_events(struct cow_dump_info *cdi, int timeout_ms,
+			       struct cow_fault_worker *w)
 {
-	struct cow_tracked_task *task;
-	struct pollfd *pfds;
-	struct cow_tracked_task **tasks;
-	int nr_tasks = 0;
-	int idx = 0;
+	struct pollfd pfds[2];
 	int ret;
-	int i;
-
-	pthread_mutex_lock(&g_tracked_tasks_lock);
-	list_for_each_entry(task, &cdi->tracked_tasks, list)
-		nr_tasks++;
-
-	g_monitor_snapshot_generation = g_tracked_tasks_generation;
-
-	if (!nr_tasks) {
-		pthread_mutex_unlock(&g_tracked_tasks_lock);
-		return 0;
-	}
-
-	pfds = xmalloc(sizeof(*pfds) * (nr_tasks + 1));
-	tasks = xmalloc(sizeof(*tasks) * nr_tasks);
-	if (!pfds || !tasks) {
-		pthread_mutex_unlock(&g_tracked_tasks_lock);
-		xfree(pfds);
-		xfree(tasks);
-		return -1;
-	}
 
 	pfds[0].fd = g_monitor_eventfd;
 	pfds[0].events = POLLIN;
 	pfds[0].revents = 0;
-	idx = 1;
-	i = 0;
-	list_for_each_entry(task, &cdi->tracked_tasks, list) {
-		tasks[i++] = task;
-		pfds[idx].fd = task->uffd;
-		pfds[idx].events = POLLIN;
-		pfds[idx].revents = 0;
-		idx++;
-	}
-	pthread_mutex_unlock(&g_tracked_tasks_lock);
+	pfds[1].fd = cdi->uffd;
+	pfds[1].events = POLLIN;
+	pfds[1].revents = 0;
 
-	ret = poll(pfds, nr_tasks + 1, timeout_ms);
-	if (ret < 0)
-		pr_perror("poll() failed on uffd set");
-	if (ret <= 0)
-		goto out;
+	ret = poll(pfds, 2, timeout_ms);
+	if (ret < 0) {
+		pr_perror("poll() failed on uffd");
+		return -1;
+	}
+	if (ret == 0)
+		return 0;
 
 	if (pfds[0].revents & POLLIN) {
 		cow_monitor_drain_eventfd();
-		goto out;
+		return 0;
 	}
 
-	for (i = 0; i < nr_tasks; i++) {
-		if (!(pfds[i + 1].revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL)))
-			continue;
-		if (cow_process_events(cdi, tasks[i], false) < 0) {
+	if (pfds[1].revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL)) {
+		if (cow_process_events(cdi, false, w) < 0) {
 			pr_err("Error processing COW events for pid %d\n",
-			       tasks[i]->source_pid);
-			ret = -1;
-			break;
+			       cdi->source_pid);
+			return -1;
 		}
 	}
 
-out:
-	xfree(tasks);
-	xfree(pfds);
 	return ret;
 }
 
-/*
- * Worker thread function.  Each worker polls the eventfd (for shutdown
- * / new-task wakeup) and all tracked task uffds.  The kernel delivers
- * each fault message to exactly one reader, so multiple workers
- * naturally load-balance without any user-space dispatch queue.
- */
+/* ------------------------------------------------------------------ */
+/*  Per-worker page buffer pool                                        */
+/* ------------------------------------------------------------------ */
+
+static void cow_worker_pool_init(struct cow_fault_worker *w)
+{
+	unsigned int i;
+
+	for (i = 0; i < COW_PAGE_POOL_SIZE; i++) {
+		w->page_pool[i] = xmalloc(PAGE_SIZE);
+		if (!w->page_pool[i])
+			break;
+	}
+	w->pool_count = i;
+}
+
+static void cow_worker_pool_fini(struct cow_fault_worker *w)
+{
+	unsigned int i;
+
+	for (i = 0; i < w->pool_count; i++)
+		xfree(w->page_pool[i]);
+	w->pool_count = 0;
+}
+
+static void *cow_worker_pool_get(struct cow_fault_worker *w)
+{
+	if (w->pool_count > 0)
+		return w->page_pool[--w->pool_count];
+	return xmalloc(PAGE_SIZE);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Worker thread pool                                                 */
+/* ------------------------------------------------------------------ */
+
 static void *cow_fault_worker_fn(void *arg)
 {
 	struct cow_fault_worker *w = (struct cow_fault_worker *)arg;
@@ -1103,35 +949,28 @@ static void *cow_fault_worker_fn(void *arg)
 
 	snprintf(name, sizeof(name), "cow-w%d", w->id);
 	pthread_setname_np(pthread_self(), name);
-	pr_info("COW fault worker %d started\n", w->id);
+
+	cow_worker_pool_init(w);
+	pr_info("COW fault worker %d started (pool=%u bufs)\n",
+		w->id, w->pool_count);
 
 	while (!__atomic_load_n(&g_stop_monitoring, __ATOMIC_ACQUIRE)) {
-		int ret;
-
-		ret = cow_wait_for_events(cdi, 500);
+		int ret = cow_wait_for_events(cdi, 500, w);
 		if (ret < 0) {
 			pr_err("COW fault worker %d: event error, exiting\n",
 			       w->id);
 			break;
 		}
-		/* ret == 0 → timeout or eventfd wakeup, loop and re-check */
 	}
 
+	cow_worker_pool_fini(w);
 	pr_info("COW fault worker %d stopped\n", w->id);
 	return NULL;
-}
-
-#define COW_FAULT_WORKERS	4
-
-static unsigned int cow_nr_fault_workers(void)
-{
-	return COW_FAULT_WORKERS;
 }
 
 int cow_start_monitor_thread(void)
 {
 	unsigned int nr, i, created = 0;
-	bool no_tasks;
 	int ret;
 
 	pthread_mutex_lock(&g_monitor_state_lock);
@@ -1151,12 +990,9 @@ int cow_start_monitor_thread(void)
 		}
 	}
 
-	pthread_mutex_lock(&g_tracked_tasks_lock);
-	no_tasks = list_empty(&g_cow_info->tracked_tasks);
-	pthread_mutex_unlock(&g_tracked_tasks_lock);
-	if (no_tasks) {
+	if (g_cow_info->uffd < 0) {
 		pthread_mutex_unlock(&g_monitor_state_lock);
-		pr_err("COW tracking has no registered tasks\n");
+		pr_err("COW tracking has no userfaultfd\n");
 		return -1;
 	}
 
@@ -1165,7 +1001,7 @@ int cow_start_monitor_thread(void)
 		return 0;
 	}
 
-	nr = cow_nr_fault_workers();
+	nr = COW_FAULT_WORKERS;
 	g_workers = xzalloc(nr * sizeof(*g_workers));
 	if (!g_workers) {
 		pthread_mutex_unlock(&g_monitor_state_lock);
@@ -1220,7 +1056,6 @@ int cow_stop_monitor_thread(void)
 	__atomic_store_n(&g_stop_monitoring, true, __ATOMIC_RELEASE);
 	pthread_mutex_unlock(&g_monitor_state_lock);
 
-	/* Wake all workers blocked in poll() */
 	cow_monitor_wakeup();
 
 	for (i = 0; i < g_nr_workers; i++) {
@@ -1242,32 +1077,30 @@ int cow_stop_monitor_thread(void)
 	return 0;
 }
 
+/* ------------------------------------------------------------------ */
+/*  Public query API                                                   */
+/* ------------------------------------------------------------------ */
+
 int cow_get_uffd_for_pid(pid_t source_pid)
 {
-	struct cow_tracked_task *task;
-
-	task = cow_find_task_by_pid(source_pid);
-	if (!task)
+	if (!g_cow_info || g_cow_info->source_pid != source_pid)
 		return -1;
-
-	return task->uffd;
+	return g_cow_info->uffd;
 }
 
-bool cow_dump_is_vma_tracked(pid_t source_pid, unsigned long start, unsigned long end)
+bool cow_dump_is_vma_tracked(pid_t source_pid, unsigned long start,
+			     unsigned long end)
 {
-	struct cow_tracked_task *task;
 	unsigned int i;
 
-	task = cow_find_task_by_pid(source_pid);
-	if (!task)
+	if (!g_cow_info || g_cow_info->source_pid != source_pid)
 		return false;
 
-	for (i = 0; i < task->nr_tracked_vmas; i++) {
-		if (task->tracked_vmas[i].start == start &&
-		    task->tracked_vmas[i].end == end)
+	for (i = 0; i < g_cow_info->nr_tracked_vmas; i++) {
+		if (g_cow_info->tracked_vmas[i].start == start &&
+		    g_cow_info->tracked_vmas[i].end == end)
 			return true;
 	}
-
 	return false;
 }
 
@@ -1278,7 +1111,6 @@ struct cow_page_queue_entry *cow_get_next_page(void)
 	if (!g_cow_info)
 		return NULL;
 
-	/* Check putback list first - entries here were already decremented from size */
 	if (g_putback_list) {
 		entry = g_putback_list;
 		g_putback_list = entry->next;
@@ -1286,7 +1118,6 @@ struct cow_page_queue_entry *cow_get_next_page(void)
 		return entry;
 	}
 
-	/* MPSC dequeue (single-consumer safe) will decrement size */
 	return mpsc_dequeue(g_cow_info->page_queue.head, g_cow_info->page_queue.size);
 }
 
@@ -1294,12 +1125,8 @@ bool cow_has_pending_pages(void)
 {
 	if (!g_cow_info)
 		return false;
-
-	/* Check putback list first (consumer-local, no atomic needed) */
 	if (g_putback_list)
 		return true;
-
-	/* Check MPSC queue */
 	return mpsc_peek(g_cow_info->page_queue.head);
 }
 
@@ -1307,10 +1134,8 @@ void cow_put_back_page(struct cow_page_queue_entry *entry)
 {
 	if (!g_cow_info || !entry)
 		return;
-
 	entry->next = g_putback_list;
 	g_putback_list = entry;
-
 	pr_debug("Re-queued COW page 0x%lx to putback list\n", entry->vaddr);
 }
 
@@ -1318,6 +1143,5 @@ unsigned long cow_get_pages_queue_size(void)
 {
 	if (!g_cow_info)
 		return 0;
-
 	return mpsc_size(g_cow_info->page_queue.size);
 }

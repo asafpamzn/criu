@@ -2,7 +2,6 @@
 #define __CR_COW_DUMP_H_
 
 #include "types.h"
-#include "common/list.h"
 
 struct pstree_item;
 struct vm_area_list;
