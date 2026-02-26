@@ -57,6 +57,7 @@ extern void compel_release_thread(struct parasite_thread_ctl *);
 
 extern int __must_check compel_start_daemon(struct parasite_ctl *ctl);
 extern int __must_check compel_stop_daemon(struct parasite_ctl *ctl);
+extern int __must_check compel_stop_daemon_fast(struct parasite_ctl *ctl);
 extern int __must_check compel_cure_remote(struct parasite_ctl *ctl);
 extern int __must_check compel_cure_local(struct parasite_ctl *ctl);
 extern int __must_check compel_cure(struct parasite_ctl *ctl);

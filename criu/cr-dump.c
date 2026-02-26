@@ -1877,7 +1877,14 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	 * in the WP worker threads.  Run them in parallel so the ~25ms
 	 * of ptrace work overlaps with any remaining WP time.
 	 */
-	ret = compel_stop_daemon(parasite_ctl);
+	/*
+	 * COW fast path: skip rt_sigreturn single-stepping (~14ms).
+	 * We detach and overwrite registers anyway.
+	 */
+	if (opts.cow_dump && opts.lazy_pages)
+		ret = compel_stop_daemon_fast(parasite_ctl);
+	else
+		ret = compel_stop_daemon(parasite_ctl);
 	gettimeofday(&t_now, NULL);
 	timersub(&t_now, &t_checkpoint, &t_delta);
 	pr_err("TIMING: compel_stop_daemon took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
