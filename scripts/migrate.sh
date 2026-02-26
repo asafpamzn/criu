@@ -607,7 +607,7 @@ if [ "$FAST_CUTOVER" = "1" ]; then
   # - kill instead of pkill — no /proc scan
   # - /dev/tcp instead of nc — no fork+exec
   _t0=${EPOCHREALTIME/./}; _t0=${_t0:0:13}  # epoch ms, no fork
-  sudo kill -STOP "$PID" 2>/dev/null || true
+  kill -STOP "$PID" 2>/dev/null || sudo kill -STOP "$PID" 2>/dev/null || true
   SOURCE_FROZEN=1
   if (echo "GO" > /dev/tcp/"$REPLICA_SSH_HOST"/"$CUTOVER_PORT") 2>/dev/null; then
     _t1=${EPOCHREALTIME/./}; _t1=${_t1:0:13}

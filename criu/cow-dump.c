@@ -91,12 +91,22 @@ static void *cow_wp_worker(void *arg)
 	struct uffdio_writeprotect wp;
 	unsigned int i;
 
-	/* Lower priority so main dump thread gets CPU first */
+	/* Lower priority + avoid core 0 so main dump thread gets CPU */
 	if (nice(19) == -1 && errno != 0)
 		pr_debug("nice(19) failed: %s\n", strerror(errno));
 	{
 		struct sched_param sp = { .sched_priority = 0 };
 		sched_setscheduler(0, SCHED_BATCH, &sp);
+	}
+	{
+		cpu_set_t mask;
+		long nproc = sysconf(_SC_NPROCESSORS_ONLN);
+		if (nproc > 2) {
+			CPU_ZERO(&mask);
+			for (long c = 2; c < nproc; c++)
+				CPU_SET(c, &mask);
+			sched_setaffinity(0, sizeof(mask), &mask);
+		}
 	}
 
 	for (i = job->start_idx; i < job->end_idx; i++) {
