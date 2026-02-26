@@ -995,7 +995,8 @@ static int fixup_thread_rseq(const struct pstree_item *item, int i)
 	return 0;
 }
 
-static int dump_task_thread(struct parasite_ctl *parasite_ctl, const struct pstree_item *item, int id)
+static int dump_task_thread(struct parasite_ctl *parasite_ctl, const struct pstree_item *item,
+			    int id, bool defer_image_write)
 {
 	struct parasite_thread_ctl *tctl = dmpi(item)->thread_ctls[id];
 	struct pid *tid = &item->threads[id];
@@ -1024,17 +1025,44 @@ static int dump_task_thread(struct parasite_ctl *parasite_ctl, const struct pstr
 		goto err;
 	}
 
-	img = open_image(CR_FD_CORE, O_DUMP, tid->ns[0].virt);
-	if (!img)
-		goto err;
+	if (!defer_image_write) {
+		img = open_image(CR_FD_CORE, O_DUMP, tid->ns[0].virt);
+		if (!img)
+			goto err;
+		ret = pb_write_one(img, core, PB_CORE);
+		close_image(img);
+	} else {
+		ret = 0;
+	}
 
-	ret = pb_write_one(img, core, PB_CORE);
-
-	close_image(img);
 err:
 	compel_release_thread(tctl);
 	pr_info("----------------------------------------\n");
 	return ret;
+}
+
+/* Write deferred thread core images (after early resume, off critical path) */
+static int write_deferred_thread_cores(const struct pstree_item *item)
+{
+	int i, ret = 0;
+
+	for (i = 0; i < item->nr_threads; i++) {
+		struct pid *tid = &item->threads[i];
+		CoreEntry *core = item->core[i];
+		struct cr_img *img;
+
+		if (item->pid->real == tid->real)
+			continue;
+
+		img = open_image(CR_FD_CORE, O_DUMP, tid->ns[0].virt);
+		if (!img)
+			return -1;
+		ret = pb_write_one(img, core, PB_CORE);
+		close_image(img);
+		if (ret)
+			return ret;
+	}
+	return 0;
 }
 
 static int dump_one_zombie(const struct pstree_item *item, const struct proc_pid_stat *pps)
@@ -1312,7 +1340,9 @@ free_rseq:
 
 static struct proc_pid_stat pps_buf;
 
-static int dump_task_threads(struct parasite_ctl *parasite_ctl, const struct pstree_item *item)
+static int dump_task_threads(struct parasite_ctl *parasite_ctl,
+			     const struct pstree_item *item,
+			     bool defer_image_write)
 {
 	int i, ret = 0;
 
@@ -1322,7 +1352,8 @@ static int dump_task_threads(struct parasite_ctl *parasite_ctl, const struct pst
 			item->threads[i].ns[0].virt = vpid(item);
 			continue;
 		}
-		ret = dump_task_thread(parasite_ctl, item, i);
+		ret = dump_task_thread(parasite_ctl, item, i,
+				       defer_image_write);
 		if (ret)
 			break;
 	}
@@ -1894,7 +1925,8 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 		goto err_cure;
 	}
 
-	ret = dump_task_threads(parasite_ctl, item);
+	ret = dump_task_threads(parasite_ctl, item,
+			       opts.cow_dump && opts.lazy_pages);
 	gettimeofday(&t_now, NULL);
 	timersub(&t_now, &t_checkpoint, &t_delta);
 	pr_err("TIMING: dump_task_threads took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
@@ -2496,6 +2528,14 @@ int cr_dump_tasks(pid_t pid)
 		pstree_switch_state(root_item, TASK_ALIVE);
 		timing_stop(TIME_FROZEN);
 		pr_err("COW early resume: process unfrozen after dump_one_task\n");
+
+		/* Write deferred thread core images (off critical path) */
+		for_each_pstree_item(item) {
+			if (write_deferred_thread_cores(item)) {
+				pr_err("Failed to write deferred thread cores\n");
+				goto err;
+			}
+		}
 	}
 
 	ret = run_plugins(DUMP_DEVICES_LATE, pid);
