@@ -1,6 +1,6 @@
 # Optimization Backlog
 
-Current state: **~80ms total unresponsive** (79ms frozen + 1ms cutover) at 100GB.
+Current state: **~53ms frozen + 1ms cutover, 70s total migration** at 95GB.
 
 ## Completed optimizations
 
@@ -15,6 +15,7 @@ Current state: **~80ms total unresponsive** (79ms frozen + 1ms cutover) at 100GB
 | Skip network_lock in COW mode | ~2ms | 0ms | 2ms |
 | compel_cure_local | ~1ms | 0ms | 1ms |
 | Cutover: bash builtins | 41ms | 1ms | 40ms |
+| 8 TCP streams + 16MB bufs + 512pg batch | 89s xfer | 58s xfer | 31s |
 
 ## Remaining frozen window breakdown (79ms)
 
@@ -65,21 +66,32 @@ predictable.  Could cache and verify rather than re-parse.
 **Effort**: High.  Need VMA change detection.
 **Risk**: Medium.  Stale cache = wrong VMAs.
 
-## Priority 2: Reduce total migration time (currently ~106s for 100GB)
+## Priority 2: Reduce total migration time (currently ~70s for 95GB)
 
-### P2-A: More TCP streams
-Currently 4 streams at ~1 GB/s total.  The network is 25 Gbps capable.
-8-16 streams could reach 2-3 GB/s, cutting transfer from 106s to 40-60s.
+### P2-A: More TCP streams — DONE
+Increased from 4 to 8 streams.  Transfer went from 89s to 58s
+(1100 → 1700 MB/s).  Also increased batch size 256→512 pages,
+socket buffers 4→16MB, and fixed VMA distribution across streams.
+Total migration: 96s → 70s at 95GB.
 
-**Effort**: Low.  Change stream count constant.
-**Risk**: Low.  More memory usage for buffers.
+**Bottleneck now**: `process_vm_readv` memory bandwidth (~1.7 GB/s).
+Going beyond 8 streams yields diminishing returns.
 
 ### P2-B: Adaptive LZ4 compression
 Skip compression for incompressible pages (random data).  Currently
-every page goes through LZ4 even when it doesn't compress.  A quick
-entropy check could skip ~50% of pages.
+every page goes through LZ4 even when it doesn't compress.  For
+random Valkey data: compression ratio 100.4% (expands!).  For
+sequential fills: 59:1 compression.  A quick entropy check could
+skip incompressible pages and save CPU.
 
 **Effort**: Medium.
+**Risk**: Low.
+
+### P2-C: 12-16 streams (diminishing returns)
+8 streams nearly saturate memory bandwidth.  12-16 might squeeze
+another 10-15% but adds context-switch overhead.
+
+**Effort**: Low (constant change).
 **Risk**: Low.
 
 ## Priority 3: Eliminate cutover freeze entirely
