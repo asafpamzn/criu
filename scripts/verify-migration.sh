@@ -19,7 +19,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/.env"
 
 SIZE_GB="${1:-10}"
-LIVE=0
+LIVE=1
 SKIP_FILL=0
 for arg in "$@"; do
   case "$arg" in
