@@ -961,25 +961,34 @@ void cow_dump_fini(void)
 	struct cow_tracked_task *task, *task_tmp;
 	struct hlist_node *n;
 	int i, remaining = 0, queue_remaining = 0;
+	bool monitor_stopped = true;
 
 	if (!g_cow_info)
 		return;
 
 	if (!g_wp_async_mode) {
 		if (cow_stop_monitor_thread()) {
-			pr_err("Failed to stop COW monitor thread, skipping COW cleanup to avoid races\n");
-			return;
+			pr_err("Failed to stop COW monitor thread, "
+			       "skipping hash/queue cleanup to avoid races\n");
+			monitor_stopped = false;
 		}
 	}
 
-	pr_info("Cleaning up COW dump (wp_async=%d)\n", g_wp_async_mode);
+	pr_info("Cleaning up COW dump (wp_async=%d, monitor_stopped=%d)\n",
+		g_wp_async_mode, monitor_stopped);
 
 	if (g_monitor_eventfd >= 0) {
 		close(g_monitor_eventfd);
 		g_monitor_eventfd = -1;
 	}
 
-	if (!g_wp_async_mode) {
+	/*
+	 * Only iterate the hash table and page queue if the monitor
+	 * thread has been stopped -- these structures are accessed
+	 * concurrently by the monitor and freeing them with a live
+	 * thread would race.
+	 */
+	if (!g_wp_async_mode && monitor_stopped) {
 		pthread_mutex_lock(&g_tracked_tasks_lock);
 		g_tracked_tasks_generation = 0;
 		g_monitor_snapshot_generation = 0;
@@ -1019,6 +1028,11 @@ void cow_dump_fini(void)
 			pr_warn("Freed %d remaining COW pages\n", remaining);
 	}
 
+	/*
+	 * Always free tracked tasks and the session structure.
+	 * The monitor thread does not modify the tracked_tasks list
+	 * after startup, so this is safe even if the thread is stuck.
+	 */
 	list_for_each_entry_safe(task, task_tmp, &g_cow_info->tracked_tasks, list) {
 		list_del(&task->list);
 		if (task->pagemap_fd >= 0)

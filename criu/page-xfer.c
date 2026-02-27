@@ -2272,6 +2272,17 @@ skip_requests:
 				}
 				continue;
 			}
+			if (ret < 0 && errno == ESRCH) {
+				pr_err("COW bulk: source process %d "
+				       "died during transfer\n",
+				       source_pid);
+				goto err;
+			}
+			if (ret < 0) {
+				pr_perror("COW bulk: readv %lu pages "
+					  "at %#lx, zero-fill",
+					  batch_pages, batch_start);
+			}
 			if (ret < (ssize_t)(batch_pages * PAGE_SIZE)) {
 				unsigned long read_pages = ret > 0 ?
 					ret / PAGE_SIZE : 0;
@@ -2562,6 +2573,28 @@ static int cow_converge_dirty_pages(struct active_image *img,
 							pr_info("COW converge: process gone\n");
 							goto done;
 						}
+						if (ret < 0) {
+							pr_perror("COW converge: readv at %#lx",
+								  batch_start);
+							pg += nr * PAGE_SIZE;
+							continue;
+						}
+						if (ret != (ssize_t)(nr * PAGE_SIZE)) {
+							unsigned long done_pg =
+								ret / PAGE_SIZE;
+							pr_warn("COW converge: "
+								"partial read "
+								"%zd/%lu at %#lx, "
+								"zero-fill\n",
+								ret,
+								nr * PAGE_SIZE,
+								batch_start);
+							for (i = done_pg; i < nr;
+							     i++)
+								memset(batch_buf +
+								       i * PAGE_SIZE,
+								       0, PAGE_SIZE);
+						}
 
 						{
 						char *sb;
@@ -2687,10 +2720,30 @@ static int cow_converge_dirty_pages(struct active_image *img,
 						remote_iov.iov_base = (void *)pg;
 						remote_iov.iov_len = nr * PAGE_SIZE;
 
-						if (process_vm_readv(source_pid,
-								     local_iovs, nr,
-								     &remote_iov, 1, 0) < 0)
+						{
+						ssize_t rret;
+						ssize_t expect = nr * PAGE_SIZE;
+
+						rret = process_vm_readv(source_pid,
+							local_iovs, nr,
+							&remote_iov, 1, 0);
+						if (rret < 0)
 							break;
+						if (rret != expect) {
+							unsigned long done =
+								rret / PAGE_SIZE;
+							pr_warn("COW final-freeze: "
+								"partial read "
+								"%zd/%zd at %#lx, "
+								"zero-fill\n",
+								rret, expect, pg);
+							for (bi = done; bi < nr;
+							     bi++)
+								memset(batch_buf +
+								       bi * PAGE_SIZE,
+								       0, PAGE_SIZE);
+						}
+						}
 
 						sb_cap = nr * (sizeof(struct page_server_iov) +
 							       sizeof(int) + LZ4_compressBound(PAGE_SIZE));

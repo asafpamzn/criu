@@ -84,11 +84,16 @@ static void write_vma_diff_file(struct vma_diff_entry *vmas, int count)
 		perror("open new_vmas.dat");
 		return;
 	}
-	if (write(fd, &count, sizeof(count)) != sizeof(count))
+	if (write(fd, &count, sizeof(count)) != sizeof(count)) {
 		perror("write count");
+		goto cleanup;
+	}
 	if (write(fd, vmas, count * sizeof(*vmas)) !=
-	    (ssize_t)(count * sizeof(*vmas)))
+	    (ssize_t)(count * sizeof(*vmas))) {
 		perror("write vmas");
+		goto cleanup;
+	}
+cleanup:
 	close(fd);
 }
 
@@ -273,7 +278,7 @@ static void *stream_worker(void *arg)
 			}
 			break;
 		}
-		ctx->bytes_received += sizeof(hdr);
+		__sync_fetch_and_add(&ctx->bytes_received, sizeof(hdr));
 
 		npages = hdr.nr_pages;
 		if (npages == 0) {
@@ -303,7 +308,16 @@ static void *stream_worker(void *arg)
 		/* Handle VMA diff: new VMAs that must be created on replica */
 		if (cmd == PS_IOV_VMA_DIFF) {
 			int nr_vmas = (int)npages;
-			size_t vma_data_sz = nr_vmas *
+			size_t vma_data_sz;
+
+			if (npages > 100000) {
+				fprintf(stderr, "stream %d: VMA diff count "
+					"too large (%llu), rejecting\n",
+					ctx->id, npages);
+				ctx->error = 1;
+				break;
+			}
+			vma_data_sz = nr_vmas *
 				sizeof(struct vma_diff_entry);
 			struct vma_diff_entry *vmas;
 
@@ -317,7 +331,7 @@ static void *stream_worker(void *arg)
 				ctx->error = 1;
 				break;
 			}
-			ctx->bytes_received += vma_data_sz;
+			__sync_fetch_and_add(&ctx->bytes_received, vma_data_sz);
 
 			write_vma_diff_file(vmas, nr_vmas);
 			signal_vma_diff_ready();
@@ -355,7 +369,7 @@ static void *stream_worker(void *arg)
 				ctx->error = 1;
 				break;
 			}
-			ctx->bytes_received += sizeof(comp_size);
+			__sync_fetch_and_add(&ctx->bytes_received, sizeof(comp_size));
 
 			if (comp_size <= 0 || comp_size > max_comp) {
 				fprintf(stderr, "stream %d: bad compressed size %d\n",
@@ -378,7 +392,7 @@ static void *stream_worker(void *arg)
 				ctx->error = 1;
 				break;
 			}
-			ctx->bytes_received += comp_size;
+			__sync_fetch_and_add(&ctx->bytes_received, comp_size);
 
 			int dec = LZ4_decompress_safe(comp_buf, data_buf,
 						      comp_size, data_len);
@@ -393,7 +407,7 @@ static void *stream_worker(void *arg)
 				ctx->error = 1;
 				break;
 			}
-			ctx->bytes_received += data_len;
+			__sync_fetch_and_add(&ctx->bytes_received, data_len);
 		} else {
 			fprintf(stderr, "stream %d: unknown cmd %d, skipping\n",
 				ctx->id, cmd);
@@ -422,14 +436,21 @@ static void *stream_worker(void *arg)
 						w < 0 ? strerror(errno) : "short",
 						w, data_len);
 				}
+				if (write_errors >= 50) {
+					fprintf(stderr, "stream %d: too many write "
+						"errors (%lu), aborting\n",
+						ctx->id, write_errors);
+					ctx->error = 1;
+					break;
+				}
 			}
 		}
 
-		ctx->pages_installed += npages;
+		__sync_fetch_and_add(&ctx->pages_installed, npages);
 	}
 
 	if (write_errors > 5)
-		fprintf(stderr, "stream %d: %lu total write errors (suppressed after 5)\n",
+		fprintf(stderr, "stream %d: %lu total write errors (suppressed after first 5)\n",
 			ctx->id, write_errors);
 
 	free(data_buf);

@@ -2007,7 +2007,7 @@ static int inject_new_vmas(struct pstree_item *item,
 		return -1;
 	}
 
-	if (count <= 0 || count > 10000) {
+	if (count <= 0 || count > 100000) {
 		pr_err("Invalid VMA count: %d\n", count);
 		close(fd);
 		return 0; /* not fatal */
@@ -2181,7 +2181,7 @@ static int run_page_recv(struct pstree_item *item)
 			if (w > 0)
 				break;
 
-			usleep(1000);
+			usleep(10000);
 		}
 	}
 
