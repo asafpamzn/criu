@@ -248,7 +248,17 @@ if [ "$FAST_CUTOVER" = "1" ]; then
   CUTOVER_LISTEN_PID=$!
   sleep 0.05  # give nc time to bind
 
-  echo "Step 9b: Writing staged marker: $REPLICA_STAGED_FILE"
+  echo "Step 9b: Signaling staged to source"
+  STAGED_PORT=${STAGED_PORT:-9004}
+  # TCP signal to source (instant) — primary method
+  if (echo "STAGED" > /dev/tcp/"$PRIMARY_IP"/"$STAGED_PORT") 2>/dev/null; then
+    echo "  Staged signal sent via TCP to $PRIMARY_IP:$STAGED_PORT"
+  elif echo "STAGED" | nc -q 0 -w 1 "$PRIMARY_IP" "$STAGED_PORT" 2>/dev/null; then
+    echo "  Staged signal sent via nc to $PRIMARY_IP:$STAGED_PORT"
+  else
+    echo "  WARN: TCP staged signal failed, writing FSx marker as fallback"
+  fi
+  # Always write FSx marker too (fallback + observability)
   echo "STAGED" | sudo tee "$REPLICA_STAGED_FILE" >/dev/null
   sudo chmod 644 "$REPLICA_STAGED_FILE" 2>/dev/null || true
   mark_phase_event "REPLICA_STAGED_FOR_CUTOVER"

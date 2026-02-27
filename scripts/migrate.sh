@@ -580,20 +580,39 @@ if [ "$FAST_CUTOVER" != "1" ] && [ -n "$CUTOVER_MARKER_FILE" ] && [[ "$CUTOVER_M
 fi
 
 if [ "$FAST_CUTOVER" = "1" ]; then
-  log "Step 7b: Waiting for replica staged marker ($REPLICA_STAGED_FILE)..."
+  STAGED_PORT=${STAGED_PORT:-9004}
+  # Kill any stale listener on the staged port
+  fuser -k "$STAGED_PORT"/tcp 2>/dev/null || true
+  log "Step 7b: Waiting for replica staged signal (TCP :$STAGED_PORT)..."
+  # Accept one TCP connection and exit immediately.
+  # Python socket gives precise control — no nc buffering/cleanup delays.
   STAGED_OK=0
-  for _ in $(seq 1 $((DUMP_EXIT_TIMEOUT_S * 20))); do
+  STAGED_MSG=$(timeout "${DUMP_EXIT_TIMEOUT_S}s" python3 -c "
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('0.0.0.0', $STAGED_PORT))
+s.listen(1)
+conn, _ = s.accept()
+data = conn.recv(64)
+conn.close()
+s.close()
+sys.stdout.write(data.decode().strip())
+" 2>/dev/null || true)
+  if [ -n "$STAGED_MSG" ]; then
+    STAGED_OK=1
+  fi
+  if [ "$STAGED_OK" -ne 1 ]; then
+    # Fallback: check FSx file
     if [ -f "$REPLICA_STAGED_FILE" ]; then
       STAGED_OK=1
-      break
     fi
-    sleep 0.05
-  done
+  fi
   if [ "$STAGED_OK" -ne 1 ]; then
-    log "ERROR: replica staged marker not found at $REPLICA_STAGED_FILE"
+    log "ERROR: replica staged signal not received"
     exit 1
   fi
-  log "  Replica staged marker detected"
+  log "  Replica staged signal received"
 fi
 
 # Step 8: Cutover/check
@@ -602,7 +621,10 @@ fi
 # Write markers AFTER the freeze window, not before/during.
 REPLICA_UP=0
 if [ "$FAST_CUTOVER" = "1" ]; then
-  valkey_cmd CLIENT PAUSE "$CUTOVER_PAUSE_MS" WRITE >/dev/null 2>&1 || true
+  # Skip CLIENT PAUSE at cutover — all benchmark clients are already
+  # disconnected and kill -STOP is sufficient to freeze the source.
+  # CLIENT PAUSE was timing out (2s) because the COW page-server holds
+  # resources that make Valkey's event loop unresponsive.
   _cutover_start=${EPOCHREALTIME/./}; _cutover_start=${_cutover_start:0:13}
   _t0=$_cutover_start
   kill -STOP "$PID" 2>/dev/null || sudo kill -STOP "$PID" 2>/dev/null || true
