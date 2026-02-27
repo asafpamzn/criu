@@ -2244,18 +2244,16 @@ skip_requests:
 		 * ~256x and the kernel walks page tables in one pass.
 		 */
 		{
-			struct iovec remote_iov;
+			struct iovec local_iov, remote_iov;
 			ssize_t ret;
 
-			for (i = 0; i < batch_pages; i++) {
-				local_iovs[i].iov_base = batch_buf + i * PAGE_SIZE;
-				local_iovs[i].iov_len = PAGE_SIZE;
-			}
+			local_iov.iov_base = batch_buf;
+			local_iov.iov_len = batch_pages * PAGE_SIZE;
 			remote_iov.iov_base = (void *)batch_start;
 			remote_iov.iov_len = batch_pages * PAGE_SIZE;
 
 			ret = process_vm_readv(source_pid,
-					       local_iovs, batch_pages,
+					       &local_iov, 1,
 					       &remote_iov, 1, 0);
 			if (ret < 0 && errno == EFAULT) {
 				/*
@@ -2324,7 +2322,6 @@ skip_requests:
 			data = cow_pg ? cow_pg->data :
 				batch_buf + i * PAGE_SIZE;
 
-			/* Compress directly into send_batch */
 			pi = (struct page_server_iov *)(send_batch + send_batch_len);
 			compressed_size = (int *)(send_batch + send_batch_len + sizeof(*pi));
 			compressed_data = send_batch + send_batch_len + sizeof(*pi) + sizeof(int);
@@ -2336,16 +2333,25 @@ skip_requests:
 				goto err;
 			}
 
-			*compressed_size = clen;
-			pi->cmd = encode_ps_cmd(PS_IOV_ADD_F_COMPRESS, PE_PRESENT);
 			pi->nr_pages = 1;
 			pi->vaddr = paddr;
 			pi->dst_id = img->dst_id;
 
-			send_batch_len += sizeof(*pi) + sizeof(int) + clen;
+			if (clen < PAGE_SIZE) {
+				/* Compression helped — send compressed */
+				*compressed_size = clen;
+				pi->cmd = encode_ps_cmd(PS_IOV_ADD_F_COMPRESS, PE_PRESENT);
+				send_batch_len += sizeof(*pi) + sizeof(int) + clen;
+			} else {
+				/* Incompressible — send raw page */
+				memcpy(send_batch + send_batch_len + sizeof(*pi),
+				       data, PAGE_SIZE);
+				pi->cmd = encode_ps_cmd(PS_IOV_ADD_F, PE_PRESENT);
+				send_batch_len += sizeof(*pi) + PAGE_SIZE;
+			}
 
 			g_compress_uncompressed_bytes += PAGE_SIZE;
-			g_compress_compressed_bytes += clen;
+			g_compress_compressed_bytes += (clen < PAGE_SIZE) ? clen : PAGE_SIZE;
 
 			lve->sent_bitmap[page_idx / 8] |=
 				(1 << (page_idx % 8));
