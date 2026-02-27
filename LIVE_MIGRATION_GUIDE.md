@@ -256,7 +256,7 @@ Spot-check:        500/500 keys match
 Verification:      ALL 7 TESTS PASS
 ```
 
-### At 200GB quiesced (3.2 million keys, 64KB values)
+### At 200GB with live traffic (3.2 million keys, 64KB values)
 
 ```
 Migration time:    114.9 seconds
