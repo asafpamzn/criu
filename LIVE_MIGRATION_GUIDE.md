@@ -29,9 +29,9 @@ sub-millisecond cutover.
 | **Checkpoint / Dump** | The act of saving the process state. CRIU calls this a "dump". |
 | **Restore** | The act of recreating the process from the saved state on another machine. |
 | **COW dump** | Our custom mode where CRIU takes the snapshot while the process keeps running. "COW" means Copy-On-Write — the kernel tracks which memory pages the process modifies after the snapshot starts. |
-| **Freeze / Frozen time** | The brief period (50-76ms in our case) when the Valkey process is completely paused. During this window, CRIU collects process metadata and sets up page tracking. Clients see a brief latency spike but no errors. |
+| **Freeze / Frozen time** | The brief period (~42-76ms in our case) when the Valkey process is paused via cgroup freezer. During this window, CRIU collects process metadata and sets up page tracking. Clients see a brief latency spike but no errors. Measured as `dump_one_task` in our logs. |
 | **Page** | A 4KB block of memory. The kernel manages memory in pages. A 200GB Valkey instance has ~50 million pages. |
-| **Write-protect (WP)** | A kernel feature where we mark memory pages as read-only. When Valkey writes to a protected page, the kernel generates a fault notification, and CRIU captures the old content before the write goes through. This is how we track changes after the snapshot. |
+| **Write-protect (WP)** | A kernel feature where we mark memory pages as read-only. We use WP_ASYNC mode: when Valkey writes to a protected page, the kernel allows the write immediately (no stall) but marks the page as dirty. CRIU later discovers which pages were dirtied by scanning the kernel's pagemap. This is how we track changes after the snapshot without slowing Valkey down. |
 | **Page server** | The CRIU component on the source machine that reads pages from Valkey's memory and streams them over TCP to the replica. |
 | **page-recv** | Our custom tool on the replica that receives pages over TCP and writes them into the restored process's memory. |
 | **Convergence** | After the bulk transfer, some pages may have been modified by Valkey. The convergence phase captures these final changes. We use a fork-snapshot to get a consistent view without freezing Valkey again. |
@@ -60,14 +60,15 @@ typical duration at 200GB.
   └─────┬──────────────────────┘
         │
   ┌─────▼──────────────────────┐
-  │  2. FREEZE (76ms)          │
-  │  - Pause Valkey (SIGSTOP)  │
+  │  2. FREEZE (42-76ms)       │
+  │  - Freeze via cgroup       │
   │  - Collect process state   │
   │    (registers, file        │
   │     descriptors, VMAs)     │
   │  - Write-protect all       │
   │    memory pages            │
-  │  - Resume Valkey (SIGCONT) │
+  │  - Unfreeze (--leave-      │
+  │    running)                │
   │  ◄ Valkey running again ►  │
   └─────┬──────────────────────┘
         │
@@ -112,28 +113,32 @@ processes from previous runs, cleans the shared filesystem, and starts
 `restore.sh` on the replica. The replica creates a "ready" signal file
 on the shared filesystem and waits.
 
-This takes ~7 seconds and happens **before** migration timing starts.
+This takes 5-10 seconds (SSH latency, process cleanup) and happens
+**before** migration timing starts.
 
-### Phase 2: Freeze (50-76ms)
+### Phase 2: Freeze (42-76ms)
 
-This is the only moment Valkey is unresponsive. CRIU does three things:
+This is the only moment Valkey is unresponsive. CRIU freezes all
+threads via the cgroup freezer (`--freeze-cgroup`), then does three
+things:
 
 1. **Collects metadata** — registers, file descriptors, open sockets,
-   signal handlers, namespaces. This goes into image files on the
-   shared filesystem.
+   signal handlers, namespaces. This goes into protobuf image files on
+   the shared filesystem.
 
-2. **Write-protects memory** — uses the kernel's userfaultfd mechanism
-   to mark all of Valkey's memory pages as write-protected. After this,
-   any write by Valkey triggers a notification that CRIU uses to track
-   changes.
+2. **Write-protects memory** — uses the kernel's userfaultfd
+   `UFFDIO_WRITEPROTECT` ioctl to mark all of Valkey's memory pages as
+   write-protected. We use WP_ASYNC mode: after this, any write by
+   Valkey goes through immediately (no stall) but the kernel marks the
+   page as dirty. CRIU discovers dirty pages later via `PAGEMAP_SCAN`.
 
-3. **Resumes Valkey** — Valkey continues serving clients. From this
-   point, CRIU works entirely in the background.
+3. **Unfreezes Valkey** (`--leave-running`) — the cgroup freeze is
+   released and Valkey continues serving clients. From this point,
+   CRIU works entirely in the background.
 
-The freeze time scales linearly with memory:
-- 95GB: ~50ms
+The freeze time (`dump_one_task`) scales roughly linearly with memory:
+- 95GB: ~42-51ms
 - 200GB: ~76ms
-- Projected 400GB: ~150ms
 
 ### Phase 3: Bulk Transfer (95% of migration time)
 
@@ -163,9 +168,10 @@ Key details:
   59:1). For random data it's skipped automatically.
 - **Batch size**: 512 pages (2MB) per read system call
 
-During this phase, Valkey is running normally. If it writes to a page
-that hasn't been transferred yet, the write-protect mechanism captures
-the pre-write content so the replica gets the correct snapshot.
+During this phase, Valkey is running normally. If it writes to a
+write-protected page, the kernel allows the write immediately but
+marks the page dirty. The convergence phase (next) discovers these
+dirty pages and re-sends them from a consistent fork snapshot.
 
 ### Phase 4: Convergence (<1 second)
 
@@ -191,20 +197,20 @@ uses ptrace to inject `mmap(MAP_FIXED)` into the restored process,
 creating matching memory regions before the page data arrives. This
 ensures the replica's memory layout matches the source at cutover.
 
-**Arena reset**: at restore time, CRIU zeros glibc's malloc fastbins
-and empties all bins. This prevents stale allocator metadata from
-causing double-free or use-after-free crashes after SIGCONT.
+**Arena reset**: at restore time, CRIU zeros glibc's `main_arena` lock
+and fastbins (96 bytes at a hardcoded offset). This prevents stale
+allocator metadata from causing double-free or deadlock after SIGCONT.
 
 ### Phase 5: Cutover (1 millisecond)
 
 The atomic switchover:
 
-1. Source sends `SIGSTOP` to Valkey (instant kernel signal)
+1. Source sends `kill -STOP` to Valkey (instant kernel signal)
 2. Source sends TCP "GO" to replica port 9003 (bash `/dev/tcp` builtin,
    no fork)
-3. Replica receives "GO", sends `SIGCONT` to the restored Valkey
-4. Source sends `SIGCONT` to its own Valkey (so it can serve as
-   fallback)
+3. Replica receives "GO", sends `kill -CONT` to the restored Valkey
+4. If `KEEP_SOURCE_RUNNING=1`: source also sends `kill -CONT` to its
+   own Valkey (so it can serve as fallback)
 
 The source is frozen for ~1ms. The replica Valkey resumes and starts
 serving immediately.
@@ -237,25 +243,13 @@ the exact instruction where it was frozen.
 Tested on AWS Graviton3 (aarch64), 32 cores, 247GB RAM, 25 Gbps
 network.
 
-### At 95GB quiesced (1.6 million keys, 64KB values, no client traffic)
+### At 95GB with live traffic (1.6M keys, 64KB SET workload during migration)
 
 ```
-Migration time:    57.7 seconds
-  Transfer:        57.2s  @ 1,708 MB/s
+Migration time:    58.6 seconds
+  Transfer:        58.2s  @ 1,680 MB/s
   Overhead:        0.4s
-Freeze time:       50ms
-Cutover:           1ms
-Memory match:      0.0% divergence
-Verification:      ALL 7 TESTS PASS
-```
-
-### At 95GB with live traffic (64KB SET workload during migration)
-
-```
-Migration time:    58.2 seconds
-  Transfer:        57.6s  @ 1,704 MB/s
-  Overhead:        0.6s
-Freeze time:       51ms
+Freeze:            50ms (dump_one_task)
 Cutover:           1ms
 Memory match:      0.0% divergence
 Spot-check:        500/500 keys match
@@ -268,19 +262,19 @@ Verification:      ALL 7 TESTS PASS
 Migration time:    114.9 seconds
   Transfer:        114.4s @ 1,707 MB/s
   Overhead:        0.5s
-Freeze time:       76ms
+Freeze:            76ms (dump_one_task)
 Cutover:           0ms
 Memory match:      0.0% divergence
 Verification:      ALL 7 TESTS PASS
 ```
 
-### Scaling characteristics
+### Scaling
 
-| Metric | Per GB |
-|--------|--------|
-| Transfer time | 0.60 s/GB |
-| Freeze time | 0.38 ms/GB |
-| Overhead | ~0.5s (constant) |
+| Metric | Per GB | Notes |
+|--------|--------|-------|
+| Transfer time | ~0.60 s/GB | Limited by process_vm_readv kernel page-table walks |
+| Freeze (dump_one_task) | ~0.38 ms/GB | Dominated by UFFDIO_WRITEPROTECT ioctl |
+| Overhead | ~0.5s | Constant: restore fork + page-recv connect + convergence + cutover |
 
 ---
 
@@ -307,13 +301,13 @@ Every migration is verified with 7 tests:
 │  ┌─────────────┐       ┌──────────────────────────────┐    │
 │  │   Valkey     │       │         CRIU                 │    │
 │  │   Server     │◀─────▶│                              │    │
-│  │             │  ptrace│  ┌────────────┐              │    │
-│  │  200GB heap  │       │  │ COW dump   │              │    │
-│  │  3.2M keys   │       │  │ (parasite) │              │    │
-│  │             │  WP    │  └────────────┘              │    │
+│  │             │ cgroup │  ┌────────────┐              │    │
+│  │  200GB heap  │ freeze│  │ COW dump   │              │    │
+│  │  3.2M keys   │       │  │ (WP_ASYNC) │              │    │
+│  │             │ uffd   │  └────────────┘              │    │
 │  │             │◀──────▶│  ┌────────────┐  8 TCP       │    │
-│  │             │  fault │  │ Page       │──streams──┐  │    │
-│  └─────────────┘  notify│  │ server     │           │  │    │
+│  │             │  WP    │  │ Page       │──streams──┐  │    │
+│  └─────────────┘       │  │ server     │           │  │    │
 │                         │  └────────────┘           │  │    │
 │                         └──────────────────────────────┘    │
 │                                                        │    │
