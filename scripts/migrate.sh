@@ -342,7 +342,7 @@ stop_source_ping_monitor
 # Kill benchmark processes. Use bracket trick to prevent self-match.
 sudo pkill -9 -f "[b]ench_loop" 2>/dev/null || true
 sudo pkill -9 -f "[v]alkey-benchmark" 2>/dev/null || true
-sleep 1
+sleep 0.1
 
 # Wait until all benchmark clients have disconnected.
 # After pkill, the benchmark's TCP connections close (FIN). Valkey's event
@@ -482,29 +482,28 @@ if [ -n "$CRIU_DUMP_STRACE_OUT" ]; then
 fi
 
 mark_local_event "DUMP_LAUNCH_MS"
-MIGRATION_START_MS=$(date +%s%3N)
+MIGRATION_START_MS=${EPOCHREALTIME/./}; MIGRATION_START_MS=${MIGRATION_START_MS:0:13}
 "${CRIU_DUMP_CMD[@]}" &
 DUMP_PID=$!
 
-sleep 2
-if ! kill -0 "$DUMP_PID" 2>/dev/null; then
-  # Dump process exited — check if page server was ready (success) or not (failure)
-  if sudo grep -a -q "PAGE SERVER READY TO SERVE" "$IMAGES_DIR/lazy-primary.log" 2>/dev/null; then
-    log "  Dump completed quickly (small dataset)"
-  else
-    log "ERROR: criu dump exited early"
-    sudo tail -n 120 "$IMAGES_DIR/lazy-primary.log" || true
-    exit 1
-  fi
-fi
 PAGE_SERVER_READY=0
-for _ in $(seq 1 600); do
+for _ in $(seq 1 1200); do
   if sudo grep -a -q "PAGE SERVER READY TO SERVE" "$IMAGES_DIR/lazy-primary.log" 2>/dev/null; then
     PAGE_SERVER_READY=1
     mark_local_event "PAGE_SERVER_READY_MS"
     break
   fi
-  sleep 0.05
+  if ! kill -0 "$DUMP_PID" 2>/dev/null; then
+    if sudo grep -a -q "PAGE SERVER READY TO SERVE" "$IMAGES_DIR/lazy-primary.log" 2>/dev/null; then
+      PAGE_SERVER_READY=1
+      mark_local_event "PAGE_SERVER_READY_MS"
+      break
+    fi
+    log "ERROR: criu dump exited early"
+    sudo tail -n 120 "$IMAGES_DIR/lazy-primary.log" || true
+    exit 1
+  fi
+  sleep 0.025
 done
 if [ "$PAGE_SERVER_READY" -ne 1 ]; then
   log "WARN: did not observe 'PAGE SERVER READY TO SERVE' in lazy-primary.log within 30s"
@@ -598,16 +597,14 @@ if [ "$FAST_CUTOVER" = "1" ]; then
 fi
 
 # Step 8: Cutover/check
+# CRITICAL PATH — every millisecond counts here.
+# Use only bash builtins (EPOCHREALTIME, kill, /dev/tcp).
+# Write markers AFTER the freeze window, not before/during.
 REPLICA_UP=0
-mark_cutover_event "CUTOVER_START_MS"
-mark_local_event "CUTOVER_START_MS"
 if [ "$FAST_CUTOVER" = "1" ]; then
   valkey_cmd CLIENT PAUSE "$CUTOVER_PAUSE_MS" WRITE >/dev/null 2>&1 || true
-  # Use bash builtins to avoid fork+exec overhead in the critical path:
-  # - EPOCHREALTIME instead of $(date) — no fork
-  # - kill instead of pkill — no /proc scan
-  # - /dev/tcp instead of nc — no fork+exec
-  _t0=${EPOCHREALTIME/./}; _t0=${_t0:0:13}  # epoch ms, no fork
+  _cutover_start=${EPOCHREALTIME/./}; _cutover_start=${_cutover_start:0:13}
+  _t0=$_cutover_start
   kill -STOP "$PID" 2>/dev/null || sudo kill -STOP "$PID" 2>/dev/null || true
   SOURCE_FROZEN=1
   if (echo "GO" > /dev/tcp/"$REPLICA_SSH_HOST"/"$CUTOVER_PORT") 2>/dev/null; then
@@ -623,8 +620,14 @@ if [ "$FAST_CUTOVER" = "1" ]; then
     _t1=${EPOCHREALTIME/./}; _t1=${_t1:0:13}
     log "Step 8: SSH cutover (fallback) — source frozen for $((_t1 - _t0))ms"
   fi
-  mark_cutover_event "CUTOVER_END_MS"
-  mark_local_event "CUTOVER_END_MS"
+  _cutover_end=${EPOCHREALTIME/./}; _cutover_end=${_cutover_end:0:13}
+  # Write markers AFTER the critical window (non-blocking)
+  {
+    printf "CUTOVER_START_MS %s PRIMARY\n" "$_cutover_start" | sudo tee -a "$CUTOVER_MARKER_FILE" >/dev/null 2>&1
+    printf "CUTOVER_END_MS %s PRIMARY\n" "$_cutover_end" | sudo tee -a "$CUTOVER_MARKER_FILE" >/dev/null 2>&1
+    printf "CUTOVER_START_MS %s PRIMARY\n" "$_cutover_start" >>"$LOCAL_MARKER_FILE" 2>/dev/null
+    printf "CUTOVER_END_MS %s PRIMARY\n" "$_cutover_end" >>"$LOCAL_MARKER_FILE" 2>/dev/null
+  } &
   REPLICA_UP=1
 else
   log "Step 8: Check replica..."
@@ -659,14 +662,14 @@ if [ "$REPLICA_UP" -ne 1 ]; then
   exit 1
 fi
 
+MIGRATION_END_MS=${EPOCHREALTIME/./}; MIGRATION_END_MS=${MIGRATION_END_MS:0:13}
+MIGRATION_TIME_MS=$((MIGRATION_END_MS - MIGRATION_START_MS))
+
 if [ "$FAST_CUTOVER" = "1" ] && [ "$KEEP_SOURCE_RUNNING" = "1" ]; then
   log "  Resuming source valkey-server (KEEP_SOURCE_RUNNING=1)"
   sudo pkill -CONT -x valkey-server 2>/dev/null || true
   SOURCE_FROZEN=0
 fi
-
-MIGRATION_END_MS=$(date +%s%3N)
-MIGRATION_TIME_MS=$((MIGRATION_END_MS - MIGRATION_START_MS))
 
 REPLICA_SYNCED=0
 if [ "$POST_REPLICA_SYNC_CHECK" = "1" ]; then
