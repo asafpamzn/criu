@@ -78,10 +78,15 @@ T0=$(date +%s)
 eval "$MARGS bash $SCRIPT_DIR/migrate.sh $SIZE_GB" > "$RUN_DIR/migrate.log" 2>&1 || true
 DUR=$(( $(date +%s) - T0 ))
 
-FROZEN=$(grep "Frozen time:" "$RUN_DIR/migrate.log" 2>/dev/null | awk '{print $3}' || echo "?")
 CUT=$(grep "TCP cutover.*frozen for" "$RUN_DIR/migrate.log" 2>/dev/null | grep -oP '\d+ms' || echo "?")
 DOT=$(grep "dump_one_task TOTAL" "$RUN_DIR/migrate.log" 2>/dev/null | awk -F: '{print $NF}' | tr -d ' s' || echo "?")
-log "  Duration: ${DUR}s  frozen: ${FROZEN}us  cutover: ${CUT}  dump_one_task: ${DOT}s"
+MIGR_MS=$(grep "Duration:.*ms" "$RUN_DIR/migrate.log" 2>/dev/null | grep -oP 'Duration: \K\d+(?=ms)' || echo "?")
+XFER_LINE=$(grep "^page-recv:.*pages.*in.*MB/s" "$RUN_DIR/migrate.log" 2>/dev/null | tail -1 || true)
+XFER_T=$(echo "$XFER_LINE" | grep -oP 'in \K[0-9.]+(?=s)' || echo "?")
+XFER_R=$(echo "$XFER_LINE" | grep -oP '\(\K[0-9.]+(?= MB/s)' || echo "?")
+XFER_MB=$(echo "$XFER_LINE" | grep -oP '\(\K[0-9.]+(?= MB\))' || echo "?")
+log "  Migration: ${MIGR_MS}ms  transfer: ${XFER_T}s ${XFER_MB}MB @ ${XFER_R} MB/s"
+log "  Frozen: dump_one_task=${DOT}s  cutover=${CUT}"
 
 if grep -q "Migration completed successfully" "$RUN_DIR/migrate.log" 2>/dev/null; then
   pass "migration completed"
@@ -162,7 +167,9 @@ log "  RESULTS: $([ "$FAIL" -eq 0 ] && echo "ALL $PASS TESTS PASSED" || echo "$F
 log ""
 for t in "${TESTS[@]}"; do log "  $t"; done
 log ""
-log "  frozen: ${FROZEN}us  cutover: ${CUT}  total: ${DUR}s"
+log "  migration: ${MIGR_MS}ms  transfer: ${XFER_T}s @ ${XFER_R} MB/s"
+log "  frozen: dump_one_task=${DOT}s  cutover=${CUT}"
+log "  total (incl. scripts): ${DUR}s"
 log "  Logs: $RUN_DIR/"
 log "================================================================"
 

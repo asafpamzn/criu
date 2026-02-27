@@ -482,6 +482,7 @@ if [ -n "$CRIU_DUMP_STRACE_OUT" ]; then
 fi
 
 mark_local_event "DUMP_LAUNCH_MS"
+MIGRATION_START_MS=$(date +%s%3N)
 "${CRIU_DUMP_CMD[@]}" &
 DUMP_PID=$!
 
@@ -663,6 +664,9 @@ if [ "$FAST_CUTOVER" = "1" ] && [ "$KEEP_SOURCE_RUNNING" = "1" ]; then
   sudo pkill -CONT -x valkey-server 2>/dev/null || true
   SOURCE_FROZEN=0
 fi
+
+MIGRATION_END_MS=$(date +%s%3N)
+MIGRATION_TIME_MS=$((MIGRATION_END_MS - MIGRATION_START_MS))
 
 REPLICA_SYNCED=0
 if [ "$POST_REPLICA_SYNC_CHECK" = "1" ]; then
@@ -930,7 +934,8 @@ if [ -n "${WORKLOAD_LOG_FILE:-}" ] && [ "$WORKLOAD_LOG_FILE" != "/dev/null" ] &&
 fi
 
 log "================================================================"
-log "Migration complete!"
+log "Migration completed successfully!"
+log "  Duration: ${MIGRATION_TIME_MS}ms ($(( MIGRATION_TIME_MS / 1000 ))s)"
 log "  Source Memory:   $MEM"
 log "  Replica Memory:  $REPLICA_MEM"
 log "----------------------------------------------------------------"
