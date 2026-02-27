@@ -2144,7 +2144,7 @@ static int send_image_complete(struct active_image *img)
  * page table walk setup) and speeds up WP clearing — which directly
  * reduces the duration of the application throughput stall.
  */
-#define PAGE_BATCH_SIZE 256
+#define PAGE_BATCH_SIZE 512
 
 static int process_vma_pages_sk(struct active_image *img,
 				struct lazy_vma_entry *lve,
@@ -4088,15 +4088,22 @@ static void *unified_page_server_thread(void *arg)
 						break;
 					}
 					tcp_cork(workers[s].sk, true);
+					{
+						int bs = 16 * 1024 * 1024;
+						setsockopt(workers[s].sk,
+							   SOL_SOCKET,
+							   SO_SNDBUF,
+							   &bs, sizeof(bs));
+					}
 				}
 
 				/*
-				 * Partition pages across workers.  Large VMAs
-				 * are split into sub-ranges so all streams
-				 * stay busy even when one VMA dominates.
+				 * Partition pages across workers.  Split VMAs
+				 * into pages_per_worker-sized ranges so all
+				 * streams stay busy.
 				 */
 				{
-				int max_ranges = nr_vmas + nr_streams;
+				int max_ranges = nr_vmas + nr_streams * 4;
 				int ri;
 
 				pages_per_worker = (total_pages + nr_streams - 1) / nr_streams;
@@ -4107,18 +4114,16 @@ static void *unified_page_server_thread(void *arg)
 					goto single_stream;
 				}
 
-				/* Build range list, splitting large VMAs */
+				/* Build range list, splitting VMAs > pages_per_worker */
 				for (vi = 0; vi < nr_vmas; vi++) {
 					unsigned long vma_pages = all_vmas[vi]->total_pages;
 
-					if (vma_pages > pages_per_worker * 3 / 2 &&
+					if (vma_pages > pages_per_worker &&
 					    nr_streams > 1) {
-						/* Split across remaining streams */
-						unsigned long chunk = (vma_pages + nr_streams - 1)
-								      / nr_streams;
+						unsigned long chunk = pages_per_worker;
 						unsigned long off = 0;
 
-						chunk = (chunk + 255) & ~255UL; /* align to 256 */
+						chunk = (chunk + 255) & ~255UL;
 						while (off < vma_pages &&
 						       nr_ranges < max_ranges) {
 							unsigned long end_pg = off + chunk;
@@ -4695,7 +4700,7 @@ no_server:
 
 	/* Enlarge socket buffers for throughput */
 	if (ask >= 0) {
-		int bufsize = 4 * 1024 * 1024;
+		int bufsize = 16 * 1024 * 1024;
 		setsockopt(ask, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
 	}
 
@@ -4730,7 +4735,7 @@ static int connect_to_page_server(void)
 
 	/* Enlarge receive buffer for throughput */
 	{
-		int bufsize = 4 * 1024 * 1024;
+		int bufsize = 16 * 1024 * 1024;
 		setsockopt(page_server_sk, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
 	}
 

@@ -143,7 +143,7 @@ static int recv_full(int sk, void *buf, size_t len)
 static int tcp_connect(const char *host, int port)
 {
 	struct sockaddr_in addr;
-	int sk, one = 1, bufsz = 4 * 1024 * 1024;
+	int sk, one = 1, bufsz = 16 * 1024 * 1024;
 
 	memset(&addr, 0, sizeof(addr));
 	addr.sin_family = AF_INET;

@@ -51,7 +51,7 @@ if [ "$SKIP_FILL" = "0" ]; then
   NUM_KEYS=$(( SIZE_GB * 16000 ))
   log "  Filling $NUM_KEYS keys (~${SIZE_GB}GB)..."
   valkey-benchmark -p "$VALKEY_PORT" -t set -n "$NUM_KEYS" -d 64000 \
-    -r "$NUM_KEYS" -c 64 --threads 4 > /dev/null 2>&1
+    -r 1000000000 -c 64 --threads 4 > /dev/null 2>&1
 fi
 SRC_KEYS=$($VCLI DBSIZE | sed 's/[^0-9]//g')
 SRC_MEM=$($VCLI info memory | grep "^used_memory:" | tr -d '\r' | cut -d: -f2)

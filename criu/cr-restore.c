@@ -2084,7 +2084,7 @@ static int run_page_recv(struct pstree_item *item)
 	port_env = getenv("PAGE_RECV_PORT");
 	streams = getenv("PAGE_RECV_STREAMS");
 	if (!streams)
-		streams = "4";
+		streams = "8";
 
 	if (!addr) {
 		pr_err("page-recv: no address (set --address or PAGE_RECV_ADDR)\n");
