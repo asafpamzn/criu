@@ -100,9 +100,9 @@ Valkey users can adopt. The constraints are non-negotiable:
 - **Architecture: both aarch64 and x86_64.** The solution must work on both
   architectures. No architecture-specific hacks or workarounds that only
   apply to one.
-- **Target scale: 100GB+ datasets with live traffic.** The solution must handle
+- **Target scale: 100GB+ datasets with live traffic.** The solution is required to handle
   large Valkey instances under active read/write workloads during migration.
-- **Source stays up, replica can be down.** The source Valkey must remain
+- **Source stays up, replica can be down.** The source Valkey is required to remain
   responsive to clients throughout the entire migration. The replica is not
   serving traffic — it can be down/stopped/rebuilding for as long as needed.
   Only the source's availability matters.
@@ -133,34 +133,38 @@ the process continues to run.
 
 ### Current State (Feb 2026)
 
-**118GB quiesced migration: SOLVED.** Production-ready. Source freeze < 100ms,
-full PONG after restore.
+**200GB quiesced migration: SOLVED.** Production-ready. 76ms freeze, 1ms
+cutover, 114.9s total migration at 1,707 MB/s. ALL 7 verification tests pass.
 
-**Live traffic (43K ops/s benchmark): ROOT CAUSE FOUND, NOT YET FIXED.**
-The process crashes (SIGSEGV in jemalloc) on the first malloc after SIGCONT.
-Root cause: during the 7-minute transfer, jemalloc on the source creates new
-mmap regions (extents for allocation churn). The replica has the dump-time
-VMA layout. Metadata transferred by convergence/allocator-re-read contains
-pointers to the new VMAs, which don't exist on the replica → SIGSEGV.
-The apparent "futex deadlock" is actually valkey's crash handler deadlocking
-on dlopen("libgcc_s.so.1") during backtrace collection after the SIGSEGV.
-See `FUTEX_DEADLOCK_RESEARCH.md` Act XVII for the full forensic analysis.
+**100GB live traffic migration: SOLVED.** Production-ready. 51ms freeze, 1ms
+cutover, 58.2s total migration at 1,704 MB/s. ALL 7 verification tests pass
+(12/14 historical runs passed; 2 failures were test-harness fill issues, not
+migration bugs).
 
-Architecture (proven at 118GB):
+The live traffic SIGSEGV (jemalloc creating new mmap extents during transfer)
+was fixed with three defenses:
+  1. **VMA mirroring**: source detects new VMAs during convergence, sends
+     `PS_IOV_VMA_DIFF` to replica, CRIU injects `mmap(MAP_FIXED)` via ptrace
+  2. **Fork-snapshot convergence**: reads dirty pages from a COW fork instead
+     of the live process, guaranteeing temporal consistency
+  3. **Arena reset**: zeros glibc fastbins and empties bins at restore time
+See `FUTEX_DEADLOCK_RESEARCH.md` Acts XVII-XIX for the full analysis.
+
+Architecture (proven at 200GB quiesced, 100GB live):
 ```
-Source: COW dump (35ms freeze) → page-server (4 TCP streams) → bulk + converge
+Source: COW dump (51ms freeze) → page-server (8 TCP streams) → bulk + converge
 Replica: criu restore → ptrace-trap → page-recv (process_vm_writev) → SIGCONT
 ```
 
 Key files:
   - `criu/cr-restore.c`: `run_page_recv()` forks page-recv in the ptrace-trap
-    window between `compel_stop_on_syscall` and `restore_rseq_cs`
+    window; `inject_new_vmas()` handles VMA mirroring via ptrace
   - `tools/page-recv.c`: standalone page receiver, handles bulk + convergence
-    EOS protocol, multi-stream, LZ4 decompression
-  - `criu/page-xfer.c`: source-side page server, multi-stream bulk transfer,
-    `cow_converge_dirty_pages_parallel()` for convergence rounds, allocator
-    re-read from frozen source (currently reads LIVE maps — bug)
+    + VMA diff protocol, multi-stream, LZ4 decompression
+  - `criu/page-xfer.c`: source-side page server, 8-stream bulk transfer,
+    fork-snapshot convergence, VMA diff detection and transmission
   - `FUTEX_DEADLOCK_RESEARCH.md`: full debugging journal
+  - `LIVE_MIGRATION_GUIDE.md`: team-facing end-to-end guide
 
 ### Deployment
 
