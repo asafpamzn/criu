@@ -3111,7 +3111,7 @@ skip_ns_bouncing:
 		 * restore, the IO threads resume in pthread_mutex_lock
 		 * and need to see the mutex as unlocked (0) to proceed.
 		 */
-		unlock_elf_mutex_array(pid, "io_threads_mutex", 128);
+		unlock_elf_mutex_array(pid, "io_threads_mutex", 256);
 
 		/*
 		 * Also unlock Valkey's signal_handler_lock.
@@ -3297,7 +3297,7 @@ skip_ns_bouncing:
 				if (itm_addr) {
 					int i;
 
-					for (i = 0; i < 16; i++) {
+					for (i = 0; i < 256; i++) {
 						int w = inject_futex_wake(
 							pid,
 							itm_addr + i * 48);
