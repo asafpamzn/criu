@@ -246,9 +246,11 @@ if [ -z "${MEM:-}" ]; then
 fi
 log "  Memory: $MEM"
 
-# Step 4: Clean images dir
+# Step 4: Clean and create local images dir
 log "Step 4: Clean $IMAGES_DIR..."
-sudo rm -rf "$IMAGES_DIR"/*
+sudo rm -rf "$IMAGES_DIR"
+sudo mkdir -p "$IMAGES_DIR"
+sudo chmod 777 "$IMAGES_DIR"
 
 # Best-effort: ensure shared marker file is writable/empty for this run.
 if [ -n "${CUTOVER_MARKER_FILE:-}" ]; then
@@ -277,20 +279,13 @@ done
 $SSH ubuntu@$REPLICA_SSH_HOST "sudo env ${REMOTE_RESTORE_ENV[*]} $SCRIPT_DIR/restore.sh" &
 REPLICA_PID=$!
 
-# Step 5b: Wait for replica ready signal
-log "Step 5b: Wait for replica ready signal..."
-READY_FILE="$IMAGES_DIR/ready.log"
-for i in $(seq 1 60); do
-  if [ -f "$READY_FILE" ]; then
-    log "  Replica ready"
-    break
-  fi
-  sleep 0.5
-done
-if [ ! -f "$READY_FILE" ]; then
-  log "ERROR: replica ready signal not found at $READY_FILE"
-  exit 1
-fi
+# Step 5b: Wait for replica to be ready.
+# The replica's restore.sh will connect to our image server (port 9005)
+# to download images.  The image server starts after the dump (Step 6),
+# and the replica's image-client retries until it connects.  No shared
+# filesystem needed for the ready signal.
+log "Step 5b: Replica started, will connect for images after dump..."
+sleep 1  # give restore.sh time to SSH + kill stale processes
 
 # Step 6: NOW start CRIU dump (replica is waiting for page server)
 log "Step 6: CRIU dump..."
@@ -509,6 +504,14 @@ if [ "$PAGE_SERVER_READY" -ne 1 ]; then
   log "WARN: did not observe 'PAGE SERVER READY TO SERVE' in lazy-primary.log within 30s"
 fi
 
+# Step 6b: Serve CRIU image files to replica over TCP.
+# All .img files are written before PAGE_SERVER_READY.
+# The replica's restore.sh connects to download images before starting CRIU restore.
+IMAGE_XFER_PORT=${IMAGE_XFER_PORT:-9005}
+fuser -k "$IMAGE_XFER_PORT"/tcp 2>/dev/null || true
+python3 "$SCRIPT_DIR/image-server.py" "$IMAGES_DIR" "$IMAGE_XFER_PORT" &
+IMAGE_SERVER_PID=$!
+log "  Image server started on :$IMAGE_XFER_PORT (PID $IMAGE_SERVER_PID)"
 
 WORKLOAD_PID=""
 if [ "$RUN_WORKLOAD_DURING_MIGRATION" = "1" ]; then

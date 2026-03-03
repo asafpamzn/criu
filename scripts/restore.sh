@@ -115,33 +115,22 @@ echo "Step 1b: Applying temporary replica network gate"
 apply_replica_gate
 mark_phase_event "REPLICA_GATE_APPLIED"
 
-# --- Step 2: Signal readiness to PRIMARY -------------------------------------
-# The primary's migrate.sh polls for this file on shared storage before
-# starting the CRIU dump.
-echo "Step 2: Creating ready signal"
-echo "READY" | sudo tee "$IMAGES_DIR/ready.log" >/dev/null
-echo "Ready signal created at $IMAGES_DIR/ready.log"
+# --- Step 2: Create local images directory -----------------------------------
+echo "Step 2: Creating local images directory"
+sudo rm -rf "$IMAGES_DIR"
+sudo mkdir -p "$IMAGES_DIR"
+sudo chmod 777 "$IMAGES_DIR"
 mark_phase_event "REPLICA_READY_SIGNAL_CREATED"
 
-# --- Step 3: Wait for source page-server ------------------------------------
-# The primary writes "PAGE SERVER READY TO SERVE" to lazy-primary.log after
-# the dump completes and the page server is accepting connections. We poll
-# the shared log file until the marker appears.
-echo "Step 3: Waiting for source COW/page-server readiness..."
-START_TIME=$(date +%s)
-while true; do
-	if [ -f "$LOG_FILE" ] && sudo grep -Eq "$PAGE_SERVER_READY_PATTERN" "$LOG_FILE" 2>/dev/null; then
-		echo "Source ready marker observed"
-		mark_phase_event "REPLICA_PAGE_SERVER_READY"
-		break
-	fi
-	ELAPSED=$(($(date +%s) - START_TIME))
-	if [ "$ELAPSED" -ge "$WAIT_TIMEOUT" ]; then
-		echo "Timeout waiting for source COW/page-server readiness"
-		exit 1
-	fi
-	sleep 0.5
-done
+# --- Step 3: Download CRIU image files from source ---------------------------
+# The source's image-server.py serves all .img files on IMAGE_XFER_PORT
+# after the dump completes.  image-client.py retries until the server is
+# up (handles the timing: replica starts before source dump finishes).
+IMAGE_XFER_PORT=${IMAGE_XFER_PORT:-9005}
+echo "Step 3: Downloading CRIU images from $PRIMARY_IP:$IMAGE_XFER_PORT..."
+python3 "$SCRIPT_DIR/image-client.py" "$PRIMARY_IP" "$IMAGE_XFER_PORT" "$IMAGES_DIR"
+echo "Images downloaded to $IMAGES_DIR"
+mark_phase_event "REPLICA_PAGE_SERVER_READY"
 
 # --- Step 4: Background replication setup ------------------------------------
 # Start wait_and_replicate.sh which waits for valkey to respond, then
@@ -250,17 +239,19 @@ if [ "$FAST_CUTOVER" = "1" ]; then
 
   echo "Step 9b: Signaling staged to source"
   STAGED_PORT=${STAGED_PORT:-9004}
-  # TCP signal to source (instant) — primary method
-  if (echo "STAGED" > /dev/tcp/"$PRIMARY_IP"/"$STAGED_PORT") 2>/dev/null; then
-    echo "  Staged signal sent via TCP to $PRIMARY_IP:$STAGED_PORT"
-  elif echo "STAGED" | nc -q 0 -w 1 "$PRIMARY_IP" "$STAGED_PORT" 2>/dev/null; then
-    echo "  Staged signal sent via nc to $PRIMARY_IP:$STAGED_PORT"
-  else
-    echo "  WARN: TCP staged signal failed, writing FSx marker as fallback"
+  # TCP signal to source — retry until the source listener is up.
+  STAGED_SENT=0
+  for _retry in $(seq 1 100); do
+    if (echo "STAGED" > /dev/tcp/"$PRIMARY_IP"/"$STAGED_PORT") 2>/dev/null; then
+      echo "  Staged signal sent via TCP to $PRIMARY_IP:$STAGED_PORT"
+      STAGED_SENT=1
+      break
+    fi
+    sleep 0.1
+  done
+  if [ "$STAGED_SENT" -ne 1 ]; then
+    echo "  WARN: TCP staged signal failed after retries"
   fi
-  # Always write FSx marker too (fallback + observability)
-  echo "STAGED" | sudo tee "$REPLICA_STAGED_FILE" >/dev/null
-  sudo chmod 644 "$REPLICA_STAGED_FILE" 2>/dev/null || true
   mark_phase_event "REPLICA_STAGED_FOR_CUTOVER"
 
   echo "Step 9c: Waiting for cutover signal..."
