@@ -294,39 +294,69 @@ Every migration is verified with 7 tests:
 
 ## Running a Migration
 
-### Quick start
+### Prerequisites
 
+On both machines:
 ```bash
-# On the source machine:
-sudo ./scripts/verify-migration.sh 100
+make -j$(nproc)                                  # build CRIU
+cd tools && gcc -O2 -o page-recv page-recv.c -llz4 -lpthread  # build page-recv
+sudo cp criu/criu /usr/local/sbin/criu           # install
+echo 1 | sudo tee /proc/sys/vm/unprivileged_userfaultfd  # allow uffd
 ```
 
-This fills 100GB, migrates with live traffic, and runs all 7 verification
-tests. Use `--skip-fill` if data is already loaded.
+Configure `scripts/.env` with the IPs and SSH key of both machines.
 
-### What the scripts do
+### Run a migration with full verification
 
-`verify-migration.sh` calls `migrate.sh` which does the heavy lifting.
-The core CRIU dump command is:
+```bash
+# Fill 100GB + migrate with live traffic + verify all 7 tests:
+sudo ./scripts/verify-migration.sh 100
 
+# Skip fill if data is already loaded:
+sudo ./scripts/verify-migration.sh 100 --skip-fill
+
+# Benchmark only (skip BGSAVE + spot-check, saves ~4 min):
+sudo ./scripts/verify-migration.sh 100 --skip-fill --benchmark
+```
+
+### Run migrate.sh directly (no test harness)
+
+```bash
+# On source — fill data first, then:
+sudo env SKIP_FILL=1 KEEP_SOURCE_RUNNING=1 \
+  RUN_WORKLOAD_DURING_MIGRATION=1 \
+  bash scripts/migrate.sh 100
+```
+
+### What the CRIU commands look like
+
+**Source** (runs inside migrate.sh):
 ```bash
 criu dump \
   --tree $PID                    # Valkey's process ID
-  --images-dir /fsx/lazy         # shared filesystem for image files
-  --cow-dump                     # enable COW mode (our fork's feature)
-  --lazy-pages                   # don't write pages to disk, stream them
-  --address $PRIMARY_IP          # source IP for page-server TCP listener
-  --port 9002                    # page-server port
-  --tcp-close                    # close client TCP connections on dump
+  --images-dir /tmp/criu-images  # local temp dir (no shared filesystem)
+  --cow-dump                     # COW mode (our fork's feature)
+  --lazy-pages                   # stream pages, don't write to disk
+  --address $SOURCE_IP           # page-server listens here
+  --port 9002                    # page-server port (8 TCP streams)
+  --serve-images 9005            # serve .img files over TCP
+  --tcp-close                    # close client sockets on dump
   --skip-in-flight               # ignore half-open sockets
   --ext-unix-sk                  # handle external unix sockets
-  --leave-running                # don't kill the process after dump
-  --freeze-cgroup $CGROUP_PATH   # freeze threads via cgroup (not SIGSTOP)
-  --display-stats                # write timing stats to stats-dump file
+  --leave-running                # resume process after dump
+  --freeze-cgroup $CGROUP        # freeze via cgroup (not SIGSTOP)
+  --display-stats                # write timing to stats-dump
 ```
 
-On the replica, `restore.sh` runs CRIU restore and launches `page-recv`
-to receive the 8-stream bulk transfer.
+**Replica** (runs inside restore.sh):
+```bash
+criu restore \
+  --images-dir /tmp/criu-images  # local dir (images downloaded here)
+  --fetch-images $SOURCE_IP:9005 # download .img files from source
+  --lazy-pages --tcp-close --cow-dump \
+  --restore-detached --leave-stopped \
+  --skip-file-rwx-check --file-validation filesize
+```
 
 ### Live traffic workload
 
@@ -342,9 +372,14 @@ valkey-benchmark \
   -n 1000000000          # runs until migration completes
 ```
 
-This workload starts after the bulk transfer phase and continues through
-convergence and cutover. It validates that VMA mirroring and fork-snapshot
-correctly handle memory changes during the transfer.
+### Ports used
+
+| Port | Direction | Purpose |
+|------|-----------|---------|
+| 9002 | source → replica | Page server (8-stream bulk page transfer) |
+| 9003 | source → replica | Cutover "GO" signal |
+| 9004 | replica → source | Staged "STAGED" signal (sent by page-recv) |
+| 9005 | source → replica | CRIU image file transfer (~500KB) |
 
 ---
 
