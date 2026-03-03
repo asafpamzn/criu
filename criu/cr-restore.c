@@ -3137,107 +3137,80 @@ skip_ns_bouncing:
 		 * On aarch64 glibc 2.39:
 		 *   tpidr_el0 → DTV pointer (at TP+0)
 		 *   DTV[2] = libc TLS block pointer (at DTV+16)
-		 *   tcache pointer at TLS block + 0x580
+		 *   tcache pointer at TLS block + offset (varies)
 		 */
 #ifdef __aarch64__
 		{
 			struct pstree_item *item;
-			int nulled = 0;
+			int nulled = 0, threads_ok = 0;
+			char mem_path2[64];
+			int mem_fd2;
 
-			for_each_pstree_item(item) {
-				int t;
+			snprintf(mem_path2, sizeof(mem_path2),
+				 "/proc/%d/mem", pid);
+			mem_fd2 = open(mem_path2, O_RDWR);
+			if (mem_fd2 >= 0) {
+				for_each_pstree_item(item) {
+					int t;
 
-				for (t = 0; t < item->nr_threads; t++) {
-					pid_t tid = item->threads[t].real;
-					unsigned long tp, dtv, tls_block;
-					unsigned long zero_val = 0;
-					struct iovec iov_tls;
-					unsigned long tls_reg = 0;
-
-					iov_tls.iov_base = &tls_reg;
-					iov_tls.iov_len = sizeof(tls_reg);
-					if (ptrace(PTRACE_GETREGSET, tid,
-						   (void *)0x401, /* NT_ARM_TLS */
-						   &iov_tls)) {
-						pr_info("tcache: tid %d: GETREGSET failed\n", tid);
-						continue;
-					}
-					tp = tls_reg;
-					if (!tp) {
-						pr_info("tcache: tid %d: TP=0\n", tid);
-						continue;
-					}
-
-					/* DTV = *(TP) */
-					if (ptrace_peek_area(tid, &dtv,
-							     (void *)tp, 8)) {
-						pr_info("tcache: tid %d: peek DTV failed\n", tid);
-						continue;
-					}
-					if (!dtv) {
-						pr_info("tcache: tid %d: DTV=0\n", tid);
-						continue;
-					}
-
-					/* TLS block = DTV[2] (at offset 16) */
-					if (ptrace_peek_area(tid, &tls_block,
-							     (void *)(dtv + 16), 8)) {
-						pr_info("tcache: tid %d: peek TLS block failed\n", tid);
-						continue;
-					}
-					if (!tls_block) {
-						pr_info("tcache: tid %d: TLS block=0\n", tid);
-						continue;
-					}
-					pr_info("tcache: tid %d: TP=0x%lx DTV=0x%lx TLS=0x%lx\n",
-						tid, tp, dtv, tls_block);
-
-					/* Scan TLS block for the tcache pointer and null it.
-				 * Validate: target must look like a tcache struct
-				 * (first 128 bytes are uint16_t counts, sum > 0
-				 * and sum < 1000).
-				 */
-					{
+					for (t = 0; t < item->nr_threads; t++) {
+						pid_t tid = item->threads[t].real;
+						unsigned long tp, dtv, tls_block;
+						struct iovec iov_tls;
+						unsigned long tls_reg = 0;
 						int off;
 
-						for (off = 0x500; off <= 0x600; off += 8) {
+						iov_tls.iov_base = &tls_reg;
+						iov_tls.iov_len = sizeof(tls_reg);
+						if (ptrace(PTRACE_GETREGSET, tid,
+							   (void *)0x401,
+							   &iov_tls))
+							continue;
+						tp = tls_reg;
+						if (!tp)
+							continue;
+
+						if (pread(mem_fd2, &dtv, 8, tp) != 8 ||
+						    !dtv)
+							continue;
+						if (pread(mem_fd2, &tls_block, 8,
+							  dtv + 16) != 8 ||
+						    !tls_block)
+							continue;
+
+						threads_ok++;
+						for (off = 0x480; off <= 0x600;
+						     off += 8) {
 							unsigned long probe;
 							unsigned short counts[64];
+							unsigned long zero = 0;
 							int k, total;
 
-							if (ptrace_peek_area(
-								tid, &probe,
-								(void *)(tls_block + off),
-								8))
+							if (pread(mem_fd2, &probe, 8,
+								  tls_block + off) != 8)
 								continue;
-							if (probe == 0 || probe < 0x10000)
+							if (!probe || probe < 0x10000)
 								continue;
-
-							/* Validate: read 128 bytes at probe */
-							if (ptrace_peek_area(
-								tid, counts,
-								(void *)probe,
-								sizeof(counts)))
+							if (pread(mem_fd2, counts,
+								  sizeof(counts),
+								  probe) !=
+							    (ssize_t)sizeof(counts))
 								continue;
-
 							total = 0;
 							for (k = 0; k < 64; k++)
 								total += counts[k];
 							if (total <= 0 || total >= 1000)
 								continue;
-
-							/* Looks like tcache — null it */
-							if (ptrace_poke_area(
-								tid, &zero_val,
-								(void *)(tls_block + off),
-								8) == 0)
+							if (pwrite(mem_fd2, &zero, 8,
+								   tls_block + off) == 8)
 								nulled++;
 						}
 					}
 				}
+				close(mem_fd2);
 			}
-			pr_err("Nulled tcache for %d threads (scanned %d)\n",
-			       nulled, item->nr_threads);
+			pr_err("Nulled %d tcache pointers (%d threads)\n",
+			       nulled, threads_ok);
 		}
 #endif
 
@@ -3344,6 +3317,76 @@ skip_ns_bouncing:
 	/* just before releasing threads we have to restore rseq_cs */
 	if (restore_rseq_cs())
 		pr_err("Unable to restore rseq_cs state\n");
+
+	/*
+	 * Re-null tcache AFTER restore_rseq_cs.  rseq_cs writes to TLS
+	 * via ptrace_poke and can overwrite our earlier tcache null.
+	 */
+	if (opts.cow_dump) {
+		pid_t pid2 = root_item->pid->real;
+#ifdef __aarch64__
+		{
+			struct pstree_item *item;
+			int nulled2 = 0;
+			char mp2[64];
+			int mf2;
+
+			snprintf(mp2, sizeof(mp2), "/proc/%d/mem", pid2);
+			mf2 = open(mp2, O_RDWR);
+			if (mf2 >= 0) {
+				for_each_pstree_item(item) {
+					int t;
+
+					for (t = 0; t < item->nr_threads; t++) {
+						pid_t tid = item->threads[t].real;
+						unsigned long tp2, dtv2, tls2;
+						struct iovec iv2;
+						unsigned long tr2 = 0;
+						int off;
+
+						iv2.iov_base = &tr2;
+						iv2.iov_len = 8;
+						if (ptrace(PTRACE_GETREGSET, tid,
+							   (void *)0x401, &iv2))
+							continue;
+						tp2 = tr2;
+						if (!tp2)
+							continue;
+						if (pread(mf2, &dtv2, 8, tp2) != 8 || !dtv2)
+							continue;
+						if (pread(mf2, &tls2, 8, dtv2 + 16) != 8 || !tls2)
+							continue;
+						for (off = 0x480; off <= 0x600; off += 8) {
+							unsigned long p;
+							unsigned short c[64];
+							unsigned long z = 0;
+							int k, tot;
+
+							if (pread(mf2, &p, 8, tls2 + off) != 8)
+								continue;
+							if (!p || p < 0x10000)
+								continue;
+							if (pread(mf2, c, sizeof(c), p) !=
+							    (ssize_t)sizeof(c))
+								continue;
+							tot = 0;
+							for (k = 0; k < 64; k++)
+								tot += c[k];
+							if (tot <= 0 || tot >= 1000)
+								continue;
+							if (pwrite(mf2, &z, 8, tls2 + off) == 8)
+								nulled2++;
+						}
+					}
+				}
+				close(mf2);
+			}
+			if (nulled2 > 0)
+				pr_err("Post-rseq tcache re-null: %d pointers\n",
+				       nulled2);
+		}
+#endif
+	}
 
 	/*
 	 * Some external devices such as GPUs might need a very late
