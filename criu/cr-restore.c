@@ -2348,6 +2348,14 @@ out_fd:
 
 static int reset_one_arena(pid_t pid, unsigned long arena)
 {
+	/*
+	 * Zero offsets 0..95 and 104..111.  Preserve top (+96).
+	 *   +0:   mutex (4) + flags (4) + have_fastchunks (4) + pad (4)
+	 *   +16:  fastbinsY[10] (80 bytes)
+	 *   +96:  top chunk pointer (8) — PRESERVED (must be valid)
+	 *   +104: last_remainder (8) — zeroed
+	 *   +112: bins[254] — initialized as empty circular lists
+	 */
 	unsigned char zeros_head[96];
 	unsigned long bins_init[254];
 	unsigned long zero_remainder = 0;
@@ -2356,7 +2364,6 @@ static int reset_one_arena(pid_t pid, unsigned long arena)
 
 	memset(zeros_head, 0, sizeof(zeros_head));
 
-	/* Build empty bin sentinels: fd = bk = &bins[2*i] - 16 */
 	for (bi = 0; bi < 254; bi += 2) {
 		unsigned long bin_addr = bins_base +
 			bi * sizeof(unsigned long) - 16;
