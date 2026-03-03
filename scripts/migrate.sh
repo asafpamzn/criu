@@ -69,11 +69,33 @@ for _ in $(seq 1 50); do
 done
 valkey-cli -p "$VALKEY_PORT" CONFIG SET lazyfree-lazy-expire no CONFIG SET save "" >/dev/null 2>&1 || true
 
-# Wait for idle threads
+# CLIENT PAUSE before dump — freeze client processing so all threads settle.
+# Must happen HERE (not in COW_PRE_FREEZE_CMD) so we can verify all threads
+# are in idle syscalls AFTER the pause processing (including any logging/printf)
+# completes. This prevents catching threads mid-malloc at cgroup freeze time.
+valkey-cli -p "$VALKEY_PORT" CLIENT PAUSE 10000 ALL >/dev/null 2>&1 || true
+
+# Wait for main thread to return to epoll_wait (meaning CLIENT PAUSE
+# processing including any log output/printf/malloc is complete)
 PID=$(pgrep -x valkey-server)
 for _ in $(seq 1 200); do
   SC=$(sudo cat /proc/$PID/syscall 2>/dev/null | awk '{print $1}')
   [ "$SC" = "22" ] || [ "$SC" = "73" ] && break; sleep 0.01
+done
+
+# Wait for ALL threads to be in idle syscalls (not just main thread).
+# Idle: 22=epoll_pwait, 73=ppoll, 98=futex, 101=nanosleep, 115=clock_nanosleep
+for _ in $(seq 1 1000); do
+  ALL_IDLE=1
+  for tid_dir in /proc/$PID/task/*/; do
+    SC=$(sudo cat "${tid_dir}syscall" 2>/dev/null | awk '{print $1}')
+    case "$SC" in
+      22|73|98|101|115) ;;
+      *) ALL_IDLE=0; break ;;
+    esac
+  done
+  [ "$ALL_IDLE" = "1" ] && break
+  sleep 0.001
 done
 
 # Cgroup freeze path
@@ -82,7 +104,7 @@ REL=$(grep '^0::' "/proc/$PID/cgroup" 2>/dev/null | cut -d: -f3 || true)
 case "$REL" in *.service) CGROUP="/sys/fs/cgroup${REL}" ;; esac
 
 CRIU_ARGS=(
-  sudo env COW_PRE_FREEZE_CMD="valkey-cli -p $VALKEY_PORT CLIENT PAUSE 5000 ALL >/dev/null 2>&1" "$CRIU_BIN" dump
+  sudo "$CRIU_BIN" dump
   --tree "$PID" --images-dir "$IMAGES_DIR"
   --cow-dump --lazy-pages
   --address "$PRIMARY_IP" --port "$CRIU_PORT"
