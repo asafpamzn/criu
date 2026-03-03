@@ -77,4 +77,20 @@ with open(f"/proc/{pid}/mem", "r+b") as f:
             break
     f.flush()
 
-print(f"null-tcache: {nulled} tcache, {arenas_zeroed} arenas ({len(tls_addrs)} threads)")
+print(f"null-tcache: {nulled} tcache, {arenas_zeroed} arenas ({len(tls_addrs)} threads)",
+      flush=True)
+if nulled == 0 and tls_addrs:
+    # Debug: check first thread's TLS chain
+    tp = tls_addrs[0]
+    try:
+        with open(f"/proc/{pid}/mem", "rb") as df:
+            df.seek(tp)
+            dtv = struct.unpack("<Q", df.read(8))[0]
+            df.seek(dtv + 16)
+            tls_block = struct.unpack("<Q", df.read(8))[0]
+            df.seek(tls_block + 0x548)
+            val = struct.unpack("<Q", df.read(8))[0]
+            print(f"  DEBUG: TP=0x{tp:x} DTV=0x{dtv:x} TLS=0x{tls_block:x} +0x548=0x{val:x}",
+                  flush=True)
+    except Exception as e:
+        print(f"  DEBUG: exception {e}", flush=True)
