@@ -66,26 +66,11 @@ echo "Restored PID $VALKEY_PID (stopped, waiting for cutover)"
 wait "$CUTOVER_PID" 2>/dev/null || true
 rm -f /tmp/cutover_msg
 
-# --- 6. Resume with cgroup freeze for safe tcache cleanup ---
-# 1. Cgroup freeze (atomic, all threads)
-# 2. SIGCONT (threads unSIGSTOP'd but immediately cgroup-frozen)
-# 3. Null tcache + reset arenas via /proc/pid/mem (safe, threads frozen)
-# 4. Cgroup unfreeze (threads run with clean allocator state)
+# --- 6. Resume ---
+# SIGCONT lets threads finish any in-flight operations (printf, malloc).
+# Then cgroup-freeze, null tcache, unfreeze for clean allocator state.
 CGROUP_PATH="/sys/fs/cgroup/system.slice/valkey-server.service"
-if [ -f "$CGROUP_PATH/cgroup.freeze" ]; then
-  echo 1 | sudo tee "$CGROUP_PATH/cgroup.freeze" > /dev/null
-  sudo kill -CONT "$VALKEY_PID" 2>/dev/null || true
-  sleep 0.1  # let SIGCONT propagate, threads are still cgroup-frozen
-
-  sudo python3 "$SCRIPT_DIR/null-tcache.py" "$VALKEY_PID" "$IMAGES_DIR"
-
-  # Unfreeze — threads run with clean state
-  echo 0 | sudo tee "$CGROUP_PATH/cgroup.freeze" > /dev/null
-  echo "Cgroup freeze/unfreeze tcache cleanup done"
-else
-  # No cgroup freeze — fallback to direct SIGCONT
-  sudo kill -CONT "$VALKEY_PID" 2>/dev/null || true
-fi
+sudo kill -CONT "$VALKEY_PID" 2>/dev/null || true
 
 for _ in $(seq 1 6000); do timeout 1s valkey-cli ping &>/dev/null && break; sleep 0.05; done
 timeout 1s valkey-cli ping &>/dev/null || { echo "ERROR: Valkey not responsive"; exit 1; }
