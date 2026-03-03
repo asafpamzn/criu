@@ -707,6 +707,8 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		BOOL_OPT(OPT_ALLOW_UPROBES, &opts.allow_uprobes),
 		{ "cow-dump", no_argument, 0, 1105 },
 		{ "leave-stopped-detach", no_argument, 0, 1106 },
+		{ "serve-images", required_argument, 0, 1107 },
+		{ "fetch-images", required_argument, 0, 1108 },
 		{},
 	};
 
@@ -1052,6 +1054,12 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 			break;
 		case 1106:
 			opts.final_state = TASK_STOPPED_DETACH;
+			break;
+		case 1107:
+			opts.serve_images_port = atoi(optarg);
+			break;
+		case 1108:
+			opts.fetch_images = optarg;
 			break;
 		case 'V':
 			pr_msg("Version: %s\n", CRIU_VERSION);

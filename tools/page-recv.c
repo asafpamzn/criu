@@ -610,6 +610,41 @@ int main(int argc, char **argv)
 		elapsed > 0 ? (double)(total_pages * PAGE_SIZE) / (1024 * 1024) / elapsed : 0,
 		any_error ? " WITH ERRORS" : "");
 
+	/* Send STAGED signal to source if configured */
+	{
+		const char *staged_addr = getenv("PAGE_RECV_STAGED_ADDR");
+		const char *staged_port_s = getenv("PAGE_RECV_STAGED_PORT");
+
+		if (staged_addr && staged_port_s) {
+			int sp = atoi(staged_port_s);
+			struct sockaddr_in sa;
+			int ssk, retry;
+
+			memset(&sa, 0, sizeof(sa));
+			sa.sin_family = AF_INET;
+			sa.sin_port = htons(sp);
+			inet_pton(AF_INET, staged_addr, &sa.sin_addr);
+
+			for (retry = 0; retry < 100; retry++) {
+				ssk = socket(AF_INET, SOCK_STREAM, 0);
+				if (ssk < 0)
+					break;
+				if (connect(ssk, (struct sockaddr *)&sa,
+					    sizeof(sa)) == 0) {
+					if (write(ssk, "STAGED\n", 7) < 0)
+					perror("staged write");
+					close(ssk);
+					fprintf(stderr,
+						"page-recv: sent STAGED to %s:%d\n",
+						staged_addr, sp);
+					break;
+				}
+				close(ssk);
+				usleep(100000);
+			}
+		}
+	}
+
 	/* Write completion marker */
 	{
 		char path[4096];

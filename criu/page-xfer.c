@@ -37,6 +37,7 @@
 #include "tls.h"
 #include "uffd.h"
 #include "cow-dump.h"
+#include "image-xfer.h"
 #include "criu-plugin.h"
 #include "plugin.h"
 #include "dump.h"
@@ -4740,6 +4741,22 @@ int cr_page_server(bool daemon_mode, bool lazy_dump, int cfd)
 	if (opts.cow_dump)
 		g_listen_sk = sk;
 no_server:
+
+	/* Serve image files in background thread if requested */
+	if (opts.serve_images_port > 0) {
+		static struct { int port; const char *dir; } img_args;
+		pthread_t img_thread;
+
+		img_args.port = opts.serve_images_port;
+		img_args.dir = opts.imgs_dir;
+		if (pthread_create(&img_thread, NULL,
+				   serve_image_files_thread,
+				   &img_args) == 0) {
+			pthread_detach(img_thread);
+			pr_err("image-xfer: serving on :%d\n",
+			       opts.serve_images_port);
+		}
+	}
 
 	if (!daemon_mode && cfd >= 0) {
 		struct ps_info info = { .pid = getpid(), .port = opts.port };

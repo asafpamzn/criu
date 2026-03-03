@@ -4,7 +4,7 @@ set -euo pipefail
 # Migration correctness verification.  Run on PRIMARY (source).
 #
 # Usage:
-#   ./verify-migration.sh [SIZE_GB] [--live] [--skip-fill]
+#   ./verify-migration.sh [SIZE_GB] [--live] [--skip-fill] [--benchmark]
 #
 # Tests:
 #   1. Key count match
@@ -21,10 +21,12 @@ source "$SCRIPT_DIR/.env"
 SIZE_GB="${1:-10}"
 LIVE=1
 SKIP_FILL=0
+BENCHMARK=0
 for arg in "$@"; do
   case "$arg" in
     --live) LIVE=1 ;;
     --skip-fill) SKIP_FILL=1 ;;
+    --benchmark) BENCHMARK=1 ;;
   esac
 done
 
@@ -93,6 +95,17 @@ if grep -q "Migration completed successfully" "$RUN_DIR/migrate.log" 2>/dev/null
 else
   fail "migration did not complete"
   cat "$RUN_DIR/migrate.log" | tail -20 >> "$RUN_DIR/verify.log"
+fi
+
+if [ "$BENCHMARK" = "1" ]; then
+  log ""
+  log "================================================================"
+  log "  BENCHMARK COMPLETE (verification skipped)"
+  log "  migration: ${MIGR_MS}ms  transfer: ${XFER_T}s @ ${XFER_R} MB/s"
+  log "  frozen: dump_one_task=${DOT}s  cutover=${CUT}"
+  log "  Logs: $RUN_DIR/"
+  log "================================================================"
+  exit "$FAIL"
 fi
 
 # ── 4. Verify replica ──
