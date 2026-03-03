@@ -66,135 +66,26 @@ echo "Restored PID $VALKEY_PID (stopped, waiting for cutover)"
 wait "$CUTOVER_PID" 2>/dev/null || true
 rm -f /tmp/cutover_msg
 
-# --- 5b. Null per-thread tcache before SIGCONT ---
-# CRIU nulls tcache via ptrace, but the offset detection may miss some.
-# Belt-and-suspenders: also null via /proc/pid/mem from this script.
-sudo python3 -c "
-import struct, os, ctypes, ctypes.util
+# --- 6. Resume with cgroup freeze for safe tcache cleanup ---
+# 1. Cgroup freeze (atomic, all threads)
+# 2. SIGCONT (threads unSIGSTOP'd but immediately cgroup-frozen)
+# 3. Null tcache + reset arenas via /proc/pid/mem (safe, threads frozen)
+# 4. Cgroup unfreeze (threads run with clean allocator state)
+CGROUP_PATH="/sys/fs/cgroup/system.slice/valkey-server.service"
+if [ -f "$CGROUP_PATH/cgroup.freeze" ]; then
+  echo 1 | sudo tee "$CGROUP_PATH/cgroup.freeze" > /dev/null
+  sudo kill -CONT "$VALKEY_PID" 2>/dev/null || true
+  sleep 0.1  # let SIGCONT propagate, threads are still cgroup-frozen
 
-pid = $VALKEY_PID
-libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
-class iv(ctypes.Structure):
-    _fields_ = [('b', ctypes.c_void_p), ('l', ctypes.c_size_t)]
+  sudo python3 "$SCRIPT_DIR/null-tcache.py" "$VALKEY_PID" "$IMAGES_DIR"
 
-nulled = 0
-for tid_s in os.listdir(f'/proc/{pid}/task/'):
-    tid = int(tid_s)
-    tls_reg = ctypes.c_ulong(0)
-    i = iv(ctypes.addressof(tls_reg), 8)
-    libc.ptrace(16, tid, 0, 0)  # ATTACH
-    try: os.waitpid(tid, 0)
-    except: pass
-    libc.ptrace(0x4204, tid, 0x401, ctypes.byref(i))  # NT_ARM_TLS
-    tp = tls_reg.value
-    libc.ptrace(17, tid, 0, 0)  # DETACH
-    if not tp: continue
-    with open(f'/proc/{pid}/mem', 'r+b') as f:
-        f.seek(tp); dtv = struct.unpack('<Q', f.read(8))[0]
-        if not dtv: continue
-        f.seek(dtv + 16); tls_block = struct.unpack('<Q', f.read(8))[0]
-        if not tls_block: continue
-        for off in range(0x500, 0x600, 8):
-            f.seek(tls_block + off)
-            val = struct.unpack('<Q', f.read(8))[0]
-            if val == 0 or val < 0x10000: continue
-            try:
-                f.seek(val)
-                counts = struct.unpack('<64H', f.read(128))
-                total = sum(counts)
-                if 0 < total < 1000:
-                    f.seek(tls_block + off)
-                    f.write(struct.pack('<Q', 0))
-                    nulled += 1
-            except: pass
-        f.flush()
-print(f'restore.sh: nulled {nulled} tcache pointers')
-" 2>/dev/null || true
-
-# --- 6. Resume + unblock stuck mutexes via ptrace futex_wake ---
-sudo kill -CONT "$VALKEY_PID" 2>/dev/null || true
-sleep 0.2
-
-# After SIGCONT, the main thread may be stuck in futex_wait on
-# main_arena.mutex (stale tcache triggered malloc corruption path).
-# Zero the mutex and inject futex(FUTEX_WAKE) via ptrace to unblock.
-sudo python3 -c "
-import struct, os, ctypes, ctypes.util, time
-
-pid = $VALKEY_PID
-libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
-PTRACE_ATTACH = 16
-PTRACE_DETACH = 17
-SYS_futex = 98
-
-# Find main_arena address
-arena = None
-with open(f'/proc/{pid}/maps') as maps:
-    for line in maps:
-        if 'libc.so' in line and 'rw-' in line:
-            arena = int(line.split('-')[0], 16) + 0xa50
-            break
-
-if arena:
-    # Zero main_arena lock+count+owner
-    with open(f'/proc/{pid}/mem', 'r+b') as f:
-        f.seek(arena)
-        f.write(struct.pack('<III', 0, 0, 0))
-        f.flush()
-
-    # Ptrace attach to main thread, inject futex(FUTEX_WAKE)
-    libc.ptrace(PTRACE_ATTACH, pid, 0, 0)
-    os.waitpid(pid, 0)
-
-    # Read registers
-    import array
-    regs = array.array('Q', [0]*34)  # user_regs_struct on aarch64
-    class iovec(ctypes.Structure):
-        _fields_ = [('iov_base', ctypes.c_void_p), ('iov_len', ctypes.c_size_t)]
-    iov = iovec(regs.buffer_info()[0], regs.buffer_info()[1] * 8)
-    libc.ptrace(0x4204, pid, 1, ctypes.byref(iov))  # PTRACE_GETREGSET, NT_PRSTATUS
-    orig_regs = array.array('Q', regs)
-
-    # Save original code at PC
-    pc = regs[32]  # pc is at index 32 in user_regs_struct
-    orig_code = (ctypes.c_char * 8)()
-    libc.ptrace(0x4203, pid, 1, ctypes.byref(iov))  # re-read for safety
-
-    # Inject SVC #0; BRK #0
-    import mmap
-    with open(f'/proc/{pid}/mem', 'r+b') as f:
-        f.seek(pc)
-        old_code = f.read(8)
-        f.seek(pc)
-        f.write(bytes([0x01, 0x00, 0x00, 0xd4, 0x00, 0x00, 0x20, 0xd4]))
-        f.flush()
-
-        # Set regs for futex(arena, FUTEX_WAKE, INT_MAX)
-        regs[8] = SYS_futex  # x8 = syscall number
-        regs[0] = arena       # x0 = uaddr
-        regs[1] = 1           # x1 = FUTEX_WAKE
-        regs[2] = 0x7fffffff  # x2 = INT_MAX
-        regs[32] = pc         # pc
-        iov = iovec(regs.buffer_info()[0], regs.buffer_info()[1] * 8)
-        libc.ptrace(0x4205, pid, 1, ctypes.byref(iov))  # PTRACE_SETREGSET
-
-        libc.ptrace(7, pid, 0, 0)  # PTRACE_CONT
-        os.waitpid(pid, 0)  # wait for BRK (SIGTRAP)
-
-        # Read result
-        libc.ptrace(0x4204, pid, 1, ctypes.byref(iov))
-        woken = regs[0]
-        print(f'futex_wake({arena:#x}): woke {woken} threads')
-
-        # Restore original code + regs
-        f.seek(pc)
-        f.write(old_code)
-        f.flush()
-
-    iov = iovec(orig_regs.buffer_info()[0], orig_regs.buffer_info()[1] * 8)
-    libc.ptrace(0x4205, pid, 1, ctypes.byref(iov))
-    libc.ptrace(PTRACE_DETACH, pid, 0, 0)
-" 2>/dev/null || true
+  # Unfreeze — threads run with clean state
+  echo 0 | sudo tee "$CGROUP_PATH/cgroup.freeze" > /dev/null
+  echo "Cgroup freeze/unfreeze tcache cleanup done"
+else
+  # No cgroup freeze — fallback to direct SIGCONT
+  sudo kill -CONT "$VALKEY_PID" 2>/dev/null || true
+fi
 
 for _ in $(seq 1 6000); do timeout 1s valkey-cli ping &>/dev/null && break; sleep 0.05; done
 timeout 1s valkey-cli ping &>/dev/null || { echo "ERROR: Valkey not responsive"; exit 1; }
