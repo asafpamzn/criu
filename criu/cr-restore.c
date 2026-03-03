@@ -1988,6 +1988,94 @@ restore_code:
 	return -1;
 }
 
+/*
+ * Reset a single glibc malloc arena via ptrace.
+ *
+ * Arena layout (glibc malloc_state, LP64):
+ *   +0:    mutex (4 bytes)
+ *   +4:    flags (4 bytes)
+ *   +8:    have_fastchunks (4) + pad (4)
+ *   +16:   fastbinsY[10] (80 bytes)
+ *   +96:   top (8 bytes) — PRESERVED
+ *   +104:  last_remainder (8 bytes)
+ *   +112:  bins[254] (2032 bytes)
+ *   +2144: binmap[4] (16 bytes)
+ *   +2160: next (8 bytes) — pointer to next arena
+ *
+ * We zero: lock+flags+fastbins (0..95), last_remainder (104..111).
+ * We init: bins as empty circular lists (fd=bk=self).
+ * We preserve: top chunk pointer (+96).
+ */
+#define ARENA_NEXT_OFFSET 2160
+
+static int reset_one_arena(pid_t pid, unsigned long arena)
+{
+	unsigned char zeros_head[96];
+	unsigned long bins_init[254];
+	unsigned long zero_remainder = 0;
+	unsigned long bins_base = arena + 112;
+	int bi, err = 0;
+
+	memset(zeros_head, 0, sizeof(zeros_head));
+
+	/* Build empty bin sentinels: fd = bk = &bins[2*i] - 16 */
+	for (bi = 0; bi < 254; bi += 2) {
+		unsigned long bin_addr = bins_base +
+			bi * sizeof(unsigned long) - 16;
+		bins_init[bi] = bin_addr;
+		bins_init[bi + 1] = bin_addr;
+	}
+
+	err |= ptrace_poke_area(pid, zeros_head,
+				(void *)arena, sizeof(zeros_head));
+	err |= ptrace_poke_area(pid, &zero_remainder,
+				(void *)(arena + 104),
+				sizeof(zero_remainder));
+	err |= ptrace_poke_area(pid, bins_init,
+				(void *)bins_base, sizeof(bins_init));
+	return err;
+}
+
+/*
+ * Walk the glibc arena linked list starting at main_arena and
+ * reset every arena.  The list is circular: main_arena.next →
+ * arena2 → arena3 → ... → main_arena.
+ */
+static void reset_all_glibc_arenas(pid_t pid, unsigned long main_arena)
+{
+	unsigned long arena = main_arena;
+	unsigned long next_val;
+	int count = 0;
+
+	do {
+		if (reset_one_arena(pid, arena)) {
+			pr_err("Failed to reset arena at 0x%lx\n", arena);
+			break;
+		}
+		count++;
+
+		/* Read the 'next' pointer */
+		if (ptrace_peek_area(pid, &next_val,
+				     (void *)(arena + ARENA_NEXT_OFFSET),
+				     sizeof(next_val))) {
+			pr_err("Failed to read arena.next at 0x%lx\n",
+			       arena + ARENA_NEXT_OFFSET);
+			break;
+		}
+
+		arena = next_val;
+
+		/* Safety: stop after 256 arenas (way more than any real system) */
+		if (count > 256) {
+			pr_err("Arena list too long, stopping at 256\n");
+			break;
+		}
+	} while (arena != main_arena && arena != 0);
+
+	pr_err("Reset %d glibc malloc arenas (main=0x%lx)\n",
+	       count, main_arena);
+}
+
 static int inject_new_vmas(struct pstree_item *item,
 			   const char *dat_path)
 {
@@ -2616,6 +2704,14 @@ skip_ns_bouncing:
 	}
 
 	/*
+	 * Reset ALL glibc arenas: main_arena + secondary arenas.
+	 * glibc creates one arena per thread (up to 8*cores).
+	 * Each arena has a mutex, fastbins, and bins that can be
+	 * in an inconsistent state after COW restore.
+	 * We walk the arena linked list (main_arena.next) and
+	 * reset each one.
+	 */
+	/*
 	 * Reset glibc main_arena: zero the lock, flags,
 	 * have_fastchunks, and all fastbinsY entries.  This
 	 * prevents corrupted fastbin chains from crashing the
@@ -2645,28 +2741,6 @@ skip_ns_bouncing:
 		pid_t pid = root_item->pid->real;
 		char maps_path[64];
 		FILE *fp;
-		/*
-		 * Zero: lock+flags+fastbins (0..95).
-		 * Zero: last_remainder (104..111).
-		 * Init: bins (112..2143) as empty circular lists.
-		 * Preserve: top (96..103).
-		 *
-		 * glibc bins are circular doubly-linked lists where
-		 * an empty bin has fd=bk=&bin_head.  Zeroing them
-		 * (NULL) causes SIGSEGV.  We must set each bin's
-		 * fd and bk to point back to itself.
-		 *
-		 * bins[] has 254 entries (127 bin pairs × fd+bk).
-		 * Each pair at bins[2*i] and bins[2*i+1] represents
-		 * one bin: bins[2*i]=fd, bins[2*i+1]=bk.  For an
-		 * empty bin: fd = bk = &bins[2*i] (self-referential).
-		 */
-		unsigned char zeros_head[96];
-		unsigned long bins_init[254];
-		unsigned long zero_remainder = 0;
-		int bi;
-
-		memset(zeros_head, 0, sizeof(zeros_head));
 
 		snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", pid);
 		fp = fopen(maps_path, "r");
@@ -2684,66 +2758,8 @@ skip_ns_bouncing:
 				if (strstr(path, "libc.so") &&
 				    perms[0] == 'r' && perms[1] == 'w' &&
 				    perms[2] == '-') {
-					unsigned long arena = start + 0xa50;
-					unsigned long bins_base = arena + 112;
-					int err = 0;
-
-					/*
-					 * Build empty bin sentinels.
-					 * Each bin pair (fd, bk) at
-					 * bins[2*i], bins[2*i+1] must
-					 * point to the address of
-					 * bins[2*i] itself.
-					 *
-					 * In glibc, bin_at(m,i) points
-					 * to bins[2*i-2] (offset by -2
-					 * for chunk->fd/bk layout).
-					 * The fd/bk are at the address
-					 * &bins[2*i-2].  For an empty
-					 * bin: fd = bk = &bins[2*i-2].
-					 */
-					/*
-					 * glibc's bin_at(m,i) returns
-					 * &bins[2*(i-1)] - 16.  The fd/bk
-					 * fields of this "fake chunk" are
-					 * at &bins[2*(i-1)].  For empty:
-					 * fd = bk = bin_at = &bins[] - 16.
-					 */
-					for (bi = 0; bi < 254; bi += 2) {
-						unsigned long bin_addr =
-							bins_base +
-							bi * sizeof(unsigned long)
-							- 16;
-						bins_init[bi] = bin_addr;
-						bins_init[bi + 1] = bin_addr;
-					}
-
-					/* Zero lock + fastbins */
-					err |= ptrace_poke_area(pid,
-						zeros_head,
-						(void *)arena,
-						sizeof(zeros_head));
-
-					/* Zero last_remainder */
-					err |= ptrace_poke_area(pid,
-						&zero_remainder,
-						(void *)(arena + 104),
-						sizeof(zero_remainder));
-
-					/* Init bins as empty */
-					err |= ptrace_poke_area(pid,
-						bins_init,
-						(void *)bins_base,
-						sizeof(bins_init));
-
-					if (err)
-						pr_err("Failed to reset arena\n");
-					else
-						pr_err("Reset glibc main_arena "
-						       "at 0x%lx (lock+fastbins"
-						       " zeroed, bins emptied,"
-						       " top preserved)\n",
-						       arena);
+					reset_all_glibc_arenas(pid,
+							       start + 0xa50);
 					break;
 				}
 			}
