@@ -3158,56 +3158,86 @@ skip_ns_bouncing:
 					iov_tls.iov_len = sizeof(tls_reg);
 					if (ptrace(PTRACE_GETREGSET, tid,
 						   (void *)0x401, /* NT_ARM_TLS */
-						   &iov_tls))
+						   &iov_tls)) {
+						pr_info("tcache: tid %d: GETREGSET failed\n", tid);
 						continue;
+					}
 					tp = tls_reg;
-					if (!tp)
+					if (!tp) {
+						pr_info("tcache: tid %d: TP=0\n", tid);
 						continue;
+					}
 
 					/* DTV = *(TP) */
 					if (ptrace_peek_area(tid, &dtv,
-							     (void *)tp, 8))
+							     (void *)tp, 8)) {
+						pr_info("tcache: tid %d: peek DTV failed\n", tid);
 						continue;
-					if (!dtv)
+					}
+					if (!dtv) {
+						pr_info("tcache: tid %d: DTV=0\n", tid);
 						continue;
+					}
 
 					/* TLS block = DTV[2] (at offset 16) */
 					if (ptrace_peek_area(tid, &tls_block,
-							     (void *)(dtv + 16), 8))
+							     (void *)(dtv + 16), 8)) {
+						pr_info("tcache: tid %d: peek TLS block failed\n", tid);
 						continue;
-					if (!tls_block)
+					}
+					if (!tls_block) {
+						pr_info("tcache: tid %d: TLS block=0\n", tid);
 						continue;
+					}
+					pr_info("tcache: tid %d: TP=0x%lx DTV=0x%lx TLS=0x%lx\n",
+						tid, tp, dtv, tls_block);
 
-					/* Null tcache pointers at known TLS offsets.
-				 * Offset varies by glibc version and TLS layout.
-				 * Null all candidates: 0x548, 0x550, 0x578, 0x580.
+					/* Scan TLS block for the tcache pointer and null it.
+				 * Validate: target must look like a tcache struct
+				 * (first 128 bytes are uint16_t counts, sum > 0
+				 * and sum < 1000).
 				 */
 					{
-						int offsets[] = {0x548, 0x550,
-								 0x578, 0x580};
-						int j;
+						int off;
 
-						for (j = 0; j < 4; j++) {
+						for (off = 0x500; off <= 0x600; off += 8) {
 							unsigned long probe;
+							unsigned short counts[64];
+							int k, total;
 
 							if (ptrace_peek_area(
 								tid, &probe,
-								(void *)(tls_block + offsets[j]),
+								(void *)(tls_block + off),
 								8))
 								continue;
-							if (probe == 0)
+							if (probe == 0 || probe < 0x10000)
 								continue;
+
+							/* Validate: read 128 bytes at probe */
+							if (ptrace_peek_area(
+								tid, counts,
+								(void *)probe,
+								sizeof(counts)))
+								continue;
+
+							total = 0;
+							for (k = 0; k < 64; k++)
+								total += counts[k];
+							if (total <= 0 || total >= 1000)
+								continue;
+
+							/* Looks like tcache — null it */
 							if (ptrace_poke_area(
 								tid, &zero_val,
-								(void *)(tls_block + offsets[j]),
-								8))
-								continue;
+								(void *)(tls_block + off),
+								8) == 0)
+								nulled++;
 						}
-						nulled++;
 					}
 				}
 			}
-			pr_err("Nulled tcache for %d threads\n", nulled);
+			pr_err("Nulled tcache for %d threads (scanned %d)\n",
+			       nulled, item->nr_threads);
 		}
 #endif
 

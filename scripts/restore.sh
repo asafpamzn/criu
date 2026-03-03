@@ -66,6 +66,51 @@ echo "Restored PID $VALKEY_PID (stopped, waiting for cutover)"
 wait "$CUTOVER_PID" 2>/dev/null || true
 rm -f /tmp/cutover_msg
 
+# --- 5b. Null per-thread tcache before SIGCONT ---
+# CRIU nulls tcache via ptrace, but the offset detection may miss some.
+# Belt-and-suspenders: also null via /proc/pid/mem from this script.
+sudo python3 -c "
+import struct, os, ctypes, ctypes.util
+
+pid = $VALKEY_PID
+libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
+class iv(ctypes.Structure):
+    _fields_ = [('b', ctypes.c_void_p), ('l', ctypes.c_size_t)]
+
+nulled = 0
+for tid_s in os.listdir(f'/proc/{pid}/task/'):
+    tid = int(tid_s)
+    tls_reg = ctypes.c_ulong(0)
+    i = iv(ctypes.addressof(tls_reg), 8)
+    libc.ptrace(16, tid, 0, 0)  # ATTACH
+    try: os.waitpid(tid, 0)
+    except: pass
+    libc.ptrace(0x4204, tid, 0x401, ctypes.byref(i))  # NT_ARM_TLS
+    tp = tls_reg.value
+    libc.ptrace(17, tid, 0, 0)  # DETACH
+    if not tp: continue
+    with open(f'/proc/{pid}/mem', 'r+b') as f:
+        f.seek(tp); dtv = struct.unpack('<Q', f.read(8))[0]
+        if not dtv: continue
+        f.seek(dtv + 16); tls_block = struct.unpack('<Q', f.read(8))[0]
+        if not tls_block: continue
+        for off in range(0x500, 0x600, 8):
+            f.seek(tls_block + off)
+            val = struct.unpack('<Q', f.read(8))[0]
+            if val == 0 or val < 0x10000: continue
+            try:
+                f.seek(val)
+                counts = struct.unpack('<64H', f.read(128))
+                total = sum(counts)
+                if 0 < total < 1000:
+                    f.seek(tls_block + off)
+                    f.write(struct.pack('<Q', 0))
+                    nulled += 1
+            except: pass
+        f.flush()
+print(f'restore.sh: nulled {nulled} tcache pointers')
+" 2>/dev/null || true
+
 # --- 6. Resume + unblock stuck mutexes via ptrace futex_wake ---
 sudo kill -CONT "$VALKEY_PID" 2>/dev/null || true
 sleep 0.2
