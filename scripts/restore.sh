@@ -66,66 +66,89 @@ echo "Restored PID $VALKEY_PID (stopped, waiting for cutover)"
 wait "$CUTOVER_PID" 2>/dev/null || true
 rm -f /tmp/cutover_msg
 
-# --- 6. Resume + unlock stuck mutexes ---
+# --- 6. Resume + unblock stuck mutexes via ptrace futex_wake ---
 sudo kill -CONT "$VALKEY_PID" 2>/dev/null || true
-sleep 0.1
+sleep 0.2
 
-# After SIGCONT, threads may deadlock on signal_handler_lock or arena
-# mutexes due to stale per-thread tcache state. Zero the lock words
-# and use FUTEX_WAKE to unblock waiting threads.
-python3 -c "
-import struct, os, ctypes, ctypes.util
+# After SIGCONT, the main thread may be stuck in futex_wait on
+# main_arena.mutex (stale tcache triggered malloc corruption path).
+# Zero the mutex and inject futex(FUTEX_WAKE) via ptrace to unblock.
+sudo python3 -c "
+import struct, os, ctypes, ctypes.util, time
 
 pid = $VALKEY_PID
-SYS_futex = 98
-FUTEX_WAKE = 1
-
 libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
+PTRACE_ATTACH = 16
+PTRACE_DETACH = 17
+SYS_futex = 98
 
-# Find signal_handler_lock address from ELF
-import subprocess
-out = subprocess.check_output(['nm', '/usr/bin/valkey-server'], text=True)
-text_base = None
-for line in open(f'/proc/{pid}/maps'):
-    if 'valkey' in line and 'r-xp' in line:
-        text_base = int(line.split('-')[0], 16)
-        break
-if text_base:
-    for line in out.split('\n'):
-        if 'signal_handler_lock' in line:
-            offset = int(line.split()[0], 16)
-            addr = text_base + offset
-            # Zero the lock and wake all waiters
-            with open(f'/proc/{pid}/mem', 'r+b') as f:
-                f.seek(addr)
-                f.write(struct.pack('<I', 0))
-                f.flush()
-            # FUTEX_WAKE all waiters on this address
-            # We can't call futex() on another process's address directly,
-            # but zeroing the lock should let threads retry and see unlocked.
-            print(f'Zeroed signal_handler_lock at 0x{addr:x}')
-
-# Also zero all arena mutexes (threads may have re-locked after SIGCONT)
+# Find main_arena address
+arena = None
 with open(f'/proc/{pid}/maps') as maps:
     for line in maps:
         if 'libc.so' in line and 'rw-' in line:
-            start = int(line.split('-')[0], 16)
-            arena = start + 0xa50
-            with open(f'/proc/{pid}/mem', 'r+b') as f:
-                seen = set()
-                addr = arena
-                count = 0
-                while addr not in seen and count < 256:
-                    seen.add(addr)
-                    count += 1
-                    f.seek(addr)
-                    f.write(struct.pack('<I', 0))  # zero mutex
-                    f.seek(addr + 2160)
-                    nxt = struct.unpack('<Q', f.read(8))[0]
-                    addr = nxt
-                f.flush()
-            print(f'Re-zeroed {count} arena mutexes after SIGCONT')
+            arena = int(line.split('-')[0], 16) + 0xa50
             break
+
+if arena:
+    # Zero main_arena lock+count+owner
+    with open(f'/proc/{pid}/mem', 'r+b') as f:
+        f.seek(arena)
+        f.write(struct.pack('<III', 0, 0, 0))
+        f.flush()
+
+    # Ptrace attach to main thread, inject futex(FUTEX_WAKE)
+    libc.ptrace(PTRACE_ATTACH, pid, 0, 0)
+    os.waitpid(pid, 0)
+
+    # Read registers
+    import array
+    regs = array.array('Q', [0]*34)  # user_regs_struct on aarch64
+    class iovec(ctypes.Structure):
+        _fields_ = [('iov_base', ctypes.c_void_p), ('iov_len', ctypes.c_size_t)]
+    iov = iovec(regs.buffer_info()[0], regs.buffer_info()[1] * 8)
+    libc.ptrace(0x4204, pid, 1, ctypes.byref(iov))  # PTRACE_GETREGSET, NT_PRSTATUS
+    orig_regs = array.array('Q', regs)
+
+    # Save original code at PC
+    pc = regs[32]  # pc is at index 32 in user_regs_struct
+    orig_code = (ctypes.c_char * 8)()
+    libc.ptrace(0x4203, pid, 1, ctypes.byref(iov))  # re-read for safety
+
+    # Inject SVC #0; BRK #0
+    import mmap
+    with open(f'/proc/{pid}/mem', 'r+b') as f:
+        f.seek(pc)
+        old_code = f.read(8)
+        f.seek(pc)
+        f.write(bytes([0x01, 0x00, 0x00, 0xd4, 0x00, 0x00, 0x20, 0xd4]))
+        f.flush()
+
+        # Set regs for futex(arena, FUTEX_WAKE, INT_MAX)
+        regs[8] = SYS_futex  # x8 = syscall number
+        regs[0] = arena       # x0 = uaddr
+        regs[1] = 1           # x1 = FUTEX_WAKE
+        regs[2] = 0x7fffffff  # x2 = INT_MAX
+        regs[32] = pc         # pc
+        iov = iovec(regs.buffer_info()[0], regs.buffer_info()[1] * 8)
+        libc.ptrace(0x4205, pid, 1, ctypes.byref(iov))  # PTRACE_SETREGSET
+
+        libc.ptrace(7, pid, 0, 0)  # PTRACE_CONT
+        os.waitpid(pid, 0)  # wait for BRK (SIGTRAP)
+
+        # Read result
+        libc.ptrace(0x4204, pid, 1, ctypes.byref(iov))
+        woken = regs[0]
+        print(f'futex_wake({arena:#x}): woke {woken} threads')
+
+        # Restore original code + regs
+        f.seek(pc)
+        f.write(old_code)
+        f.flush()
+
+    iov = iovec(orig_regs.buffer_info()[0], orig_regs.buffer_info()[1] * 8)
+    libc.ptrace(0x4205, pid, 1, ctypes.byref(iov))
+    libc.ptrace(PTRACE_DETACH, pid, 0, 0)
 " 2>/dev/null || true
 
 for _ in $(seq 1 6000); do timeout 1s valkey-cli ping &>/dev/null && break; sleep 0.05; done

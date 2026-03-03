@@ -1904,6 +1904,93 @@ static int vma_set_regs(pid_t pid, user_regs_struct_t *regs)
 	return 0;
 }
 
+/*
+ * Inject futex(FUTEX_WAKE) syscall into a stopped thread via ptrace.
+ * Wakes all threads blocked in futex_wait on the given address.
+ * The target thread must be ptrace-stopped (SIGSTOP).
+ */
+static int inject_futex_wake(pid_t tid, unsigned long futex_addr)
+{
+	user_regs_struct_t orig_regs, regs;
+	unsigned char orig_code[8];
+	unsigned long pc, result;
+	int status;
+
+	if (vma_get_regs(tid, &orig_regs))
+		return -1;
+
+#ifdef __aarch64__
+	pc = (unsigned long)orig_regs.pc;
+#else
+	pc = (unsigned long)orig_regs.ip;
+#endif
+
+	if (ptrace_peek_area(tid, orig_code, (void *)pc,
+			     sizeof(orig_code)))
+		return -1;
+
+	if (ptrace_poke_area(tid, (void *)vma_syscall_insn,
+			     (void *)pc, sizeof(vma_syscall_insn)))
+		goto restore_code_fw;
+
+	regs = orig_regs;
+#ifdef __aarch64__
+	regs.regs[8] = __NR_futex;	/* syscall number */
+	regs.regs[0] = futex_addr;	/* uaddr */
+	regs.regs[1] = 1;		/* FUTEX_WAKE */
+	regs.regs[2] = INT_MAX;	/* wake all waiters */
+	regs.regs[3] = 0;
+	regs.regs[4] = 0;
+	regs.regs[5] = 0;
+	regs.pc = pc;
+#else
+	regs.ax = __NR_futex;
+	regs.di = futex_addr;
+	regs.si = 1;			/* FUTEX_WAKE */
+	regs.dx = INT_MAX;
+	regs.r10 = 0;
+	regs.r8 = 0;
+	regs.r9 = 0;
+	regs.ip = pc;
+#endif
+
+	if (vma_set_regs(tid, &regs))
+		goto restore_code_fw;
+
+	if (ptrace(PTRACE_CONT, tid, NULL, NULL))
+		goto restore_all_fw;
+
+	if (waitpid(tid, &status, __WALL) != tid)
+		goto restore_all_fw;
+
+	if (!WIFSTOPPED(status) || WSTOPSIG(status) != SIGTRAP)
+		goto restore_all_fw;
+
+	if (vma_get_regs(tid, &regs))
+		goto restore_all_fw;
+
+#ifdef __aarch64__
+	result = regs.regs[0];
+#else
+	result = regs.ax;
+#endif
+
+	if (ptrace_poke_area(tid, orig_code, (void *)pc,
+			     sizeof(orig_code)))
+		pr_err("futex_wake: restore code failed\n");
+	if (vma_set_regs(tid, &orig_regs))
+		pr_err("futex_wake: restore regs failed\n");
+	return (int)result; /* number of woken threads, or -errno */
+
+restore_all_fw:
+	vma_set_regs(tid, &orig_regs);
+restore_code_fw:
+	if (ptrace_poke_area(tid, orig_code, (void *)pc,
+			     sizeof(orig_code)))
+		pr_err("futex_wake: restore code failed\n");
+	return -1;
+}
+
 static int inject_mmap_syscall(pid_t pid, unsigned long addr,
 			       unsigned long len, int prot,
 			       unsigned long *result)
@@ -2000,6 +2087,93 @@ restore_code:
  * and see -EINTR.  If the mutex value is 0 (unlocked), they CAS(0→1)
  * and proceed.  If still locked (1 or 2), they futex_wait and deadlock.
  */
+/*
+ * Find the absolute address of an ELF symbol in the process's binary.
+ * Returns 0 if not found.
+ */
+static unsigned long find_elf_symbol_addr(pid_t pid, const char *sym_name)
+{
+	char maps_path[64], line[512];
+	FILE *fp;
+	unsigned long text_base = 0;
+	char bin_path[PATH_MAX] = "";
+	int fd, i;
+	Elf64_Ehdr ehdr;
+	Elf64_Shdr *shdrs = NULL;
+	char *strtab = NULL;
+	Elf64_Sym *symtab = NULL;
+	int sym_count = 0;
+	unsigned long result = 0;
+
+	snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", pid);
+	fp = fopen(maps_path, "r");
+	if (!fp)
+		return 0;
+	while (fgets(line, sizeof(line), fp)) {
+		char perms[8], path[256];
+		unsigned long start;
+
+		path[0] = '\0';
+		if (sscanf(line, "%lx-%*x %4s %*s %*s %*s %255[^\n]",
+			   &start, perms, path) < 2)
+			continue;
+		if (perms[0] == 'r' && perms[2] == 'x' &&
+		    strstr(path, "valkey") && text_base == 0) {
+			text_base = start;
+			strncpy(bin_path, path, sizeof(bin_path) - 1);
+			break;
+		}
+	}
+	fclose(fp);
+	if (!text_base)
+		return 0;
+
+	fd = open(bin_path, O_RDONLY);
+	if (fd < 0)
+		return 0;
+	if (read(fd, &ehdr, sizeof(ehdr)) != sizeof(ehdr))
+		goto out;
+	shdrs = xmalloc(ehdr.e_shnum * sizeof(Elf64_Shdr));
+	if (!shdrs)
+		goto out;
+	if (pread(fd, shdrs, ehdr.e_shnum * sizeof(Elf64_Shdr),
+		  ehdr.e_shoff) < 0)
+		goto out;
+	for (i = 0; i < ehdr.e_shnum; i++) {
+		if (shdrs[i].sh_type == SHT_SYMTAB) {
+			int strtab_idx = shdrs[i].sh_link;
+			int j;
+
+			sym_count = shdrs[i].sh_size / sizeof(Elf64_Sym);
+			symtab = xmalloc(shdrs[i].sh_size);
+			strtab = xmalloc(shdrs[strtab_idx].sh_size);
+			if (!symtab || !strtab)
+				goto out;
+			if (pread(fd, symtab, shdrs[i].sh_size,
+				  shdrs[i].sh_offset) < 0)
+				goto out;
+			if (pread(fd, strtab, shdrs[strtab_idx].sh_size,
+				  shdrs[strtab_idx].sh_offset) < 0)
+				goto out;
+			for (j = 0; j < sym_count; j++) {
+				if (strstr(strtab + symtab[j].st_name,
+					   sym_name)) {
+					result = text_base +
+						 symtab[j].st_value;
+					break;
+				}
+			}
+			break;
+		}
+	}
+out:
+	xfree(symtab);
+	xfree(strtab);
+	xfree(shdrs);
+	close(fd);
+	return result;
+}
+
 static int unlock_elf_mutex_array(pid_t pid, const char *sym_name,
 				  int max_count)
 {
@@ -2121,13 +2295,18 @@ static int unlock_elf_mutex_array(pid_t pid, const char *sym_name,
 			unsigned long addr = abs_addr + i * mutex_size;
 			unsigned int val;
 
-			/* Read current value first */
+			/* Read the __lock field */
 			if (pread(mem_fd, &val, sizeof(val), addr) ==
 			    sizeof(val) && val != 0) {
-				unsigned int z = 0;
+				/*
+				 * Zero __lock (4) + __count (4) + __owner (4).
+				 * glibc checks __owner == 0 on lock; leaving
+				 * it nonzero triggers an assertion failure.
+				 */
+				unsigned char z12[12] = {0};
 
-				if (pwrite(mem_fd, &z, sizeof(z), addr) ==
-				    sizeof(z))
+				if (pwrite(mem_fd, z12, sizeof(z12), addr) ==
+				    sizeof(z12))
 					unlocked++;
 			}
 		}
@@ -2941,6 +3120,195 @@ skip_ns_bouncing:
 		 * Without unlocking, the handler deadlocks.
 		 */
 		unlock_elf_mutex_array(pid, "signal_handler_lock", 1);
+
+		/*
+		 * Null each thread's glibc tcache pointer.
+		 *
+		 * The tcache (thread-local allocation cache) contains
+		 * pointers to freed chunks that are stale after COW
+		 * restore.  If not nulled, the first malloc from any
+		 * thread follows a corrupt tcache entry → "double
+		 * free or corruption" → abort → signal handler
+		 * deadlock.
+		 *
+		 * With tcache=NULL, malloc skips the fast path and
+		 * goes directly to the arena (which we already reset).
+		 *
+		 * On aarch64 glibc 2.39:
+		 *   tpidr_el0 → DTV pointer (at TP+0)
+		 *   DTV[2] = libc TLS block pointer (at DTV+16)
+		 *   tcache pointer at TLS block + 0x580
+		 */
+#ifdef __aarch64__
+		{
+			struct pstree_item *item;
+			int nulled = 0;
+
+			for_each_pstree_item(item) {
+				int t;
+
+				for (t = 0; t < item->nr_threads; t++) {
+					pid_t tid = item->threads[t].real;
+					unsigned long tp, dtv, tls_block;
+					unsigned long zero_val = 0;
+					struct iovec iov_tls;
+					unsigned long tls_reg = 0;
+
+					iov_tls.iov_base = &tls_reg;
+					iov_tls.iov_len = sizeof(tls_reg);
+					if (ptrace(PTRACE_GETREGSET, tid,
+						   (void *)0x401, /* NT_ARM_TLS */
+						   &iov_tls))
+						continue;
+					tp = tls_reg;
+					if (!tp)
+						continue;
+
+					/* DTV = *(TP) */
+					if (ptrace_peek_area(tid, &dtv,
+							     (void *)tp, 8))
+						continue;
+					if (!dtv)
+						continue;
+
+					/* TLS block = DTV[2] (at offset 16) */
+					if (ptrace_peek_area(tid, &tls_block,
+							     (void *)(dtv + 16), 8))
+						continue;
+					if (!tls_block)
+						continue;
+
+					/* Null tcache pointers at known TLS offsets.
+				 * Offset varies by glibc version and TLS layout.
+				 * Null all candidates: 0x548, 0x550, 0x578, 0x580.
+				 */
+					{
+						int offsets[] = {0x548, 0x550,
+								 0x578, 0x580};
+						int j;
+
+						for (j = 0; j < 4; j++) {
+							unsigned long probe;
+
+							if (ptrace_peek_area(
+								tid, &probe,
+								(void *)(tls_block + offsets[j]),
+								8))
+								continue;
+							if (probe == 0)
+								continue;
+							if (ptrace_poke_area(
+								tid, &zero_val,
+								(void *)(tls_block + offsets[j]),
+								8))
+								continue;
+						}
+						nulled++;
+					}
+				}
+			}
+			pr_err("Nulled tcache for %d threads\n", nulled);
+		}
+#endif
+
+		/*
+		 * Inject FUTEX_WAKE on all zeroed mutexes.
+		 *
+		 * Zeroing a mutex word via ptrace doesn't wake threads
+		 * already in the kernel's futex wait queue.  We need
+		 * to execute futex(FUTEX_WAKE) inside the process to
+		 * unblock them.  Use the main thread (pid) which is
+		 * ptrace-stopped at rt_sigreturn.
+		 */
+		{
+			char maps_path2[64];
+			FILE *fp2;
+			int woken = 0;
+
+			/* Wake all arena mutexes */
+			snprintf(maps_path2, sizeof(maps_path2),
+				 "/proc/%d/maps", pid);
+			fp2 = fopen(maps_path2, "r");
+			if (fp2) {
+				char line2[512];
+
+				while (fgets(line2, sizeof(line2), fp2)) {
+					unsigned long start2;
+					char perms2[8], path2[256];
+
+					path2[0] = '\0';
+					if (sscanf(line2,
+						   "%lx-%*x %4s %*s %*s %*s %255[^\n]",
+						   &start2, perms2,
+						   path2) < 2)
+						continue;
+					if (strstr(path2, "libc.so") &&
+					    perms2[0] == 'r' &&
+					    perms2[1] == 'w') {
+						unsigned long arena;
+						unsigned long next_val;
+						unsigned long main_arena;
+						int count = 0;
+
+						main_arena = start2 + 0xa50;
+						arena = main_arena;
+						do {
+							int w = inject_futex_wake(
+								pid, arena);
+							if (w > 0)
+								woken += w;
+							count++;
+							if (ptrace_peek_area(
+								pid, &next_val,
+								(void *)(arena + ARENA_NEXT_OFFSET),
+								sizeof(next_val)))
+								break;
+							arena = next_val;
+							if (count > 256)
+								break;
+						} while (arena != main_arena &&
+							 arena != 0);
+						break;
+					}
+				}
+				fclose(fp2);
+			}
+
+			/* Wake signal_handler_lock waiters */
+			{
+				unsigned long shl_addr;
+
+				shl_addr = find_elf_symbol_addr(
+					pid, "signal_handler_lock");
+				if (shl_addr) {
+					int w = inject_futex_wake(pid,
+								  shl_addr);
+					if (w > 0)
+						woken += w;
+				}
+			}
+
+			/* Wake io_threads_mutex waiters */
+			{
+				unsigned long itm_addr;
+
+				itm_addr = find_elf_symbol_addr(
+					pid, "io_threads_mutex");
+				if (itm_addr) {
+					int i;
+
+					for (i = 0; i < 16; i++) {
+						int w = inject_futex_wake(
+							pid,
+							itm_addr + i * 48);
+						if (w > 0)
+							woken += w;
+					}
+				}
+			}
+
+			pr_err("FUTEX_WAKE: woke %d threads\n", woken);
+		}
 	}
 
 	/* just before releasing threads we have to restore rseq_cs */
