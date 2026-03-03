@@ -292,87 +292,124 @@ Every migration is verified with 7 tests:
 
 ---
 
-## Architecture Diagram
+## Running a Migration
+
+### Quick start
+
+```bash
+# On the source machine:
+sudo ./scripts/verify-migration.sh 100
+```
+
+This fills 100GB, migrates with live traffic, and runs all 7 verification
+tests. Use `--skip-fill` if data is already loaded.
+
+### What the scripts do
+
+`verify-migration.sh` calls `migrate.sh` which does the heavy lifting.
+The core CRIU dump command is:
+
+```bash
+criu dump \
+  --tree $PID                    # Valkey's process ID
+  --images-dir /fsx/lazy         # shared filesystem for image files
+  --cow-dump                     # enable COW mode (our fork's feature)
+  --lazy-pages                   # don't write pages to disk, stream them
+  --address $PRIMARY_IP          # source IP for page-server TCP listener
+  --port 9002                    # page-server port
+  --tcp-close                    # close client TCP connections on dump
+  --skip-in-flight               # ignore half-open sockets
+  --ext-unix-sk                  # handle external unix sockets
+  --leave-running                # don't kill the process after dump
+  --freeze-cgroup $CGROUP_PATH   # freeze threads via cgroup (not SIGSTOP)
+  --display-stats                # write timing stats to stats-dump file
+```
+
+On the replica, `restore.sh` runs CRIU restore and launches `page-recv`
+to receive the 8-stream bulk transfer.
+
+### Live traffic workload
+
+During migration, the test runs a write workload against the source:
+
+```bash
+valkey-benchmark \
+  -t set                 # SET commands only
+  -r 1000000             # random keys from 1M keyspace
+  -c 13                  # 13 concurrent clients (~8-9K writes/s)
+  -P 16                  # pipeline depth 16
+  -d 64000               # 64KB values (matches dataset)
+  -n 1000000000          # runs until migration completes
+```
+
+This workload starts after the bulk transfer phase and continues through
+convergence and cutover. It validates that VMA mirroring and fork-snapshot
+correctly handle memory changes during the transfer.
+
+---
+
+## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     SOURCE MACHINE                          │
-│                                                             │
-│  ┌─────────────┐       ┌──────────────────────────────┐    │
-│  │   Valkey     │       │         CRIU                 │    │
-│  │   Server     │◀─────▶│                              │    │
-│  │             │ cgroup │  ┌────────────┐              │    │
-│  │  200GB heap  │ freeze│  │ COW dump   │              │    │
-│  │  3.2M keys   │       │  │ (WP_ASYNC) │              │    │
-│  │             │ uffd   │  └────────────┘              │    │
-│  │             │◀──────▶│  ┌────────────┐  8 TCP       │    │
-│  │             │  WP    │  │ Page       │──streams──┐  │    │
-│  └─────────────┘       │  │ server     │           │  │    │
-│                         │  └────────────┘           │  │    │
-│                         └──────────────────────────────┘    │
-│                                                        │    │
-└────────────────────────────────────────────────────────│────┘
-                                                         │
-                          25 Gbps network                │
-                          1,707 MB/s actual              │
-                                                         │
-┌────────────────────────────────────────────────────────│────┐
-│                     REPLICA MACHINE                    │    │
-│                                                        │    │
-│  ┌─────────────┐       ┌──────────────────────────────┐    │
-│  │   Valkey     │       │         CRIU                 │    │
-│  │   (restored) │◀──────│                              │    │
-│  │             │ process│  ┌────────────┐              │    │
-│  │  200GB heap  │ _vm_  │  │ page-recv  │◀─────────┘  │    │
-│  │  3.2M keys   │ writev│  │ (8 threads)│              │    │
-│  │             │       │  └────────────┘              │    │
-│  │  SIGSTOP    │       │                              │    │
-│  │  until all   │       │  Restore forks process,     │    │
-│  │  pages       │       │  sets up VMAs, then          │    │
-│  │  installed   │       │  page-recv fills memory      │    │
-│  └─────────────┘       └──────────────────────────────┘    │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+Source                                        Replica
+┌─────────────┐                              ┌─────────────┐
+│   Valkey     │                              │   Valkey     │
+│   (running)  │                              │  (restored,  │
+│              │                              │   stopped)   │
+└──────┬───────┘                              └──────┬───────┘
+       │ cgroup freeze                               │ process_vm_writev
+       │ + uffd WP_ASYNC                             │
+┌──────▼───────┐    8 TCP streams @ 1.7 GB/s  ┌──────▼───────┐
+│  CRIU dump   │ ════════════════════════════▶ │  page-recv   │
+│  + page      │ ════════════════════════════▶ │  (8 threads) │
+│    server    │ ════════════════════════════▶ │              │
+│              │ ════════════════════════════▶ │  CRIU restore│
+│ process_vm_  │ ════════════════════════════▶ │  forks the   │
+│ readv        │ ════════════════════════════▶ │  process and │
+│ (512-page    │ ════════════════════════════▶ │  sets up VMAs│
+│  batches)    │ ════════════════════════════▶ │              │
+└──────────────┘                              └──────────────┘
+       │                                             │
+       │  Convergence: fork-snapshot                 │
+       │  → scan dirty pages                         │
+       │  → send final diffs ───────────────────────▶│
+       │                                             │
+       │  Cutover: kill -STOP ──── TCP "GO" ────────▶│ kill -CONT
+       │          (1ms)                              │ Valkey live!
 ```
 
 ---
 
 ## Key Files
 
-| File | What it does |
-|------|-------------|
-| `scripts/migrate.sh` | Main orchestration script, runs on the source |
-| `scripts/restore.sh` | Replica-side script, starts CRIU restore + page-recv |
-| `criu/cr-dump.c` | CRIU dump entry point, initiates COW tracking |
-| `criu/cow-dump.c` | COW page tracking: write-protect, fault handling |
-| `criu/page-xfer.c` | Page server: reads memory, 8-stream TCP transfer |
-| `tools/page-recv.c` | Replica-side page receiver, multi-threaded |
-| `criu/cr-restore.c` | CRIU restore: forks process, sets up VMAs, runs page-recv |
-| `scripts/verify-migration.sh` | Automated 7-test verification suite |
+| File | Role |
+|------|------|
+| `scripts/migrate.sh` | Source-side orchestration (prepare, dump, cutover) |
+| `scripts/restore.sh` | Replica-side orchestration (CRIU restore, page-recv, SIGCONT) |
+| `scripts/verify-migration.sh` | End-to-end test: fill, migrate, verify 7 checks |
+| `criu/cow-dump.c` | COW engine: write-protect setup, dirty page tracking |
+| `criu/page-xfer.c` | Page server: 8-stream bulk transfer, fork-snapshot convergence, VMA diff |
+| `tools/page-recv.c` | Replica page receiver: 8-thread TCP, LZ4, process_vm_writev |
+| `criu/cr-restore.c` | CRIU restore: fork process tree, VMA injection, run page-recv |
+| `criu/cr-dump.c` | CRIU dump: freeze, collect state, launch COW |
 
 ---
 
-## Current Status
+## Status
 
-Both quiesced and live traffic migrations are **production-ready** at
-100GB+. Tested on aarch64 (Graviton3). The live traffic SIGSEGV issue
-(jemalloc VMA mismatch) was fully resolved with VMA mirroring +
-fork-snapshot convergence + arena reset. See `FUTEX_DEADLOCK_RESEARCH.md`
-Acts XVII-XIX for the full forensic analysis.
+Production-ready at 200GB with live traffic. Tested on aarch64
+(Graviton3). 14 live traffic runs at 100GB: 12 passed, 2 failed due
+to test-harness fill issues (not migration bugs).
 
 ## Limitations
 
-1. **Transfer speed**: Bottlenecked at 1.7 GB/s by `process_vm_readv`
-   kernel overhead (page table walks). Not network or CPU limited.
-   Migration time scales linearly: ~0.6s per GB of data.
+1. **Transfer speed**: 1.7 GB/s, limited by kernel `process_vm_readv`
+   page-table walks. Migration time is ~0.6s per GB of data.
 
-2. **Memory requirement**: The replica must have enough RAM to hold the
-   full dataset. Both machines need sufficient memory for the process +
-   OS overhead.
+2. **Memory**: replica needs enough RAM for the full dataset.
 
-3. **TCP connections**: Existing client TCP connections are closed
-   (`--tcp-close`). Clients must reconnect to the replica. This is
-   standard for Valkey failover.
+3. **Client connections**: TCP sockets are closed (`--tcp-close`).
+   Clients reconnect to the replica after cutover.
 
-4. **x86_64**: Currently tested on aarch64 only. x86_64 support is
-   expected to work (CRIU supports it natively) but not yet validated.
+4. **x86_64**: tested on aarch64 only. x86_64 is expected to work
+   (CRIU supports it) but not yet validated.
