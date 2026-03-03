@@ -446,5 +446,15 @@ to test-harness fill issues (not migration bugs).
 3. **Client connections**: TCP sockets are closed (`--tcp-close`).
    Clients reconnect to the replica after cutover.
 
-4. **x86_64**: tested on aarch64 only. x86_64 is expected to work
+4. **Multi-threaded Valkey (io-threads > 1)**: with `io-threads 16`,
+   the transfer and cutover work correctly (58s, 1ms cutover), but
+   the restored process deadlocks on glibc arena mutexes after
+   SIGCONT. The all-arena reset prevents the crash ("double free")
+   but IO threads block on `pthread_mutex_lock` for mutexes that
+   were held at dump time. Root cause: Valkey's IO thread sleep
+   pattern (`pthread_mutex_lock` on a main-thread-held mutex) creates
+   state that can't be cleanly restored. Single-threaded Valkey
+   (`io-threads 1`, the default) works correctly.
+
+5. **x86_64**: tested on aarch64 only. x86_64 is expected to work
    (CRIU supports it) but not yet validated.
