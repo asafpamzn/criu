@@ -1989,6 +1989,165 @@ restore_code:
 }
 
 /*
+ * Unlock pthread mutexes in a named ELF symbol.
+ *
+ * Finds the symbol in the process's ELF binary, then zeros the lock
+ * word of each pthread_mutex_t in the array.  This handles Valkey's
+ * io_threads_mutex[] which keeps IO threads sleeping via locked
+ * mutexes held by the main thread.
+ *
+ * After COW restore, the IO threads resume in pthread_mutex_lock()
+ * and see -EINTR.  If the mutex value is 0 (unlocked), they CAS(0→1)
+ * and proceed.  If still locked (1 or 2), they futex_wait and deadlock.
+ */
+static int unlock_elf_mutex_array(pid_t pid, const char *sym_name,
+				  int max_count)
+{
+	char maps_path[64], line[512];
+	FILE *fp;
+	unsigned long text_base = 0;
+	char bin_path[PATH_MAX] = "";
+	int fd, i, found = 0;
+	Elf64_Ehdr ehdr;
+	Elf64_Shdr *shdrs = NULL;
+	char *strtab = NULL;
+	Elf64_Sym *symtab = NULL;
+	int sym_count = 0;
+	unsigned long sym_offset = 0, sym_size = 0;
+
+	/* Find the main executable and its base address */
+	snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", pid);
+	fp = fopen(maps_path, "r");
+	if (!fp)
+		return -1;
+
+	while (fgets(line, sizeof(line), fp)) {
+		char perms[8], path[256];
+		unsigned long start;
+
+		path[0] = '\0';
+		if (sscanf(line, "%lx-%*x %4s %*s %*s %*s %255[^\n]",
+			   &start, perms, path) < 2)
+			continue;
+		/* First r-x mapping of the binary */
+		if (perms[0] == 'r' && perms[2] == 'x' &&
+		    strstr(path, "valkey") && text_base == 0) {
+			text_base = start;
+			strncpy(bin_path, path, sizeof(bin_path) - 1);
+			break;
+		}
+	}
+	fclose(fp);
+
+	if (!text_base || !bin_path[0])
+		return -1;
+
+	/* Parse ELF symbol table to find the symbol */
+	fd = open(bin_path, O_RDONLY);
+	if (fd < 0)
+		return -1;
+
+	if (read(fd, &ehdr, sizeof(ehdr)) != sizeof(ehdr))
+		goto out_fd;
+
+	shdrs = xmalloc(ehdr.e_shnum * sizeof(Elf64_Shdr));
+	if (!shdrs)
+		goto out_fd;
+	if (pread(fd, shdrs, ehdr.e_shnum * sizeof(Elf64_Shdr),
+		  ehdr.e_shoff) < 0)
+		goto out_shdrs;
+
+	/* Find .symtab and its string table */
+	for (i = 0; i < ehdr.e_shnum; i++) {
+		if (shdrs[i].sh_type == SHT_SYMTAB) {
+			int strtab_idx = shdrs[i].sh_link;
+
+			sym_count = shdrs[i].sh_size / sizeof(Elf64_Sym);
+			symtab = xmalloc(shdrs[i].sh_size);
+			strtab = xmalloc(shdrs[strtab_idx].sh_size);
+			if (!symtab || !strtab)
+				goto out_shdrs;
+			if (pread(fd, symtab, shdrs[i].sh_size,
+				  shdrs[i].sh_offset) < 0)
+				goto out_shdrs;
+			if (pread(fd, strtab, shdrs[strtab_idx].sh_size,
+				  shdrs[strtab_idx].sh_offset) < 0)
+				goto out_shdrs;
+			break;
+		}
+	}
+
+	if (!symtab)
+		goto out_shdrs;
+
+	/* Search for the symbol */
+	for (i = 0; i < sym_count; i++) {
+		const char *name = strtab + symtab[i].st_name;
+
+		if (strstr(name, sym_name)) {
+			sym_offset = symtab[i].st_value;
+			sym_size = symtab[i].st_size;
+			found = 1;
+			break;
+		}
+	}
+
+	if (!found)
+		goto out_shdrs;
+
+	/* Zero the lock word (first 4 bytes) of each pthread_mutex_t.
+	 * sizeof(pthread_mutex_t) = 48 on aarch64 glibc.
+	 * Use /proc/pid/mem for direct writes (ptrace_poke_area may
+	 * fail on BSS pages that haven't been faulted in). */
+	{
+		unsigned long abs_addr = text_base + sym_offset;
+		int mutex_size = 48;
+		int count = sym_size / mutex_size;
+		int unlocked = 0;
+		char mem_path[64];
+		int mem_fd;
+
+		if (count > max_count)
+			count = max_count;
+		if (count <= 0)
+			count = max_count;
+
+		snprintf(mem_path, sizeof(mem_path), "/proc/%d/mem", pid);
+		mem_fd = open(mem_path, O_RDWR);
+		if (mem_fd < 0)
+			goto out_shdrs;
+
+		for (i = 0; i < count; i++) {
+			unsigned long addr = abs_addr + i * mutex_size;
+			unsigned int val;
+
+			/* Read current value first */
+			if (pread(mem_fd, &val, sizeof(val), addr) ==
+			    sizeof(val) && val != 0) {
+				unsigned int z = 0;
+
+				if (pwrite(mem_fd, &z, sizeof(z), addr) ==
+				    sizeof(z))
+					unlocked++;
+			}
+		}
+		close(mem_fd);
+
+		pr_err("Unlocked %d/%d mutexes in %s "
+		       "(base=0x%lx abs=0x%lx)\n",
+		       unlocked, count, sym_name, text_base, abs_addr);
+	}
+
+out_shdrs:
+	xfree(symtab);
+	xfree(strtab);
+	xfree(shdrs);
+out_fd:
+	close(fd);
+	return found ? 0 : -1;
+}
+
+/*
  * Reset a single glibc malloc arena via ptrace.
  *
  * Arena layout (glibc malloc_state, LP64):
@@ -2765,6 +2924,23 @@ skip_ns_bouncing:
 			}
 			fclose(fp);
 		}
+
+		/*
+		 * Unlock Valkey's io_threads_mutex[] array.
+		 * With io-threads > 1, the main thread holds these
+		 * mutexes locked to keep IO threads sleeping.  After
+		 * restore, the IO threads resume in pthread_mutex_lock
+		 * and need to see the mutex as unlocked (0) to proceed.
+		 */
+		unlock_elf_mutex_array(pid, "io_threads_mutex", 128);
+
+		/*
+		 * Also unlock Valkey's signal_handler_lock.
+		 * If a thread hits corrupted tcache, glibc calls
+		 * abort() → SIGABRT → signal handler → this lock.
+		 * Without unlocking, the handler deadlocks.
+		 */
+		unlock_elf_mutex_array(pid, "signal_handler_lock", 1);
 	}
 
 	/* just before releasing threads we have to restore rseq_cs */
