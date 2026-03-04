@@ -1,100 +1,108 @@
 <section>
-  <h2>COW WP_ASYNC Convergence Timeline</h2>
+  <h2>COW WP_ASYNC: Convergence Timeline &amp; Gaps</h2>
 
   <div class="two-col">
     <div>
-      <h4 class="cyan">Phase 1: Bulk Transfer (source running)</h4>
-      <div style="font-size:0.52em; line-height:1.6;">
-        <div style="background:#1e293b; border-radius:6px; padding:8px; margin-bottom:6px; border-left:3px solid #4ade80;">
-          <strong style="color:#4ade80;">① Dump + Early Resume (~51ms freeze)</strong><br>
-          ptrace seize → capture metadata (regs, FDs, signals, timers) → parasite pages → <strong>SIGCONT</strong><br>
-          <em>Source is running again. All non-memory state captured.</em>
+      <h4 class="cyan">Current COW Convergence (Memory Only)</h4>
+      <div style="font-size:0.5em; line-height:1.6;">
+        <div style="background:#1e293b; border-radius:6px; padding:7px; margin-bottom:5px; border-left:3px solid #4ade80;">
+          <strong style="color:#4ade80;">① Dump freeze (~51ms)</strong><br>
+          Capture ALL state: regs, FDs, signals, timers, memory pages, VMA layout<br>
+          <code>SIGCONT</code> → source running again
         </div>
-        <div style="background:#1e293b; border-radius:6px; padding:8px; margin-bottom:6px; border-left:3px solid #22d3ee;">
-          <strong style="color:#22d3ee;">② Linear page transfer (~58s for 100GB)</strong><br>
-          8 TCP streams × <code>process_vm_readv</code> batches (512 pages) + LZ4 compress → send<br>
-          WP_ASYNC: kernel auto-clears WP on write, <code>PAGE_IS_WRITTEN</code> bit set<br>
-          <em>Source serving traffic throughout. Writes tracked by kernel.</em>
+        <div style="background:#1e293b; border-radius:6px; padding:7px; margin-bottom:5px; border-left:3px solid #22d3ee;">
+          <strong style="color:#22d3ee;">② Bulk transfer (~58s)</strong><br>
+          8 TCP streams, <code>process_vm_readv</code> + LZ4. Source serving traffic.
         </div>
-      </div>
-
-      <h4 style="color:#fbbf24; margin-top:10px;">Phase 2: Convergence</h4>
-      <div style="font-size:0.52em; line-height:1.6;">
-        <div style="background:#1e293b; border-radius:6px; padding:8px; margin-bottom:6px; border-left:3px solid #fbbf24;">
+        <div style="background:#1e293b; border-radius:6px; padding:7px; margin-bottom:5px; border-left:3px solid #fbbf24;">
           <strong style="color:#fbbf24;">③ Wait for idle threads</strong><br>
-          Poll <code>/proc/PID/task/*/syscall</code> — wait until all threads in epoll/futex/nanosleep<br>
-          <em>Ensures no thread holds allocator locks (prevents deadlock on SIGSTOP).</em>
+          Poll <code>/proc/PID/task/*/syscall</code> — all in epoll/futex/nanosleep
         </div>
-        <div style="background:#1e293b; border-radius:6px; padding:8px; margin-bottom:6px; border-left:3px solid #f87171;">
-          <strong style="color:#f87171;">④ First freeze: SIGSTOP (~1ms)</strong><br>
-          <code>kill(source_pid, SIGSTOP)</code> → <code>PAGEMAP_SCAN(PAGE_IS_WRITTEN)</code> per VMA<br>
-          <em>Atomic scan: finds all pages dirtied since bulk transfer.</em>
+        <div style="background:#1e293b; border-radius:6px; padding:7px; margin-bottom:5px; border-left:3px solid #f87171;">
+          <strong style="color:#f87171;">④ SIGSTOP → PAGEMAP_SCAN → fork snapshot</strong><br>
+          Find dirty pages, fork for consistency, SIGCONT source (~1ms)
         </div>
-        <div style="background:#1e293b; border-radius:6px; padding:8px; margin-bottom:6px; border-left:3px solid #a78bfa;">
-          <strong style="color:#a78bfa;">⑤ Fork snapshot</strong><br>
-          Inject <code>clone(SIGCHLD)</code> via ptrace → child inherits COW memory snapshot<br>
-          <code>SIGCONT</code> source immediately — fork has the consistent snapshot<br>
-          <em>Source responsive again in ~1ms. Fork lives ~2s.</em>
+        <div style="background:#1e293b; border-radius:6px; padding:7px; margin-bottom:5px; border-left:3px solid #a78bfa;">
+          <strong style="color:#a78bfa;">⑤ Read dirty pages from fork</strong><br>
+          Consistent snapshot across 8 streams. Kill fork.
         </div>
-        <div style="background:#1e293b; border-radius:6px; padding:8px; margin-bottom:6px; border-left:3px solid #a78bfa;">
-          <strong style="color:#a78bfa;">⑥ Read dirty pages from fork</strong><br>
-          <code>process_vm_readv</code> from fork PID across 8 TCP streams<br>
-          <em>Temporally consistent: all pages from same point in time.</em><br>
-          Kill fork when done.
+        <div style="background:#1e293b; border-radius:6px; padding:7px; margin-bottom:5px; border-left:3px solid #f87171;">
+          <strong style="color:#f87171;">⑥ Second SIGSTOP → final scan + new VMAs</strong><br>
+          Near-zero dirty. Detect new mmap extents → <code>PS_IOV_VMA_DIFF</code>
+        </div>
+        <div style="background:#1e293b; border-radius:6px; padding:7px; margin-bottom:5px; border-left:3px solid #4ade80;">
+          <strong style="color:#4ade80;">⑦ SIGCONT + close all streams</strong><br>
+          Migration complete.
         </div>
       </div>
     </div>
 
     <div>
-      <h4 style="color:#fb923c;">Phase 3: Final Convergence</h4>
-      <div style="font-size:0.52em; line-height:1.6;">
-        <div style="background:#1e293b; border-radius:6px; padding:8px; margin-bottom:6px; border-left:3px solid #fb923c;">
-          <strong style="color:#fb923c;">⑦ Post-fork dirty scan</strong><br>
-          Source was running during fork read (~2s). Scan for new dirty pages.<br>
-          Send across 8 streams. Typically ~86K pages (vs ~26M in bulk).
-        </div>
-        <div style="background:#1e293b; border-radius:6px; padding:8px; margin-bottom:6px; border-left:3px solid #f87171;">
-          <strong style="color:#f87171;">⑧ Second freeze: SIGSTOP (~1ms)</strong><br>
-          Final <code>PAGEMAP_SCAN</code> — should find near-zero dirty pages.<br>
-          Send remaining dirty pages.
-        </div>
-        <div style="background:#1e293b; border-radius:6px; padding:8px; margin-bottom:6px; border-left:3px solid #f87171;">
-          <strong style="color:#f87171;">⑨ Detect new VMAs</strong><br>
-          Compare live <code>/proc/PID/maps</code> with dump-time VMA list.<br>
-          New anonymous rw- VMAs → send <code>PS_IOV_VMA_DIFF</code> header + page data.<br>
-          Replica: <code>mmap(MAP_FIXED)</code> via ptrace to create them.
-        </div>
-        <div style="background:#1e293b; border-radius:6px; padding:8px; margin-bottom:6px; border-left:3px solid #4ade80;">
-          <strong style="color:#4ade80;">⑩ SIGCONT + Close</strong><br>
-          Resume source. Send <code>PS_IOV_CLOSE</code> on all 8 streams.<br>
-          <em>Migration complete. Total cutover: ~1ms.</em>
-        </div>
+      <h4 style="color:#f87171;">What's Missing for General-Purpose</h4>
+      <p style="font-size:0.48em; color:#94a3b8; margin-bottom:6px;">
+        Between ① and ⑥, the source is alive. Anything it does to non-memory state is <strong>lost</strong>.
+        This is analogous to how <code>pre_dump</code> only captures memory, and the full <code>dump</code>
+        must re-capture everything.
+      </p>
+
+      <div style="font-size:0.48em;">
+        <table style="width:100%; border-collapse:collapse;">
+          <thead>
+            <tr style="border-bottom:2px solid #475569;">
+              <th style="text-align:left; padding:4px; color:#f87171;">Resource</th>
+              <th style="text-align:left; padding:4px; color:#f87171;">What can happen</th>
+              <th style="text-align:left; padding:4px; color:#f87171;">Needed at convergence</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr style="border-bottom:1px solid #334155;">
+              <td style="padding:4px;"><strong>Threads</strong></td>
+              <td style="padding:4px;"><code>pthread_create/exit</code></td>
+              <td style="padding:4px;">Re-seize, ptrace new threads, dump regs/TLS</td>
+            </tr>
+            <tr style="border-bottom:1px solid #334155;">
+              <td style="padding:4px;"><strong>FDs</strong></td>
+              <td style="padding:4px;"><code>open/close/accept/dup2</code></td>
+              <td style="padding:4px;">Re-drain FD table via parasite</td>
+            </tr>
+            <tr style="border-bottom:1px solid #334155;">
+              <td style="padding:4px;"><strong>Signals</strong></td>
+              <td style="padding:4px;"><code>sigaction()</code>, new pending</td>
+              <td style="padding:4px;">Re-dump sigactions + <code>PTRACE_PEEKSIGINFO</code></td>
+            </tr>
+            <tr style="border-bottom:1px solid #334155;">
+              <td style="padding:4px;"><strong>Timers</strong></td>
+              <td style="padding:4px;"><code>timer_settime</code>, new timers</td>
+              <td style="padding:4px;">Re-read via parasite</td>
+            </tr>
+            <tr style="border-bottom:1px solid #334155;">
+              <td style="padding:4px;"><strong>FS context</strong></td>
+              <td style="padding:4px;"><code>chdir/chroot/umask</code></td>
+              <td style="padding:4px;">Re-read from /proc + parasite</td>
+            </tr>
+            <tr>
+              <td style="padding:4px;"><strong>Socket state</strong></td>
+              <td style="padding:4px;">New connections, queue data</td>
+              <td style="padding:4px;">Re-dump socket repair + queues</td>
+            </tr>
+          </tbody>
+        </table>
       </div>
 
-      <h4 class="cyan" style="margin-top:10px;">Why This Works</h4>
-      <div style="font-size:0.5em; background:#0f172a; border:1px solid #334155; border-radius:6px; padding:8px;">
-        <table style="width:100%; border-collapse:collapse;">
-          <tr style="border-bottom:1px solid #334155;">
-            <td style="padding:3px;"><strong>Non-memory state</strong></td>
-            <td style="padding:3px;">Immutable after dump (process was frozen)</td>
-          </tr>
-          <tr style="border-bottom:1px solid #334155;">
-            <td style="padding:3px;"><strong>Memory pages</strong></td>
-            <td style="padding:3px;">WP_ASYNC tracks writes, PAGEMAP_SCAN finds them</td>
-          </tr>
-          <tr style="border-bottom:1px solid #334155;">
-            <td style="padding:3px;"><strong>Consistency</strong></td>
-            <td style="padding:3px;">Fork snapshot reads all dirty pages atomically</td>
-          </tr>
-          <tr style="border-bottom:1px solid #334155;">
-            <td style="padding:3px;"><strong>New VMAs</strong></td>
-            <td style="padding:3px;">VMA diff protocol + ptrace injection on replica</td>
-          </tr>
-          <tr>
-            <td style="padding:3px;"><strong>libc safety</strong></td>
-            <td style="padding:3px;">Arena pages excluded from convergence</td>
-          </tr>
-        </table>
+      <div style="font-size:0.48em; margin-top:10px; background:#1e293b; border:1px solid #fbbf24; border-radius:6px; padding:6px;">
+        <strong style="color:#fbbf24;">The pre-dump → dump analogy:</strong><br>
+        <code>pre_dump</code> = memory-only snapshot (process stays alive)<br>
+        <code>dump</code> = full snapshot of everything<br><br>
+        Current COW convergence = memory-only re-sync (like pre_dump)<br>
+        <strong>Missing:</strong> a "convergence dump" that re-captures non-memory state<br>
+        (= essentially a second <code>dump_one_task</code> at step ⑥)
+      </div>
+
+      <div style="font-size:0.48em; margin-top:8px; background:#0f172a; border:1px solid #4ade80; border-radius:6px; padding:6px;">
+        <strong style="color:#4ade80;">Why Valkey doesn't need it:</strong>
+        Single event loop, fixed thread count, stable FD set (listen + client sockets only change
+        via <code>accept()</code> which is reflected in memory state), no <code>sigaction()</code> changes,
+        no timer creation. The memory-only convergence is sufficient for this specific workload.
       </div>
     </div>
   </div>
