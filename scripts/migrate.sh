@@ -73,7 +73,9 @@ valkey-cli -p "$VALKEY_PORT" CONFIG SET lazyfree-lazy-expire no CONFIG SET save 
 # Must happen HERE (not in COW_PRE_FREEZE_CMD) so we can verify all threads
 # are in idle syscalls AFTER the pause processing (including any logging/printf)
 # completes. This prevents catching threads mid-malloc at cgroup freeze time.
-valkey-cli -p "$VALKEY_PORT" CLIENT PAUSE 10000 ALL >/dev/null 2>&1 || true
+# The page server re-quiesces before convergence via COW_PRE_CONVERGE_CMD.
+# 350ms: ~10ms settle + 277ms dump freeze + margin
+valkey-cli -p "$VALKEY_PORT" CLIENT PAUSE 350 ALL >/dev/null 2>&1 || true
 
 # Wait for main thread to return to epoll_wait (meaning CLIENT PAUSE
 # processing including any log output/printf/malloc is complete)
@@ -104,7 +106,9 @@ REL=$(grep '^0::' "/proc/$PID/cgroup" 2>/dev/null | cut -d: -f3 || true)
 case "$REL" in *.service) CGROUP="/sys/fs/cgroup${REL}" ;; esac
 
 CRIU_ARGS=(
-  sudo "$CRIU_BIN" dump
+  sudo
+  COW_PRE_FREEZE_CMD="valkey-cli -p $VALKEY_PORT CLIENT PAUSE 50 ALL"
+  "$CRIU_BIN" dump
   --tree "$PID" --images-dir "$IMAGES_DIR"
   --cow-dump --lazy-pages
   --address "$PRIMARY_IP" --port "$CRIU_PORT"
@@ -164,7 +168,10 @@ _t1=${EPOCHREALTIME/./}; _t1=${_t1:0:13}
 MIGRATION_END_MS=${EPOCHREALTIME/./}; MIGRATION_END_MS=${MIGRATION_END_MS:0:13}
 log "Cutover: source frozen $((_t1 - _t0))ms"
 
-[ "$KEEP_SOURCE_RUNNING" = "1" ] && sudo pkill -CONT -x valkey-server 2>/dev/null || true
+if [ "$KEEP_SOURCE_RUNNING" = "1" ]; then
+  sudo pkill -CONT -x valkey-server 2>/dev/null || true
+  valkey-cli -p "$VALKEY_PORT" CLIENT UNPAUSE >/dev/null 2>&1 || true
+fi
 
 # --- 10. Cleanup ---
 [ -n "$WORKLOAD_PID" ] && { kill "$WORKLOAD_PID" 2>/dev/null; sudo pkill -9 -f "[v]alkey-benchmark" 2>/dev/null; } || true

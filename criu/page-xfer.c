@@ -2900,15 +2900,39 @@ static bool addr_in_dump_vmas(u64 start, u64 end, u64 dst_id)
 #include <linux/elf.h>
 #include <sys/syscall.h>
 
+/*
+ * Fork injection code: 16 bytes.
+ *
+ * After clone(), the parent (x0 = child_pid > 0) falls through
+ * to BRK which ptrace catches.  The child (x0 = 0) branches to
+ * an infinite loop, staying alive for process_vm_readv.
+ *
+ * aarch64:  SVC #0         → clone syscall
+ *           CBZ x0, +8     → child: skip BRK, go to loop
+ *           BRK #0         → parent: ptrace trap
+ *           B .            → child: infinite loop (SIGSTOP'd later)
+ *
+ * x86-64:   syscall        → clone
+ *           test eax,eax   → check return
+ *           jz +1          → child: jump to loop
+ *           int3           → parent: ptrace trap
+ *           jmp -2         → child: infinite loop
+ */
 #ifdef __aarch64__
-static const unsigned char fork_syscall_insn[8] = {
-	0x01, 0x00, 0x00, 0xd4,	/* svc #0 */
-	0x00, 0x00, 0x20, 0xd4		/* brk #0 */
+static const unsigned char fork_syscall_insn[16] = {
+	0x01, 0x00, 0x00, 0xd4,	/* svc #0           */
+	0x40, 0x00, 0x00, 0xb4,	/* cbz x0, +8 (→B.) */
+	0x00, 0x00, 0x20, 0xd4,	/* brk #0           */
+	0x00, 0x00, 0x00, 0x14		/* b .   (loop)     */
 };
 #elif defined(__x86_64__)
-static const unsigned char fork_syscall_insn[8] = {
-	0x0f, 0x05,			/* syscall */
-	0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc
+static const unsigned char fork_syscall_insn[16] = {
+	0x0f, 0x05,			/* syscall      */
+	0x85, 0xc0,			/* test eax,eax */
+	0x74, 0x01,			/* jz +1 (→jmp) */
+	0xcc,				/* int3 (parent)*/
+	0xeb, 0xfe,			/* jmp -2 (loop)*/
+	0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc
 };
 #endif
 
@@ -2936,7 +2960,7 @@ static int xfer_set_regs(pid_t pid, user_regs_struct_t *regs)
 static pid_t fork_source_snapshot(pid_t source_pid)
 {
 	user_regs_struct_t orig_regs, regs;
-	unsigned char orig_code[8];
+	unsigned char orig_code[16];
 	unsigned long pc;
 	pid_t fork_pid;
 	int status;
@@ -3102,9 +3126,7 @@ static int converge_send_batch(int sk, struct active_image *img,
 	int sb_len = 0, sb_cap;
 	ssize_t ret;
 
-	/* Skip libc rw- pages — keep the clean dump-time arena */
-	if (page_in_libc_rw(pg_start, nr * PAGE_SIZE))
-		return 0;
+	/* libc rw- pages are now properly re-sent from the fork */
 
 	for (i = 0; i < nr; i++) {
 		local_iovs[i].iov_base = batch_buf + i * PAGE_SIZE;
@@ -3464,6 +3486,7 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 		struct converge_region *freeze_dirty = NULL;
 		int freeze_dirty_count = 0, freeze_dirty_cap = 0;
 		unsigned long freeze_pages = 0;
+		pid_t fork_pid = -1;
 
 		/*
 		 * Pre-freeze hook: quiesce application writes so all
@@ -3597,8 +3620,9 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 		 * COW overhead: ~672 MB (vs 60 GB for bgsave).
 		 */
 		{
-			pid_t fork_pid = -1;
 			pid_t read_pid;
+
+			fork_pid = -1;
 
 			if (freeze_dirty_count > 0)
 				fork_pid = fork_source_snapshot(source_pid);
@@ -3626,14 +3650,57 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 					freeze_pages = sent;
 			}
 
-			/* Clean up fork */
+			/*
+			 * Re-send libc rw- pages from fork.
+			 * The bulk transfer may have read these
+			 * mid-traffic with stale arena state.
+			 * Reading from the fork (quiesced snapshot)
+			 * gives consistent arena bins/fastbins.
+			 */
 			if (fork_pid > 0) {
-				kill(fork_pid, SIGKILL);
-				/* We're not the parent — can't waitpid.
-				 * The source process (parent) will reap
-				 * via its SIGCHLD handler, or init will.
-				 */
+				char lmaps[64];
+				FILE *lmfp;
+
+				snprintf(lmaps, sizeof(lmaps),
+					 "/proc/%d/maps", fork_pid);
+				lmfp = fopen(lmaps, "r");
+				if (lmfp) {
+					char ll[512];
+
+					while (fgets(ll, sizeof(ll), lmfp)) {
+						unsigned long ls, le;
+						char lp[8], lpath[256];
+						struct converge_region lr;
+
+						lpath[0] = '\0';
+						if (sscanf(ll,
+							   "%lx-%lx %4s %*s %*s %*s %255[^\n]",
+							   &ls, &le, lp,
+							   lpath) < 3)
+							continue;
+						if (lp[0] != 'r' ||
+						    lp[1] != 'w' ||
+						    !strstr(lpath, "libc.so"))
+							continue;
+						lr.start = ls;
+						lr.end = le;
+						lr.categories = 0;
+						converge_dispatch_parallel(
+							img, fork_pid,
+							sockets, nr_streams,
+							&lr, 1);
+						pr_err("COW converge: "
+						       "re-sent libc rw- "
+						       "%lx-%lx (%lu pages) "
+						       "from fork\n",
+						       ls, le,
+						       (le - ls) / PAGE_SIZE);
+					}
+					fclose(lmfp);
+				}
 			}
+
+			/* Fork kept alive for dump-time re-send below */
 		}
 
 		pr_err("COW converge fork-snapshot: %lu dirty pages "
@@ -3827,16 +3894,7 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 					if (mp[0] != 'r' || mp[1] != 'w' ||
 					    mp[2] != '-')
 						continue;
-					/*
-					 * Only process anonymous rw- pages.
-					 * File-backed VMAs (libc.so, etc.)
-					 * are restored from dump images and
-					 * must not be overwritten — sending
-					 * them creates temporal inconsistency
-					 * with the heap pages.
-					 */
-					if (mpath[0] != '\0')
-						continue;
+					/* Include ALL rw- pages for fork re-send */
 
 					if (addr_in_dump_vmas(ms, me,
 							      img->dst_id)) {
@@ -3883,20 +3941,39 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 			}
 
 			/*
-			 * Skip dump-time allocator re-read.  With
-			 * fork-based consistency (no convergence),
-			 * the bulk + fork already provide consistent
-			 * data.  The re-read introduces a THIRD time
-			 * point that corrupts allocator metadata.
+			 * Re-send dump-time pages from the fork.
+			 * The bulk transfer reads pages over 60s,
+			 * creating a temporal patchwork (pages from
+			 * different time points).  Re-sending ALL
+			 * dump-time VMA pages from the fork gives
+			 * the replica a single consistent snapshot.
 			 */
-			if (dump_count > 0)
-				pr_err("COW converge: skipping %lu "
-				       "dump-time allocator pages "
-				       "(%d regions, %.1f MB) — "
-				       "fork provides consistency\n",
+			if (dump_count > 0 && fork_pid > 0) {
+				long re_sent;
+
+				pr_err("COW converge: re-sending %lu "
+				       "dump-time pages (%d regions, "
+				       "%.1f MB) from fork\n",
 				       dump_pages, dump_count,
 				       (double)(dump_pages * PAGE_SIZE) /
 				       (1024 * 1024));
+				re_sent = converge_dispatch_parallel(
+					img, fork_pid, sockets,
+					nr_streams, dump_regions,
+					dump_count);
+				if (re_sent >= 0)
+					pr_err("COW converge: re-sent "
+					       "%ld pages from fork\n",
+					       re_sent);
+			} else if (dump_count > 0) {
+				pr_err("COW converge: no fork, "
+				       "skipping %lu dump-time "
+				       "pages\n", dump_pages);
+			}
+
+			/* Clean up fork now that re-send is done */
+			if (fork_pid > 0)
+				kill(fork_pid, SIGKILL);
 
 			/*
 			 * Step 2: send VMA diff + page data for new VMAs

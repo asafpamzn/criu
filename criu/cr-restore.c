@@ -2041,22 +2041,58 @@ static int inject_mmap_syscall(pid_t pid, unsigned long addr,
 	if (vma_set_regs(pid, &regs))
 		goto restore_code;
 
-	if (ptrace(PTRACE_CONT, pid, NULL, NULL))
+	if (ptrace(PTRACE_CONT, pid, NULL, NULL)) {
+		pr_perror("VMA mmap: PTRACE_CONT failed");
 		goto restore_all;
+	}
 
-	if (waitpid(pid, &status, __WALL) != pid)
+	if (waitpid(pid, &status, __WALL) != pid) {
+		pr_perror("VMA mmap: waitpid failed");
 		goto restore_all;
+	}
 
-	if (!WIFSTOPPED(status) || WSTOPSIG(status) != SIGTRAP)
+	if (!WIFSTOPPED(status)) {
+		pr_err("VMA mmap: not stopped (status=0x%x)\n", status);
 		goto restore_all;
+	}
 
+	if (WSTOPSIG(status) != SIGTRAP) {
+		pr_err("VMA mmap: got signal %d (expected SIGTRAP), "
+		       "suppressing and retrying\n", WSTOPSIG(status));
+		/*
+		 * Suppress the unexpected signal by re-injecting
+		 * with PTRACE_CONT data=0, wait for BRK trap.
+		 */
+		if (ptrace(PTRACE_CONT, pid, NULL, NULL) == 0 &&
+		    waitpid(pid, &status, __WALL) == pid &&
+		    WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP) {
+			pr_err("VMA mmap: retry succeeded after "
+			       "signal suppression\n");
+			goto read_result;
+		}
+		goto restore_all;
+	}
+
+read_result:
 	if (vma_get_regs(pid, &regs))
 		goto restore_all;
 
 #ifdef __aarch64__
 	*result = regs.regs[0];
+	if ((long)*result < 0 && (long)*result > -4096) {
+		pr_err("VMA mmap: kernel returned error %ld "
+		       "for addr=0x%lx len=%lu\n",
+		       (long)*result, addr, len);
+		goto restore_all;
+	}
 #else
 	*result = regs.ax;
+	if ((long)*result < 0 && (long)*result > -4096) {
+		pr_err("VMA mmap: kernel returned error %ld "
+		       "for addr=0x%lx len=%lu\n",
+		       (long)*result, addr, len);
+		goto restore_all;
+	}
 #endif
 
 	if (ptrace_poke_area(pid, orig_code, (void *)pc,
@@ -2073,6 +2109,186 @@ restore_code:
 			     sizeof(orig_code)))
 		pr_err("VMA mirror: failed to restore code\n");
 	return -1;
+}
+
+/*
+ * Call a function inside the restored process via ptrace.
+ *
+ * Same pattern as inject_mmap_syscall: save regs/code, inject a
+ * trap instruction at PC, set up function call registers, execute,
+ * wait for trap, restore.  The function returns to the BRK/INT3
+ * instruction we planted at the original PC.
+ *
+ * On aarch64: x0=arg, x30=return_addr(→BRK), pc=func_addr
+ * On x86-64:  rdi=arg, push return_addr(→INT3), rip=func_addr
+ */
+static int __attribute__((unused))
+inject_function_call(pid_t pid, unsigned long func_addr,
+		     unsigned long arg0, unsigned long *result)
+{
+	user_regs_struct_t orig_regs, regs;
+	unsigned char orig_code[8];
+	unsigned long pc;
+	int status;
+
+	if (vma_get_regs(pid, &orig_regs))
+		return -1;
+
+#ifdef __aarch64__
+	pc = (unsigned long)orig_regs.pc;
+#else
+	pc = (unsigned long)orig_regs.ip;
+#endif
+
+	if (ptrace_peek_area(pid, orig_code, (void *)pc,
+			     sizeof(orig_code)))
+		return -1;
+
+	/* Plant BRK/INT3 at PC — the function's ret lands here */
+	if (ptrace_poke_area(pid, (void *)vma_syscall_insn,
+			     (void *)pc, sizeof(vma_syscall_insn)))
+		goto fc_restore_code;
+
+	regs = orig_regs;
+#ifdef __aarch64__
+	regs.regs[0] = arg0;		/* first argument */
+	regs.regs[30] = pc;		/* LR → BRK trap */
+	regs.pc = func_addr;
+#else
+	/* x86-64: push return address onto stack */
+	regs.sp -= 8;
+	if (ptrace(PTRACE_POKEDATA, pid, (void *)regs.sp, pc))
+		goto fc_restore_all;
+	regs.di = arg0;
+	regs.ip = func_addr;
+#endif
+
+	if (vma_set_regs(pid, &regs))
+		goto fc_restore_all;
+
+	if (ptrace(PTRACE_CONT, pid, NULL, NULL))
+		goto fc_restore_all;
+
+	if (waitpid(pid, &status, __WALL) != pid)
+		goto fc_restore_all;
+
+	if (!WIFSTOPPED(status) || WSTOPSIG(status) != SIGTRAP)
+		goto fc_restore_all;
+
+	if (vma_get_regs(pid, &regs))
+		goto fc_restore_all;
+
+#ifdef __aarch64__
+	*result = regs.regs[0];
+#else
+	*result = regs.ax;
+#endif
+
+	if (ptrace_poke_area(pid, orig_code, (void *)pc,
+			     sizeof(orig_code)))
+		pr_err("inject_function_call: restore code failed\n");
+	if (vma_set_regs(pid, &orig_regs))
+		pr_err("inject_function_call: restore regs failed\n");
+	return 0;
+
+fc_restore_all:
+	vma_set_regs(pid, &orig_regs);
+fc_restore_code:
+	if (ptrace_poke_area(pid, orig_code, (void *)pc,
+			     sizeof(orig_code)))
+		pr_err("inject_function_call: restore code failed\n");
+	return -1;
+}
+
+/*
+ * Find the absolute address of an exported symbol in the process's
+ * libc.  Uses .dynsym (works on stripped libc).  Returns 0 if not found.
+ */
+static unsigned long __attribute__((unused))
+find_libc_symbol(pid_t pid, const char *sym_name)
+{
+	char maps_path[64], line[512];
+	FILE *fp;
+	unsigned long base = 0;
+	char lib_path[PATH_MAX] = "";
+	int fd, i;
+	Elf64_Ehdr ehdr;
+	Elf64_Shdr *shdrs = NULL;
+	char *strtab = NULL;
+	Elf64_Sym *symtab = NULL;
+	int sym_count = 0;
+	unsigned long result = 0;
+
+	snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", pid);
+	fp = fopen(maps_path, "r");
+	if (!fp)
+		return 0;
+	while (fgets(line, sizeof(line), fp)) {
+		char perms[8], path[256];
+		unsigned long start, offset;
+
+		path[0] = '\0';
+		if (sscanf(line, "%lx-%*x %4s %lx %*s %*s %255[^\n]",
+			   &start, perms, &offset, path) < 3)
+			continue;
+		/* First mapping of libc at file offset 0 = load base */
+		if (strstr(path, "libc.so") && offset == 0 && base == 0) {
+			base = start;
+			strncpy(lib_path, path, sizeof(lib_path) - 1);
+			break;
+		}
+	}
+	fclose(fp);
+	if (!base || !lib_path[0])
+		return 0;
+
+	fd = open(lib_path, O_RDONLY);
+	if (fd < 0)
+		return 0;
+	if (read(fd, &ehdr, sizeof(ehdr)) != sizeof(ehdr))
+		goto out;
+	shdrs = xmalloc(ehdr.e_shnum * sizeof(Elf64_Shdr));
+	if (!shdrs)
+		goto out;
+	if (pread(fd, shdrs, ehdr.e_shnum * sizeof(Elf64_Shdr),
+		  ehdr.e_shoff) < 0)
+		goto out;
+
+	for (i = 0; i < ehdr.e_shnum; i++) {
+		if (shdrs[i].sh_type == SHT_DYNSYM) {
+			int strtab_idx = shdrs[i].sh_link;
+			int j;
+
+			sym_count = shdrs[i].sh_size / sizeof(Elf64_Sym);
+			symtab = xmalloc(shdrs[i].sh_size);
+			strtab = xmalloc(shdrs[strtab_idx].sh_size);
+			if (!symtab || !strtab)
+				goto out;
+			if (pread(fd, symtab, shdrs[i].sh_size,
+				  shdrs[i].sh_offset) < 0)
+				goto out;
+			if (pread(fd, strtab, shdrs[strtab_idx].sh_size,
+				  shdrs[strtab_idx].sh_offset) < 0)
+				goto out;
+
+			for (j = 0; j < sym_count; j++) {
+				const char *name = strtab +
+					symtab[j].st_name;
+				if (strcmp(name, sym_name) == 0 &&
+				    symtab[j].st_value != 0) {
+					result = base + symtab[j].st_value;
+					break;
+				}
+			}
+			break;
+		}
+	}
+out:
+	xfree(symtab);
+	xfree(strtab);
+	xfree(shdrs);
+	close(fd);
+	return result;
 }
 
 /*
@@ -2349,12 +2565,14 @@ out_fd:
 static int reset_one_arena(pid_t pid, unsigned long arena)
 {
 	/*
-	 * Zero offsets 0..95 and 104..111.  Preserve top (+96).
-	 *   +0:   mutex (4) + flags (4) + have_fastchunks (4) + pad (4)
-	 *   +16:  fastbinsY[10] (80 bytes)
-	 *   +96:  top chunk pointer (8) — PRESERVED (must be valid)
-	 *   +104: last_remainder (8) — zeroed
-	 *   +112: bins[254] — initialized as empty circular lists
+	 * Full reset: zero mutex+flags+fastbins (0..95), zero
+	 * last_remainder (+104), init bins as empty circular
+	 * lists.  Preserve top chunk (+96).
+	 *
+	 * The fork re-send provides a correct top chunk pointer.
+	 * Empty bins force glibc to use the top chunk or
+	 * sysmalloc for all allocations — safe regardless of
+	 * what bin state the fork had.
 	 */
 	unsigned char zeros_head[96];
 	unsigned long bins_init[254];
@@ -2468,21 +2686,31 @@ static int inject_new_vmas(struct pstree_item *item,
 		unsigned long result;
 		unsigned long vaddr = (unsigned long)vmas[i].start;
 		unsigned long vlen = (unsigned long)(vmas[i].end - vmas[i].start);
+		int retry, ok = 0;
 
-		if (inject_mmap_syscall(pid, vaddr, vlen,
-					vmas[i].prot, &result) < 0) {
-			pr_err("VMA mirror: inject mmap(%lx, %lu) "
-			       "failed\n", vaddr, vlen);
-			continue;
-		}
+		for (retry = 0; retry < 3; retry++) {
+			if (inject_mmap_syscall(pid, vaddr, vlen,
+						vmas[i].prot,
+						&result) < 0) {
+				pr_err("VMA mirror: inject mmap(%lx, %lu) "
+				       "failed (attempt %d)\n",
+				       vaddr, vlen, retry + 1);
+				continue;
+			}
 
-		if (result != vaddr) {
-			pr_err("VMA mirror: mmap returned %lx, "
-			       "expected %lx\n", result, vaddr);
-		} else {
-			pr_info("VMA mirror: created %lx-%lx\n",
-				vaddr, vaddr + vlen);
+			if (result != vaddr) {
+				pr_err("VMA mirror: mmap returned %lx, "
+				       "expected %lx\n", result, vaddr);
+			} else {
+				pr_info("VMA mirror: created %lx-%lx\n",
+					vaddr, vaddr + vlen);
+			}
+			ok = 1;
+			break;
 		}
+		if (!ok)
+			pr_err("VMA mirror: giving up on %lx-%lx "
+			       "after 3 attempts\n", vaddr, vaddr + vlen);
 	}
 
 	xfree(vmas);
@@ -3091,6 +3319,7 @@ skip_ns_bouncing:
 		fp = fopen(maps_path, "r");
 		if (fp) {
 			char line[512];
+			unsigned long libc_end = 0;
 
 			while (fgets(line, sizeof(line), fp)) {
 				unsigned long start, end;
@@ -3100,13 +3329,23 @@ skip_ns_bouncing:
 				if (sscanf(line, "%lx-%lx %4s %*s %*s %*s %255[^\n]",
 					   &start, &end, perms, path) < 3)
 					continue;
-				if (strstr(path, "libc.so") &&
-				    perms[0] == 'r' && perms[1] == 'w' &&
-				    perms[2] == '-') {
+				/*
+				 * Track libc.so mappings.  The rw-
+				 * data segment is anonymous (no path)
+				 * and contiguous with the last libc
+				 * mapping.
+				 */
+				if (strstr(path, "libc.so")) {
+					libc_end = end;
+					continue;
+				}
+				if (libc_end && start == libc_end &&
+				    perms[0] == 'r' && perms[1] == 'w') {
 					reset_all_glibc_arenas(pid,
 							       start + 0xa50);
 					break;
 				}
+				libc_end = 0;
 			}
 			fclose(fp);
 		}
@@ -3129,7 +3368,65 @@ skip_ns_bouncing:
 		unlock_elf_mutex_array(pid, "signal_handler_lock", 1);
 
 		/*
+		 * Also unlock bug_report_start — Valkey's crash
+		 * reporting mutex, right after signal_handler_lock.
+		 * Without this, the signal handler deadlocks on the
+		 * second mutex during crash reporting.
+		 */
+		unlock_elf_mutex_array(pid, "bug_report_start", 1);
+
+		/*
+		 * Zero the io_threads LTO blob to reset all IO thread
+		 * state: io_threads_pending, io_threads_list, and
+		 * io_threads_active.  Without this, IO threads wake
+		 * after SIGCONT and try to process stale client lists
+		 * from convergence time (closed sockets) → crash.
+		 *
+		 * The blob is "io_threads.lto_priv.0" (2048 bytes)
+		 * containing all static io_threads module variables.
+		 * Zeroing sets pending=0, lists=NULL, active=0 — IO
+		 * threads spin-wait harmlessly until the main thread
+		 * reinitializes them.
+		 */
+		{
+			unsigned long iot_addr;
+
+			iot_addr = find_elf_symbol_addr(pid,
+						"io_threads.lto_priv");
+			if (iot_addr) {
+				char mp[64];
+				int mfd;
+				unsigned char zeros[2048];
+
+				memset(zeros, 0, sizeof(zeros));
+				snprintf(mp, sizeof(mp),
+					 "/proc/%d/mem", pid);
+				mfd = open(mp, O_RDWR);
+				if (mfd >= 0) {
+					ssize_t w = pwrite(mfd, zeros,
+							   sizeof(zeros),
+							   iot_addr);
+					if (w == sizeof(zeros))
+						pr_err("Zeroed io_threads blob "
+						       "(%d bytes at 0x%lx)\n",
+						       (int)sizeof(zeros),
+						       iot_addr);
+					else
+						pr_err("io_threads blob write "
+						       "failed: %zd\n", w);
+					close(mfd);
+				}
+			}
+		}
+
+		/*
 		 * Null each thread's glibc tcache pointer.
+		 * With fork re-send, tcache entries are from the
+		 * quiesced fork snapshot and are consistent.
+		 * Skip tcache null to preserve this state.
+		 *
+		 * TODO: re-enable if migration without fork re-send
+		 * is used (e.g., for small datasets).
 		 *
 		 * The tcache (thread-local allocation cache) contains
 		 * pointers to freed chunks that are stale after COW
@@ -3146,80 +3443,9 @@ skip_ns_bouncing:
 		 *   DTV[2] = libc TLS block pointer (at DTV+16)
 		 *   tcache pointer at TLS block + offset (varies)
 		 */
-#ifdef __aarch64__
-		{
-			struct pstree_item *item;
-			int nulled = 0, threads_ok = 0;
-			char mem_path2[64];
-			int mem_fd2;
-
-			snprintf(mem_path2, sizeof(mem_path2),
-				 "/proc/%d/mem", pid);
-			mem_fd2 = open(mem_path2, O_RDWR);
-			if (mem_fd2 >= 0) {
-				for_each_pstree_item(item) {
-					int t;
-
-					for (t = 0; t < item->nr_threads; t++) {
-						pid_t tid = item->threads[t].real;
-						unsigned long tp, dtv, tls_block;
-						struct iovec iov_tls;
-						unsigned long tls_reg = 0;
-						int off;
-
-						iov_tls.iov_base = &tls_reg;
-						iov_tls.iov_len = sizeof(tls_reg);
-						if (ptrace(PTRACE_GETREGSET, tid,
-							   (void *)0x401,
-							   &iov_tls))
-							continue;
-						tp = tls_reg;
-						if (!tp)
-							continue;
-
-						if (pread(mem_fd2, &dtv, 8, tp) != 8 ||
-						    !dtv)
-							continue;
-						if (pread(mem_fd2, &tls_block, 8,
-							  dtv + 16) != 8 ||
-						    !tls_block)
-							continue;
-
-						threads_ok++;
-						for (off = 0x480; off <= 0x600;
-						     off += 8) {
-							unsigned long probe;
-							unsigned short counts[64];
-							unsigned long zero = 0;
-							int k, total;
-
-							if (pread(mem_fd2, &probe, 8,
-								  tls_block + off) != 8)
-								continue;
-							if (!probe || probe < 0x10000)
-								continue;
-							if (pread(mem_fd2, counts,
-								  sizeof(counts),
-								  probe) !=
-							    (ssize_t)sizeof(counts))
-								continue;
-							total = 0;
-							for (k = 0; k < 64; k++)
-								total += counts[k];
-							if (total <= 0 || total >= 1000)
-								continue;
-							if (pwrite(mem_fd2, &zero, 8,
-								   tls_block + off) == 8)
-								nulled++;
-						}
-					}
-				}
-				close(mem_fd2);
-			}
-			pr_err("Nulled %d tcache pointers (%d threads)\n",
-			       nulled, threads_ok);
-		}
-#endif
+		/* tcache null skipped — fork re-send provides
+		 * consistent tcache from quiesced snapshot */
+		pr_err("Skipped tcache null (fork re-send active)\n");
 
 		/*
 		 * Inject FUTEX_WAKE on all zeroed mutexes.
@@ -3242,17 +3468,24 @@ skip_ns_bouncing:
 			if (fp2) {
 				char line2[512];
 
+				unsigned long libc_end2 = 0;
+
 				while (fgets(line2, sizeof(line2), fp2)) {
-					unsigned long start2;
+					unsigned long start2, end2;
 					char perms2[8], path2[256];
 
 					path2[0] = '\0';
 					if (sscanf(line2,
-						   "%lx-%*x %4s %*s %*s %*s %255[^\n]",
-						   &start2, perms2,
-						   path2) < 2)
+						   "%lx-%lx %4s %*s %*s %*s %255[^\n]",
+						   &start2, &end2, perms2,
+						   path2) < 3)
 						continue;
-					if (strstr(path2, "libc.so") &&
+					if (strstr(path2, "libc.so")) {
+						libc_end2 = end2;
+						continue;
+					}
+					if (libc_end2 &&
+					    start2 == libc_end2 &&
 					    perms2[0] == 'r' &&
 					    perms2[1] == 'w') {
 						unsigned long arena;
@@ -3329,71 +3562,7 @@ skip_ns_bouncing:
 	 * Re-null tcache AFTER restore_rseq_cs.  rseq_cs writes to TLS
 	 * via ptrace_poke and can overwrite our earlier tcache null.
 	 */
-	if (opts.cow_dump) {
-		pid_t pid2 = root_item->pid->real;
-#ifdef __aarch64__
-		{
-			struct pstree_item *item;
-			int nulled2 = 0;
-			char mp2[64];
-			int mf2;
-
-			snprintf(mp2, sizeof(mp2), "/proc/%d/mem", pid2);
-			mf2 = open(mp2, O_RDWR);
-			if (mf2 >= 0) {
-				for_each_pstree_item(item) {
-					int t;
-
-					for (t = 0; t < item->nr_threads; t++) {
-						pid_t tid = item->threads[t].real;
-						unsigned long tp2, dtv2, tls2;
-						struct iovec iv2;
-						unsigned long tr2 = 0;
-						int off;
-
-						iv2.iov_base = &tr2;
-						iv2.iov_len = 8;
-						if (ptrace(PTRACE_GETREGSET, tid,
-							   (void *)0x401, &iv2))
-							continue;
-						tp2 = tr2;
-						if (!tp2)
-							continue;
-						if (pread(mf2, &dtv2, 8, tp2) != 8 || !dtv2)
-							continue;
-						if (pread(mf2, &tls2, 8, dtv2 + 16) != 8 || !tls2)
-							continue;
-						for (off = 0x480; off <= 0x600; off += 8) {
-							unsigned long p;
-							unsigned short c[64];
-							unsigned long z = 0;
-							int k, tot;
-
-							if (pread(mf2, &p, 8, tls2 + off) != 8)
-								continue;
-							if (!p || p < 0x10000)
-								continue;
-							if (pread(mf2, c, sizeof(c), p) !=
-							    (ssize_t)sizeof(c))
-								continue;
-							tot = 0;
-							for (k = 0; k < 64; k++)
-								tot += c[k];
-							if (tot <= 0 || tot >= 1000)
-								continue;
-							if (pwrite(mf2, &z, 8, tls2 + off) == 8)
-								nulled2++;
-						}
-					}
-				}
-				close(mf2);
-			}
-			if (nulled2 > 0)
-				pr_err("Post-rseq tcache re-null: %d pointers\n",
-				       nulled2);
-		}
-#endif
-	}
+	/* Post-rseq tcache null skipped — fork re-send active */
 
 	/*
 	 * Some external devices such as GPUs might need a very late
