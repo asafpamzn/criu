@@ -3912,7 +3912,10 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 						}
 						dump_regions[dump_count].start = ms;
 						dump_regions[dump_count].end = me;
-						dump_regions[dump_count].categories = 0;
+						/* Mark file-backed rw- for
+						 * fork re-send (libc, valkey) */
+						dump_regions[dump_count].categories =
+							(mpath[0] != '\0') ? 1 : 0;
 						dump_count++;
 						dump_pages += (me - ms) / PAGE_SIZE;
 					} else {
@@ -3941,12 +3944,16 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 			}
 
 			/*
-			 * Re-send dump-time pages from the fork.
+			 * Re-send ALL dump-time pages from the fork.
 			 * The bulk transfer reads pages over 60s,
-			 * creating a temporal patchwork (pages from
-			 * different time points).  Re-sending ALL
-			 * dump-time VMA pages from the fork gives
-			 * the replica a single consistent snapshot.
+			 * creating a temporal patchwork — heap
+			 * fastbin chains span pages from different
+			 * time points.  Re-sending from the fork
+			 * gives the replica a consistent snapshot.
+			 *
+			 * TODO: implement dirty bitmap during bulk
+			 * to re-send only modified pages (~5-10GB
+			 * instead of 99GB).
 			 */
 			if (dump_count > 0 && fork_pid > 0) {
 				long re_sent;
@@ -3965,13 +3972,9 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 					pr_err("COW converge: re-sent "
 					       "%ld pages from fork\n",
 					       re_sent);
-			} else if (dump_count > 0) {
-				pr_err("COW converge: no fork, "
-				       "skipping %lu dump-time "
-				       "pages\n", dump_pages);
 			}
 
-			/* Clean up fork now that re-send is done */
+			/* Clean up fork */
 			if (fork_pid > 0)
 				kill(fork_pid, SIGKILL);
 

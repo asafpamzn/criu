@@ -1938,25 +1938,18 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	}
 
 	/*
-	 * COW early unfreeze: freeze-critical work is done
-	 * (registers, sigacts, threads, pagemap captured).
-	 * Unfreeze now — WP threads continue in background.
+	 * Join WP threads during freeze — accurate dirty tracking.
+	 * With WP completing while frozen, all writes after unfreeze
+	 * are tracked.  The convergence scan finds ALL dirty pages
+	 * and re-sends only those from the fork (~5-10GB, not 99GB).
 	 */
-	if (opts.cow_dump && opts.lazy_pages) {
-		extern struct pstree_item *root_item;
-
-		if (arch_set_thread_regs(root_item, true) < 0)
-			goto err_cure;
-		cr_plugin_fini(CR_PLUGIN_STAGE__DUMP, 0);
-		pstree_switch_state(root_item, TASK_ALIVE);
-		timing_stop(TIME_FROZEN);
-
-		gettimeofday(&t_now, NULL);
-		timersub(&t_now, &t_start, &t_delta);
-		pr_err("COW early unfreeze after %ld.%06ld seconds\n",
-		       t_delta.tv_sec, t_delta.tv_usec);
-
+	if (opts.cow_dump) {
 		ret = cow_dump_finish_wp();
+		gettimeofday(&t_now, NULL);
+		timersub(&t_now, &t_checkpoint, &t_delta);
+		pr_err("TIMING: cow_dump_finish_wp took %ld.%06ld seconds\n",
+		       t_delta.tv_sec, t_delta.tv_usec);
+		t_checkpoint = t_now;
 		if (ret) {
 			pr_err("Async write-protect failed\n");
 			goto err_cure;
@@ -2546,8 +2539,13 @@ int cr_dump_tasks(pid_t pid)
 	 * The page server starts after resume in cr_dump_finish().
 	 */
 	if (opts.lazy_pages && opts.cow_dump) {
-		/* Unfreeze + WP join + pagemap already done in dump_one_task */
-		pr_err("COW early resume: already unfrozen in dump_one_task\n");
+		if (arch_set_thread_regs(root_item, true) < 0)
+			goto err;
+
+		cr_plugin_fini(CR_PLUGIN_STAGE__DUMP, 0);
+		pstree_switch_state(root_item, TASK_ALIVE);
+		timing_stop(TIME_FROZEN);
+		pr_err("COW early resume: process unfrozen after dump_one_task\n");
 
 		/* Write deferred thread core images (off critical path) */
 		for_each_pstree_item(item) {

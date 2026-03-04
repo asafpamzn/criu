@@ -3443,9 +3443,80 @@ skip_ns_bouncing:
 		 *   DTV[2] = libc TLS block pointer (at DTV+16)
 		 *   tcache pointer at TLS block + offset (varies)
 		 */
-		/* tcache null skipped — fork re-send provides
-		 * consistent tcache from quiesced snapshot */
-		pr_err("Skipped tcache null (fork re-send active)\n");
+#ifdef __aarch64__
+		{
+			struct pstree_item *item;
+			int nulled = 0, threads_ok = 0;
+			char mem_path2[64];
+			int mem_fd2;
+
+			snprintf(mem_path2, sizeof(mem_path2),
+				 "/proc/%d/mem", pid);
+			mem_fd2 = open(mem_path2, O_RDWR);
+			if (mem_fd2 >= 0) {
+				for_each_pstree_item(item) {
+					int t;
+
+					for (t = 0; t < item->nr_threads; t++) {
+						pid_t tid = item->threads[t].real;
+						unsigned long tp, dtv, tls_block;
+						struct iovec iov_tls;
+						unsigned long tls_reg = 0;
+						int off;
+
+						iov_tls.iov_base = &tls_reg;
+						iov_tls.iov_len = sizeof(tls_reg);
+						if (ptrace(PTRACE_GETREGSET, tid,
+							   (void *)0x401,
+							   &iov_tls))
+							continue;
+						tp = tls_reg;
+						if (!tp)
+							continue;
+
+						if (pread(mem_fd2, &dtv, 8, tp) != 8 ||
+						    !dtv)
+							continue;
+						if (pread(mem_fd2, &tls_block, 8,
+							  dtv + 16) != 8 ||
+						    !tls_block)
+							continue;
+
+						threads_ok++;
+						for (off = 0x480; off <= 0x600;
+						     off += 8) {
+							unsigned long probe;
+							unsigned short counts[64];
+							unsigned long zero = 0;
+							int k, total;
+
+							if (pread(mem_fd2, &probe, 8,
+								  tls_block + off) != 8)
+								continue;
+							if (!probe || probe < 0x10000)
+								continue;
+							if (pread(mem_fd2, counts,
+								  sizeof(counts),
+								  probe) !=
+							    (ssize_t)sizeof(counts))
+								continue;
+							total = 0;
+							for (k = 0; k < 64; k++)
+								total += counts[k];
+							if (total <= 0 || total >= 1000)
+								continue;
+							if (pwrite(mem_fd2, &zero, 8,
+								   tls_block + off) == 8)
+								nulled++;
+						}
+					}
+				}
+				close(mem_fd2);
+			}
+			pr_err("Nulled %d tcache pointers (%d threads)\n",
+			       nulled, threads_ok);
+		}
+#endif
 
 		/*
 		 * Inject FUTEX_WAKE on all zeroed mutexes.
@@ -3562,7 +3633,71 @@ skip_ns_bouncing:
 	 * Re-null tcache AFTER restore_rseq_cs.  rseq_cs writes to TLS
 	 * via ptrace_poke and can overwrite our earlier tcache null.
 	 */
-	/* Post-rseq tcache null skipped — fork re-send active */
+	if (opts.cow_dump) {
+		pid_t pid2 = root_item->pid->real;
+#ifdef __aarch64__
+		{
+			struct pstree_item *item;
+			int nulled2 = 0;
+			char mp2[64];
+			int mf2;
+
+			snprintf(mp2, sizeof(mp2), "/proc/%d/mem", pid2);
+			mf2 = open(mp2, O_RDWR);
+			if (mf2 >= 0) {
+				for_each_pstree_item(item) {
+					int t;
+
+					for (t = 0; t < item->nr_threads; t++) {
+						pid_t tid = item->threads[t].real;
+						unsigned long tp2, dtv2, tls2;
+						struct iovec iv2;
+						unsigned long tr2 = 0;
+						int off;
+
+						iv2.iov_base = &tr2;
+						iv2.iov_len = 8;
+						if (ptrace(PTRACE_GETREGSET, tid,
+							   (void *)0x401, &iv2))
+							continue;
+						tp2 = tr2;
+						if (!tp2)
+							continue;
+						if (pread(mf2, &dtv2, 8, tp2) != 8 || !dtv2)
+							continue;
+						if (pread(mf2, &tls2, 8, dtv2 + 16) != 8 || !tls2)
+							continue;
+						for (off = 0x480; off <= 0x600; off += 8) {
+							unsigned long p;
+							unsigned short c[64];
+							unsigned long z = 0;
+							int k, tot;
+
+							if (pread(mf2, &p, 8, tls2 + off) != 8)
+								continue;
+							if (!p || p < 0x10000)
+								continue;
+							if (pread(mf2, c, sizeof(c), p) !=
+							    (ssize_t)sizeof(c))
+								continue;
+							tot = 0;
+							for (k = 0; k < 64; k++)
+								tot += c[k];
+							if (tot <= 0 || tot >= 1000)
+								continue;
+							if (pwrite(mf2, &z, 8, tls2 + off) == 8)
+								nulled2++;
+						}
+					}
+				}
+				close(mf2);
+			}
+			if (nulled2 > 0)
+				pr_err("Post-rseq tcache re-null: %d pointers\n",
+				       nulled2);
+		}
+#endif
+	}
 
 	/*
 	 * Some external devices such as GPUs might need a very late
