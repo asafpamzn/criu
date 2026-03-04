@@ -1,0 +1,66 @@
+<section>
+  <h2>FD Types: What Gets Saved?</h2>
+
+  <div class="state-grid" style="grid-template-columns: 1fr 1fr 1fr;">
+    <div class="state-box" style="border-left: 3px solid #4ade80;">
+      <span class="title">Regular Files (regfile)</span>
+      <div class="desc">
+        <strong>Saved:</strong> file path, position (<code>lseek</code> offset), flags (<code>O_APPEND</code>, <code>O_NONBLOCK</code>…), <code>mnt_id</code>, <code>fd_flags</code> (<code>O_CLOEXEC</code>), file owner (<code>F_SETOWN</code>)<br><br>
+        <strong>NOT saved:</strong> file content — assumed to exist on the destination filesystem at the same path. If the file moved, restore fails.<br><br>
+        <em>Source:</em> <code>files-reg.c</code>
+      </div>
+    </div>
+
+    <div class="state-box" style="border-left: 3px solid #22d3ee;">
+      <span class="title">Pipes (pipe)</span>
+      <div class="desc">
+        <strong>Saved:</strong> pipe ID (links read + write ends across processes), flags, <strong>buffered data</strong> still in the pipe<br><br>
+        <strong>How:</strong> CRIU reads pending data from the pipe via <code>splice()</code> into a temporary buffer, saves it to image. On restore, creates new pipe, writes data back, then distributes FDs.<br><br>
+        <strong>Pair linking:</strong> read-end and write-end share the same pipe ID — restored as one <code>pipe2()</code> call.<br><br>
+        <em>Source:</em> <code>pipes.c</code>
+      </div>
+    </div>
+
+    <div class="state-box" style="border-left: 3px solid #fbbf24;">
+      <span class="title">FIFOs (named pipes)</span>
+      <div class="desc">
+        <strong>Saved:</strong> filesystem path, flags, buffered data<br><br>
+        <strong>Difference from pipes:</strong> FIFOs have a path on disk (e.g., <code>/tmp/myfifo</code>). On restore, CRIU re-opens the path with the same flags. The FIFO file must exist on the destination.<br><br>
+        <em>Source:</em> <code>fifo.c</code>
+      </div>
+    </div>
+
+    <div class="state-box" style="border-left: 3px solid #a78bfa;">
+      <span class="title">eventfd / signalfd / timerfd</span>
+      <div class="desc">
+        <strong>eventfd:</strong> counter value + flags (<code>EFD_SEMAPHORE</code>, <code>EFD_NONBLOCK</code>)<br>
+        <strong>signalfd:</strong> signal mask (which signals are watched)<br>
+        <strong>timerfd:</strong> clock ID, set-time flags, current value + interval<br><br>
+        All from <code>/proc/PID/fdinfo/N</code> — kernel exposes type-specific fields there.<br><br>
+        <em>Source:</em> <code>eventfd.c</code>, <code>signalfd.c</code>, <code>timerfd.c</code>
+      </div>
+    </div>
+
+    <div class="state-box" style="border-left: 3px solid #f87171;">
+      <span class="title">epoll / inotify / fanotify</span>
+      <div class="desc">
+        <strong>epoll:</strong> list of watched FDs + events + data for each (<code>tfd:</code> lines in fdinfo)<br>
+        <strong>inotify:</strong> watch descriptors — each with inode, sdev, mask, file handle<br>
+        <strong>fanotify:</strong> flags, event-flags, marks (inode or mount marks with file handles)<br><br>
+        These are <strong>FD-watching FDs</strong> — they reference other FDs, creating dependencies resolved during restore.<br><br>
+        <em>Source:</em> <code>eventpoll.c</code>, <code>fsnotify.c</code>
+      </div>
+    </div>
+
+    <div class="state-box" style="border-left: 3px solid #fb923c;">
+      <span class="title">TTYs / memfd / BPF maps / pidfd</span>
+      <div class="desc">
+        <strong>TTY:</strong> terminal settings (<code>termios</code>), session/pgrp, window size<br>
+        <strong>memfd:</strong> name, seals (<code>F_SEAL_*</code>), full content (anonymous file in RAM)<br>
+        <strong>BPF map:</strong> map type, key/value sizes, max entries, flags, data<br>
+        <strong>pidfd:</strong> target PID, inode (reference to another process)<br><br>
+        <em>Source:</em> <code>tty.c</code>, <code>memfd.c</code>, <code>bpfmap.c</code>, <code>pidfd.c</code>
+      </div>
+    </div>
+  </div>
+</section>

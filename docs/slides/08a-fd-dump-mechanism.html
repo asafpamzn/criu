@@ -1,0 +1,70 @@
+<section>
+  <h2>How CRIU Dumps File Descriptors</h2>
+
+  <div class="two-col">
+    <div>
+      <h4 class="cyan">The 4-Step FD Drain Pipeline</h4>
+
+      <div class="state-grid" style="grid-template-columns: 1fr;">
+        <div class="state-box" style="border-left: 3px solid #22d3ee;">
+          <span class="title">1. Enumerate — collect_fds()</span>
+          <div class="desc">Read <code>/proc/PID/fd/</code> directory to get all open FD numbers. Store them in a <code>parasite_drain_fd</code> array.</div>
+        </div>
+        <div class="state-box" style="border-left: 3px solid #a78bfa;">
+          <span class="title">2. Drain — parasite_drain_fds_seized()</span>
+          <div class="desc">The parasite (running inside the target process) sends each FD to CRIU using <strong>SCM_RIGHTS</strong> over a Unix socket. This gives CRIU a local copy of the FD — CRIU can now <code>fstat()</code>, <code>read()</code>, and inspect each one.</div>
+        </div>
+        <div class="state-box" style="border-left: 3px solid #fbbf24;">
+          <span class="title">3. Classify — dump_one_file()</span>
+          <div class="desc">For each drained FD, determine its type using:<br>
+            • <code>fstat()</code> → <code>S_ISSOCK</code>, <code>S_ISREG</code>, <code>S_ISFIFO</code>, <code>S_ISCHR</code><br>
+            • <code>fstatfs()</code> → filesystem magic (<code>PIPEFS</code>, <code>ANON_INODE_FS</code>)<br>
+            • <code>/proc/PID/fdinfo/</code> → position, flags, type-specific data<br>
+            • <code>readlink(/proc/PID/fd/N)</code> → link name for anon types
+          </div>
+        </div>
+        <div class="state-box" style="border-left: 3px solid #4ade80;">
+          <span class="title">4. Dispatch — fdtype_ops→dump()</span>
+          <div class="desc">Each FD type has its own dump handler (e.g., <code>pipe_dump_ops</code>, <code>regfile_dump_ops</code>, <code>eventfd_dump_ops</code>). The handler serializes type-specific state into a protobuf image file.</div>
+        </div>
+      </div>
+    </div>
+
+    <div>
+      <h4 class="cyan">The Classification Tree</h4>
+      <pre style="font-size:0.5em;"><code>dump_one_file(pid, fd, lfd)
+│
+├─ S_ISSOCK? ──→ dump_socket()
+│                ├─ AF_UNIX  → unix_sk_dump_ops
+│                ├─ AF_INET  → inet_sk_dump_ops
+│                ├─ AF_PACKET→ packet_sk_dump_ops
+│                └─ AF_NETLINK→ netlink_sk_dump_ops
+│
+├─ S_ISCHR? ───→ dump_chrdev()
+│                ├─ MEM_MAJOR → regfile (e.g. /dev/null)
+│                ├─ MISC+TUN  → tunfile_dump_ops
+│                └─ is_tty?   → tty_dump_ops
+│
+├─ ANON_INODE_FS? → read link name
+│                ├─ "eventfd"  → eventfd_dump_ops
+│                ├─ "[eventpoll]" → eventpoll_dump_ops
+│                ├─ "inotify"  → inotify_dump_ops
+│                ├─ "signalfd" → signalfd_dump_ops
+│                ├─ "[timerfd]"→ timerfd_dump_ops
+│                ├─ "pidfd"    → pidfd_dump_ops
+│                └─ "bpf-map"  → bpfmap_dump_ops
+│
+├─ S_ISREG/DIR? → regfile_dump_ops
+│                  or memfd_dump_ops
+│                  or nsfile_dump_ops
+│
+└─ S_ISFIFO?
+   ├─ PIPEFS → pipe_dump_ops
+   └─ other  → fifo_dump_ops</code></pre>
+
+      <div class="code-note" style="margin-top: 8px;">
+        Each FD is assigned a <strong>unique ID</strong> via <code>fd_id_generate()</code> (using <code>kcmp()</code> to detect shared file descriptions). If two FDs in different processes point to the same kernel <code>struct file</code>, they get the same ID — only dumped once.
+      </div>
+    </div>
+  </div>
+</section>

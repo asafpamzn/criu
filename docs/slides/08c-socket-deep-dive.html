@@ -1,0 +1,72 @@
+<section>
+  <h2>Socket FDs: The Most Complex Case</h2>
+
+  <div class="two-col">
+    <div>
+      <div class="state-grid" style="grid-template-columns: 1fr;">
+        <div class="state-box" style="border-left: 3px solid #f87171;">
+          <span class="title">TCP Sockets — sk-tcp.c + soccr library</span>
+          <div class="desc">
+            <strong>The hardest FD type to checkpoint.</strong> Must preserve a live connection.<br><br>
+            <strong>Dump:</strong><br>
+            1. Put socket into <code>TCP_REPAIR</code> mode (kernel API)<br>
+            2. Read full TCP state: seq/ack numbers, window, timestamps, congestion algorithm + state, MSS, options<br>
+            3. Read queued data: <strong>send queue</strong>, <strong>receive queue</strong>, out-of-order queue via <code>TCP_REPAIR_QUEUE</code><br>
+            4. Save source/dest IP:port, socket options<br><br>
+            <strong>Restore:</strong><br>
+            1. Create socket in <code>TCP_REPAIR</code> mode<br>
+            2. Bind + connect (succeeds immediately in repair mode)<br>
+            3. Inject all queued data back<br>
+            4. Restore seq numbers, window, timestamps<br>
+            5. Exit repair mode — connection appears uninterrupted<br><br>
+            <strong>Network lock:</strong> CRIU blocks network traffic with iptables/nftables during dump to prevent new data arriving.
+          </div>
+        </div>
+
+        <div class="state-box" style="border-left: 3px solid #22d3ee;">
+          <span class="title">UDP Sockets — sk-inet.c</span>
+          <div class="desc">
+            <strong>Saved:</strong> bind address:port, connect address (if connected), socket options (<code>SO_REUSEADDR</code>, <code>SO_BROADCAST</code>, etc.), pending data in receive queue<br><br>
+            <strong>Simpler than TCP:</strong> no connection state, no sequence numbers. Just re-create the socket and re-bind. Data in transit is lost (UDP has no delivery guarantees anyway).
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div>
+      <div class="state-grid" style="grid-template-columns: 1fr;">
+        <div class="state-box" style="border-left: 3px solid #a78bfa;">
+          <span class="title">Unix Sockets — sk-unix.c</span>
+          <div class="desc">
+            <strong>Saved:</strong> socket type (stream/dgram/seqpacket), bound path or abstract name, peer (who's connected), socket state, <strong>queued data</strong> (in both directions), socket options, file owner<br><br>
+            <strong>Challenges:</strong><br>
+            • <strong>Connected pairs</strong> must be restored together (like pipe ends)<br>
+            • <strong>External connections</strong> (to processes outside the dump tree) are handled via <code>--external unix[inode]</code> or the fd inherit mechanism<br>
+            • <strong>Passed FDs</strong> in the queue (via SCM_RIGHTS) must also be dumped<br><br>
+            <em>Source:</em> <code>sk-unix.c</code>, <code>sk-queue.c</code>
+          </div>
+        </div>
+
+        <div class="state-box" style="border-left: 3px solid #fbbf24;">
+          <span class="title">Netlink Sockets — sk-netlink.c</span>
+          <div class="desc">
+            <strong>Saved:</strong> protocol (NETLINK_ROUTE, NETLINK_GENERIC, etc.), port ID, multicast groups, socket options<br><br>
+            Used by processes to talk to the kernel (routing tables, network config). On restore, re-create with same protocol and re-bind to same port ID.
+          </div>
+        </div>
+
+        <div class="state-box" style="border-left: 3px solid #4ade80;">
+          <span class="title">Packet Sockets — sk-packet.c</span>
+          <div class="desc">
+            <strong>Saved:</strong> protocol, bound interface, fanout config, socket options, ring buffer config (TPACKET versions)<br><br>
+            Raw network access (e.g., tcpdump). On restore, re-create and re-bind to interface. Relatively rare in typical workloads.
+          </div>
+        </div>
+      </div>
+
+      <div class="code-note" style="margin-top: 8px;">
+        <strong>Restore FD distribution:</strong> One "master" process opens the FD, then distributes copies to all other processes that need it via <strong>SCM_RIGHTS</strong> over a CRIU transport socket (<code>send_fd_to_peer()</code> / <code>recv_fd_from_peer()</code>).
+      </div>
+    </div>
+  </div>
+</section>
