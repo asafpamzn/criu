@@ -74,8 +74,8 @@ valkey-cli -p "$VALKEY_PORT" CONFIG SET lazyfree-lazy-expire no CONFIG SET save 
 # are in idle syscalls AFTER the pause processing (including any logging/printf)
 # completes. This prevents catching threads mid-malloc at cgroup freeze time.
 # The page server re-quiesces before convergence via COW_PRE_CONVERGE_CMD.
-# 350ms: ~10ms settle + 277ms dump freeze + margin
-valkey-cli -p "$VALKEY_PORT" CLIENT PAUSE 350 ALL >/dev/null 2>&1 || true
+# 200ms: ~10ms settle + 166ms dump freeze + margin
+valkey-cli -p "$VALKEY_PORT" CLIENT PAUSE 200 ALL >/dev/null 2>&1 || true
 
 # Wait for main thread to return to epoll_wait (meaning CLIENT PAUSE
 # processing including any log output/printf/malloc is complete)

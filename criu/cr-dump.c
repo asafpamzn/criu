@@ -152,7 +152,7 @@ int collect_mappings(pid_t pid, struct vm_area_list *vma_area_list, dump_filemap
 	 *
 	 * Also, we don't need to dump them during pre-dump.
 	 */
-	if (dump_file) {
+	if (dump_file && !opts.cow_dump) {
 		ret = collect_madv_guards(pid, vma_area_list);
 		gettimeofday(&t_now, NULL);
 		timersub(&t_now, &t_checkpoint, &t_delta);
