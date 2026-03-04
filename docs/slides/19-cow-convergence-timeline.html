@@ -1,0 +1,101 @@
+<section>
+  <h2>COW WP_ASYNC Convergence Timeline</h2>
+
+  <div class="two-col">
+    <div>
+      <h4 class="cyan">Phase 1: Bulk Transfer (source running)</h4>
+      <div style="font-size:0.52em; line-height:1.6;">
+        <div style="background:#1e293b; border-radius:6px; padding:8px; margin-bottom:6px; border-left:3px solid #4ade80;">
+          <strong style="color:#4ade80;">① Dump + Early Resume (~51ms freeze)</strong><br>
+          ptrace seize → capture metadata (regs, FDs, signals, timers) → parasite pages → <strong>SIGCONT</strong><br>
+          <em>Source is running again. All non-memory state captured.</em>
+        </div>
+        <div style="background:#1e293b; border-radius:6px; padding:8px; margin-bottom:6px; border-left:3px solid #22d3ee;">
+          <strong style="color:#22d3ee;">② Linear page transfer (~58s for 100GB)</strong><br>
+          8 TCP streams × <code>process_vm_readv</code> batches (512 pages) + LZ4 compress → send<br>
+          WP_ASYNC: kernel auto-clears WP on write, <code>PAGE_IS_WRITTEN</code> bit set<br>
+          <em>Source serving traffic throughout. Writes tracked by kernel.</em>
+        </div>
+      </div>
+
+      <h4 style="color:#fbbf24; margin-top:10px;">Phase 2: Convergence</h4>
+      <div style="font-size:0.52em; line-height:1.6;">
+        <div style="background:#1e293b; border-radius:6px; padding:8px; margin-bottom:6px; border-left:3px solid #fbbf24;">
+          <strong style="color:#fbbf24;">③ Wait for idle threads</strong><br>
+          Poll <code>/proc/PID/task/*/syscall</code> — wait until all threads in epoll/futex/nanosleep<br>
+          <em>Ensures no thread holds allocator locks (prevents deadlock on SIGSTOP).</em>
+        </div>
+        <div style="background:#1e293b; border-radius:6px; padding:8px; margin-bottom:6px; border-left:3px solid #f87171;">
+          <strong style="color:#f87171;">④ First freeze: SIGSTOP (~1ms)</strong><br>
+          <code>kill(source_pid, SIGSTOP)</code> → <code>PAGEMAP_SCAN(PAGE_IS_WRITTEN)</code> per VMA<br>
+          <em>Atomic scan: finds all pages dirtied since bulk transfer.</em>
+        </div>
+        <div style="background:#1e293b; border-radius:6px; padding:8px; margin-bottom:6px; border-left:3px solid #a78bfa;">
+          <strong style="color:#a78bfa;">⑤ Fork snapshot</strong><br>
+          Inject <code>clone(SIGCHLD)</code> via ptrace → child inherits COW memory snapshot<br>
+          <code>SIGCONT</code> source immediately — fork has the consistent snapshot<br>
+          <em>Source responsive again in ~1ms. Fork lives ~2s.</em>
+        </div>
+        <div style="background:#1e293b; border-radius:6px; padding:8px; margin-bottom:6px; border-left:3px solid #a78bfa;">
+          <strong style="color:#a78bfa;">⑥ Read dirty pages from fork</strong><br>
+          <code>process_vm_readv</code> from fork PID across 8 TCP streams<br>
+          <em>Temporally consistent: all pages from same point in time.</em><br>
+          Kill fork when done.
+        </div>
+      </div>
+    </div>
+
+    <div>
+      <h4 style="color:#fb923c;">Phase 3: Final Convergence</h4>
+      <div style="font-size:0.52em; line-height:1.6;">
+        <div style="background:#1e293b; border-radius:6px; padding:8px; margin-bottom:6px; border-left:3px solid #fb923c;">
+          <strong style="color:#fb923c;">⑦ Post-fork dirty scan</strong><br>
+          Source was running during fork read (~2s). Scan for new dirty pages.<br>
+          Send across 8 streams. Typically ~86K pages (vs ~26M in bulk).
+        </div>
+        <div style="background:#1e293b; border-radius:6px; padding:8px; margin-bottom:6px; border-left:3px solid #f87171;">
+          <strong style="color:#f87171;">⑧ Second freeze: SIGSTOP (~1ms)</strong><br>
+          Final <code>PAGEMAP_SCAN</code> — should find near-zero dirty pages.<br>
+          Send remaining dirty pages.
+        </div>
+        <div style="background:#1e293b; border-radius:6px; padding:8px; margin-bottom:6px; border-left:3px solid #f87171;">
+          <strong style="color:#f87171;">⑨ Detect new VMAs</strong><br>
+          Compare live <code>/proc/PID/maps</code> with dump-time VMA list.<br>
+          New anonymous rw- VMAs → send <code>PS_IOV_VMA_DIFF</code> header + page data.<br>
+          Replica: <code>mmap(MAP_FIXED)</code> via ptrace to create them.
+        </div>
+        <div style="background:#1e293b; border-radius:6px; padding:8px; margin-bottom:6px; border-left:3px solid #4ade80;">
+          <strong style="color:#4ade80;">⑩ SIGCONT + Close</strong><br>
+          Resume source. Send <code>PS_IOV_CLOSE</code> on all 8 streams.<br>
+          <em>Migration complete. Total cutover: ~1ms.</em>
+        </div>
+      </div>
+
+      <h4 class="cyan" style="margin-top:10px;">Why This Works</h4>
+      <div style="font-size:0.5em; background:#0f172a; border:1px solid #334155; border-radius:6px; padding:8px;">
+        <table style="width:100%; border-collapse:collapse;">
+          <tr style="border-bottom:1px solid #334155;">
+            <td style="padding:3px;"><strong>Non-memory state</strong></td>
+            <td style="padding:3px;">Immutable after dump (process was frozen)</td>
+          </tr>
+          <tr style="border-bottom:1px solid #334155;">
+            <td style="padding:3px;"><strong>Memory pages</strong></td>
+            <td style="padding:3px;">WP_ASYNC tracks writes, PAGEMAP_SCAN finds them</td>
+          </tr>
+          <tr style="border-bottom:1px solid #334155;">
+            <td style="padding:3px;"><strong>Consistency</strong></td>
+            <td style="padding:3px;">Fork snapshot reads all dirty pages atomically</td>
+          </tr>
+          <tr style="border-bottom:1px solid #334155;">
+            <td style="padding:3px;"><strong>New VMAs</strong></td>
+            <td style="padding:3px;">VMA diff protocol + ptrace injection on replica</td>
+          </tr>
+          <tr>
+            <td style="padding:3px;"><strong>libc safety</strong></td>
+            <td style="padding:3px;">Arena pages excluded from convergence</td>
+          </tr>
+        </table>
+      </div>
+    </div>
+  </div>
+</section>

@@ -1,0 +1,65 @@
+<section>
+  <h2>Freeze vs. Convergence: What Changes?</h2>
+
+  <div class="two-col">
+    <div>
+      <h4 class="cyan">Captured Once at Initial Freeze</h4>
+      <p style="font-size:0.55em; color:#94a3b8; margin-bottom:8px;">These are <strong>point-in-time snapshots</strong> — the process is ptrace-seized, so they can't change.</p>
+
+      <div class="state-grid" style="grid-template-columns: 1fr;">
+        <div class="state-box" style="border-left: 3px solid #4ade80;">
+          <span class="title">✓ Thread registers, TLS, rseq</span>
+          <div class="desc">Captured via ptrace at dump. Threads are frozen — registers don't change.</div>
+        </div>
+        <div class="state-box" style="border-left: 3px solid #4ade80;">
+          <span class="title">✓ File descriptors</span>
+          <div class="desc">Drained via parasite SCM_RIGHTS. Process frozen → can't open/close FDs.</div>
+        </div>
+        <div class="state-box" style="border-left: 3px solid #4ade80;">
+          <span class="title">✓ Signal handlers + pending signals</span>
+          <div class="desc">sigaction table + PTRACE_PEEKSIGINFO queues. Stable while frozen.</div>
+        </div>
+        <div class="state-box" style="border-left: 3px solid #4ade80;">
+          <span class="title">✓ Timers (itimer + POSIX)</span>
+          <div class="desc">Read via parasite. Timer values frozen at dump time.</div>
+        </div>
+        <div class="state-box" style="border-left: 3px solid #4ade80;">
+          <span class="title">✓ Credentials, rlimits, cgroups, namespaces</span>
+          <div class="desc">All kernel metadata. Can't change while ptrace-seized.</div>
+        </div>
+        <div class="state-box" style="border-left: 3px solid #4ade80;">
+          <span class="title">✓ Filesystem context (cwd, root, umask)</span>
+          <div class="desc">Process identity. Stable.</div>
+        </div>
+        <div class="state-box" style="border-left: 3px solid #4ade80;">
+          <span class="title">✓ VMA layout (at dump time)</span>
+          <div class="desc">Memory map from <code>/proc/PID/smaps</code>. Captured once, used as baseline.</div>
+        </div>
+      </div>
+    </div>
+
+    <div>
+      <h4 style="color: #f87171;">Must Be Re-captured at Convergence</h4>
+      <p style="font-size:0.55em; color:#94a3b8; margin-bottom:8px;">After early resume, the process is <strong>running and mutating</strong> these resources.</p>
+
+      <div class="state-grid" style="grid-template-columns: 1fr;">
+        <div class="state-box" style="border-left: 3px solid #f87171;">
+          <span class="title">✗ Dirty memory pages</span>
+          <div class="desc">The core problem. Process writes to pages tracked by WP_ASYNC. <code>PAGEMAP_SCAN(PAGE_IS_WRITTEN)</code> finds them, atomically re-arms WP. Multiple iterative rounds until convergence (dirty count → 0).</div>
+        </div>
+        <div class="state-box" style="border-left: 3px solid #f87171;">
+          <span class="title">✗ New VMAs (mmap extents)</span>
+          <div class="desc">jemalloc / allocators create new <code>mmap()</code> regions during migration. Not in the dump-time VMA list. Detected by comparing live <code>/proc/PID/maps</code> with dump-time VMAs. Sent as <code>PS_IOV_VMA_DIFF</code> + page data. Replica injects <code>mmap(MAP_FIXED)</code> via ptrace.</div>
+        </div>
+        <div class="state-box" style="border-left: 3px solid #fbbf24;">
+          <span class="title">⚠ Temporal consistency</span>
+          <div class="desc">Reading dirty pages from a <em>live</em> process creates cross-page inconsistency (page A from time T₁, page B from T₂ → corrupted allocator metadata). <strong>Solution: fork-snapshot.</strong> CRIU injects <code>clone(SIGCHLD)</code> via ptrace → reads ALL dirty pages from the COW fork → kills fork.</div>
+        </div>
+        <div class="state-box" style="border-left: 3px solid #fbbf24;">
+          <span class="title">⚠ libc rw- exclusion</span>
+          <div class="desc">glibc <code>main_arena</code> rw- pages are excluded from convergence. Bulk transfer already sent the clean dump-time snapshot. Overwriting with live state would corrupt fastbins/bins metadata.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
