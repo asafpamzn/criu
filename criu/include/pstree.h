@@ -64,6 +64,9 @@ struct lazy_vma_list {
 	pid_t source_pid;             /* PID for process_vm_readv */
 };
 
+struct vm_area_list;
+struct mem_dump_ctl;
+
 struct dmp_info {
 	struct ns_id *netns;
 	struct page_pipe *mem_pp;
@@ -71,6 +74,10 @@ struct dmp_info {
 	struct parasite_thread_ctl **thread_ctls;
 	uint64_t *thread_sp;
 	struct criu_rseq_cs *thread_rseq_cs;
+
+	/* Deferred pagemap dump (COW early unfreeze) */
+	struct vm_area_list *cow_vmas;
+	struct mem_dump_ctl *cow_mdc;
 
 	/*
 	 * Although we don't support dumping different struct creds in general,

@@ -1813,37 +1813,14 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 			pr_err("Failed to initialize COW dump for VMAs\n");
 			goto err_cure;
 		}
-
-		/*
-		 * Launch WP threads async — they run in parallel with
-		 * the dump work below.  Joined by cow_dump_finish_wp().
-		 */
-		ret = cow_dump_start_wp();
-		if (ret) {
-			pr_err("Failed to start async write-protect\n");
-			goto err_cure;
-		}
-
-		/*
-		 * COW tracking applies UFFD write-protect to writable VMAs.
-		 * The parasite itself can fault on protected pages (e.g. rseq/TLS
-		 * writes) while we are still in dump_one_task(), so start monitor
-		 * early to service those faults and avoid deadlock in RPC commands.
-		 */
-		if (opts.lazy_pages && !cow_is_wp_async() && cow_start_monitor_thread()) {
-			pr_err("Failed to start COW monitor thread\n");
-			ret = -1;
-			goto err_cure;
-		}
-
-		gettimeofday(&t_now, NULL);
-		timersub(&t_now, &t_checkpoint, &t_delta);
-		pr_err("TIMING: cow_dump_start_wp took %ld.%06ld seconds\n",
-		       t_delta.tv_sec, t_delta.tv_usec);
-		t_checkpoint = t_now;
 	}
 
-	/* These run in parallel with WP threads */
+	/*
+	 * Pagemap scan BEFORE WP threads to avoid mmap_lock
+	 * contention.  Sequential: pagemap ~8ms then WP ~68ms
+	 * = ~76ms total.  Parallel caused 174ms from lock
+	 * bouncing between 33 threads.
+	 */
 	ret = parasite_dump_pages_seized(item, &vmas, &mdc, parasite_ctl);
 	gettimeofday(&t_now, NULL);
 	timersub(&t_now, &t_checkpoint, &t_delta);
@@ -1851,6 +1828,30 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	t_checkpoint = t_now;
 	if (ret)
 		goto err_cure;
+
+	/*
+	 * Start WP AFTER pagemap — no mmap_lock contention.
+	 * WP runs in parallel with the remaining dump work
+	 * (sigacts/itimers/threads: ~3ms).
+	 */
+	if (opts.cow_dump) {
+		ret = cow_dump_start_wp();
+		if (ret) {
+			pr_err("Failed to start async write-protect\n");
+			goto err_cure;
+		}
+		if (opts.lazy_pages && !cow_is_wp_async() &&
+		    cow_start_monitor_thread()) {
+			pr_err("Failed to start COW monitor thread\n");
+			ret = -1;
+			goto err_cure;
+		}
+		gettimeofday(&t_now, NULL);
+		timersub(&t_now, &t_checkpoint, &t_delta);
+		pr_err("TIMING: cow_dump_start_wp took %ld.%06ld seconds\n",
+		       t_delta.tv_sec, t_delta.tv_usec);
+		t_checkpoint = t_now;
+	}
 
 	ret = parasite_dump_sigacts_seized(parasite_ctl, item);
 	gettimeofday(&t_now, NULL);
@@ -1936,14 +1937,26 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 		goto err_cure;
 	}
 
-	/* Join WP threads after ptrace work — overlapped with above */
-	if (opts.cow_dump) {
-		ret = cow_dump_finish_wp();
+	/*
+	 * COW early unfreeze: freeze-critical work is done
+	 * (registers, sigacts, threads, pagemap captured).
+	 * Unfreeze now — WP threads continue in background.
+	 */
+	if (opts.cow_dump && opts.lazy_pages) {
+		extern struct pstree_item *root_item;
+
+		if (arch_set_thread_regs(root_item, true) < 0)
+			goto err_cure;
+		cr_plugin_fini(CR_PLUGIN_STAGE__DUMP, 0);
+		pstree_switch_state(root_item, TASK_ALIVE);
+		timing_stop(TIME_FROZEN);
+
 		gettimeofday(&t_now, NULL);
-		timersub(&t_now, &t_checkpoint, &t_delta);
-		pr_err("TIMING: cow_dump_finish_wp took %ld.%06ld seconds\n",
+		timersub(&t_now, &t_start, &t_delta);
+		pr_err("COW early unfreeze after %ld.%06ld seconds\n",
 		       t_delta.tv_sec, t_delta.tv_usec);
-		t_checkpoint = t_now;
+
+		ret = cow_dump_finish_wp();
 		if (ret) {
 			pr_err("Async write-protect failed\n");
 			goto err_cure;
@@ -2533,13 +2546,8 @@ int cr_dump_tasks(pid_t pid)
 	 * The page server starts after resume in cr_dump_finish().
 	 */
 	if (opts.lazy_pages && opts.cow_dump) {
-		if (arch_set_thread_regs(root_item, true) < 0)
-			goto err;
-
-		cr_plugin_fini(CR_PLUGIN_STAGE__DUMP, 0);
-		pstree_switch_state(root_item, TASK_ALIVE);
-		timing_stop(TIME_FROZEN);
-		pr_err("COW early resume: process unfrozen after dump_one_task\n");
+		/* Unfreeze + WP join + pagemap already done in dump_one_task */
+		pr_err("COW early resume: already unfrozen in dump_one_task\n");
 
 		/* Write deferred thread core images (off critical path) */
 		for_each_pstree_item(item) {
