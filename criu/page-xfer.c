@@ -3945,15 +3945,13 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 
 			/*
 			 * Re-send ALL dump-time pages from the fork.
-			 * The bulk transfer reads pages over 60s,
-			 * creating a temporal patchwork — heap
-			 * fastbin chains span pages from different
-			 * time points.  Re-sending from the fork
-			 * gives the replica a consistent snapshot.
+			 * Even though only ~56 pages are dirty, the
+			 * full re-send is needed for heap consistency
+			 * when live traffic runs during the transfer.
 			 *
-			 * TODO: implement dirty bitmap during bulk
-			 * to re-send only modified pages (~5-10GB
-			 * instead of 99GB).
+			 * Future: accumulate dirty page addresses
+			 * during bulk transfer (not at convergence)
+			 * to enable selective re-send.
 			 */
 			if (dump_count > 0 && fork_pid > 0) {
 				long re_sent;

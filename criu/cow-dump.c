@@ -1754,6 +1754,50 @@ int cow_scan_dirty_pages(pid_t source_pid,
 	return ret;
 }
 
+/*
+ * Non-destructive dirty scan: find written pages WITHOUT
+ * re-setting WP.  Used to accumulate all dirty-since-dump
+ * pages for the fork re-send.
+ */
+int cow_scan_dirty_pages_peek(pid_t source_pid,
+			      unsigned long start, unsigned long end,
+			      void *regions, unsigned long max_regions,
+			      unsigned long *walk_end)
+{
+	struct cow_tracked_task *task;
+	struct pm_scan_arg arg;
+	int ret;
+
+	if (!g_wp_async_mode)
+		return 0;
+
+	task = cow_find_task_by_pid(source_pid);
+	if (!task || task->pagemap_fd < 0)
+		return -1;
+
+	memset(&arg, 0, sizeof(arg));
+	arg.size = sizeof(arg);
+	arg.flags = 0; /* non-destructive: don't re-WP */
+	arg.start = start;
+	arg.end = end;
+	arg.vec = (u64)(unsigned long)regions;
+	arg.vec_len = max_regions;
+	arg.max_pages = 0;
+	arg.category_anyof_mask = PAGE_IS_WRITTEN;
+	arg.return_mask = PAGE_IS_WRITTEN;
+
+	ret = ioctl(task->pagemap_fd, PAGEMAP_SCAN, &arg);
+	if (ret < 0) {
+		pr_perror("PAGEMAP_SCAN peek [%lx-%lx) failed", start, end);
+		return -1;
+	}
+
+	if (walk_end)
+		*walk_end = arg.walk_end;
+
+	return ret;
+}
+
 bool cow_dump_is_vma_tracked(pid_t source_pid, unsigned long start, unsigned long end)
 {
 	struct cow_tracked_task *task;

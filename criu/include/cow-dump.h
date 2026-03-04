@@ -255,5 +255,9 @@ extern int cow_scan_dirty_pages(pid_t source_pid,
 				unsigned long start, unsigned long end,
 				void *regions, unsigned long max_regions,
 				unsigned long *walk_end);
+extern int cow_scan_dirty_pages_peek(pid_t source_pid,
+				     unsigned long start, unsigned long end,
+				     void *regions, unsigned long max_regions,
+				     unsigned long *walk_end);
 
 #endif /* __CR_COW_DUMP_H_ */
