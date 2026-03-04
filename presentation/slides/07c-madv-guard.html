@@ -1,0 +1,75 @@
+<section>
+  <h2>MADV_GUARD_INSTALL — Invisible Guard Pages</h2>
+
+  <div class="two-col">
+    <div>
+      <h4 class="cyan">What Are Guard Pages?</h4>
+      <p class="small">A guard page is an unmapped hole in the address space that triggers <code>SIGSEGV</code> on any access. Created with:</p>
+      <pre><code class="language-c">madvise(addr, len, MADV_GUARD_INSTALL);</code></pre>
+
+      <p class="small"><strong>Primary use case: stack overflow protection.</strong></p>
+      <p class="small">When a thread's stack grows, it approaches a guard page. If the stack overflows, it hits the guard → SIGSEGV → clean crash instead of silently corrupting adjacent memory.</p>
+
+      <div class="state-grid" style="grid-template-columns: 1fr;">
+        <div class="state-box">
+          <span class="title">The Invisibility Problem</span>
+          <div class="desc">
+            Unlike regular VMAs, guard pages are <strong>NOT</strong> represented as
+            <code>struct vm_area_struct</code> in the kernel. They're invisible in:
+            <ul>
+              <li><code>/proc/PID/maps</code> — not listed</li>
+              <li><code>/proc/PID/smaps</code> — not listed</li>
+              <li>Kernel VMA linked list — not present</li>
+            </ul>
+            They exist only as PTE-level markers (unmapped entries with a special poison value).
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div>
+      <h4 class="cyan">How CRIU Handles Them</h4>
+
+      <pre><code class="language-c">// collect_mappings() in cr-dump.c
+// Collected AFTER parsing maps/smaps:
+if (dump_file) {  // only during full dump
+    ret = collect_madv_guards(pid,
+                              vma_area_list);
+}
+</code></pre>
+
+      <div class="state-grid" style="grid-template-columns: 1fr;">
+        <div class="state-box">
+          <span class="title">Collection</span>
+          <div class="desc">
+            <code>collect_madv_guards()</code> uses a kernel interface to discover guard pages
+            that are invisible in maps/smaps. Each guard page is stored as a VMA entry
+            with <strong>only the <code>VMA_AREA_GUARD</code> flag</strong> set — no permissions,
+            no file backing, no page content.
+          </div>
+        </div>
+        <div class="state-box">
+          <span class="title">Restore</span>
+          <div class="desc">
+            On restore, CRIU calls <code>madvise(MADV_GUARD_INSTALL)</code> to recreate
+            each guard page at its original address. Without this, the restored process
+            would lose stack overflow protection.
+          </div>
+        </div>
+        <div class="state-box">
+          <span class="title">Skipped in Pre-dump</span>
+          <div class="desc">
+            Guard pages have <strong>no memory content</strong> to transfer — they're just
+            markers. So <code>pre_dump_one_task</code> skips them entirely
+            (the <code>dump_file</code> parameter is <code>NULL</code> during pre-dump).
+          </div>
+        </div>
+      </div>
+
+      <div class="code-note" style="margin-top: 8px;">
+        🔑 Linux 6.x feature. Older kernels use the VMA-based <code>MAP_GROWSDOWN</code>
+        guard gap instead, which IS visible in maps/smaps.
+      </div>
+    </div>
+  </div>
+</section>

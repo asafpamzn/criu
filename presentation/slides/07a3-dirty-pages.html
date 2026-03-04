@@ -1,0 +1,64 @@
+<section>
+  <h2>What Are Dirty Pages?</h2>
+
+  <div class="two-col">
+    <div>
+      <h4 class="cyan">The Dirty Bit — Hardware Level</h4>
+      <p class="small">Every page of memory has a <strong>Page Table Entry (PTE)</strong> in the CPU's page table. One bit in the PTE is the <strong>dirty bit</strong>:</p>
+
+      <div class="state-grid" style="grid-template-columns: 1fr;">
+        <div class="state-box" style="border-left: 3px solid #4ade80;">
+          <span class="title">Clean Page (dirty=0)</span>
+          <div class="desc">Content matches its source. For file-backed pages: matches the file on disk. For anonymous pages after fork: matches the parent's copy. The kernel can <strong>drop</strong> clean file pages — just re-read from disk later.</div>
+        </div>
+        <div class="state-box" style="border-left: 3px solid #f87171;">
+          <span class="title">Dirty Page (dirty=1)</span>
+          <div class="desc">The process has <strong>written</strong> to this page. In-memory content differs from the backing source. For file pages: must be written back to disk before reclaiming. For anonymous pages (heap/stack): data exists <strong>only in RAM</strong> — losing it means data loss.</div>
+        </div>
+      </div>
+
+      <pre style="font-size:0.55em;"><code>Page Table Entry (PTE) on x86_64:
+┌─────────────────────────────────┐
+│ Physical Address │ Flags        │
+│ (bits 12-51)     │ D=dirty      │
+│                  │ A=accessed   │
+│                  │ R/W=writable │
+│                  │ P=present    │
+└─────────────────────────────────┘
+CPU sets the D bit automatically
+on first write — no software needed.</code></pre>
+    </div>
+
+    <div>
+      <h4 class="cyan">Why CRIU Cares About Dirty Pages</h4>
+
+      <div class="state-grid" style="grid-template-columns: 1fr;">
+        <div class="state-box">
+          <span class="title">What must be dumped?</span>
+          <div class="desc">
+            <strong>Clean file-backed pages</strong> → skip (re-read from file on restore)<br>
+            <strong>Dirty file-backed pages</strong> → MUST dump (modified, differs from file)<br>
+            <strong>Anonymous pages</strong> → MUST dump (no backing file at all)<br><br>
+            A 100GB Valkey process is mostly anonymous heap → <strong>nearly all pages must be dumped</strong>.
+          </div>
+        </div>
+        <div class="state-box">
+          <span class="title">Iterative Pre-dump (standard CRIU)</span>
+          <div class="desc">
+            <strong>Round 1:</strong> Dump ALL pages, clear dirty bits<br>
+            <strong>Round 2:</strong> Dump only pages dirtied since round 1<br>
+            <strong>Round 3:</strong> Even fewer dirty pages...<br>
+            <strong>Final dump:</strong> Freeze + dump remaining dirty pages<br><br>
+            Each round transfers less data → shorter final freeze.
+          </div>
+        </div>
+        <div class="state-box">
+          <span class="title">COW Mode Alternative</span>
+          <div class="desc">
+            Instead of querying kernel dirty bits, COW mode uses <strong>userfaultfd write-protect</strong>. Every VMA is write-protected; on first write the CPU traps, CRIU snapshots the <strong>original</strong> page, then allows the write. Real-time tracking — no page table walk needed.
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>

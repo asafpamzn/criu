@@ -1,0 +1,62 @@
+<section>
+  <h2>smaps Memory Accounting: RSS, PSS, Shared &amp; Private</h2>
+  <p class="small dim">Per-VMA stats computed by walking the page table. Each page is classified on two axes.</p>
+
+  <div class="two-col">
+    <div>
+      <h4 class="cyan">The Two Axes</h4>
+      <pre style="font-size:0.6em; margin-bottom:8px;"><code>              Shared          Private
+           (mapped by       (mapped by
+           multiple          only this
+           processes)        process)
+  ┌──────────────────┬──────────────────┐
+  │  Shared_Clean    │  Private_Clean   │
+  │  (can drop,      │  (can drop,      │
+Clean  re-read file)     re-read file)   │
+  │                  │                  │
+  ├──────────────────┼──────────────────┤
+  │  Shared_Dirty    │  Private_Dirty   │
+  │  (must write     │  ★ MUST DUMP ★   │
+Dirty  back to file)    (only in RAM)    │
+  │                  │                  │
+  └──────────────────┴──────────────────┘</code></pre>
+
+      <div class="state-grid" style="grid-template-columns: 1fr;">
+        <div class="state-box">
+          <span class="title">RSS — Resident Set Size</span>
+          <div class="desc">Total pages in physical RAM for this VMA. Shared pages counted <strong>fully</strong> in each process → <strong>over-counts</strong> when many processes share libc, etc.</div>
+        </div>
+        <div class="state-box">
+          <span class="title">PSS — Proportional Set Size</span>
+          <div class="desc">Like RSS, but shared pages <strong>divided equally</strong>. If 10 processes share a 4KB page, each gets 0.4KB in PSS. Gives a <strong>fair</strong> per-process memory cost.</div>
+        </div>
+        <div class="state-box">
+          <span class="title">Size</span>
+          <div class="desc">Virtual size of the VMA (end - start). May be much larger than RSS — pages can be allocated but not yet faulted in, or swapped out.</div>
+        </div>
+      </div>
+    </div>
+
+    <div>
+      <h4 class="cyan">Concrete Examples</h4>
+      <div class="state-grid" style="grid-template-columns: 1fr;">
+        <div class="state-box" style="border-left: 3px solid #4ade80;">
+          <span class="title">Shared_Clean — libc.so .text</span>
+          <div class="desc">100 processes map <code>/lib/libc.so.6</code> read-only. The code pages are loaded once into RAM, shared by all. Nobody writes to them → <strong>clean</strong>. CRIU skips these — just re-mmap the file on restore.</div>
+        </div>
+        <div class="state-box" style="border-left: 3px solid #fbbf24;">
+          <span class="title">Shared_Dirty — shared mmap file</span>
+          <div class="desc">Two processes <code>mmap(MAP_SHARED)</code> a data file and write to it. Pages are dirty and shared. Rare in typical server workloads.</div>
+        </div>
+        <div class="state-box" style="border-left: 3px solid #22d3ee;">
+          <span class="title">Private_Clean — freshly loaded .data</span>
+          <div class="desc">A file-backed page loaded by this process but not yet written. Could be a read-only config file mapping. Can be reclaimed and re-read.</div>
+        </div>
+        <div class="state-box" style="border-left: 3px solid #f87171;">
+          <span class="title">Private_Dirty — heap, stack, modified data ★</span>
+          <div class="desc">This is where <strong>all the action is for CRIU</strong>. Valkey's 100GB dataset lives here — anonymous heap pages that exist only in RAM. Every single one must be captured and transferred.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>

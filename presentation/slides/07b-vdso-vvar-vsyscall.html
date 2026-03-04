@@ -1,0 +1,54 @@
+<section>
+  <h2>Special Kernel VMAs: vDSO, vvar, vsyscall</h2>
+  <p class="small dim">The kernel injects these mappings into every process. They're not created by the process itself.</p>
+
+  <div class="state-grid" style="grid-template-columns: 1fr 1fr 1fr;">
+    <div class="state-box" style="border-left: 3px solid #22d3ee;">
+      <span class="title">vDSO — Virtual Dynamic Shared Object</span>
+      <div class="desc">
+        <p>A tiny shared library (<strong>~4KB</strong>) mapped by the kernel into every process's address space at a random address (ASLR).</p>
+        <p><strong>Contains optimized syscalls:</strong></p>
+        <ul>
+          <li><code>gettimeofday()</code></li>
+          <li><code>clock_gettime()</code></li>
+          <li><code>getcpu()</code></li>
+        </ul>
+        <p>These run <strong>entirely in userspace</strong> — no kernel trap needed. Reads time data from vvar pages directly.</p>
+        <p style="color:#fbbf24;">Architecture-specific: different code on x86_64 vs aarch64. CRIU must <code>parasite_fixup_vdso()</code> because the address may differ on the destination machine.</p>
+      </div>
+    </div>
+
+    <div class="state-box" style="border-left: 3px solid #a78bfa;">
+      <span class="title">vvar — Virtual Variable Pages</span>
+      <div class="desc">
+        <p><strong>Read-only data pages</strong> mapped alongside vDSO. Contains the kernel's live timekeeping data:</p>
+        <ul>
+          <li>Current wall-clock time</li>
+          <li>Monotonic clock parameters</li>
+          <li>Clock multiplier &amp; shift values</li>
+          <li>Sequence counter for lock-free reads</li>
+        </ul>
+        <p>The vDSO code reads these pages directly — no syscall needed to get the time.</p>
+        <p style="color:#fbbf24;">Mapped with special kernel flags: <code>VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP</code>. CRIU has a special exemption for vvar in its <code>io_pf</code> unsupported-VMA check.</p>
+      </div>
+    </div>
+
+    <div class="state-box" style="border-left: 3px solid #f87171;">
+      <span class="title">vsyscall — Legacy (x86_64 only)</span>
+      <div class="desc">
+        <p>Predecessor to vDSO. <strong>Fixed address</strong>:</p>
+        <pre style="font-size:0.7em; margin:4px 0;"><code>0xffffffffff600000</code></pre>
+        <p>Same syscalls as vDSO but at <strong>hardcoded addresses</strong> — a security risk (no ASLR).</p>
+        <p>Modern kernels <strong>emulate</strong> it: the page is mapped but accesses trap to the kernel, which then executes the real syscall. Much slower than vDSO.</p>
+        <p style="color:#f87171;">Being phased out. <strong>Not present on aarch64.</strong></p>
+        <p>CRIU marks it as <code>VMA_AREA_VSYSCALL</code>.</p>
+      </div>
+    </div>
+  </div>
+
+  <pre style="font-size:0.55em;"><code class="language-c">// handle_vma() in proc_parse.c — detection by name
+if (!strcmp(file_path, "[vsyscall]"))    vma->status |= VMA_AREA_VSYSCALL;
+else if (!strcmp(file_path, "[vdso]"))   handle_vdso_vma(vma);   // VMA_AREA_VDSO
+else if (!strcmp(file_path, "[vvar]"))   handle_vvar_vma(vma);   // VMA_AREA_VVAR
+</code></pre>
+</section>
