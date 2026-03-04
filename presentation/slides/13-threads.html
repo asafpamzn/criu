@@ -1,0 +1,56 @@
+<section>
+  <h2>Step 8: Threads</h2>
+
+  <pre><code class="language-c">ret = dump_task_threads(parasite_ctl, item, defer_image_write);
+// Iterates over item->nr_threads, skipping leader (already dumped)
+</code></pre>
+
+  <p class="small dim">Each thread is a separate scheduling entity with its own state. The leader's state is dumped in <code>dump_task_core_all</code>; additional threads are handled here.</p>
+
+  <div class="two-col">
+    <div>
+      <h4 class="purple">Per-Thread State Captured</h4>
+      <ul class="small">
+        <li><strong>CPU Registers</strong> — general purpose, FP/SIMD via ptrace</li>
+        <li><strong>TLS</strong> — Thread-Local Storage base address</li>
+        <li><strong>Stack</strong> — signal alternate stack (sigaltstack)</li>
+        <li><strong>Futex robust list</strong> — for pthread mutex cleanup</li>
+        <li><strong>Scheduling</strong> — policy, priority, nice value</li>
+        <li><strong>Seccomp filters</strong> — per-thread BPF filters</li>
+        <li><strong>Private pending signals</strong> — per-thread signal queue</li>
+        <li><strong>Cgroup</strong> — thread-level cgroup membership</li>
+        <li><strong>LSM profile</strong> — AppArmor/SELinux context</li>
+        <li><strong>rseq</strong> — restartable sequences state</li>
+        <li><strong>clear_tid_addr</strong> — for CLONE_CHILD_CLEARTID</li>
+        <li><strong>pdeath_sig</strong> — parent-death signal</li>
+      </ul>
+    </div>
+    <div>
+      <h4 class="purple">How Threads Are Dumped</h4>
+      <div class="flow-container" style="gap:4px;">
+        <div class="flow-step cat-threads" style="padding:5px 10px;">
+          <div class="num" style="width:22px;height:22px;font-size:0.7em;">1</div>
+          <div class="smaller"><strong>dump_task_rseq()</strong> — read rseq config via PTRACE_GET_RSEQ_CONFIGURATION <em>(before infection)</em></div>
+        </div>
+        <div class="flow-step cat-threads" style="padding:5px 10px;">
+          <div class="num" style="width:22px;height:22px;font-size:0.7em;">2</div>
+          <div class="smaller"><strong>parasite_dump_thread_seized()</strong> — parasite reads TLS, tid_addr, sas, comm, creds</div>
+        </div>
+        <div class="flow-step cat-threads" style="padding:5px 10px;">
+          <div class="num" style="width:22px;height:22px;font-size:0.7em;">3</div>
+          <div class="smaller"><strong>dump_thread_core()</strong> — futex robust list, scheduler info, seccomp</div>
+        </div>
+        <div class="flow-step cat-threads" style="padding:5px 10px;">
+          <div class="num" style="width:22px;height:22px;font-size:0.7em;">4</div>
+          <div class="smaller"><strong>fixup_thread_rseq()</strong> — if thread was in rseq critical section, redirect IP to abort handler</div>
+        </div>
+      </div>
+
+      <div class="code-note" style="font-size:0.6em; margin-top:10px;">
+        🔧 rseq fixup is critical: if a thread was mid-rseq when seized,
+        its instruction pointer must be moved to the abort handler address,
+        otherwise it would resume in an inconsistent state.
+      </div>
+    </div>
+  </div>
+</section>

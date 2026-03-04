@@ -1,0 +1,40 @@
+<section>
+  <h2>pre_dump_one_task — Step by Step</h2>
+  <p class="small dim">Lightweight pass: memory pages only, process stays alive</p>
+  <div class="flow-container">
+    <div class="flow-step cat-memory">
+      <div class="num">1</div>
+      <div><strong>collect_mappings(pid, &amp;vmas, NULL)</strong><br>
+        <span class="dim">Parse /proc/PID/smaps → build VMA list. NULL = skip file metadata.</span></div>
+    </div>
+    <div class="flow-step cat-parasite">
+      <div class="num">2</div>
+      <div><strong>parasite_infect_seized(pid, item, &amp;vmas)</strong><br>
+        <span class="dim">Inject parasite code into the process (Compel)</span></div>
+    </div>
+    <div class="flow-step">
+      <div class="num">3</div>
+      <div><strong>parasite_fixup_vdso()</strong> + <strong>parasite_dump_misc_seized()</strong><br>
+        <span class="dim">Fix vDSO refs, read brk/pid/umask — minimal metadata</span></div>
+    </div>
+    <div class="flow-step cat-fds">
+      <div class="num">4</div>
+      <div><strong>predump_task_files(pid)</strong><br>
+        <span class="dim">Pre-cache file metadata for next iteration</span></div>
+    </div>
+    <div class="flow-step cat-memory highlight">
+      <div class="num">5</div>
+      <div><strong>parasite_dump_pages_seized(item, &amp;vmas, &amp;mdc, ctl)</strong><br>
+        <span class="dim">Read dirty memory pages — the main work. mdc.pre_dump = true</span></div>
+    </div>
+    <div class="flow-step cat-parasite">
+      <div class="num">6</div>
+      <div><strong>compel_cure_remote(parasite_ctl)</strong><br>
+        <span class="dim">Remove parasite — process resumes running</span></div>
+    </div>
+  </div>
+  <div class="code-note">
+    💡 Pre-dump only reads pages — it doesn't dump threads, FDs, signals, or timers.
+    The process continues running so these keep changing anyway.
+  </div>
+</section>

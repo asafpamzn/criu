@@ -1,0 +1,29 @@
+<section>
+  <h2>Two Dump Modes</h2>
+  <div class="compare">
+    <div class="compare-col">
+      <h4 class="cyan">pre_dump_one_task</h4>
+      <p class="small" style="color:#34d399;">Iterative Memory Pre-copy</p>
+      <ul>
+        <li>Only dumps <strong>memory pages</strong></li>
+        <li>Process keeps running after each pass</li>
+        <li>Tracks dirty pages between iterations</li>
+        <li>Used for <strong>live migration</strong> — reduces final freeze time</li>
+        <li>No files, signals, threads, or timers</li>
+      </ul>
+      <p class="smaller dim" style="margin-top:12px;">Typical: run 1-3 pre-dump passes, then one full dump</p>
+    </div>
+    <div class="compare-col">
+      <h4 class="cyan">dump_one_task</h4>
+      <p class="small" style="color:#f87171;">Full Checkpoint</p>
+      <ul>
+        <li>Captures <strong>everything</strong></li>
+        <li>Process is <strong>frozen</strong> during dump</li>
+        <li>~20 distinct collection steps</li>
+        <li>Produces complete image set</li>
+        <li>Sufficient to recreate the process from scratch</li>
+      </ul>
+      <p class="smaller dim" style="margin-top:12px;">One call per process in the tree</p>
+    </div>
+  </div>
+</section>

@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>How CRIU Copies a Process</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@4.6.1/dist/reveal.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@4.6.1/dist/theme/black.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@4.6.1/plugin/highlight/monokai.min.css">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="reveal">
+<div class="slides">
+  <!-- Each slide is loaded from its own HTML file -->
+  <section data-external="slides/01-title.html"></section>
+  <section data-external="slides/02-what-is-a-process.html"></section>
+  <section data-external="slides/03-two-dump-modes.html"></section>
+  <section data-external="slides/04-predump-walkthrough.html"></section>
+  <section data-external="slides/05-full-dump-overview.html"></section>
+  <section data-external="slides/06-process-identity.html"></section>
+  <section data-external="slides/06a-identity-deep-dive.html"></section>
+  <section data-external="slides/06b-zombies-misc.html"></section>
+  <section data-external="slides/06c-personality.html"></section>
+  <section data-external="slides/07-memory-mappings.html"></section>
+  <section data-external="slides/08-file-descriptors.html"></section>
+  <section data-external="slides/09-parasite-mechanism.html"></section>
+  <section data-external="slides/10-memory-pages.html"></section>
+  <section data-external="slides/11-signals.html"></section>
+  <section data-external="slides/12-timers.html"></section>
+  <section data-external="slides/13-threads.html"></section>
+  <section data-external="slides/14-core-dump.html"></section>
+  <section data-external="slides/15-filesystem-cleanup.html"></section>
+  <section data-external="slides/16-summary-timeline.html"></section>
+  <section data-external="slides/17-deep-dive-topics.html"></section>
+</div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@4.6.1/dist/reveal.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@4.6.1/plugin/highlight/highlight.min.js"></script>
+<script>
+  // Load external slide files
+  async function loadExternalSlides() {
+    const sections = document.querySelectorAll('section[data-external]');
+    for (const section of sections) {
+      const url = section.getAttribute('data-external');
+      try {
+        const response = await fetch(url);
+        if (response.ok) {
+          const html = await response.text();
+          // Parse the loaded HTML to extract the inner <section> content
+          const parser = new DOMParser();
+          const doc = parser.parseFromString(html, 'text/html');
+          const loadedSection = doc.querySelector('section');
+          if (loadedSection) {
+            // Copy attributes from loaded section to our section
+            for (const attr of loadedSection.attributes) {
+              section.setAttribute(attr.name, attr.value);
+            }
+            section.innerHTML = loadedSection.innerHTML;
+          } else {
+            section.innerHTML = html;
+          }
+        } else {
+          section.innerHTML = '<h2 style="color:#f87171;">Failed to load: ' + url + '</h2>';
+        }
+      } catch (e) {
+        section.innerHTML = '<h2 style="color:#f87171;">Error loading: ' + url + '</h2><p>' + e.message + '</p>';
+      }
+    }
+  }
+
+  loadExternalSlides().then(() => {
+    Reveal.initialize({
+      hash: true,
+      slideNumber: true,
+      transition: 'slide',
+      backgroundTransition: 'fade',
+      width: 1200,
+      height: 700,
+      margin: 0.04,
+      plugins: [RevealHighlight]
+    });
+  });
+</script>
+</body>
+</html>

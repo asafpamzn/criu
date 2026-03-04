@@ -1,0 +1,37 @@
+<section>
+  <h2>Step 2: Memory Mappings (VMAs)</h2>
+
+  <pre><code class="language-c">ret = collect_mappings(pid, &vmas, dump_filemap);
+</code></pre>
+
+  <div class="two-col">
+    <div>
+      <h4 class="green">What are VMAs?</h4>
+      <p class="small">Virtual Memory Areas — each contiguous region of the process's address space:</p>
+      <ul class="small">
+        <li><strong>Code</strong> — .text (executable, read-only)</li>
+        <li><strong>Data</strong> — .data, .bss, heap</li>
+        <li><strong>Stack</strong> — per-thread stacks</li>
+        <li><strong>File-mapped</strong> — mmap'd files, shared libs</li>
+        <li><strong>Anonymous</strong> — malloc'd memory</li>
+        <li><strong>Shared memory</strong> — SysV IPC, memfd</li>
+        <li><strong>Special</strong> — vDSO, vvar, vsyscall</li>
+      </ul>
+    </div>
+    <div>
+      <h4 class="green">What does collect_mappings do?</h4>
+      <ol class="small">
+        <li>Parses <code>/proc/PID/smaps</code> (or <code>/proc/PID/maps</code> in COW mode)</li>
+        <li>Builds a linked list of <code>vma_area</code> structs</li>
+        <li>For file-backed VMAs, calls <code>dump_filemap()</code> to record the backing file</li>
+        <li>Collects <code>MADV_GUARD_INSTALL</code> pages</li>
+        <li>Counts private pages (for page-pipe sizing)</li>
+      </ol>
+
+      <div class="code-note" style="font-size:0.65em;">
+        ⚡ In <code>pre_dump</code> the second arg is <code>NULL</code> — no file metadata needed.<br>
+        In <code>dump</code> it's <code>dump_filemap</code> — must identify every backing file.
+      </div>
+    </div>
+  </div>
+</section>

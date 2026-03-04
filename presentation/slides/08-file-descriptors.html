@@ -1,0 +1,39 @@
+<section>
+  <h2>Step 3: Open File Descriptors</h2>
+
+  <pre><code class="language-c">// Only if not sharing FD table with parent
+if (!shared_fdtable(item)) {
+    dfds = xmalloc(sizeof(*dfds));
+    ret = collect_fds(pid, &dfds);     // reads /proc/PID/fd/
+    // ... later, after parasite injection:
+    ret = dump_task_files_seized(parasite_ctl, item, dfds);
+}
+</code></pre>
+
+  <div class="two-col">
+    <div>
+      <h4 class="yellow">Phase 1: Enumerate</h4>
+      <p class="small"><code>collect_fds()</code> reads <code>/proc/PID/fd/</code> directory</p>
+      <ul class="smaller">
+        <li>Builds array of FD numbers</li>
+        <li>Doesn't read content yet — just numbers</li>
+        <li>Grows buffer dynamically (PAGE_SIZE chunks)</li>
+      </ul>
+    </div>
+    <div>
+      <h4 class="yellow">Phase 2: Dump via Parasite</h4>
+      <p class="small"><code>dump_task_files_seized()</code> uses the parasite to:</p>
+      <ul class="smaller">
+        <li>Drain FDs from the process into CRIU</li>
+        <li>Read detailed fdinfo for each FD</li>
+        <li>Classify: regular file, socket, pipe, eventpoll, timerfd, signalfd, etc.</li>
+        <li>Dump type-specific metadata (e.g. socket addresses, pipe buffers)</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="code-note">
+    🔗 If <code>shared_fdtable(item)</code> is true, this process shares its FD table with
+    its parent (CLONE_FILES) — no need to dump it again.
+  </div>
+</section>

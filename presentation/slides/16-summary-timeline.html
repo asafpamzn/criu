@@ -1,0 +1,77 @@
+<section>
+  <h2>Summary: dump_one_task Timeline</h2>
+  <p class="small dim">Complete flow from frozen process to image files on disk.</p>
+
+  <div class="two-col">
+    <div>
+      <div class="timeline">
+        <div class="tl-item frozen">
+          <strong class="red">Process frozen</strong> (ptrace SEIZE) — all threads stopped
+        </div>
+        <div class="tl-item">
+          <strong>parse_pid_stat</strong> — read /proc/PID/stat
+        </div>
+        <div class="tl-item">
+          <strong class="green">collect_mappings</strong> — parse smaps, build VMA list
+        </div>
+        <div class="tl-item">
+          <strong class="yellow">collect_fds</strong> — enumerate /proc/PID/fd/
+        </div>
+        <div class="tl-item">
+          <strong class="orange">parse_posix_timers</strong> — read /proc/PID/timers
+        </div>
+        <div class="tl-item">
+          <strong class="red">dump_task_signals</strong> — PTRACE_PEEKSIGINFO
+        </div>
+        <div class="tl-item">
+          <strong class="purple">dump_task_rseq</strong> — PTRACE_GET_RSEQ_CONFIGURATION
+        </div>
+        <div class="tl-item parasite-phase">
+          <strong class="pink">parasite_infect_seized</strong> — inject PIE blob ▶
+        </div>
+        <div class="tl-item parasite-phase">
+          <strong class="yellow">dump_task_files_seized</strong> — drain FDs via parasite
+        </div>
+        <div class="tl-item parasite-phase" style="background:rgba(52,211,153,0.15); border-left-color:#34d399;">
+          <strong class="green">parasite_dump_pages_seized</strong> — read all memory pages ★
+        </div>
+      </div>
+    </div>
+    <div>
+      <div class="timeline">
+        <div class="tl-item parasite-phase">
+          <strong class="red">parasite_dump_sigacts_seized</strong> — rt_sigaction × 64
+        </div>
+        <div class="tl-item parasite-phase">
+          <strong class="orange">parasite_dump_itimers + posix_timers</strong>
+        </div>
+        <div class="tl-item parasite-phase">
+          <strong class="blue">dump_task_core_all</strong> — regs, creds, rlimits, personality
+        </div>
+        <div class="tl-item parasite-phase">
+          <strong class="pink">compel_stop_daemon</strong> — stop parasite
+        </div>
+        <div class="tl-item">
+          <strong class="purple">dump_task_threads</strong> — per-thread registers, TLS, seccomp
+        </div>
+        <div class="tl-item">
+          <strong class="pink">compel_cure</strong> — remove parasite, restore registers
+        </div>
+        <div class="tl-item">
+          <strong class="green">dump_task_mm</strong> — VMA metadata, auxv, exe link
+        </div>
+        <div class="tl-item">
+          <strong style="color:#c084fc;">dump_task_fs</strong> — cwd, root, umask
+        </div>
+        <div class="tl-item frozen">
+          <strong class="red">Process resumed</strong> (or killed, depending on --leave-running)
+        </div>
+      </div>
+      <div class="code-note" style="font-size:0.6em; margin-top:8px;">
+        <span class="pink">█</span> = parasite active &nbsp;&nbsp;
+        <span class="red">█</span> = process frozen boundary &nbsp;&nbsp;
+        ★ = heaviest step (memory pages)
+      </div>
+    </div>
+  </div>
+</section>

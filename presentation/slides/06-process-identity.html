@@ -1,0 +1,41 @@
+<section>
+  <h2>Step 1: Process Identity &amp; Metadata</h2>
+
+  <pre><code class="language-c">// First thing dump_one_task does:
+ret = parse_pid_stat(pid, &pps_buf);
+</code></pre>
+
+  <p class="small">Reads <code>/proc/PID/stat</code> to get:</p>
+
+  <div class="state-grid" style="grid-template-columns: 1fr 1fr 1fr;">
+    <div class="state-box">
+      <span class="title">Identity</span>
+      <div class="desc">pid, sid, pgid, comm (command name), flags</div>
+    </div>
+    <div class="state-box">
+      <span class="title">Code &amp; Data Bounds</span>
+      <div class="desc">start_code, end_code, start_data, end_data, start_stack, start_brk</div>
+    </div>
+    <div class="state-box">
+      <span class="title">Arguments &amp; Environment</span>
+      <div class="desc">arg_start, arg_end, env_start, env_end</div>
+    </div>
+    <div class="state-box">
+      <span class="title">Exit Code</span>
+      <div class="desc">For zombies — captured in task_state + exit_code</div>
+    </div>
+    <div class="state-box">
+      <span class="title">Personality</span>
+      <div class="desc">Read from /proc/PID/personality — execution domain flags</div>
+    </div>
+    <div class="state-box">
+      <span class="title">Misc</span>
+      <div class="desc">loginuid, oom_score_adj, child_subreaper, dumpable flag</div>
+    </div>
+  </div>
+
+  <div class="code-note">
+    📌 The <code>pps_buf</code> (proc_pid_stat) is reused later by <code>dump_task_mm</code>
+    and <code>dump_task_core_all</code> — it's the source of truth for many metadata fields.
+  </div>
+</section>

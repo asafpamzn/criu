@@ -1,0 +1,38 @@
+<section>
+  <h2>What Defines a Running Process?</h2>
+  <p class="small dim">A Linux process is scattered state across the kernel. CRIU must capture <em>all</em> of it.</p>
+  <div class="state-grid">
+    <div class="state-box">
+      <span class="icon">🧠</span><span class="title">Memory</span>
+      <div class="desc">Virtual memory areas (VMAs) + actual page contents — the biggest chunk</div>
+    </div>
+    <div class="state-box">
+      <span class="icon">🧵</span><span class="title">Threads</span>
+      <div class="desc">Each thread's CPU registers, TLS, stack, scheduling policy, seccomp filters</div>
+    </div>
+    <div class="state-box">
+      <span class="icon">📄</span><span class="title">File Descriptors</span>
+      <div class="desc">Open files, sockets, pipes, eventpolls, timerfd — everything in /proc/PID/fd/</div>
+    </div>
+    <div class="state-box">
+      <span class="icon">🚦</span><span class="title">Signals</span>
+      <div class="desc">Signal handler table (sigactions) + pending signal queues (private + shared)</div>
+    </div>
+    <div class="state-box">
+      <span class="icon">⏱️</span><span class="title">Timers</span>
+      <div class="desc">Interval timers (itimers) and POSIX timers — must fire at the right time after restore</div>
+    </div>
+    <div class="state-box">
+      <span class="icon">🔐</span><span class="title">Credentials &amp; Security</span>
+      <div class="desc">UID/GID, capabilities, LSM profiles, rlimits, loginuid, oom_score_adj</div>
+    </div>
+    <div class="state-box">
+      <span class="icon">📁</span><span class="title">Filesystem Context</span>
+      <div class="desc">Current working directory, root directory, umask</div>
+    </div>
+    <div class="state-box">
+      <span class="icon">🏷️</span><span class="title">Namespaces &amp; Cgroups</span>
+      <div class="desc">PID, net, mount, IPC, UTS, user, cgroup, time namespace memberships</div>
+    </div>
+  </div>
+</section>

@@ -1,0 +1,62 @@
+<section>
+  <h2>The Parasite — CRIU's Secret Weapon</h2>
+  <p class="small dim">Some state can only be read from <em>inside</em> the process. CRIU injects code to do it.</p>
+
+  <div class="parasite-diagram">
+    <div class="parasite-box criu">
+      <strong>CRIU</strong><br>
+      <span class="smaller">coordinator process</span>
+    </div>
+    <div class="arrow">→</div>
+    <div class="parasite-box process">
+      <strong>Target Process</strong><br>
+      <span class="smaller">ptrace-seized, frozen</span>
+    </div>
+    <div class="arrow">→</div>
+    <div class="parasite-box parasite">
+      <strong>Parasite Code</strong><br>
+      <span class="smaller">PIE blob injected<br>into target's address space</span>
+    </div>
+  </div>
+
+  <div class="two-col">
+    <div>
+      <h4 class="pink">Lifecycle</h4>
+      <div class="flow-container" style="gap:4px;">
+        <div class="flow-step cat-parasite" style="padding:5px 10px;">
+          <div class="num" style="width:22px;height:22px;font-size:0.7em;">1</div>
+          <div class="smaller"><strong>parasite_infect_seized()</strong> — mmap space in target, copy PIE blob, start daemon thread</div>
+        </div>
+        <div class="flow-step cat-parasite" style="padding:5px 10px;">
+          <div class="num" style="width:22px;height:22px;font-size:0.7em;">2</div>
+          <div class="smaller"><strong>RPC commands</strong> — CRIU sends commands, parasite executes syscalls in target context</div>
+        </div>
+        <div class="flow-step cat-parasite" style="padding:5px 10px;">
+          <div class="num" style="width:22px;height:22px;font-size:0.7em;">3</div>
+          <div class="smaller"><strong>compel_stop_daemon()</strong> — stop the parasite daemon</div>
+        </div>
+        <div class="flow-step cat-parasite" style="padding:5px 10px;">
+          <div class="num" style="width:22px;height:22px;font-size:0.7em;">4</div>
+          <div class="smaller"><strong>compel_cure()</strong> — munmap the blob, restore original registers</div>
+        </div>
+      </div>
+    </div>
+    <div>
+      <h4 class="pink">What the parasite collects</h4>
+      <ul class="small">
+        <li><strong>Signal handlers</strong> — rt_sigaction() for all 64 signals</li>
+        <li><strong>Timers</strong> — getitimer(), timer_gettime()</li>
+        <li><strong>File descriptors</strong> — drains FDs via SCM_RIGHTS</li>
+        <li><strong>Memory pages</strong> — process_vm_readv()</li>
+        <li><strong>Misc</strong> — brk, pid, sid, pgid, umask, dumpable</li>
+        <li><strong>Credentials</strong> — real/effective/saved UIDs/GIDs</li>
+        <li><strong>Thread leader state</strong> — registers, TLS</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="code-note">
+    🧬 The parasite is built by <strong>Compel</strong> — a separate subproject that generates
+    Position-Independent Executables for injection. See <code>compel/</code> directory.
+  </div>
+</section>
