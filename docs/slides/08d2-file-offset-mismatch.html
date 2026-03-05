@@ -1,0 +1,37 @@
+<section>
+  <h2>File Offset Mismatch on Restore</h2>
+  <p class="small dim">What happens when the source file offset doesn't match the replica's file?</p>
+
+  <p class="smaller dim" style="margin-bottom:8px;">Source log at 50KB, replica log already at 100KB:</p>
+
+  <div class="state-grid" style="grid-template-columns: 1fr 1fr 1fr;">
+    <div class="state-box" style="border-left: 3px solid #4ade80;">
+      <span class="title">O_APPEND mode ✅ (most log files)</span>
+      <div class="desc">
+        CRIU restores offset=50KB, but <code>O_APPEND</code> <strong>always seeks to end</strong> before each write. Process writes at 100KB (end of file).<br><br>
+        <strong>Safe</strong> — offset is effectively ignored for writes. This is why log files opened with O_APPEND just work after migration.
+      </div>
+    </div>
+    <div class="state-box" style="border-left: 3px solid #f87171;">
+      <span class="title">Regular write mode ❌ (no O_APPEND)</span>
+      <div class="desc">
+        CRIU restores offset=50KB. Process writes at 50KB, <strong>overwriting</strong> existing content in the 50KB–100KB range.<br><br>
+        <strong>Data corruption</strong> if the file diverged between source and replica.
+      </div>
+    </div>
+    <div class="state-box" style="border-left: 3px solid #22d3ee;">
+      <span class="title">Typical migration pattern ✅</span>
+      <div class="desc">
+        Replica starts fresh from CRIU restore — <strong>no pre-existing log file</strong>. Either:<br><br>
+        • Shared filesystem (NFS/EFS) — same file<br>
+        • File copied before restore<br>
+        • File re-created empty<br><br>
+        Offset mismatch is a non-issue when the file is identical.
+      </div>
+    </div>
+  </div>
+
+  <div class="code-note" style="margin-top:10px;">
+    <strong>Key takeaway:</strong> CRIU faithfully restores the file offset and flags. Whether that's correct depends on your deployment. For live migration with shared storage or fresh replicas, it works perfectly. For diverged files without O_APPEND, beware.
+  </div>
+</section>

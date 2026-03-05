@@ -1,0 +1,49 @@
+<section>
+  <h2>COW: Why Send Zeros Instead of Skipping?</h2>
+  <p class="small dim">Skipping unmapped pages would cause deadlocks on the replica.</p>
+
+  <div class="two-col">
+    <div>
+      <h4 class="red">Why not just skip?</h4>
+      <div class="state-grid" style="grid-template-columns: 1fr;">
+        <div class="state-box" style="border-left: 3px solid #f87171;">
+          <span class="title">Deadlock scenario</span>
+          <div class="desc">
+            If COW skips an unmapped page, the replica's userfaultfd will fault on that address later when the process accesses it. The page server can't service the fault — the source never had that page mapped.<br><br>
+            <strong>→ Replica process hangs forever waiting for a page that will never arrive.</strong>
+          </div>
+        </div>
+        <div class="state-box" style="border-left: 3px solid #22d3ee;">
+          <span class="title">No layered images in COW mode</span>
+          <div class="desc">
+            COW sends ALL pages in one pass. No <code>PP_HOLE_PARENT</code>. No parent layers. The replica gets a <strong>complete memory image</strong> directly — every address in the VMA range must be accounted for.
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div>
+      <h4 class="green">Why zeros are cheap</h4>
+      <div class="state-grid" style="grid-template-columns: 1fr;">
+        <div class="state-box" style="border-left: 3px solid #a78bfa;">
+          <span class="title">LZ4 compression to the rescue</span>
+          <div class="desc">
+            A 4KB zero page compresses to <strong>~20 bytes</strong> on the wire. For a 100GB process with 50% zero pages, the extra network cost is:<br><br>
+            <code>12.8M zero pages × 20 bytes = ~256 MB</code><br>
+            vs 50GB uncompressed. That's <strong>0.5% overhead</strong>.
+          </div>
+        </div>
+        <div class="state-box" style="border-left: 3px solid #fbbf24;">
+          <span class="title">The real cost: RSS bloat on replica</span>
+          <div class="desc">
+            The problem isn't network — it's that <code>process_vm_writev()</code> on the replica <strong>materializes</strong> zero pages into physical RAM. This causes RSS bloat. See next slide for the fix.
+          </div>
+        </div>
+      </div>
+
+      <div class="code-note" style="margin-top:8px;">
+        <strong>Summary:</strong> Sending zeros = safe + cheap on network. Skipping = deadlock. The tradeoff is replica RSS bloat (fixable separately).
+      </div>
+    </div>
+  </div>
+</section>

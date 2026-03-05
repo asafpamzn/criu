@@ -1,0 +1,64 @@
+<section>
+  <h2>AWS Option A: Move Secondary Private IP</h2>
+  <p class="small dim">Fastest approach. Same subnet required. ~1-2 seconds.</p>
+
+  <div class="two-col">
+    <div>
+      <h4 class="cyan">Setup &amp; Migration Steps</h4>
+      <pre style="font-size:0.5em;"><code class="language-bash"># Setup: assign a secondary IP to source instance
+aws ec2 assign-private-ip-addresses \
+  --network-interface-id eni-source-abc123 \
+  --private-ip-addresses 10.0.1.100
+
+# Valkey listens on 10.0.1.100:6379
+# Clients connect to 10.0.1.100:6379
+
+# === MIGRATION CUTOVER ===
+
+# Step 1: Unassign from source
+aws ec2 unassign-private-ip-addresses \
+  --network-interface-id eni-source-abc123 \
+  --private-ip-addresses 10.0.1.100
+
+# Step 2: Assign to replica
+aws ec2 assign-private-ip-addresses \
+  --network-interface-id eni-replica-def456 \
+  --private-ip-addresses 10.0.1.100
+
+# Step 3: Configure IP on replica OS
+ssh replica "sudo ip addr add 10.0.1.100/24 \
+  dev eth0"
+
+# Clients' TCP connections resume on replica!</code></pre>
+    </div>
+    <div>
+      <div class="state-grid" style="grid-template-columns: 1fr;">
+        <div class="state-box">
+          <span class="title">Requirements</span>
+          <div class="desc">
+            • Both instances in <strong>same subnet</strong> (same AZ)<br>
+            • Secondary IP (not the primary IP of the instance)<br>
+            • Security groups allow traffic on port 6379<br>
+            • ~1-2s for AWS API + ARP propagation
+          </div>
+        </div>
+        <div class="state-box">
+          <span class="title">Why secondary IP?</span>
+          <div class="desc">
+            An EC2 instance's <strong>primary private IP</strong> cannot be moved — it's fixed for the lifetime of the instance. But <strong>secondary IPs</strong> can be freely assigned/unassigned via the API. So Valkey binds to a secondary IP, which we move at cutover time.
+          </div>
+        </div>
+        <div class="state-box" style="border-left: 3px solid #4ade80;">
+          <span class="title">Migration Timeline</span>
+          <div class="desc">
+            CRIU dump (51ms) → page transfer (58s) → cutover:<br>
+            1. CRIU restore on replica (1ms)<br>
+            2. Move IP via AWS API (1-2s)<br>
+            3. SIGCONT restored process<br>
+            → client traffic resumes
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>

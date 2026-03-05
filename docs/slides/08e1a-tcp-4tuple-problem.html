@@ -1,0 +1,40 @@
+<section>
+  <h2>Migrating TCP: The IP Address Problem</h2>
+  <p class="small dim">CRIU restores TCP state perfectly — but the server IP changes.</p>
+
+  <div class="two-col">
+    <div>
+      <h4 class="red">The Problem: TCP 4-Tuple</h4>
+      <div class="state-grid" style="grid-template-columns: 1fr;">
+        <div class="state-box">
+          <span class="title">A TCP connection is identified by</span>
+          <div class="desc">
+            <code>(src_ip, src_port, dst_ip, dst_port)</code><br><br>
+            Client connected to: <code>10.0.1.5:6379</code><br>
+            After migration, server is at: <code>10.0.2.8:6379</code><br><br>
+            CRIU restores the socket with <code>TCP_REPAIR</code>: seq numbers ✅, queued data ✅, window ✅.<br>
+            But the <strong>server IP changed</strong>. The client's OS routes packets to <code>10.0.1.5</code> — which is now dead. <strong>Connection hangs → timeout → error.</strong>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div>
+      <h4 class="yellow">What Must the Client Do?</h4>
+      <div class="state-grid" style="grid-template-columns: 1fr;">
+        <div class="state-box" style="border-left: 3px solid #4ade80;">
+          <span class="title">With floating IP (recommended)</span>
+          <div class="desc"><strong>Nothing.</strong> The IP moves to the new machine. The client's TCP connection continues mid-stream. It sees a brief pause (~50ms) but no disconnection. No code changes needed.</div>
+        </div>
+        <div class="state-box" style="border-left: 3px solid #f87171;">
+          <span class="title">Without floating IP</span>
+          <div class="desc"><strong>Reconnect.</strong> Client gets a TCP error (RST or timeout), must resolve new IP and reconnect. Well-written clients (Valkey, Redis libraries) do this automatically with retry logic.</div>
+        </div>
+      </div>
+
+      <div class="code-note" style="margin-top:8px;">
+        <strong>For Valkey live migration:</strong> We use floating IP (ENI migration in AWS). The client sees a ~50ms pause, zero disconnections, zero data loss.
+      </div>
+    </div>
+  </div>
+</section>

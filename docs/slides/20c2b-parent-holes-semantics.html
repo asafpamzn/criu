@@ -1,0 +1,32 @@
+<section>
+  <h2>Why Parent Holes Matter</h2>
+  <p class="small dim">Parent holes are the glue that makes incremental pre-dumps efficient.</p>
+
+  <div class="state-grid" style="grid-template-columns: 1fr 1fr;">
+    <div class="state-box">
+      <span class="title">Without parent holes</span>
+      <div class="desc">Every incremental pre-dump becomes a full dump. The restore side wouldn't know which pages to get from the parent vs. the current image. Parent holes make incremental pre-dump efficient.</div>
+    </div>
+    <div class="state-box">
+      <span class="title">Zero pages are different</span>
+      <div class="desc">Zero/unmapped pages are NOT in the page-pipe at all. They don't need parent images — the kernel naturally provides zeros via fresh anonymous pages. Don't confuse them with parent holes!</div>
+    </div>
+    <div class="state-box">
+      <span class="title">First pre-dump: no holes</span>
+      <div class="desc"><code>has_parent=false</code>, so <code>page_in_parent()</code> always returns false. All present pages classified as dirty → all get dumped. Parent holes only appear from the 2nd pre-dump onward.</div>
+    </div>
+    <div class="state-box">
+      <span class="title">Restore resolution</span>
+      <div class="desc">On restore, CRIU walks layers <strong>newest-first</strong>:<br><br>
+        • Dirty page found → <strong>use it</strong><br>
+        • Parent hole → <strong>look in parent layer</strong><br>
+        • Zero → <strong>leave unmapped</strong><br><br>
+        Each page resolved exactly once.
+      </div>
+    </div>
+  </div>
+
+  <div class="code-note" style="margin-top:10px;">
+    <strong>Analogy:</strong> Think of it like Docker image layers. Each layer only stores what changed. A "parent hole" is like a transparent pixel — it means "inherit from the layer below". The bottom layer has no holes because there's nothing below it.
+  </div>
+</section>

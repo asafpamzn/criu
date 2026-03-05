@@ -1,0 +1,49 @@
+<section>
+  <h2>Hardware Interrupts</h2>
+  <p class="small dim">Electrical events from hardware — completely invisible to processes.</p>
+
+  <div class="two-col">
+    <div>
+      <div class="state-grid" style="grid-template-columns: 1fr;">
+        <div class="state-box" style="border-left: 3px solid #64748b;">
+          <span class="title">What they are</span>
+          <div class="desc">Electrical events from hardware: timer tick, disk I/O complete, network packet arrived, keyboard keypress. The CPU stops what it's doing and jumps to a <strong>kernel interrupt handler</strong>.</div>
+        </div>
+        <div class="state-box" style="border-left: 3px solid #64748b;">
+          <span class="title">Who handles them</span>
+          <div class="desc">The <strong>kernel</strong> — always. Interrupt handlers run in kernel space with no process context. The interrupted process is simply paused and resumed — it never knows it happened.</div>
+        </div>
+        <div class="state-box" style="border-left: 3px solid #64748b;">
+          <span class="title">Visible to process?</span>
+          <div class="desc"><strong>No.</strong> Completely transparent. There is no per-process interrupt state. Nothing to checkpoint.</div>
+        </div>
+      </div>
+    </div>
+
+    <div>
+      <h4 class="red">Interrupt Flow</h4>
+      <pre style="font-size:0.6em;"><code>CPU executing process code
+        ↓
+[INTERRUPT] ← hardware signal (e.g. NIC)
+        ↓
+Kernel interrupt handler runs
+(process is paused, unaware)
+        ↓
+Handler finishes → CPU resumes process
+(process never knew)</code></pre>
+
+      <div class="state-grid" style="grid-template-columns: 1fr;">
+        <div class="state-box">
+          <span class="title">Why CRIU ignores interrupts</span>
+          <div class="desc">
+            Interrupt <em>effects</em> that matter to processes are mediated through higher-level abstractions CRIU <em>does</em> save:<br><br>
+            • Disk I/O complete → <strong>file descriptor state</strong><br>
+            • Network packet arrived → <strong>socket buffers</strong> (TCP repair)<br>
+            • Timer tick → <strong>POSIX timers / itimers</strong><br><br>
+            Interrupts themselves are transient kernel events — no per-process state to checkpoint.
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>

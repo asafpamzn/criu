@@ -1,0 +1,47 @@
+<section>
+  <h2>🔮 Future Fix: VMA Shrink Diff</h2>
+  <p class="small dim">Tell the replica to munmap() instead of sending zero pages.</p>
+
+  <div class="two-col">
+    <div>
+      <h4 class="yellow">Current: Send Zeros</h4>
+      <pre style="font-size:0.6em;"><code>Source: page unmapped (EFAULT)
+  → memset(buf, 0, PAGE_SIZE)
+  → send_page_compressed(zero page)
+
+Replica: process_vm_writev(zeros)
+  → physical page allocated ❌
+  → RSS bloat</code></pre>
+
+      <div class="state-grid" style="grid-template-columns: 1fr;">
+        <div class="state-box">
+          <span class="title">Works but wasteful</span>
+          <div class="desc">Every unmapped page becomes a real physical page on the replica. For sparse allocators, this can add up to significant RSS overhead.</div>
+        </div>
+      </div>
+    </div>
+
+    <div>
+      <h4 class="cyan">Better: Send VMA Shrink</h4>
+      <pre style="font-size:0.6em;"><code>Source: detects VMA shrank
+  → send PS_IOV_VMA_SHRINK to replica
+
+Replica: munmap(old_end, shrink_size)
+  → no physical pages wasted ✅
+  → RSS matches source exactly</code></pre>
+
+      <div class="state-grid" style="grid-template-columns: 1fr;">
+        <div class="state-box">
+          <span class="title">Similar to existing VMA diff</span>
+          <div class="desc">We already have <code>PS_IOV_VMA_DIFF</code> for new VMAs that appear during transfer. A shrink diff is the reverse — tell the replica to <code>munmap()</code> ranges that disappeared. Same protocol, opposite direction.</div>
+        </div>
+        <div class="state-box" style="border-left: 3px solid #fbbf24;">
+          <span class="title">Priority: LOW</span>
+          <div class="desc">
+            For dense Valkey heaps, the bloat is typically a few hundred pages out of 52M (&lt;0.001%). Only matters for sparse allocators with many unmapped holes. Deferred until real-world need arises.
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>

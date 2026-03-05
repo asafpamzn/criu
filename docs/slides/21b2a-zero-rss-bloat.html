@@ -1,0 +1,71 @@
+<section>
+  <h2>Zero Page RSS Bloat on the Replica</h2>
+  <p class="small dim">Sending zeros for unmapped pages materializes physical RAM on the replica.</p>
+
+  <div class="two-col">
+    <div>
+      <h4 class="red">The Problem</h4>
+      <div class="state-grid" style="grid-template-columns: 1fr;">
+        <div class="state-box">
+          <span class="title">What happens on the replica</span>
+          <div class="desc">
+            The replica's <code>page-recv</code> writes every received page via <code>process_vm_writev()</code>.<br><br>
+            For zero pages, this <strong>materializes a physical page</strong> filled with zeros. The kernel doesn't know these are "don't care" pages — they consume real RAM.
+          </div>
+        </div>
+        <div class="state-box">
+          <span class="title">Scale example</span>
+          <div class="desc">
+            <table style="font-size:0.9em; width:100%; border-collapse:collapse;">
+              <tr style="border-bottom:1px solid #334155;">
+                <td style="padding:3px 6px;">Source RSS</td>
+                <td style="padding:3px 6px;">100 GB</td>
+              </tr>
+              <tr style="border-bottom:1px solid #334155;">
+                <td style="padding:3px 6px;">Source VMA size</td>
+                <td style="padding:3px 6px;">120 GB (VMAs &gt; RSS)</td>
+              </tr>
+              <tr style="border-bottom:1px solid #334155;">
+                <td style="padding:3px 6px;">Unmapped holes</td>
+                <td style="padding:3px 6px;">~20 GB of zeros sent</td>
+              </tr>
+              <tr>
+                <td style="padding:3px 6px;"><strong>Replica RSS</strong></td>
+                <td style="padding:3px 6px; color:#f87171;"><strong>~120 GB</strong> (20% bloat)</td>
+              </tr>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div>
+      <h4 class="green">Why It's Tolerable Today</h4>
+      <div class="state-grid" style="grid-template-columns: 1fr;">
+        <div class="state-box">
+          <span class="title">Self-healing factors</span>
+          <div class="desc">
+            <strong>1.</strong> jemalloc reclaims zero pages on next allocation cycle<br>
+            <strong>2.</strong> Dense Valkey heaps have few unmapped holes (&lt;5%)<br>
+            <strong>3.</strong> Replica is temporary — becomes primary soon<br>
+            <strong>4.</strong> Alternative (deadlock from skipping) is worse
+          </div>
+        </div>
+        <div class="state-box">
+          <span class="title">Current code path</span>
+          <div class="desc">
+            <pre style="font-size:0.9em;"><code>Source: page unmapped (EFAULT)
+  → memset(buf, 0, PAGE_SIZE)
+  → send_page_compressed(zero page)
+Replica: process_vm_writev(zeros)
+  → physical page allocated ❌</code></pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="code-note" style="margin-top:6px;">
+        <strong>For dense heaps (Valkey):</strong> bloat is typically a few hundred pages out of 52M (&lt;0.001%). Only sparse allocators with many unmapped holes see significant impact.
+      </div>
+    </div>
+  </div>
+</section>
