@@ -1,0 +1,69 @@
+<section>
+  <h2>How CRIU Handles Regular Files (e.g. Log Files)</h2>
+  <p class="small dim">CRIU saves the <strong>file descriptor metadata</strong>, NOT the file contents.</p>
+
+  <div class="two-col">
+    <div>
+      <h4 class="cyan">What CRIU Saves (Dump)</h4>
+      <div class="state-grid" style="grid-template-columns: 1fr;">
+        <div class="state-box">
+          <span class="title">Per regular file FD</span>
+          <div class="desc">
+            <strong>File path</strong> — <code>/var/log/app.log</code><br>
+            <strong>File offset</strong> — e.g. 50KB (where the cursor is)<br>
+            <strong>Open flags</strong> — <code>O_WRONLY | O_APPEND | O_CREAT</code><br>
+            <strong>File mode</strong> — permissions (0644)<br>
+            <strong>File locks</strong> — flock/fcntl if any<br><br>
+            <strong style="color:#f87171;">NOT saved:</strong> file contents, directory entries, filesystem state
+          </div>
+        </div>
+      </div>
+
+      <h4 class="cyan" style="margin-top:8px;">What CRIU Does on Restore</h4>
+      <pre style="font-size:0.55em;"><code class="language-c">// Simplified restore logic:
+fd = open("/var/log/app.log",
+          saved_flags);   // O_WRONLY|O_APPEND
+lseek(fd, saved_offset);  // seek to 50KB
+// → process resumes writing</code></pre>
+      <div class="code-note" style="margin-top:4px;">
+        The file must <strong>exist at the same path</strong> on the destination. CRIU does not create or copy file contents.
+      </div>
+    </div>
+
+    <div>
+      <h4 class="yellow">Offset Mismatch: The Log File Problem</h4>
+      <p class="smaller dim">Source log at 50KB, replica log already at 100KB:</p>
+
+      <div class="state-grid" style="grid-template-columns: 1fr;">
+        <div class="state-box" style="border-left: 3px solid #4ade80;">
+          <span class="title">O_APPEND mode ✅ (most log files)</span>
+          <div class="desc">
+            CRIU restores offset=50KB, but <code>O_APPEND</code> <strong>always seeks to end</strong> before each write. Process writes at 100KB (end of file).<br>
+            <strong>Safe</strong> — offset is effectively ignored for writes.
+          </div>
+        </div>
+        <div class="state-box" style="border-left: 3px solid #f87171;">
+          <span class="title">Regular write mode ❌ (no O_APPEND)</span>
+          <div class="desc">
+            CRIU restores offset=50KB. Process writes at 50KB, <strong>overwriting</strong> existing content in the 50KB–100KB range.<br>
+            <strong>Data corruption</strong> if the file diverged.
+          </div>
+        </div>
+        <div class="state-box" style="border-left: 3px solid #22d3ee;">
+          <span class="title">Typical migration pattern ✅</span>
+          <div class="desc">
+            Replica starts fresh from CRIU restore — <strong>no pre-existing log file</strong>. Either:<br>
+            • Shared filesystem (NFS/EFS) — same file on both machines<br>
+            • File copied before restore<br>
+            • File re-created empty (process opens, writes from scratch)<br>
+            Offset mismatch is a non-issue when the file is the same.
+          </div>
+        </div>
+      </div>
+
+      <div class="code-note" style="margin-top:6px;">
+        <strong>Valkey case:</strong> Data lives in 100GB of anonymous memory (dumped by CRIU). RDB/AOF are persistence files managed by Valkey — not part of the CRIU FD restore path for live migration.
+      </div>
+    </div>
+  </div>
+</section>
