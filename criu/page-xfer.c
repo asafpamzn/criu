@@ -3700,7 +3700,16 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 				}
 			}
 
-			/* Fork kept alive for dump-time re-send below */
+			/*
+			 * Kill fork — dirty pages already re-sent above.
+			 * Non-dirty pages are unchanged since dump, so the
+			 * bulk transfer's copy is correct.  No need to
+			 * re-send all 99GB.
+			 */
+			if (fork_pid > 0) {
+				kill(fork_pid, SIGKILL);
+				fork_pid = -1;
+			}
 		}
 
 		pr_err("COW converge fork-snapshot: %lu dirty pages "
@@ -3856,21 +3865,17 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 		}
 
 		/*
-		 * Re-read allocator metadata from the frozen source,
-		 * split into dump-time VMAs (re-read in place) and
-		 * new VMAs (send VMA diff + page data on stream 0).
+		 * Detect new VMAs created during migration (e.g. jemalloc
+		 * mmap extents).  The replica doesn't have them — send a
+		 * VMA diff so the replica can create them via ptrace.
 		 *
-		 * New VMAs are mmap regions jemalloc created during
-		 * migration.  The replica doesn't have them — we send
-		 * a VMA diff so the replica can create them via ptrace
-		 * before page data arrives.
+		 * Dump-time VMAs do NOT need full re-send: non-dirty pages
+		 * are unchanged since dump (bulk transfer copy is correct),
+		 * dirty pages were already re-sent from the fork above.
 		 */
 		{
 			char maps_path[64];
 			FILE *mfp;
-			struct converge_region *dump_regions = NULL;
-			int dump_count = 0, dump_cap = 0;
-			unsigned long dump_pages = 0;
 			struct vma_diff_entry *new_vmas = NULL;
 			int new_vma_count = 0, new_vma_cap = 0;
 			unsigned long new_vma_pages = 0;
@@ -3894,32 +3899,10 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 					if (mp[0] != 'r' || mp[1] != 'w' ||
 					    mp[2] != '-')
 						continue;
-					/* Include ALL rw- pages for fork re-send */
 
-					if (addr_in_dump_vmas(ms, me,
-							      img->dst_id)) {
-						/* Dump-time VMA: skip */
-						if (dump_count >= dump_cap) {
-							int nc = (dump_cap + 16) * 2;
-							struct converge_region *tmp;
-
-							tmp = xrealloc(dump_regions,
-								nc * sizeof(*tmp));
-							if (!tmp)
-								break;
-							dump_regions = tmp;
-							dump_cap = nc;
-						}
-						dump_regions[dump_count].start = ms;
-						dump_regions[dump_count].end = me;
-						/* Mark file-backed rw- for
-						 * fork re-send (libc, valkey) */
-						dump_regions[dump_count].categories =
-							(mpath[0] != '\0') ? 1 : 0;
-						dump_count++;
-						dump_pages += (me - ms) / PAGE_SIZE;
-					} else {
-						/* New VMA: collect for diff */
+					/* Only collect NEW VMAs (not in dump) */
+					if (!addr_in_dump_vmas(ms, me,
+							       img->dst_id)) {
 						if (new_vma_count >= new_vma_cap) {
 							int nc = (new_vma_cap + 16) * 2;
 							struct vma_diff_entry *tmp;
@@ -3944,40 +3927,7 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 			}
 
 			/*
-			 * Re-send ALL dump-time pages from the fork.
-			 * Even though only ~56 pages are dirty, the
-			 * full re-send is needed for heap consistency
-			 * when live traffic runs during the transfer.
-			 *
-			 * Future: accumulate dirty page addresses
-			 * during bulk transfer (not at convergence)
-			 * to enable selective re-send.
-			 */
-			if (dump_count > 0 && fork_pid > 0) {
-				long re_sent;
-
-				pr_err("COW converge: re-sending %lu "
-				       "dump-time pages (%d regions, "
-				       "%.1f MB) from fork\n",
-				       dump_pages, dump_count,
-				       (double)(dump_pages * PAGE_SIZE) /
-				       (1024 * 1024));
-				re_sent = converge_dispatch_parallel(
-					img, fork_pid, sockets,
-					nr_streams, dump_regions,
-					dump_count);
-				if (re_sent >= 0)
-					pr_err("COW converge: re-sent "
-					       "%ld pages from fork\n",
-					       re_sent);
-			}
-
-			/* Clean up fork */
-			if (fork_pid > 0)
-				kill(fork_pid, SIGKILL);
-
-			/*
-			 * Step 2: send VMA diff + page data for new VMAs
+			 * Send VMA diff + page data for new VMAs
 			 * on stream 0.  The replica will pause when it
 			 * receives the diff, inject mmap(MAP_FIXED) via
 			 * ptrace, then resume to receive page data.
@@ -4054,7 +4004,6 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 				xfree(lio);
 			}
 
-			xfree(dump_regions);
 			xfree(new_vmas);
 		}
 
