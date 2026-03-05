@@ -3700,16 +3700,7 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 				}
 			}
 
-			/*
-			 * Kill fork — dirty pages already re-sent above.
-			 * Non-dirty pages are unchanged since dump, so the
-			 * bulk transfer's copy is correct.  No need to
-			 * re-send all 99GB.
-			 */
-			if (fork_pid > 0) {
-				kill(fork_pid, SIGKILL);
-				fork_pid = -1;
-			}
+			/* Fork kept alive for allocator re-send below */
 		}
 
 		pr_err("COW converge fork-snapshot: %lu dirty pages "
@@ -3865,17 +3856,21 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 		}
 
 		/*
-		 * Detect new VMAs created during migration (e.g. jemalloc
-		 * mmap extents).  The replica doesn't have them — send a
-		 * VMA diff so the replica can create them via ptrace.
+		 * Re-send allocator metadata pages from fork +
+		 * detect new VMAs for VMA diff.
 		 *
-		 * Dump-time VMAs do NOT need full re-send: non-dirty pages
-		 * are unchanged since dump (bulk transfer copy is correct),
-		 * dirty pages were already re-sent from the fork above.
+		 * Re-send: [heap], file-backed rw- (valkey BSS, libc),
+		 *          small anonymous VMAs (thread stacks/TLS).
+		 * Skip:    large anonymous VMAs (jemalloc data extents).
+		 * This overwrites the arena reset with the fork's
+		 * consistent allocator state (~84 MB, ~0.05s).
 		 */
 		{
 			char maps_path[64];
 			FILE *mfp;
+			struct converge_region *alloc_regions = NULL;
+			int alloc_count = 0, alloc_cap = 0;
+			unsigned long alloc_pages = 0, skip_pages = 0;
 			struct vma_diff_entry *new_vmas = NULL;
 			int new_vma_count = 0, new_vma_cap = 0;
 			unsigned long new_vma_pages = 0;
@@ -3889,18 +3884,19 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 				while (fgets(mline, sizeof(mline), mfp)) {
 					unsigned long ms, me;
 					char mp[8], mpath[256];
+					unsigned long vma_sz;
 
 					mpath[0] = '\0';
 					if (sscanf(mline,
 						   "%lx-%lx %4s %*s %*s %*s %255[^\n]",
 						   &ms, &me, mp, mpath) < 3)
 						continue;
-
 					if (mp[0] != 'r' || mp[1] != 'w' ||
 					    mp[2] != '-')
 						continue;
 
-					/* Only collect NEW VMAs (not in dump) */
+					vma_sz = me - ms;
+
 					if (!addr_in_dump_vmas(ms, me,
 							       img->dst_id)) {
 						if (new_vma_count >= new_vma_cap) {
@@ -3920,11 +3916,63 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 							PROT_READ | PROT_WRITE;
 						new_vmas[new_vma_count].pad = 0;
 						new_vma_count++;
-						new_vma_pages += (me - ms) / PAGE_SIZE;
+						new_vma_pages += vma_sz / PAGE_SIZE;
+					} else {
+						/*
+						 * Dump-time VMA: re-send if
+						 * allocator metadata (file-backed,
+						 * [heap], or small anonymous).
+						 * Skip large anonymous (data).
+						 */
+						int is_alloc = (mpath[0] != '\0')
+							|| (vma_sz < 1048576);
+						if (is_alloc) {
+							if (alloc_count >= alloc_cap) {
+								int nc = (alloc_cap + 16) * 2;
+								struct converge_region *t;
+								t = xrealloc(alloc_regions,
+									nc * sizeof(*t));
+								if (!t) break;
+								alloc_regions = t;
+								alloc_cap = nc;
+							}
+							alloc_regions[alloc_count].start = ms;
+							alloc_regions[alloc_count].end = me;
+							alloc_regions[alloc_count].categories = 0;
+							alloc_count++;
+							alloc_pages += vma_sz / PAGE_SIZE;
+						} else {
+							skip_pages += vma_sz / PAGE_SIZE;
+						}
 					}
 				}
 				fclose(mfp);
 			}
+
+			/* Re-send allocator pages from fork */
+			if (alloc_count > 0 && fork_pid > 0) {
+				long re_sent;
+
+				pr_err("COW converge: re-sending %lu "
+				       "allocator pages (%d regions, "
+				       "%.1f MB, skipping %.1f GB)\n",
+				       alloc_pages, alloc_count,
+				       (double)(alloc_pages * PAGE_SIZE) /
+				       (1024 * 1024),
+				       (double)(skip_pages * PAGE_SIZE) /
+				       (1024 * 1024 * 1024));
+				re_sent = converge_dispatch_parallel(
+					img, fork_pid, sockets,
+					nr_streams, alloc_regions,
+					alloc_count);
+				if (re_sent >= 0)
+					pr_err("COW converge: re-sent "
+					       "%ld allocator pages\n",
+					       re_sent);
+			}
+			if (fork_pid > 0)
+				kill(fork_pid, SIGKILL);
+			xfree(alloc_regions);
 
 			/*
 			 * Send VMA diff + page data for new VMAs

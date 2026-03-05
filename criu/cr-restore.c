@@ -2928,20 +2928,48 @@ static int finalize_restore_detach(void)
 		if (!task_alive(item))
 			continue;
 
-		for (i = 0; i < item->nr_threads; i++) {
-			pid = item->threads[i].real;
-			if (pid < 0) {
-				pr_err("pstree item has invalid pid %d\n", pid);
-				continue;
+		/*
+		 * Workers first, main thread last (COW mode).
+		 * Workers resume into wait syscalls; 10ms settle
+		 * before main thread enters the event loop.
+		 */
+		{
+			int main_idx = -1;
+
+			for (i = 0; i < item->nr_threads; i++) {
+				pid = item->threads[i].real;
+				if (pid < 0)
+					continue;
+				if (arch_set_thread_regs_nosigrt(
+					    &item->threads[i])) {
+					pr_perror("Restoring regs for %d", pid);
+					return -1;
+				}
+				if (pid == item->pid->real)
+					main_idx = i;
 			}
 
-			if (arch_set_thread_regs_nosigrt(&item->threads[i])) {
-				pr_perror("Restoring regs for %d failed", pid);
-				return -1;
+			for (i = 0; i < item->nr_threads; i++) {
+				if (i == main_idx)
+					continue;
+				pid = item->threads[i].real;
+				if (pid < 0)
+					continue;
+				if (ptrace(PTRACE_DETACH, pid, NULL, 0)) {
+					pr_perror("Unable to detach %d", pid);
+					return -1;
+				}
 			}
-			if (ptrace(PTRACE_DETACH, pid, NULL, 0)) {
-				pr_perror("Unable to detach %d", pid);
-				return -1;
+
+			if (opts.cow_dump)
+				usleep(10000);
+
+			if (main_idx >= 0) {
+				pid = item->threads[main_idx].real;
+				if (ptrace(PTRACE_DETACH, pid, NULL, 0)) {
+					pr_perror("Unable to detach %d", pid);
+					return -1;
+				}
 			}
 		}
 	}
@@ -3351,13 +3379,10 @@ skip_ns_bouncing:
 		}
 
 		/*
-		 * Unlock Valkey's io_threads_mutex[] array.
-		 * With io-threads > 1, the main thread holds these
-		 * mutexes locked to keep IO threads sleeping.  After
-		 * restore, the IO threads resume in pthread_mutex_lock
-		 * and need to see the mutex as unlocked (0) to proceed.
+		 * Do NOT unlock io_threads_mutex[].
+		 * IO threads stay sleeping; main thread's event loop
+		 * wakes them via adjustIOThreadsByEventLoad().
 		 */
-		unlock_elf_mutex_array(pid, "io_threads_mutex", 256);
 
 		/*
 		 * Also unlock Valkey's signal_handler_lock.
