@@ -1,0 +1,64 @@
+<section>
+  <h2>Why COW Doesn't Need smaps</h2>
+
+  <div class="two-col">
+    <div>
+      <h4 class="cyan">Three Things COW Doesn't Need</h4>
+      <div class="state-grid" style="grid-template-columns: 1fr;">
+        <div class="state-box">
+          <span class="title">① No dirty-page accounting</span>
+          <div class="desc">COW mode uses <strong>userfaultfd write-protect (UFFD-WP)</strong> to track writes in real-time. Every first write triggers a WP fault → CRIU snapshots the page. No need for kernel's dirty-page stats.</div>
+        </div>
+        <div class="state-box">
+          <span class="title">② VmFlags derived from filename</span>
+          <div class="desc">The critical flag is <code>MAP_GROWSDOWN</code> (stack). COW uses <code>set_maps_derived_flags()</code> to detect it from the <code>[stack]</code> filename in maps output — no VmFlags line needed.</div>
+        </div>
+        <div class="state-box">
+          <span class="title">③ All pages transferred anyway</span>
+          <div class="desc">COW dump sends <strong>all pages</strong> (bulk transfer), then converges on dirty pages. It doesn't need per-VMA RSS/PSS to decide what to transfer.</div>
+        </div>
+      </div>
+    </div>
+
+    <div>
+      <h4 class="yellow">What about the missing VmFlags?</h4>
+      <div class="state-grid" style="grid-template-columns: 1fr;">
+        <div class="state-box">
+          <span class="title">Derivable from maps output</span>
+          <div class="desc">
+            <table style="font-size:0.9em; width:100%; border-collapse:collapse;">
+              <tr style="border-bottom:1px solid #334155;">
+                <td style="padding:3px 6px;"><code>[stack]</code></td>
+                <td>→ <code>MAP_GROWSDOWN</code></td>
+              </tr>
+              <tr style="border-bottom:1px solid #334155;">
+                <td style="padding:3px 6px;"><code>[vdso]</code></td>
+                <td>→ <code>VMA_AREA_VDSO</code></td>
+              </tr>
+              <tr style="border-bottom:1px solid #334155;">
+                <td style="padding:3px 6px;"><code>[vvar]</code></td>
+                <td>→ <code>VMA_AREA_VVAR</code></td>
+              </tr>
+              <tr>
+                <td style="padding:3px 6px;">permissions <code>rwxp</code></td>
+                <td>→ <code>PROT_*</code> flags</td>
+              </tr>
+            </table>
+          </div>
+        </div>
+        <div class="state-box">
+          <span class="title">Not needed for COW</span>
+          <div class="desc">
+            madvise flags (<code>hg</code>, <code>nh</code>, <code>mg</code>, etc.) — the restored process will set these itself.<br>
+            <code>MAP_LOCKED</code> — not needed during migration, process re-mlocks on startup.<br>
+            Memory accounting — not needed, all pages sent.
+          </div>
+        </div>
+      </div>
+
+      <div class="code-note" style="margin-top:8px;">
+        <strong>Result:</strong> For 200GB Valkey, parsing maps takes <strong>&lt;1ms</strong> vs smaps taking <strong>2-5 seconds</strong>. This alone saves most of the freeze time.
+      </div>
+    </div>
+  </div>
+</section>

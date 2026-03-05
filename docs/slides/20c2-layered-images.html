@@ -1,0 +1,65 @@
+<section>
+  <h2>The Layered Image Model</h2>
+  <p class="small dim">Incremental pre-dumps build a stack of image layers. Parent holes are the glue.</p>
+
+  <div class="two-col">
+    <div>
+      <h4 class="yellow">How Layers Stack</h4>
+      <div style="font-size:0.6em;">
+        <div style="background:#1e293b; border:1px solid #475569; border-radius:6px; padding:8px; margin-bottom:4px;">
+          <div style="color:#4ade80; font-weight:bold;">Pre-dump 1 (parent) — no baseline</div>
+          <div style="color:#94a3b8;"><code>has_parent=false</code> → ALL present pages dumped</div>
+          <div style="display:flex; gap:3px; margin-top:4px;">
+            <span style="background:#22c55e; padding:2px 6px; border-radius:3px; color:#000; font-size:0.85em;">Page A</span>
+            <span style="background:#22c55e; padding:2px 6px; border-radius:3px; color:#000; font-size:0.85em;">Page B</span>
+            <span style="background:#334155; padding:2px 6px; border-radius:3px; color:#64748b; font-size:0.85em;">zero</span>
+            <span style="background:#22c55e; padding:2px 6px; border-radius:3px; color:#000; font-size:0.85em;">Page D</span>
+          </div>
+        </div>
+        <div style="text-align:center; color:#475569; font-size:0.9em;">↓ clear_refs → process runs → some pages modified</div>
+        <div style="background:#1e293b; border:2px solid #fbbf24; border-radius:6px; padding:8px; margin-top:4px;">
+          <div style="color:#fbbf24; font-weight:bold;">Pre-dump 2 (incremental) — has parent</div>
+          <div style="color:#94a3b8;">Only dirty pages + parent holes</div>
+          <div style="display:flex; gap:3px; margin-top:4px;">
+            <span style="background:transparent; border:1px dashed #fbbf24; padding:2px 6px; border-radius:3px; color:#fbbf24; font-size:0.85em;">hole→A</span>
+            <span style="background:#eab308; padding:2px 6px; border-radius:3px; color:#000; font-size:0.85em;">Page B'</span>
+            <span style="background:#334155; padding:2px 6px; border-radius:3px; color:#64748b; font-size:0.85em;">zero</span>
+            <span style="background:transparent; border:1px dashed #fbbf24; padding:2px 6px; border-radius:3px; color:#fbbf24; font-size:0.85em;">hole→D</span>
+          </div>
+        </div>
+        <div style="text-align:center; color:#475569; font-size:0.9em;">↓ clear_refs → process runs → fewer pages modified</div>
+        <div style="background:#1e293b; border:2px solid #22d3ee; border-radius:6px; padding:8px; margin-top:4px;">
+          <div style="color:#22d3ee; font-weight:bold;">Final dump — smallest delta</div>
+          <div style="color:#94a3b8;">Mostly parent holes, few dirty pages</div>
+          <div style="display:flex; gap:3px; margin-top:4px;">
+            <span style="background:transparent; border:1px dashed #22d3ee; padding:2px 6px; border-radius:3px; color:#22d3ee; font-size:0.85em;">hole→A</span>
+            <span style="background:transparent; border:1px dashed #22d3ee; padding:2px 6px; border-radius:3px; color:#22d3ee; font-size:0.85em;">hole→B'</span>
+            <span style="background:#334155; padding:2px 6px; border-radius:3px; color:#64748b; font-size:0.85em;">zero</span>
+            <span style="background:#06b6d4; padding:2px 6px; border-radius:3px; color:#000; font-size:0.85em;">Page D'</span>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div>
+      <h4 class="cyan">Why parent holes matter</h4>
+      <div class="state-grid" style="grid-template-columns: 1fr;">
+        <div class="state-box">
+          <span class="title">Without parent holes</span>
+          <div class="desc">Every incremental pre-dump becomes a full dump. The restore side wouldn't know which pages to get from parent vs current image. Parent holes make incremental pre-dump efficient.</div>
+        </div>
+        <div class="state-box">
+          <span class="title">Zero pages are different</span>
+          <div class="desc">Zero/unmapped pages are NOT in the page-pipe at all. They don't need parent images — the kernel naturally provides zeros. Don't confuse them with parent holes!</div>
+        </div>
+        <div class="state-box">
+          <span class="title">First pre-dump: no holes</span>
+          <div class="desc"><code>has_parent=false</code>, so <code>page_in_parent()</code> always returns false. All present pages classified as dirty → all get dumped. Parent holes only appear from the 2nd pre-dump.</div>
+        </div>
+        <div class="state-box">
+          <span class="title">Restore resolution</span>
+          <div class="desc">On restore, CRIU walks layers newest-first. Dirty page found → use it. Parent hole → look in parent layer. Zero → leave unmapped. Each page resolved exactly once.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>

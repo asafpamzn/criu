@@ -1,0 +1,69 @@
+<section>
+  <h2>maps vs smaps: The Performance Gap</h2>
+
+  <pre style="font-size:0.6em;"><code class="language-c">// collect_mappings() in cr-dump.c
+use_maps = opts.cow_dump && opts.lazy_pages;
+ret = use_maps ? parse_maps(pid, vma_area_list, dump_file)
+               : parse_smaps(pid, vma_area_list, dump_file);</code></pre>
+
+  <div class="two-col">
+    <div>
+      <h4 class="red">What smaps Provides (expensive)</h4>
+      <div class="state-grid" style="grid-template-columns: 1fr;">
+        <div class="state-box">
+          <span class="title">VmFlags line</span>
+          <div class="desc">
+            2-letter codes for kernel VM flags:<br>
+            <code>gd</code>=MAP_GROWSDOWN, <code>lo</code>=MAP_LOCKED,<br>
+            <code>nr</code>=MAP_NORESERVE, <code>ht</code>=MAP_HUGETLB,<br>
+            <code>io</code>/<code>pf</code>=VM_IO/VM_PFNMAP (unsupported),<br>
+            <code>sr</code>, <code>rr</code>, <code>dc</code>, <code>mg</code>, <code>hg</code>, <code>nh</code>, <code>wf</code> = madvise flags
+          </div>
+        </div>
+        <div class="state-box">
+          <span class="title">Memory accounting stats</span>
+          <div class="desc">RSS, PSS, Shared/Private Clean/Dirty — the kernel must <strong>walk all PTEs</strong> to compute these. For 200GB = 52M pages → takes <strong>2-5 seconds</strong>.</div>
+        </div>
+      </div>
+    </div>
+    <div>
+      <h4 class="green">What maps Provides (cheap)</h4>
+      <div class="state-grid" style="grid-template-columns: 1fr;">
+        <div class="state-box">
+          <span class="title">Just the VMA boundaries</span>
+          <div class="desc">
+            Address range, permissions, offset, device, inode, filename.<br>
+            <strong>No page table walk</strong> — just iterates kernel <code>vm_area_struct</code> linked list.<br>
+            Cost: <strong>&lt;1 millisecond</strong> regardless of memory size.
+          </div>
+        </div>
+        <div class="state-box">
+          <span class="title">Performance comparison (200GB)</span>
+          <div class="desc">
+            <table style="font-size:0.95em; width:100%; border-collapse:collapse;">
+              <tr style="border-bottom:1px solid #334155;">
+                <td></td>
+                <td style="color:#f87171;"><strong>smaps</strong></td>
+                <td style="color:#4ade80;"><strong>maps</strong></td>
+              </tr>
+              <tr style="border-bottom:1px solid #334155;">
+                <td>Kernel work</td>
+                <td>Walk 52M PTEs</td>
+                <td>Iterate VMA list</td>
+              </tr>
+              <tr style="border-bottom:1px solid #334155;">
+                <td>Time (200GB)</td>
+                <td>2-5 seconds</td>
+                <td>&lt;1ms</td>
+              </tr>
+              <tr>
+                <td>Speedup</td>
+                <td colspan="2" style="color:#4ade80;"><strong>~5000×</strong></td>
+              </tr>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>

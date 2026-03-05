@@ -1,0 +1,59 @@
+<section>
+  <h2>COW Mode: The Unmapped Page Problem</h2>
+  <p class="small dim">COW mode skips pagemap — so how does it handle pages that aren't in memory?</p>
+
+  <div class="two-col">
+    <div>
+      <h4 class="yellow">Standard CRIU: knows before reading</h4>
+      <pre style="font-size:0.55em;"><code class="language-c">// should_dump_page() checks pagemap:
+if (!(pme & (PME_PRESENT | PME_SWAP)))
+    skip;  // not in RAM or swap
+if (__page_is_zero(pme))
+    skip;  // kernel zero page
+// → never tries to read unmapped pages</code></pre>
+      <div class="state-grid" style="grid-template-columns: 1fr;">
+        <div class="state-box">
+          <span class="title">Pagemap tells you what's there</span>
+          <div class="desc">Each 8-byte entry says: present? in swap? soft-dirty? zero page? Standard CRIU skips unmapped pages before ever touching them.</div>
+        </div>
+      </div>
+    </div>
+    <div>
+      <h4 class="green">COW Mode: discovers at read time</h4>
+      <pre style="font-size:0.55em;"><code class="language-c">// send_lazy_vma_page() in page-xfer.c:
+ret = process_vm_readv(source_pid,
+    &local_iov, 1, &remote_iov, 1, 0);
+
+if (ret != PAGE_SIZE) {
+    if (ret < 0 && errno == EFAULT) {
+        // Page not mapped! Can't read it.
+        memset(buffer, 0, PAGE_SIZE);
+        // Fall through → send zeros
+    }
+}
+// BOTH normal and EFAULT pages sent:
+send_page_compressed(sk, data, dst_id, vaddr);</code></pre>
+      <div class="state-grid" style="grid-template-columns: 1fr;">
+        <div class="state-box">
+          <span class="title">EFAULT = page not in memory</span>
+          <div class="desc"><code>process_vm_readv()</code> returns <code>EFAULT</code> for addresses that have no physical page. COW mode zero-fills the buffer and <strong>sends it as a zero page</strong>.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div style="background:#1e293b; border:1px solid #22d3ee; border-radius:6px; padding:8px 12px; font-size:0.55em; margin-top:8px;">
+    <strong style="color:#22d3ee;">Why not just skip?</strong> If COW skips the unmapped page, the replica's userfaultfd will fault on that address later. The page server can't service the fault (source unmapped the page). <strong>→ Deadlock.</strong> Sending zeros is the safe path — the replica gets a complete memory image with no holes to fill later.
+  </div>
+
+  <div style="display:flex; gap:10px; margin-top:8px;">
+    <div style="flex:1; background:#1e293b; border:1px solid #4ade80; border-radius:6px; padding:6px 10px; font-size:0.5em;">
+      <strong style="color:#4ade80;">No layered images</strong><br>
+      COW sends ALL pages in one pass. No <code>PP_HOLE_PARENT</code>. Replica gets a complete memory image directly.
+    </div>
+    <div style="flex:1; background:#1e293b; border:1px solid #a78bfa; border-radius:6px; padding:6px 10px; font-size:0.5em;">
+      <strong style="color:#a78bfa;">LZ4 compression helps</strong><br>
+      A zero page compresses to ~20 bytes on the wire. Network cost is negligible.
+    </div>
+  </div>
+</section>

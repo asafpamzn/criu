@@ -1,0 +1,44 @@
+<section>
+  <h2>smaps: VmFlags — 2-Letter Codes</h2>
+  <p class="small dim">The <code>VmFlags:</code> line encodes kernel <code>vm_flags</code>. CRIU parses these in <code>parse_vma_vmflags()</code>.</p>
+
+  <div class="two-col">
+    <div>
+      <h4 class="yellow">mmap() Flags</h4>
+      <p class="smaller dim">Restored via mmap arguments:</p>
+      <table style="font-size:0.6em; width:100%; border-collapse:collapse;">
+        <tr style="border-bottom:1px solid #334155;"><td style="padding:3px 6px;"><code>gd</code></td><td>MAP_GROWSDOWN</td><td>Stack — grows downward</td></tr>
+        <tr style="border-bottom:1px solid #334155;"><td style="padding:3px 6px;"><code>lo</code></td><td>MAP_LOCKED</td><td>mlock'd — can't be swapped</td></tr>
+        <tr style="border-bottom:1px solid #334155;"><td style="padding:3px 6px;"><code>nr</code></td><td>MAP_NORESERVE</td><td>No swap reservation</td></tr>
+        <tr style="border-bottom:1px solid #334155;"><td style="padding:3px 6px;"><code>ht</code></td><td>MAP_HUGETLB</td><td>Huge pages (2MB/512KB)</td></tr>
+        <tr><td style="padding:3px 6px;"><code>dp</code></td><td>MAP_DROPPABLE</td><td>Kernel can discard under pressure</td></tr>
+      </table>
+
+      <h4 class="yellow" style="margin-top:12px;">Special Kernel Flags</h4>
+      <table style="font-size:0.6em; width:100%; border-collapse:collapse;">
+        <tr style="border-bottom:1px solid #334155;"><td style="padding:3px 6px;"><code>io</code></td><td>VM_IO</td><td>I/O mapped (device MMIO) — can't vmsplice</td></tr>
+        <tr style="border-bottom:1px solid #334155;"><td style="padding:3px 6px;"><code>pf</code></td><td>VM_PFNMAP</td><td>Raw PFN mapped — can't vmsplice</td></tr>
+        <tr><td style="padding:3px 6px;"><code>ss</code></td><td>Shadow Stack</td><td>Intel CET / ARM BTI security</td></tr>
+      </table>
+    </div>
+
+    <div>
+      <h4 class="yellow">madvise() Flags</h4>
+      <p class="smaller dim">Restored via madvise calls after mmap:</p>
+      <table style="font-size:0.6em; width:100%; border-collapse:collapse;">
+        <tr style="border-bottom:1px solid #334155;"><td style="padding:3px 6px;"><code>sr</code></td><td>MADV_SEQUENTIAL</td><td>Aggressive readahead</td></tr>
+        <tr style="border-bottom:1px solid #334155;"><td style="padding:3px 6px;"><code>rr</code></td><td>MADV_RANDOM</td><td>Disable readahead</td></tr>
+        <tr style="border-bottom:1px solid #334155;"><td style="padding:3px 6px;"><code>dc</code></td><td>MADV_DONTFORK</td><td>Don't copy on fork()</td></tr>
+        <tr style="border-bottom:1px solid #334155;"><td style="padding:3px 6px;"><code>dd</code></td><td>MADV_DONTDUMP</td><td>Exclude from core dumps</td></tr>
+        <tr style="border-bottom:1px solid #334155;"><td style="padding:3px 6px;"><code>mg</code></td><td>MADV_MERGEABLE</td><td>Enable KSM dedup</td></tr>
+        <tr style="border-bottom:1px solid #334155;"><td style="padding:3px 6px;"><code>hg</code></td><td>MADV_HUGEPAGE</td><td>Use THP</td></tr>
+        <tr style="border-bottom:1px solid #334155;"><td style="padding:3px 6px;"><code>nh</code></td><td>MADV_NOHUGEPAGE</td><td>Don't use THP</td></tr>
+        <tr><td style="padding:3px 6px;"><code>wf</code></td><td>MADV_WIPEONFORK</td><td>Zero in child after fork</td></tr>
+      </table>
+
+      <div class="code-note" style="margin-top:12px;">
+        <strong>Restore order matters:</strong> First <code>mmap()</code> with the mmap flags, then <code>madvise()</code> for each advisory flag. VmFlags tell CRIU which madvise calls to replay.
+      </div>
+    </div>
+  </div>
+</section>

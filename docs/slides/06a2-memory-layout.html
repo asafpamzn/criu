@@ -1,0 +1,27 @@
+<section>
+  <h2>Step 1 Deep Dive: Memory Layout Boundaries</h2>
+  <p class="small dim">Virtual addresses from <code>/proc/PID/stat</code> defining the process memory map.</p>
+
+  <div class="state-grid" style="grid-template-columns: 1fr 1fr;">
+    <div class="state-box">
+      <span class="title">start_code / end_code</span>
+      <div class="desc"><strong>.text segment</strong> — executable machine code. Read-only, shared across fork()s. Defines where the program's instructions live.</div>
+    </div>
+    <div class="state-box">
+      <span class="title">start_data / end_data</span>
+      <div class="desc"><strong>.data + .bss segments</strong> — initialized globals and zero-initialized globals. Writable, COW'd on fork().</div>
+    </div>
+    <div class="state-box">
+      <span class="title">start_stack</span>
+      <div class="desc"><strong>Main thread's stack bottom.</strong> Grows downward on x86/arm. Other threads' stacks are in separate mmap'd VMAs.</div>
+    </div>
+    <div class="state-box">
+      <span class="title">start_brk</span>
+      <div class="desc"><strong>Heap start</strong> (brk area). The <em>current</em> brk value (heap end) is read separately via the parasite's <code>brk(0)</code> call.</div>
+    </div>
+    <div class="state-box" style="grid-column: span 2;">
+      <span class="title">arg_start/end, env_start/end</span>
+      <div class="desc"><strong>argv[] and environ[] strings</strong> in memory. Defines what <code>/proc/PID/cmdline</code> and <code>/proc/PID/environ</code> show. Must be in the exact same location after restore.</div>
+    </div>
+  </div>
+</section>

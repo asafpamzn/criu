@@ -1,0 +1,48 @@
+<section>
+  <h2>Dirty Pages: The Hardware Dirty Bit</h2>
+
+  <div class="two-col">
+    <div>
+      <h4 class="cyan">What Is the Dirty Bit?</h4>
+      <p class="small">Every page of memory has a <strong>Page Table Entry (PTE)</strong> in the CPU's page table. One bit in the PTE is the <strong>dirty bit</strong>:</p>
+
+      <div class="state-grid" style="grid-template-columns: 1fr;">
+        <div class="state-box" style="border-left: 3px solid #4ade80;">
+          <span class="title">Clean Page (dirty=0)</span>
+          <div class="desc">Content matches its source. For file-backed pages: matches the file on disk. For anonymous pages after fork: matches the parent's copy. The kernel can <strong>drop</strong> clean file pages — just re-read from disk later.</div>
+        </div>
+        <div class="state-box" style="border-left: 3px solid #f87171;">
+          <span class="title">Dirty Page (dirty=1)</span>
+          <div class="desc">The process has <strong>written</strong> to this page. In-memory content differs from the backing source. For anonymous pages (heap/stack): data exists <strong>only in RAM</strong> — losing it means data loss.</div>
+        </div>
+      </div>
+    </div>
+
+    <div>
+      <h4 class="cyan">PTE Layout (x86_64)</h4>
+      <pre style="font-size:0.6em;"><code>Page Table Entry (PTE):
+┌─────────────────────────────────┐
+│ Physical Address │ Flags        │
+│ (bits 12-51)     │ D=dirty      │
+│                  │ A=accessed   │
+│                  │ R/W=writable │
+│                  │ P=present    │
+└─────────────────────────────────┘
+CPU sets the D bit automatically
+on first write — no software needed.</code></pre>
+
+      <h4 class="yellow" style="margin-top:12px;">What CRIU must dump</h4>
+      <div class="state-grid" style="grid-template-columns: 1fr;">
+        <div class="state-box">
+          <span class="title">Classification for dump</span>
+          <div class="desc">
+            <strong style="color:#64748b;">Clean file-backed</strong> → skip (re-read from file on restore)<br>
+            <strong style="color:#f87171;">Dirty file-backed</strong> → MUST dump (differs from file)<br>
+            <strong style="color:#f87171;">Anonymous pages</strong> → MUST dump (no backing file)<br><br>
+            A 100GB Valkey = mostly anonymous heap → <strong>nearly all pages must be dumped</strong>.
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>

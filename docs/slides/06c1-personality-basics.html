@@ -1,0 +1,30 @@
+<section>
+  <h2>Personality: What Is It?</h2>
+
+  <pre><code class="language-c">static int get_task_personality(pid_t pid, u32 *personality) {
+    fd = open_proc(pid, "personality");
+    ret = read(fd, loc_buf, sizeof(loc_buf) - 1);
+    *personality = atoi(loc_buf);
+}
+</code></pre>
+
+  <p class="small">A 32-bit value read from <code>/proc/PID/personality</code> that controls how the kernel behaves for this process. It's a bitmask combining a <strong>base personality</strong> (low byte) with <strong>flags</strong> (high bytes).</p>
+
+  <p class="small">Set via <code>personality()</code> syscall or inherited from parent. Typically set by the dynamic loader or by exec of a 32-bit binary on a 64-bit kernel.</p>
+
+  <h4 class="cyan" style="margin-top: 18px;">Common Base Personalities</h4>
+  <div class="state-grid" style="grid-template-columns: 1fr 1fr 1fr;">
+    <div class="state-box">
+      <span class="title">PER_LINUX (0x0000)</span>
+      <div class="desc">Default. Standard Linux behavior. 64-bit process on 64-bit kernel, or 32-bit on 32-bit kernel.</div>
+    </div>
+    <div class="state-box">
+      <span class="title">PER_LINUX32 (0x0008)</span>
+      <div class="desc">32-bit compatibility mode on a 64-bit kernel. <code>uname -m</code> reports <code>i686</code> instead of <code>x86_64</code>. Syscall numbers follow 32-bit ABI.</div>
+    </div>
+    <div class="state-box">
+      <span class="title">PER_LINUX_32BIT</span>
+      <div class="desc">Limits virtual address space to 32-bit range. Used for some legacy binaries that assume 32-bit pointers.</div>
+    </div>
+  </div>
+</section>

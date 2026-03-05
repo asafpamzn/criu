@@ -1,0 +1,44 @@
+<section>
+  <h2>Step 1 Deep Dive: Misc Fields</h2>
+
+  <div class="state-grid" style="grid-template-columns: 1fr 1fr;">
+    <div class="state-box">
+      <span class="title">loginuid</span>
+      <div class="desc">
+        Read from <code>/proc/PID/loginuid</code>. Part of the Linux audit subsystem.
+        Records the <strong>original UID that logged in</strong> via SSH/PAM.
+        Unlike real/effective UID, it <strong>survives su/sudo</strong>.
+        If not restored correctly, you may lose ability to SSH into the container after migration.
+        <br><br>
+        <span style="color:#fbbf24;">⚠️ Dumping loginuid is marked as <em>critical</em> in the code.</span>
+      </div>
+    </div>
+    <div class="state-box">
+      <span class="title">oom_score_adj</span>
+      <div class="desc">
+        Read from <code>/proc/PID/oom_score_adj</code>. Range: -1000 to +1000.<br>
+        <strong>-1000</strong> = never OOM-kill this process<br>
+        <strong>+1000</strong> = kill this first when OOM occurs<br>
+        Databases and caches (like Valkey) often set this to -1000 to avoid data loss.
+      </div>
+    </div>
+    <div class="state-box">
+      <span class="title">child_subreaper</span>
+      <div class="desc">
+        Set via <code>prctl(PR_SET_CHILD_SUBREAPER)</code>.
+        When a child's parent dies, orphaned descendants re-parent to the nearest
+        subreaper instead of PID 1. Used by systemd, container init processes, and
+        process supervisors.
+      </div>
+    </div>
+    <div class="state-box">
+      <span class="title">dumpable</span>
+      <div class="desc">
+        Controls whether ptrace attach and core dumps are allowed.
+        If 0: <code>/proc/PID/maps</code> is restricted (root only).
+        Set via <code>prctl(PR_SET_DUMPABLE)</code>. SUID binaries auto-clear it.
+        CRIU needs it to be dumpable=1 during dump; restores the original value.
+      </div>
+    </div>
+  </div>
+</section>

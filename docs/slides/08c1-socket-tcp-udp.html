@@ -1,0 +1,32 @@
+<section>
+  <h2>Socket FDs: TCP &amp; UDP</h2>
+
+  <div class="state-grid" style="grid-template-columns: 1fr 1fr;">
+    <div class="state-box" style="border-left: 3px solid #f87171;">
+      <span class="title">TCP Sockets — sk-tcp.c + soccr library</span>
+      <div class="desc">
+        <strong>The hardest FD type to checkpoint.</strong> Must preserve a live connection.<br><br>
+        <strong>Dump:</strong><br>
+        1. Put socket into <code>TCP_REPAIR</code> mode (kernel API)<br>
+        2. Read full TCP state: seq/ack numbers, window, timestamps, congestion algorithm + state, MSS, options<br>
+        3. Read queued data: <strong>send queue</strong>, <strong>receive queue</strong>, out-of-order queue via <code>TCP_REPAIR_QUEUE</code><br>
+        4. Save source/dest IP:port, socket options<br><br>
+        <strong>Restore:</strong><br>
+        1. Create socket in <code>TCP_REPAIR</code> mode<br>
+        2. Bind + connect (succeeds immediately in repair mode)<br>
+        3. Inject all queued data back<br>
+        4. Restore seq numbers, window, timestamps<br>
+        5. Exit repair mode — connection appears uninterrupted<br><br>
+        <strong>Network lock:</strong> CRIU blocks network traffic with iptables/nftables during dump to prevent new data arriving.
+      </div>
+    </div>
+
+    <div class="state-box" style="border-left: 3px solid #22d3ee;">
+      <span class="title">UDP Sockets — sk-inet.c</span>
+      <div class="desc">
+        <strong>Saved:</strong> bind address:port, connect address (if connected), socket options (<code>SO_REUSEADDR</code>, <code>SO_BROADCAST</code>, etc.), pending data in receive queue<br><br>
+        <strong>Simpler than TCP:</strong> no connection state, no sequence numbers. Just re-create the socket and re-bind. Data in transit is lost (UDP has no delivery guarantees anyway).
+      </div>
+    </div>
+  </div>
+</section>

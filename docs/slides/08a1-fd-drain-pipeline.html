@@ -1,0 +1,48 @@
+<section>
+  <h2>FD Dump: The 4-Step Drain Pipeline</h2>
+
+  <div class="two-col">
+    <div>
+      <div class="state-grid" style="grid-template-columns: 1fr;">
+        <div class="state-box" style="border-left: 3px solid #22d3ee;">
+          <span class="title">1. Enumerate — collect_fds()</span>
+          <div class="desc">Read <code>/proc/PID/fd/</code> directory to get all open FD numbers. Store them in a <code>parasite_drain_fd</code> array.</div>
+        </div>
+        <div class="state-box" style="border-left: 3px solid #a78bfa;">
+          <span class="title">2. Drain — parasite_drain_fds_seized()</span>
+          <div class="desc">The parasite (running inside the target process) sends each FD to CRIU using <strong>SCM_RIGHTS</strong> over a Unix socket. This gives CRIU a local copy — CRIU can now <code>fstat()</code>, <code>read()</code>, and inspect each one.</div>
+        </div>
+        <div class="state-box" style="border-left: 3px solid #fbbf24;">
+          <span class="title">3. Classify — dump_one_file()</span>
+          <div class="desc">For each drained FD, determine its type using:<br>
+            • <code>fstat()</code> → <code>S_ISSOCK</code>, <code>S_ISREG</code>, <code>S_ISFIFO</code>, <code>S_ISCHR</code><br>
+            • <code>fstatfs()</code> → filesystem magic (<code>PIPEFS</code>, <code>ANON_INODE_FS</code>)<br>
+            • <code>/proc/PID/fdinfo/</code> → position, flags, type-specific data
+          </div>
+        </div>
+        <div class="state-box" style="border-left: 3px solid #4ade80;">
+          <span class="title">4. Dispatch — fdtype_ops→dump()</span>
+          <div class="desc">Each FD type has its own dump handler (e.g., <code>pipe_dump_ops</code>, <code>regfile_dump_ops</code>). Serializes type-specific state into a protobuf image file.</div>
+        </div>
+      </div>
+    </div>
+
+    <div>
+      <h4 class="cyan">Why SCM_RIGHTS?</h4>
+      <div class="state-grid" style="grid-template-columns: 1fr;">
+        <div class="state-box">
+          <span class="title">The problem</span>
+          <div class="desc">CRIU (a separate process) can't directly access another process's file descriptors. <code>/proc/PID/fd/N</code> gives a symlink, but opening it creates a <strong>new</strong> file description — not the same one.</div>
+        </div>
+        <div class="state-box">
+          <span class="title">The solution</span>
+          <div class="desc">The parasite (running <em>inside</em> the target) uses <code>sendmsg()</code> with <code>SCM_RIGHTS</code> to pass the actual FD over a Unix socket. CRIU receives the <strong>exact same kernel file description</strong> — same offset, same flags, same locks.</div>
+        </div>
+        <div class="state-box">
+          <span class="title">Shared FD detection</span>
+          <div class="desc">Each FD gets a <strong>unique ID</strong> via <code>fd_id_generate()</code> using <code>kcmp()</code> to detect shared file descriptions. If two FDs in different processes point to the same kernel <code>struct file</code>, only dumped once.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>

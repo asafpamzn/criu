@@ -1,0 +1,31 @@
+<section>
+  <h2>MADV_GUARD_INSTALL — What Are Guard Pages?</h2>
+
+  <div class="two-col">
+    <div>
+      <p class="small">A guard page is an unmapped hole in the address space that triggers <code>SIGSEGV</code> on any access. Created with:</p>
+      <pre><code class="language-c">madvise(addr, len, MADV_GUARD_INSTALL);</code></pre>
+
+      <p class="small"><strong>Primary use case: stack overflow protection.</strong></p>
+      <p class="small">When a thread's stack grows, it approaches a guard page. If the stack overflows, it hits the guard → SIGSEGV → clean crash instead of silently corrupting adjacent memory.</p>
+    </div>
+
+    <div>
+      <div class="state-grid" style="grid-template-columns: 1fr;">
+        <div class="state-box">
+          <span class="title">The Invisibility Problem</span>
+          <div class="desc">
+            Unlike regular VMAs, guard pages are <strong>NOT</strong> represented as
+            <code>struct vm_area_struct</code> in the kernel. They're invisible in:
+            <ul>
+              <li><code>/proc/PID/maps</code> — not listed</li>
+              <li><code>/proc/PID/smaps</code> — not listed</li>
+              <li>Kernel VMA linked list — not present</li>
+            </ul>
+            They exist only as PTE-level markers (unmapped entries with a special poison value).
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>

@@ -1,0 +1,49 @@
+<section>
+  <h2>smaps: Page States</h2>
+
+  <div class="two-col">
+    <div>
+      <h4 class="cyan">Three Key Page States</h4>
+      <div class="state-grid" style="grid-template-columns: 1fr;">
+        <div class="state-box" style="border-left: 3px solid #22d3ee;">
+          <span class="title">Referenced</span>
+          <div class="desc">Pages accessed (read or written) recently. The kernel tracks this for its LRU page reclaim — unreferenced pages get swapped out first. <strong>Not directly used by CRIU</strong> — informational only.</div>
+        </div>
+        <div class="state-box" style="border-left: 3px solid #f87171;">
+          <span class="title">Anonymous</span>
+          <div class="desc">Pages with <strong>NO file backing</strong> — they exist only in RAM (and swap). Created by: heap (<code>brk</code>/<code>mmap(MAP_ANONYMOUS)</code>), stack, COW'd pages after <code>fork()</code>. <strong>All anonymous pages must be dumped by CRIU</strong> — there's no file to re-read them from.</div>
+        </div>
+        <div class="state-box" style="border-left: 3px solid #a78bfa;">
+          <span class="title">LazyFree</span>
+          <div class="desc">Pages marked with <code>madvise(MADV_FREE)</code>. The process says "I don't need this data anymore, but don't bother freeing now — reclaim when you need memory." Used by jemalloc to return pages cheaply.</div>
+        </div>
+      </div>
+    </div>
+
+    <div>
+      <h4 class="cyan">smaps Memory Accounting</h4>
+      <pre style="font-size:0.6em;"><code>Size:               2048 kB
+Rss:                1024 kB  ← pages in RAM
+Pss:                 512 kB  ← proportional share
+Shared_Clean:        256 kB
+Shared_Dirty:          0 kB
+Private_Clean:       256 kB
+Private_Dirty:       512 kB  ← CRIU must dump these
+Referenced:         1024 kB
+Anonymous:          1024 kB  ← no file backing
+LazyFree:              0 kB
+Swap:                  0 kB</code></pre>
+      <div class="state-grid" style="grid-template-columns: 1fr;">
+        <div class="state-box">
+          <span class="title">What CRIU uses these for</span>
+          <div class="desc">
+            <strong>Private_Dirty</strong> — pages modified, must dump<br>
+            <strong>Anonymous</strong> — no file backing, must dump<br>
+            <strong>Swap</strong> — paged out, read from swap<br>
+            <strong>RSS/PSS</strong> — size estimation for page-pipe allocation
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
