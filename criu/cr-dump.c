@@ -2463,6 +2463,23 @@ int cr_dump_tasks(pid_t pid)
 			goto err;
 		if (cow_dump_pre_init(pid))
 			goto err;
+
+		/*
+		 * Hybrid pre-copy: inject userfaultfd via brief
+		 * ptrace (~5ms), then apply WP while running.
+		 * This enables dirty tracking BEFORE the freeze,
+		 * so the dump only needs to send the delta.
+		 */
+		if (cow_is_wp_async() && !kdat.has_uffd_proc) {
+			if (cow_inject_userfaultfd(pid)) {
+				pr_err("Failed to inject userfaultfd\n");
+				goto err;
+			}
+			if (cow_pre_copy_apply_wp(pid)) {
+				pr_err("Failed to apply pre-copy WP\n");
+				goto err;
+			}
+		}
 	}
 
 	/*

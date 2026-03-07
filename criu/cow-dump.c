@@ -1,4 +1,7 @@
 #include <sys/types.h>
+#include <sys/syscall.h>
+#include <sys/uio.h>
+#include <sys/wait.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <fcntl.h>
@@ -1960,4 +1963,321 @@ unsigned long cow_get_queue_size(void)
 	pthread_spin_unlock(&g_cow_info->queue_lock);
 
 	return count;
+}
+
+/*
+ * cow_inject_userfaultfd - Create a userfaultfd in the target process
+ * via ptrace syscall injection.  Brief seize (~5ms), no parasite needed.
+ *
+ * Injects userfaultfd(O_CLOEXEC|O_NONBLOCK) into the target, retrieves
+ * the fd via pidfd_getfd(), negotiates UFFDIO_API, and stores it in
+ * g_cow_pre_task.  The target is detached immediately after.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int cow_inject_userfaultfd(pid_t pid)
+{
+	struct cow_tracked_task *task;
+	user_regs_struct_t orig_regs, regs;
+	unsigned char orig_code[8];
+	unsigned long pc;
+	int status, target_fd, uffd = -1;
+	int pidfd = -1;
+
+	/*
+	 * aarch64 instruction sequence:
+	 *   SVC #0   (syscall)
+	 *   BRK #0   (trap back to ptrace)
+	 */
+	static const unsigned char uffd_insn[8] = {
+		0x01, 0x00, 0x00, 0xd4,  /* svc #0 */
+		0x00, 0x00, 0x20, 0xd4,  /* brk #0 */
+	};
+
+	task = g_cow_pre_task;
+	if (!task || task->source_pid != pid) {
+		pr_err("cow_inject_uffd: no pre_task for %d\n", pid);
+		return -1;
+	}
+	if (task->uffd >= 0)
+		return 0;  /* already have uffd */
+
+	/* Seize */
+	if (ptrace(PTRACE_SEIZE, pid, NULL, 0)) {
+		pr_perror("cow_inject_uffd: SEIZE %d", pid);
+		return -1;
+	}
+	if (ptrace(PTRACE_INTERRUPT, pid, NULL, NULL)) {
+		pr_perror("cow_inject_uffd: INTERRUPT");
+		goto detach;
+	}
+	if (waitpid(pid, &status, __WALL) != pid) {
+		pr_perror("cow_inject_uffd: waitpid");
+		goto detach;
+	}
+
+	/* Save state */
+	if (({ struct iovec _iv = { .iov_base = &orig_regs, .iov_len = sizeof(orig_regs) }; ptrace(PTRACE_GETREGSET, pid, (void *)(unsigned long)1, &_iv); })) {
+		pr_err("cow_inject_uffd: get regs failed\n");
+		goto detach;
+	}
+
+#ifdef __aarch64__
+	pc = (unsigned long)orig_regs.pc;
+#else
+	pc = (unsigned long)orig_regs.ip;
+#endif
+
+	if (ptrace_peek_area(pid, orig_code, (void *)pc,
+			     sizeof(orig_code))) {
+		pr_err("cow_inject_uffd: peek code failed\n");
+		goto detach;
+	}
+
+	/* Inject userfaultfd() syscall */
+	if (ptrace_poke_area(pid, (void *)uffd_insn, (void *)pc,
+			     sizeof(uffd_insn))) {
+		pr_err("cow_inject_uffd: poke code failed\n");
+		goto restore;
+	}
+
+	regs = orig_regs;
+#ifdef __aarch64__
+	regs.regs[8] = 282;  /* __NR_userfaultfd on aarch64 */
+	regs.regs[0] = 0x80800;  /* O_CLOEXEC | O_NONBLOCK */
+	regs.pc = pc;
+#else
+	regs.orig_ax = 323;  /* __NR_userfaultfd on x86_64 */
+	regs.di = 0x80800;
+	regs.ip = pc;
+#endif
+
+	if (ptrace(PTRACE_SETREGSET, pid, (void *)1, &(struct iovec){ .iov_base = &regs, .iov_len = sizeof(regs) })) {
+		pr_err("cow_inject_uffd: set regs failed\n");
+		goto restore;
+	}
+
+	if (ptrace(PTRACE_CONT, pid, NULL, NULL)) {
+		pr_perror("cow_inject_uffd: CONT");
+		goto restore;
+	}
+
+	/* Wait for BRK trap */
+	while (1) {
+		if (waitpid(pid, &status, __WALL) != pid) {
+			pr_perror("cow_inject_uffd: waitpid result");
+			goto restore;
+		}
+		if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP)
+			break;
+		if (WIFSTOPPED(status) &&
+		    (WSTOPSIG(status) == SIGSTOP ||
+		     WSTOPSIG(status) == (SIGTRAP | 0x80))) {
+			ptrace(PTRACE_CONT, pid, NULL, NULL);
+			continue;
+		}
+		pr_err("cow_inject_uffd: unexpected status %x\n", status);
+		goto restore;
+	}
+
+	/* Read result fd */
+	if (ptrace(PTRACE_GETREGSET, pid, (void *)1, &(struct iovec){ .iov_base = &regs, .iov_len = sizeof(regs) })) {
+		pr_err("cow_inject_uffd: get result regs\n");
+		goto restore;
+	}
+
+#ifdef __aarch64__
+	target_fd = (int)regs.regs[0];
+#else
+	target_fd = (int)regs.ax;
+#endif
+
+	if (target_fd < 0) {
+		pr_err("cow_inject_uffd: userfaultfd() returned %d\n",
+		       target_fd);
+		goto restore;
+	}
+
+	/* Get fd to our process via pidfd_getfd */
+	pidfd = syscall(SYS_pidfd_open, pid, 0);
+	if (pidfd < 0) {
+		pr_perror("cow_inject_uffd: pidfd_open");
+		goto restore;
+	}
+
+	uffd = syscall(SYS_pidfd_getfd, pidfd, target_fd, 0);
+	close(pidfd);
+	if (uffd < 0) {
+		pr_perror("cow_inject_uffd: pidfd_getfd(%d)", target_fd);
+		goto restore;
+	}
+
+	/* Negotiate UFFDIO_API */
+	{
+		struct uffdio_api api;
+
+		memset(&api, 0, sizeof(api));
+		api.api = UFFD_API;
+		api.features = UFFD_FEATURE_PAGEFAULT_FLAG_WP;
+		if (g_wp_async_mode)
+			api.features |= UFFD_FEATURE_WP_ASYNC;
+
+		if (ioctl(uffd, UFFDIO_API, &api)) {
+			pr_perror("cow_inject_uffd: UFFDIO_API");
+			close(uffd);
+			uffd = -1;
+			goto restore;
+		}
+
+		if (g_wp_async_mode &&
+		    !(api.features & UFFD_FEATURE_WP_ASYNC)) {
+			pr_err("cow_inject_uffd: WP_ASYNC not granted\n");
+			g_wp_async_mode = false;
+		}
+	}
+
+	task->uffd = uffd;
+
+	/*
+	 * Close the fd in the target process so CRIU doesn't
+	 * try to dump it.  We already have our copy via pidfd_getfd.
+	 * Inject close() syscall: x8=57 (__NR_close), x0=target_fd.
+	 */
+	{
+		user_regs_struct_t cregs;
+		struct iovec civ;
+
+		cregs = orig_regs;
+		civ.iov_base = &cregs;
+		civ.iov_len = sizeof(cregs);
+#ifdef __aarch64__
+		cregs.regs[8] = 57;  /* __NR_close */
+		cregs.regs[0] = target_fd;
+		cregs.pc = pc;
+#else
+		cregs.orig_ax = 3;  /* __NR_close */
+		cregs.di = target_fd;
+		cregs.ip = pc;
+#endif
+		/* Code is still SVC+BRK from the uffd injection */
+		ptrace(PTRACE_SETREGSET, pid,
+		       (void *)(unsigned long)1, &civ);
+		ptrace(PTRACE_CONT, pid, NULL, NULL);
+		waitpid(pid, &status, __WALL);
+		/* Ignore result — close might fail if fd was
+		 * already closed by dup2 or similar. */
+	}
+
+	pr_err("cow_inject_uffd: got uffd=%d from pid %d "
+	       "(target_fd=%d closed, ~5ms seize)\n",
+	       uffd, pid, target_fd);
+
+restore:
+	{
+		struct iovec riov = { .iov_base = &orig_regs,
+				      .iov_len = sizeof(orig_regs) };
+
+		if (ptrace_poke_area(pid, orig_code,
+				     (void *)pc, sizeof(orig_code)))
+			pr_debug("cow_inject_uffd: restore code failed\n");
+		(void)ptrace(PTRACE_SETREGSET, pid,
+			     (void *)(unsigned long)1, &riov);
+	}
+detach:
+	ptrace(PTRACE_DETACH, pid, NULL, NULL);
+	return (uffd >= 0) ? 0 : -1;
+}
+
+/*
+ * cow_pre_copy_apply_wp - Register VMAs + apply WP_ASYNC while
+ * the process is running.  Uses the uffd from cow_inject_userfaultfd
+ * or cow_dump_pre_init.
+ */
+int cow_pre_copy_apply_wp(pid_t pid)
+{
+	struct cow_tracked_task *task;
+	char path[64];
+	FILE *fp;
+	char line[512];
+	struct uffdio_register reg;
+	struct uffdio_writeprotect wp;
+	int nr_reg = 0, nr_wp = 0;
+	unsigned long total_pages = 0;
+	struct cow_tracked_vma *tvmas = NULL;
+	unsigned int tvma_count = 0, tvma_cap = 0;
+
+	if (!g_wp_async_mode)
+		return 0;
+
+	task = g_cow_pre_task;
+	if (!task && !(task = cow_find_task_by_pid(pid)))
+		return -1;
+	if (task->uffd < 0)
+		return -1;
+
+	snprintf(path, sizeof(path), "/proc/%d/maps", pid);
+	fp = fopen(path, "r");
+	if (!fp)
+		return -1;
+
+	while (fgets(line, sizeof(line), fp)) {
+		unsigned long start, end;
+		char perms[8], mpath[256];
+		int ret;
+
+		mpath[0] = '\0';
+		if (sscanf(line, "%lx-%lx %4s %*s %*s %*s %255[^\n]",
+			   &start, &end, perms, mpath) < 3)
+			continue;
+		if (perms[1] != 'w')
+			continue;
+		if (strstr(mpath, "[vvar]") || strstr(mpath, "[vdso]") ||
+		    strstr(mpath, "[vsyscall]"))
+			continue;
+
+		memset(&reg, 0, sizeof(reg));
+		reg.range.start = start;
+		reg.range.len = end - start;
+		reg.mode = UFFDIO_REGISTER_MODE_WP;
+
+		ret = ioctl(task->uffd, UFFDIO_REGISTER, &reg);
+		if (ret < 0)
+			continue;
+		nr_reg++;
+
+		memset(&wp, 0, sizeof(wp));
+		wp.range.start = start;
+		wp.range.len = end - start;
+		wp.mode = UFFDIO_WRITEPROTECT_MODE_WP;
+
+		if (ioctl(task->uffd, UFFDIO_WRITEPROTECT, &wp))
+			continue;
+		nr_wp++;
+		total_pages += (end - start) / PAGE_SIZE;
+
+		/* Track VMA for later dirty scanning */
+		if (tvma_count >= tvma_cap) {
+			unsigned int nc = (tvma_cap + 64) * 2;
+			struct cow_tracked_vma *tmp;
+
+			tmp = xrealloc(tvmas, nc * sizeof(*tmp));
+			if (!tmp) break;
+			tvmas = tmp;
+			tvma_cap = nc;
+		}
+		tvmas[tvma_count].start = start;
+		tvmas[tvma_count].end = end;
+		tvma_count++;
+	}
+	fclose(fp);
+
+	task->tracked_vmas = tvmas;
+	task->nr_tracked_vmas = tvma_count;
+	task->total_pages = total_pages;
+
+	pr_err("cow_pre_copy_wp: %d registered, %d WP'd "
+	       "(%lu pages, %.1f GB)\n",
+	       nr_reg, nr_wp, total_pages,
+	       (double)(total_pages * PAGE_SIZE) / (1024UL*1024*1024));
+	return 0;
 }

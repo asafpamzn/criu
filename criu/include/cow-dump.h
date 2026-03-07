@@ -41,6 +41,8 @@ struct cow_page_queue_entry {
  * Returns: 0 on success, -1 on error
  */
 extern int cow_dump_pre_init(pid_t pid);
+extern int cow_inject_userfaultfd(pid_t pid);
+extern int cow_pre_copy_apply_wp(pid_t pid);
 
 /**
  * cow_dump_init - Initialize COW dump for a process
