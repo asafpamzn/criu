@@ -3345,7 +3345,8 @@ static long converge_dispatch_parallel(struct active_image *img,
  */
 static int cow_converge_dirty_pages_parallel(struct active_image *img,
 					     pid_t source_pid,
-					     int *sockets, int nr_streams)
+					     int *sockets, int nr_streams,
+					     pid_t bulk_fork_pid)
 {
 	struct converge_region *regions;
 	unsigned long iteration, prev_dirty = 0;
@@ -3949,26 +3950,32 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 				fclose(mfp);
 			}
 
-			/* Re-send allocator pages from fork */
-			if (alloc_count > 0 && fork_pid > 0) {
-				long re_sent;
+			/* Re-send allocator pages from BULK fork (T0) */
+			{
+				pid_t asrc = bulk_fork_pid > 0 ?
+					bulk_fork_pid : fork_pid;
 
-				pr_err("COW converge: re-sending %lu "
-				       "allocator pages (%d regions, "
-				       "%.1f MB, skipping %.1f GB)\n",
-				       alloc_pages, alloc_count,
-				       (double)(alloc_pages * PAGE_SIZE) /
-				       (1024 * 1024),
-				       (double)(skip_pages * PAGE_SIZE) /
-				       (1024 * 1024 * 1024));
-				re_sent = converge_dispatch_parallel(
-					img, fork_pid, sockets,
-					nr_streams, alloc_regions,
-					alloc_count);
-				if (re_sent >= 0)
-					pr_err("COW converge: re-sent "
-					       "%ld allocator pages\n",
-					       re_sent);
+				if (alloc_count > 0 && asrc > 0) {
+					long re_sent;
+
+					pr_err("COW converge: re-sending "
+					       "%lu alloc pages from %s "
+					       "fork %d\n",
+					       alloc_pages,
+					       asrc == bulk_fork_pid ?
+					       "bulk" : "converge",
+					       asrc);
+					re_sent =
+						converge_dispatch_parallel(
+							img, asrc, sockets,
+							nr_streams,
+							alloc_regions,
+							alloc_count);
+					if (re_sent >= 0)
+						pr_err("COW converge: "
+						       "re-sent %ld\n",
+						       re_sent);
+				}
 			}
 			if (fork_pid > 0)
 				kill(fork_pid, SIGKILL);
@@ -4170,6 +4177,7 @@ static void *unified_page_server_thread(void *arg)
 				pthread_t threads[COW_TRANSFER_STREAMS];
 				struct lazy_vma_entry **all_vmas;
 				struct vma_range *all_ranges = NULL;
+				pid_t bulk_fork = -1;
 				int nr_vmas = 0, vi = 0, s;
 				int nr_ranges = 0;
 				unsigned long total_pages = 0;
@@ -4310,7 +4318,17 @@ static void *unified_page_server_thread(void *arg)
 				       nr_streams, nr_ranges,
 				       nr_vmas, total_pages);
 
-				/* Launch worker threads */
+				/* Fork for consistent bulk snapshot */
+				{
+				if (cow_is_wp_async())
+					bulk_fork = fork_source_snapshot(
+							source_pid);
+				if (bulk_fork > 0) {
+					pr_err("Bulk: fork %d\n", bulk_fork);
+					for (s = 0; s < nr_streams; s++)
+						workers[s].source_pid =
+							bulk_fork;
+				}
 				for (s = 0; s < nr_streams; s++) {
 					if (pthread_create(&threads[s], NULL,
 							   stream_worker_func,
@@ -4320,11 +4338,11 @@ static void *unified_page_server_thread(void *arg)
 					}
 				}
 
-				/* Wait for all workers */
 				for (s = 0; s < nr_streams; s++)
 					pthread_join(threads[s], NULL);
+				/* Keep bulk_fork alive for allocator re-send */
+				}
 
-				/* Check results */
 				for (s = 0; s < nr_streams; s++) {
 					if (workers[s].failed)
 						image_failed = true;
@@ -4363,11 +4381,15 @@ static void *unified_page_server_thread(void *arg)
 							conv_sks[s] = workers[s].sk;
 						if (cow_converge_dirty_pages_parallel(
 							    img, source_pid,
-							    conv_sks, nr_streams) < 0)
+							    conv_sks, nr_streams,
+							    bulk_fork) < 0)
 							pr_warn("COW convergence had errors (non-fatal)\n");
 						xfree(conv_sks);
 					}
 				}
+
+				if (bulk_fork > 0)
+					kill(bulk_fork, SIGKILL);
 
 				/* Send final close + close sockets */
 				for (s = 0; s < nr_streams; s++) {

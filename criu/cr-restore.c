@@ -2604,7 +2604,7 @@ static int reset_one_arena(pid_t pid, unsigned long arena)
  * reset every arena.  The list is circular: main_arena.next →
  * arena2 → arena3 → ... → main_arena.
  */
-static void reset_all_glibc_arenas(pid_t pid, unsigned long main_arena)
+static void __attribute__((unused)) reset_all_glibc_arenas(pid_t pid, unsigned long main_arena)
 {
 	unsigned long arena = main_arena;
 	unsigned long next_val;
@@ -2961,8 +2961,65 @@ static int finalize_restore_detach(void)
 				}
 			}
 
-			if (opts.cow_dump)
+			if (opts.cow_dump) {
 				usleep(10000);
+
+				/* Final arena mutex zero + wake.
+				 * All pages delivered. Allocator
+				 * re-send from bulk fork set bins.
+				 * Mutex might still be 1 from the
+				 * re-send — zero it now.
+				 */
+				{
+					pid_t mp = item->pid->real;
+					char m[64];
+					FILE *f;
+					unsigned long le2 = 0;
+
+					snprintf(m, sizeof(m),
+						 "/proc/%d/maps", mp);
+					f = fopen(m, "r");
+					if (f) {
+						char l[512];
+
+						while (fgets(l, sizeof(l), f)) {
+							unsigned long s, e;
+							char p[8], pa[256];
+
+							pa[0] = '\0';
+							if (sscanf(l,
+								   "%lx-%lx %4s %*s %*s %*s %255[^\n]",
+								   &s, &e, p,
+								   pa) < 3)
+								continue;
+							if (strstr(pa, "libc.so")) {
+								le2 = e;
+								continue;
+							}
+							if (le2 && s == le2 &&
+							    p[0] == 'r' &&
+							    p[1] == 'w') {
+								unsigned long a = s + 0xa50;
+								unsigned int z = 0;
+								int fd;
+
+								snprintf(m, sizeof(m),
+									 "/proc/%d/mem", mp);
+								fd = open(m, O_RDWR);
+								if (fd >= 0) {
+									if (pwrite(fd, &z, 4, a) == 4)
+										pr_err("Final arena zero 0x%lx\n", a);
+									close(fd);
+								}
+								inject_futex_wake(mp, a);
+								break;
+							}
+							le2 = 0;
+						}
+						fclose(f);
+					}
+				}
+			}
 
 			if (main_idx >= 0) {
 				pid = item->threads[main_idx].real;
@@ -3369,8 +3426,33 @@ skip_ns_bouncing:
 				}
 				if (libc_end && start == libc_end &&
 				    perms[0] == 'r' && perms[1] == 'w') {
-					reset_all_glibc_arenas(pid,
-							       start + 0xa50);
+					/* Zero arena mutex only.
+					 * Bulk fork re-send keeps bins
+					 * consistent.  Mutex might be
+					 * held at T0 (mid-malloc during
+					 * SEIZE).
+					 */
+					{
+						unsigned long a;
+						unsigned int z = 0;
+						char m[64];
+						int f;
+
+						a = start + 0xa50;
+						snprintf(m, sizeof(m),
+							 "/proc/%d/mem",
+							 pid);
+						f = open(m, O_RDWR);
+						if (f >= 0) {
+							if (pwrite(f, &z,
+								   4, a) == 4)
+								pr_err(
+								"Zeroed arena "
+								"lock at "
+								"0x%lx\n", a);
+							close(f);
+						}
+					}
 					break;
 				}
 				libc_end = 0;
