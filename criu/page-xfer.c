@@ -87,6 +87,7 @@ static void psi2iovec(struct page_server_iov *ps, struct iovec *iov)
 #define PS_IOV_ADD_F_PF 9
 #define PS_IOV_ADD_F_COMPRESS 10
 #define PS_IOV_VMA_DIFF       11
+#define PS_IOV_T3_REGS        12
 
 struct vma_diff_entry {
 	u64 start;
@@ -94,6 +95,16 @@ struct vma_diff_entry {
 	u32 prot;
 	u32 pad;
 };
+
+struct t3_thread_regs {
+	u64 regs[31];
+	u64 sp;
+	u64 pc;
+	u64 pstate;
+	u64 tls;
+};
+
+static int g_t3_regs_sent;
 
 #define PS_IOV_CLOSE	   0x1023
 
@@ -3111,6 +3122,106 @@ detach:
 	return -1;
 }
 
+static int capture_and_send_t3_regs(pid_t source_pid, int socket,
+				    u32 dst_id)
+{
+	char task_dir[64];
+	DIR *dir;
+	struct dirent *de;
+	pid_t tids[256];
+	int nr_threads = 0, i;
+	struct t3_thread_regs *t3;
+	struct page_server_iov hdr;
+
+	snprintf(task_dir, sizeof(task_dir),
+		 "/proc/%d/task", source_pid);
+	dir = opendir(task_dir);
+	if (!dir)
+		return -1;
+	while ((de = readdir(dir)) != NULL && nr_threads < 256) {
+		if (de->d_name[0] == '.')
+			continue;
+		tids[nr_threads++] = atoi(de->d_name);
+	}
+	closedir(dir);
+	if (!nr_threads)
+		return -1;
+
+	for (i = 0; i < nr_threads - 1; i++) {
+		int j;
+		for (j = i + 1; j < nr_threads; j++)
+			if (tids[j] < tids[i]) {
+				pid_t tmp = tids[i];
+				tids[i] = tids[j];
+				tids[j] = tmp;
+			}
+	}
+
+	t3 = xmalloc(nr_threads * sizeof(*t3));
+	if (!t3)
+		return -1;
+	memset(t3, 0, nr_threads * sizeof(*t3));
+
+	for (i = 0; i < nr_threads; i++) {
+		pid_t tid = tids[i];
+		int status;
+		struct iovec iov;
+		user_regs_struct_t gp;
+		unsigned long tls_val = 0;
+
+		if (ptrace(PTRACE_SEIZE, tid, NULL, 0) ||
+		    ptrace(PTRACE_INTERRUPT, tid, NULL, NULL) ||
+		    waitpid(tid, &status, __WALL) != tid) {
+			ptrace(PTRACE_DETACH, tid, NULL, NULL);
+			continue;
+		}
+		iov.iov_base = &gp;
+		iov.iov_len = sizeof(gp);
+		if (!ptrace(PTRACE_GETREGSET, tid,
+			    (void *)(unsigned long)NT_PRSTATUS, &iov)) {
+#ifdef __aarch64__
+			memcpy(t3[i].regs, gp.regs, 31 * sizeof(u64));
+			t3[i].sp = gp.sp;
+			t3[i].pc = gp.pc;
+			t3[i].pstate = gp.pstate;
+#else
+			t3[i].sp = gp.sp;
+			t3[i].pc = gp.ip;
+#endif
+		}
+		iov.iov_base = &tls_val;
+		iov.iov_len = sizeof(tls_val);
+		if (!ptrace(PTRACE_GETREGSET, tid, (void *)0x401UL, &iov))
+			t3[i].tls = tls_val;
+		ptrace(PTRACE_DETACH, tid, NULL, NULL);
+	}
+
+	pr_err("T3 regs: captured %d threads\n", nr_threads);
+
+	hdr.cmd = encode_ps_cmd(PS_IOV_T3_REGS, 0);
+	hdr.nr_pages = nr_threads;
+	hdr.vaddr = 0;
+	hdr.dst_id = dst_id;
+	if (send_psi(socket, &hdr)) {
+		xfree(t3);
+		return -1;
+	}
+	{
+		size_t total = nr_threads * sizeof(*t3);
+		size_t sent = 0;
+		while (sent < total) {
+			int w = __send(socket, (char *)t3 + sent,
+				       total - sent, 0);
+			if (w <= 0) { xfree(t3); return -1; }
+			sent += w;
+		}
+	}
+	pr_err("T3 regs: sent %d threads (%zu bytes)\n",
+	       nr_threads, (size_t)(nr_threads * sizeof(*t3)));
+	xfree(t3);
+	return 0;
+}
+
 /*
  * Send a batch of dirty pages to a specific socket.
  * Used by both convergence iterations and final-freeze.
@@ -3658,7 +3769,7 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 			 * Reading from the fork (quiesced snapshot)
 			 * gives consistent arena bins/fastbins.
 			 */
-			if (fork_pid > 0) {
+			if (!g_t3_regs_sent && fork_pid > 0) {
 				char lmaps[64];
 				FILE *lmfp;
 
@@ -3857,8 +3968,40 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 		}
 
 		/*
+		 * T3 register re-capture + libc rw- from frozen source.
+		 * libc rw- is file-backed (not MAP_ANONYMOUS) so WP never
+		 * tracks it.  Must re-send explicitly for T3 consistency.
+		 */
+		{
+			int t3_ok = capture_and_send_t3_regs(
+				source_pid, sockets[0], img->dst_id);
+			if (t3_ok == 0) {
+				g_t3_regs_sent = 1;
+				pr_err("COW converge: T3 regs sent\n");
+				if (g_libc_rw_start) {
+					struct converge_region lr;
+
+					lr.start = g_libc_rw_start;
+					lr.end = g_libc_rw_end;
+					lr.categories = 0;
+					converge_dispatch_parallel(
+						img, source_pid,
+						sockets, nr_streams,
+						&lr, 1);
+					pr_err("COW converge: sent libc "
+					       "rw- from frozen source "
+					       "(%lu pages)\n",
+					       (g_libc_rw_end -
+						g_libc_rw_start) /
+					       PAGE_SIZE);
+				}
+			}
+		}
+
+		/*
 		 * Re-send allocator metadata pages from fork +
 		 * detect new VMAs for VMA diff.
+		 * SKIPPED when T3 regs sent (registers match memory).
 		 *
 		 * Re-send: [heap], file-backed rw- (valkey BSS, libc),
 		 *          small anonymous VMAs (thread stacks/TLS).
@@ -3950,8 +4093,8 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 				fclose(mfp);
 			}
 
-			/* Re-send allocator pages from BULK fork (T0) */
-			{
+			/* Re-send allocator pages — skip if T3 regs sent */
+			if (!g_t3_regs_sent) {
 				pid_t asrc = bulk_fork_pid > 0 ?
 					bulk_fork_pid : fork_pid;
 

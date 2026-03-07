@@ -2917,6 +2917,44 @@ static void finalize_restore(void)
 	}
 }
 
+struct t3_thread_regs {
+	unsigned long regs[31];
+	unsigned long sp;
+	unsigned long pc;
+	unsigned long pstate;
+	unsigned long tls;
+};
+static struct t3_thread_regs *g_t3_regs;
+static int g_t3_regs_count;
+
+static void load_t3_regs(void)
+{
+	char path[PATH_MAX];
+	int fd, cnt;
+	ssize_t r;
+
+	snprintf(path, sizeof(path), "%s/t3_regs.dat", opts.imgs_dir);
+	fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return;
+	r = read(fd, &cnt, sizeof(cnt));
+	if (r != sizeof(cnt) || cnt <= 0 || cnt > 1024) {
+		close(fd);
+		return;
+	}
+	g_t3_regs = xmalloc(cnt * sizeof(*g_t3_regs));
+	if (!g_t3_regs) { close(fd); return; }
+	r = read(fd, g_t3_regs, cnt * sizeof(*g_t3_regs));
+	close(fd);
+	if (r != (ssize_t)(cnt * sizeof(*g_t3_regs))) {
+		xfree(g_t3_regs);
+		g_t3_regs = NULL;
+		return;
+	}
+	g_t3_regs_count = cnt;
+	pr_err("Loaded T3 registers for %d threads\n", cnt);
+}
+
 static int finalize_restore_detach(void)
 {
 	struct pstree_item *item;
@@ -2944,6 +2982,31 @@ static int finalize_restore_detach(void)
 					    &item->threads[i])) {
 					pr_perror("Restoring regs for %d", pid);
 					return -1;
+				}
+				if (g_t3_regs && i < g_t3_regs_count) {
+					user_regs_struct_t r;
+					struct iovec iv, tiv;
+					unsigned long tv;
+#ifdef __aarch64__
+					memcpy(r.regs, g_t3_regs[i].regs,
+					       31 * sizeof(unsigned long));
+					r.sp = g_t3_regs[i].sp;
+					r.pc = g_t3_regs[i].pc;
+					r.pstate = g_t3_regs[i].pstate;
+#endif
+					iv.iov_base = &r;
+					iv.iov_len = sizeof(r);
+					ptrace(PTRACE_SETREGSET, pid,
+					       (void *)(unsigned long)
+					       NT_PRSTATUS, &iv);
+					tv = g_t3_regs[i].tls;
+					tiv.iov_base = &tv;
+					tiv.iov_len = sizeof(tv);
+					ptrace(PTRACE_SETREGSET, pid,
+					       (void *)0x401UL, &tiv);
+					pr_err("T3 regs: thread %d pid %d "
+					       "pc=%lx\n", i, pid,
+					       g_t3_regs[i].pc);
 				}
 				if (pid == item->pid->real)
 					main_idx = i;
@@ -3395,7 +3458,13 @@ skip_ns_bouncing:
 	 * or sysmalloc.  Freed bin chunks are "leaked" but this
 	 * prevents abort from stale fd/bk pointers.
 	 */
-	if (opts.cow_dump) {
+	if (opts.cow_dump)
+		load_t3_regs();
+
+	if (opts.cow_dump && g_t3_regs) {
+		pr_err("T3 regs: skipping arena reset + alloc cleanup "
+		       "(registers match T3 memory)\n");
+	} else if (opts.cow_dump) {
 		pid_t pid = root_item->pid->real;
 		char maps_path[64];
 		FILE *fp;
