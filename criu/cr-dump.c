@@ -1830,17 +1830,18 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 		goto err_cure;
 
 	/*
-	 * Start WP AFTER pagemap — no mmap_lock contention.
-	 * WP runs in parallel with the remaining dump work
-	 * (sigacts/itimers/threads: ~3ms).
+	 * WP_SYNC: start WP during freeze (overlaps with dump work).
+	 * WP_ASYNC: defer WP to after unfreeze — saves ~70ms from
+	 * the freeze window.  WP applied while process runs; the
+	 * process may briefly stall on mmap_lock but isn't frozen.
 	 */
-	if (opts.cow_dump) {
+	if (opts.cow_dump && !cow_is_wp_async()) {
 		ret = cow_dump_start_wp();
 		if (ret) {
 			pr_err("Failed to start async write-protect\n");
 			goto err_cure;
 		}
-		if (opts.lazy_pages && !cow_is_wp_async() &&
+		if (opts.lazy_pages &&
 		    cow_start_monitor_thread()) {
 			pr_err("Failed to start COW monitor thread\n");
 			ret = -1;
@@ -1938,12 +1939,10 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	}
 
 	/*
-	 * Join WP threads during freeze — accurate dirty tracking.
-	 * With WP completing while frozen, all writes after unfreeze
-	 * are tracked.  The convergence scan finds ALL dirty pages
-	 * and re-sends only those from the fork (~5-10GB, not 99GB).
+	 * WP_SYNC: join WP threads during freeze.
+	 * WP_ASYNC: WP not started yet, nothing to join.
 	 */
-	if (opts.cow_dump) {
+	if (opts.cow_dump && !cow_is_wp_async()) {
 		ret = cow_dump_finish_wp();
 		gettimeofday(&t_now, NULL);
 		timersub(&t_now, &t_checkpoint, &t_delta);
@@ -2546,6 +2545,30 @@ int cr_dump_tasks(pid_t pid)
 		pstree_switch_state(root_item, TASK_ALIVE);
 		timing_stop(TIME_FROZEN);
 		pr_err("COW early resume: process unfrozen after dump_one_task\n");
+
+		/*
+		 * WP_ASYNC: apply write-protect NOW, while the process
+		 * is running.  This saves ~70ms from the freeze window.
+		 * The process may briefly stall on mmap_lock during
+		 * UFFDIO_WRITEPROTECT ioctls but is not frozen.
+		 */
+		if (cow_is_wp_async()) {
+			struct timeval t_wp_s, t_wp_e, t_wp_d;
+
+			gettimeofday(&t_wp_s, NULL);
+			ret = cow_dump_start_wp();
+			if (!ret)
+				ret = cow_dump_finish_wp();
+			gettimeofday(&t_wp_e, NULL);
+			timersub(&t_wp_e, &t_wp_s, &t_wp_d);
+			pr_err("TIMING: post-unfreeze WP took "
+			       "%ld.%06ld seconds\n",
+			       t_wp_d.tv_sec, t_wp_d.tv_usec);
+			if (ret) {
+				pr_err("Post-unfreeze WP failed\n");
+				goto err;
+			}
+		}
 
 		/* Write deferred thread core images (off critical path) */
 		for_each_pstree_item(item) {
