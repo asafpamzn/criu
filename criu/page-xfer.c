@@ -104,8 +104,6 @@ struct t3_thread_regs {
 	u64 tls;
 };
 
-static int g_t3_regs_sent;
-
 #define PS_IOV_CLOSE	   0x1023
 
 /* Compression state machine states for bulk stream reader */
@@ -2481,11 +2479,6 @@ static int final_queue_drain(struct active_image *img, pid_t source_pid,
 }
 
 /*
- * Send a raw RESP command to the local Valkey server to pause
- * or unpause client writes.  Used during convergence to stop
- * the write storm so dirty pages drop to zero.
- */
-/*
  * WP_ASYNC convergence: after the initial linear transfer, scan for
  * pages dirtied by the source process and re-send them.  Each scan
  * atomically re-arms WP, so writes after the scan are tracked for
@@ -2495,8 +2488,6 @@ static int final_queue_drain(struct active_image *img, pid_t source_pid,
 #define CONVERGE_MAX_REGIONS		4096
 #define CONVERGE_MAX_ITERS		20
 #define CONVERGE_THRESHOLD_ABS		64
-#define CONVERGE_FREEZE_THRESHOLD	4096	/* pages — freeze when below this */
-#define CONVERGE_STALL_ROUNDS		3	/* freeze after N rounds with <5% improvement */
 
 struct converge_region {
 	u64 start;
@@ -2834,11 +2825,9 @@ err:
 }
 
 /*
- * libc rw- exclusion range.  Detected once from /proc/PID/maps.
- * Convergence skips these pages — the bulk transfer sends them
- * from the clean dump state and we never overwrite them.
- * This prevents the glibc main_arena from being corrupted by
- * temporally inconsistent convergence page reads.
+ * libc rw- range.  Detected once from /proc/PID/maps.
+ * Bulk transfer skips these (file-backed, not WP-tracked).
+ * T3 path re-sends them explicitly from the frozen source.
  */
 static unsigned long g_libc_rw_start;
 static unsigned long g_libc_rw_end;
@@ -3239,8 +3228,6 @@ static int converge_send_batch(int sk, struct active_image *img,
 	int sb_len = 0, sb_cap;
 	ssize_t ret;
 
-	/* libc rw- pages are now properly re-sent from the fork */
-
 	for (i = 0; i < nr; i++) {
 		local_iovs[i].iov_base = batch_buf + i * PAGE_SIZE;
 		local_iovs[i].iov_len = PAGE_SIZE;
@@ -3462,8 +3449,6 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 					     pid_t bulk_fork_pid)
 {
 	struct converge_region *regions;
-	unsigned long iteration, prev_dirty = 0;
-	int stall_count = 0;
 
 	if (!cow_is_wp_async() || nr_streams < 1)
 		return 0;
@@ -3475,125 +3460,8 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 		return -1;
 
 	/*
-	 * Skip iterative convergence: go straight to the fork-based
-	 * final freeze.  Convergence creates cross-round temporal
-	 * inconsistency (pages from different time points → corrupted
-	 * allocator metadata).  The fork reads ALL dirty-since-dump
-	 * pages from a single consistent COW snapshot.
-	 */
-	pr_err("COW converge: skipping iterative convergence, "
-	       "using fork-based consistency snapshot\n");
-	iteration = 0;
-
-	for (; 0; iteration++) {
-		struct lazy_vma_entry *lve;
-		unsigned long total_dirty = 0;
-		struct converge_region *all_dirty = NULL;
-		int all_dirty_count = 0, all_dirty_cap = 0;
-
-		/* Phase 1: scan all VMAs, collect dirty regions */
-		list_for_each_entry(lve, get_global_lazy_vmas(), list) {
-			unsigned long scan_pos;
-
-			if (lve->dst_id != img->dst_id)
-				continue;
-
-			scan_pos = lve->start;
-			while (scan_pos < lve->end) {
-				unsigned long walk_end = 0;
-				int nr_regions, r;
-
-				nr_regions = cow_scan_dirty_pages(
-					source_pid, scan_pos, lve->end,
-					regions, CONVERGE_MAX_REGIONS,
-					&walk_end);
-				if (nr_regions < 0)
-					goto err;
-				if (nr_regions == 0) {
-					scan_pos = walk_end;
-					if (walk_end >= lve->end)
-						break;
-					continue;
-				}
-
-				/* Accumulate regions */
-				if (all_dirty_count + nr_regions > all_dirty_cap) {
-					int new_cap = (all_dirty_cap + nr_regions) * 2;
-					struct converge_region *tmp;
-					tmp = xrealloc(all_dirty,
-						       new_cap * sizeof(*tmp));
-					if (!tmp)
-						goto err;
-					all_dirty = tmp;
-					all_dirty_cap = new_cap;
-				}
-				for (r = 0; r < nr_regions; r++) {
-					all_dirty[all_dirty_count++] = regions[r];
-					total_dirty += (regions[r].end - regions[r].start)
-						       / PAGE_SIZE;
-				}
-
-				scan_pos = walk_end;
-				if (walk_end >= lve->end)
-					break;
-			}
-		}
-
-		pr_err("COW converge iter %lu: %lu dirty pages across %d regions\n",
-		       iteration, total_dirty, all_dirty_count);
-
-		if (total_dirty == 0)
-			break;
-
-		/* Dynamic freeze trigger: threshold or stall */
-		if (total_dirty <= CONVERGE_FREEZE_THRESHOLD) {
-			pr_err("COW converge: below freeze threshold (%lu <= %d), "
-			       "triggering final freeze\n",
-			       total_dirty, CONVERGE_FREEZE_THRESHOLD);
-			xfree(all_dirty);
-			break;
-		}
-		if (iteration >= 2 && prev_dirty > 0) {
-			long improvement = (long)prev_dirty - (long)total_dirty;
-			if (improvement < 0 ||
-			    (unsigned long)improvement < prev_dirty / 20) {
-				stall_count++;
-				pr_err("COW converge: stall %d/%d "
-				       "(prev=%lu cur=%lu)\n",
-				       stall_count, CONVERGE_STALL_ROUNDS,
-				       prev_dirty, total_dirty);
-				if (stall_count >= CONVERGE_STALL_ROUNDS) {
-					pr_err("COW converge: stall limit hit, "
-					       "triggering final freeze\n");
-					xfree(all_dirty);
-					break;
-				}
-			} else {
-				stall_count = 0;
-			}
-		}
-		prev_dirty = total_dirty;
-
-		/* Phase 2: parallel send — regions round-robin to workers */
-		if (all_dirty_count > 0) {
-			long sent = converge_dispatch_parallel(
-				img, source_pid, sockets, nr_streams,
-				all_dirty, all_dirty_count);
-			if (sent < 0) {
-				xfree(all_dirty);
-				goto err;
-			}
-			pr_err("COW converge iter %lu: sent %ld pages\n",
-			       iteration, sent);
-		}
-
-		xfree(all_dirty);
-	}
-
-	/*
-	 * Final freeze: SIGSTOP source, scan remaining dirty pages,
-	 * send across all streams, SIGCONT.  The libc rw- exclusion
-	 * ensures the glibc arena stays clean from the dump snapshot.
+	 * Final freeze: SIGSTOP source, fork a COW snapshot, scan
+	 * dirty pages, send across all streams, then capture T3 regs.
 	 */
 	{
 		struct lazy_vma_entry *lve;
@@ -3697,50 +3565,6 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 			 * Reading from the fork (quiesced snapshot)
 			 * gives consistent arena bins/fastbins.
 			 */
-			if (!g_t3_regs_sent && fork_pid > 0) {
-				char lmaps[64];
-				FILE *lmfp;
-
-				snprintf(lmaps, sizeof(lmaps),
-					 "/proc/%d/maps", fork_pid);
-				lmfp = fopen(lmaps, "r");
-				if (lmfp) {
-					char ll[512];
-
-					while (fgets(ll, sizeof(ll), lmfp)) {
-						unsigned long ls, le;
-						char lp[8], lpath[256];
-						struct converge_region lr;
-
-						lpath[0] = '\0';
-						if (sscanf(ll,
-							   "%lx-%lx %4s %*s %*s %*s %255[^\n]",
-							   &ls, &le, lp,
-							   lpath) < 3)
-							continue;
-						if (lp[0] != 'r' ||
-						    lp[1] != 'w' ||
-						    !strstr(lpath, "libc.so"))
-							continue;
-						lr.start = ls;
-						lr.end = le;
-						lr.categories = 0;
-						converge_dispatch_parallel(
-							img, fork_pid,
-							sockets, nr_streams,
-							&lr, 1);
-						pr_err("COW converge: "
-						       "re-sent libc rw- "
-						       "%lx-%lx (%lu pages) "
-						       "from fork\n",
-						       ls, le,
-						       (le - ls) / PAGE_SIZE);
-					}
-					fclose(lmfp);
-				}
-			}
-
-			/* Fork kept alive for allocator re-send below */
 		}
 
 		pr_err("COW converge fork-snapshot: %lu dirty pages "
@@ -3904,7 +3728,6 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 			int t3_ok = capture_and_send_t3_regs(
 				source_pid, sockets[0], img->dst_id);
 			if (t3_ok == 0) {
-				g_t3_regs_sent = 1;
 				pr_err("COW converge: T3 regs sent\n");
 				if (g_libc_rw_start) {
 					struct converge_region lr;
@@ -3927,22 +3750,12 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 		}
 
 		/*
-		 * Re-send allocator metadata pages from fork +
-		 * detect new VMAs for VMA diff.
-		 * SKIPPED when T3 regs sent (registers match memory).
-		 *
-		 * Re-send: [heap], file-backed rw- (valkey BSS, libc),
-		 *          small anonymous VMAs (thread stacks/TLS).
-		 * Skip:    large anonymous VMAs (jemalloc data extents).
-		 * This overwrites the arena reset with the fork's
-		 * consistent allocator state (~84 MB, ~0.05s).
+		 * Detect new VMAs (e.g. jemalloc mmap extents created
+		 * during transfer) and send VMA diff to replica.
 		 */
 		{
 			char maps_path[64];
 			FILE *mfp;
-			struct converge_region *alloc_regions = NULL;
-			int alloc_count = 0, alloc_cap = 0;
-			unsigned long alloc_pages = 0, skip_pages = 0;
 			struct vma_diff_entry *new_vmas = NULL;
 			int new_vma_count = 0, new_vma_cap = 0;
 			unsigned long new_vma_pages = 0;
@@ -3956,7 +3769,6 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 				while (fgets(mline, sizeof(mline), mfp)) {
 					unsigned long ms, me;
 					char mp[8], mpath[256];
-					unsigned long vma_sz;
 
 					mpath[0] = '\0';
 					if (sscanf(mline,
@@ -3966,8 +3778,6 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 					if (mp[0] != 'r' || mp[1] != 'w' ||
 					    mp[2] != '-')
 						continue;
-
-					vma_sz = me - ms;
 
 					if (!addr_in_dump_vmas(ms, me,
 							       img->dst_id)) {
@@ -3988,69 +3798,14 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 							PROT_READ | PROT_WRITE;
 						new_vmas[new_vma_count].pad = 0;
 						new_vma_count++;
-						new_vma_pages += vma_sz / PAGE_SIZE;
-					} else {
-						/*
-						 * Dump-time VMA: re-send if
-						 * allocator metadata (file-backed,
-						 * [heap], or small anonymous).
-						 * Skip large anonymous (data).
-						 */
-						int is_alloc = (mpath[0] != '\0')
-							|| (vma_sz < 1048576);
-						if (is_alloc) {
-							if (alloc_count >= alloc_cap) {
-								int nc = (alloc_cap + 16) * 2;
-								struct converge_region *t;
-								t = xrealloc(alloc_regions,
-									nc * sizeof(*t));
-								if (!t) break;
-								alloc_regions = t;
-								alloc_cap = nc;
-							}
-							alloc_regions[alloc_count].start = ms;
-							alloc_regions[alloc_count].end = me;
-							alloc_regions[alloc_count].categories = 0;
-							alloc_count++;
-							alloc_pages += vma_sz / PAGE_SIZE;
-						} else {
-							skip_pages += vma_sz / PAGE_SIZE;
-						}
+						new_vma_pages += (me - ms) / PAGE_SIZE;
 					}
 				}
 				fclose(mfp);
 			}
 
-			/* Re-send allocator pages — skip if T3 regs sent */
-			if (!g_t3_regs_sent) {
-				pid_t asrc = bulk_fork_pid > 0 ?
-					bulk_fork_pid : fork_pid;
-
-				if (alloc_count > 0 && asrc > 0) {
-					long re_sent;
-
-					pr_err("COW converge: re-sending "
-					       "%lu alloc pages from %s "
-					       "fork %d\n",
-					       alloc_pages,
-					       asrc == bulk_fork_pid ?
-					       "bulk" : "converge",
-					       asrc);
-					re_sent =
-						converge_dispatch_parallel(
-							img, asrc, sockets,
-							nr_streams,
-							alloc_regions,
-							alloc_count);
-					if (re_sent >= 0)
-						pr_err("COW converge: "
-						       "re-sent %ld\n",
-						       re_sent);
-				}
-			}
 			if (fork_pid > 0)
 				kill(fork_pid, SIGKILL);
-			xfree(alloc_regions);
 
 			/*
 			 * Send VMA diff + page data for new VMAs
@@ -4139,10 +3894,6 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 
 	xfree(regions);
 	return 0;
-
-err:
-	xfree(regions);
-	return -1;
 }
 
 /*
@@ -4411,7 +4162,7 @@ static void *unified_page_server_thread(void *arg)
 
 				for (s = 0; s < nr_streams; s++)
 					pthread_join(threads[s], NULL);
-				/* Keep bulk_fork alive for allocator re-send */
+				/* Keep bulk_fork alive for convergence */
 				}
 
 				for (s = 0; s < nr_streams; s++) {

@@ -84,7 +84,7 @@ static const char *g_images_dir;
 
 static void write_vma_diff_file(struct vma_diff_entry *vmas, int count)
 {
-	char path[4096];
+	char path[256];
 	int fd;
 
 	snprintf(path, sizeof(path), "%s/new_vmas.dat", g_images_dir);
@@ -108,7 +108,7 @@ cleanup:
 
 static void signal_vma_diff_ready(void)
 {
-	char path[4096];
+	char path[256];
 	int fd;
 
 	snprintf(path, sizeof(path), "%s/vma_diff_ready", g_images_dir);
@@ -119,7 +119,7 @@ static void signal_vma_diff_ready(void)
 
 static void wait_for_vma_created(void)
 {
-	char path[4096];
+	char path[256];
 	struct timespec ts = { .tv_sec = 0, .tv_nsec = 1000000 }; /* 1ms */
 	int i;
 
@@ -701,7 +701,7 @@ int main(int argc, char **argv)
 
 	/* Write completion marker */
 	{
-		char path[4096];
+		char path[256];
 		int fd;
 
 		snprintf(path, sizeof(path), "%s/bulk_stream_done", images_dir);

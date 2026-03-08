@@ -2758,14 +2758,12 @@ static int finalize_restore_detach(void)
 				}
 			}
 
-			if (opts.cow_dump) {
+			if (opts.cow_dump && !g_t3_regs) {
 				usleep(10000);
 
-				/* Final arena mutex zero + wake.
-				 * All pages delivered. Allocator
-				 * re-send from bulk fork set bins.
-				 * Mutex might still be 1 from the
-				 * re-send — zero it now.
+				/*
+				 * Fallback: zero arena mutex + wake.
+				 * Only when T3 regs unavailable.
 				 */
 				{
 					pid_t mp = item->pid->real;
@@ -3159,38 +3157,10 @@ skip_ns_bouncing:
 	}
 
 	/*
-	 * Reset ALL glibc arenas: main_arena + secondary arenas.
-	 * glibc creates one arena per thread (up to 8*cores).
-	 * Each arena has a mutex, fastbins, and bins that can be
-	 * in an inconsistent state after COW restore.
-	 * We walk the arena linked list (main_arena.next) and
-	 * reset each one.
-	 */
-	/*
-	 * Reset glibc main_arena: zero the lock, flags,
-	 * have_fastchunks, and all fastbinsY entries.  This
-	 * prevents corrupted fastbin chains from crashing the
-	 * process after restore.  glibc falls back to the top
-	 * chunk or sysmalloc for future allocations.
-	 *
-	 * Layout of main_arena (at libc rw- + 0xa50):
-	 *   +0:   mutex (4 bytes)
-	 *   +4:   flags (4 bytes)
-	 *   +8:   have_fastchunks (4 bytes) + pad (4 bytes)
-	 *   +16:  fastbinsY[0..9] (10 × 8 = 80 bytes)
-	 *   +96:  top chunk pointer (PRESERVED)
-	 *   +104: last_remainder → zero (avoid stale ref)
-	 *   +112: bins[254] (2032 bytes) → zero all
-	 *   +2144: binmap, next, next_free, etc.
-	 *
-	 * We zero: lock+flags+fastbins (0..95),
-	 *          last_remainder (104..111),
-	 *          bins (112..2143).
-	 * Preserve: top chunk pointer (+96, 8 bytes).
-	 *
-	 * With empty bins, glibc falls through to the top chunk
-	 * or sysmalloc.  Freed bin chunks are "leaked" but this
-	 * prevents abort from stale fd/bk pointers.
+	 * COW mode: load T3 registers if available.
+	 * With T3 regs, registers match T3 memory — skip all
+	 * arena/tcache/mutex workarounds.  Fallback path only
+	 * runs when T3 capture failed.
 	 */
 	if (opts.cow_dump)
 		load_t3_regs();
@@ -3217,24 +3187,14 @@ skip_ns_bouncing:
 				if (sscanf(line, "%lx-%lx %4s %*s %*s %*s %255[^\n]",
 					   &start, &end, perms, path) < 3)
 					continue;
-				/*
-				 * Track libc.so mappings.  The rw-
-				 * data segment is anonymous (no path)
-				 * and contiguous with the last libc
-				 * mapping.
-				 */
+				/* Find libc rw- data segment */
 				if (strstr(path, "libc.so")) {
 					libc_end = end;
 					continue;
 				}
 				if (libc_end && start == libc_end &&
 				    perms[0] == 'r' && perms[1] == 'w') {
-					/* Zero arena mutex only.
-					 * Bulk fork re-send keeps bins
-					 * consistent.  Mutex might be
-					 * held at T0 (mid-malloc during
-					 * SEIZE).
-					 */
+					/* Zero arena mutex at main_arena+0 */
 					{
 						unsigned long a;
 						unsigned int z = 0;
@@ -3263,41 +3223,11 @@ skip_ns_bouncing:
 			fclose(fp);
 		}
 
-		/*
-		 * Do NOT unlock io_threads_mutex[].
-		 * IO threads stay sleeping; main thread's event loop
-		 * wakes them via adjustIOThreadsByEventLoad().
-		 */
-
-		/*
-		 * Also unlock Valkey's signal_handler_lock.
-		 * If a thread hits corrupted tcache, glibc calls
-		 * abort() → SIGABRT → signal handler → this lock.
-		 * Without unlocking, the handler deadlocks.
-		 */
+		/* Unlock Valkey signal handler + crash reporting mutexes */
 		unlock_elf_mutex_array(pid, "signal_handler_lock", 1);
-
-		/*
-		 * Also unlock bug_report_start — Valkey's crash
-		 * reporting mutex, right after signal_handler_lock.
-		 * Without this, the signal handler deadlocks on the
-		 * second mutex during crash reporting.
-		 */
 		unlock_elf_mutex_array(pid, "bug_report_start", 1);
 
-		/*
-		 * Zero the io_threads LTO blob to reset all IO thread
-		 * state: io_threads_pending, io_threads_list, and
-		 * io_threads_active.  Without this, IO threads wake
-		 * after SIGCONT and try to process stale client lists
-		 * from convergence time (closed sockets) → crash.
-		 *
-		 * The blob is "io_threads.lto_priv.0" (2048 bytes)
-		 * containing all static io_threads module variables.
-		 * Zeroing sets pending=0, lists=NULL, active=0 — IO
-		 * threads spin-wait harmlessly until the main thread
-		 * reinitializes them.
-		 */
+		/* Zero io_threads LTO blob to reset IO thread state */
 		{
 			unsigned long iot_addr;
 
@@ -3329,30 +3259,7 @@ skip_ns_bouncing:
 			}
 		}
 
-		/*
-		 * Null each thread's glibc tcache pointer.
-		 * With fork re-send, tcache entries are from the
-		 * quiesced fork snapshot and are consistent.
-		 * Skip tcache null to preserve this state.
-		 *
-		 * TODO: re-enable if migration without fork re-send
-		 * is used (e.g., for small datasets).
-		 *
-		 * The tcache (thread-local allocation cache) contains
-		 * pointers to freed chunks that are stale after COW
-		 * restore.  If not nulled, the first malloc from any
-		 * thread follows a corrupt tcache entry → "double
-		 * free or corruption" → abort → signal handler
-		 * deadlock.
-		 *
-		 * With tcache=NULL, malloc skips the fast path and
-		 * goes directly to the arena (which we already reset).
-		 *
-		 * On aarch64 glibc 2.39:
-		 *   tpidr_el0 → DTV pointer (at TP+0)
-		 *   DTV[2] = libc TLS block pointer (at DTV+16)
-		 *   tcache pointer at TLS block + offset (varies)
-		 */
+		/* Null each thread's glibc tcache pointer */
 #ifdef __aarch64__
 		{
 			struct pstree_item *item;
@@ -3428,15 +3335,7 @@ skip_ns_bouncing:
 		}
 #endif
 
-		/*
-		 * Inject FUTEX_WAKE on all zeroed mutexes.
-		 *
-		 * Zeroing a mutex word via ptrace doesn't wake threads
-		 * already in the kernel's futex wait queue.  We need
-		 * to execute futex(FUTEX_WAKE) inside the process to
-		 * unblock them.  Use the main thread (pid) which is
-		 * ptrace-stopped at rt_sigreturn.
-		 */
+		/* Inject FUTEX_WAKE on all zeroed mutexes */
 		{
 			char maps_path2[64];
 			FILE *fp2;
@@ -3540,10 +3439,10 @@ skip_ns_bouncing:
 		pr_err("Unable to restore rseq_cs state\n");
 
 	/*
-	 * Re-null tcache AFTER restore_rseq_cs.  rseq_cs writes to TLS
-	 * via ptrace_poke and can overwrite our earlier tcache null.
+	 * Fallback: re-null tcache AFTER restore_rseq_cs.
+	 * Skipped when T3 regs match T3 memory.
 	 */
-	if (opts.cow_dump) {
+	if (opts.cow_dump && !g_t3_regs) {
 		pid_t pid2 = root_item->pid->real;
 #ifdef __aarch64__
 		{

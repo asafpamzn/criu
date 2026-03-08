@@ -143,31 +143,23 @@ cow_converge_dirty_pages_parallel()
   │    PAGEMAP_SCAN finds pages written since T0
   │    ~39 dirty pages typical for quiesced, ~30K for live
   │
-  ├─ Re-send libc rw- from T1 fork          [line 3772]
-  │    Arena pages (file-backed, not WP-tracked)
-  │    SKIPPED when T3 regs active (g_t3_regs_sent)
-  │
-  ├─ Post-fork T2 dirty pages               [line 3716]
+  ├─ Post-fork T2 dirty pages
   │    Pages dirtied while reading T1 fork
   │    Read from live source via process_vm_readv
   │
-  ├─ Second freeze (T3)                     [line 3789]
+  ├─ Second freeze (T3)
   │    kill(source_pid, SIGSTOP)
   │    Scan + send final dirty pages (T3)
   │
-  ├─ *** T3 REGISTER RE-CAPTURE ***         [line 3970]
+  ├─ *** T3 REGISTER RE-CAPTURE ***
   │    capture_and_send_t3_regs()  (see §5 below)
   │    Re-send libc rw- from frozen source
   │
-  ├─ VMA diff detection                     [line 3990]
+  ├─ VMA diff detection
   │    Scan /proc/pid/maps for new VMAs created after dump
   │    Send PS_IOV_VMA_DIFF to replica
   │
-  ├─ Allocator re-send                      [line 4096]
-  │    SKIPPED when g_t3_regs_sent (T3 regs match memory)
-  │    Fallback only: sends [heap] + BSS from convergence fork
-  │
-  └─ SIGCONT source                         [line 4180]
+  └─ SIGCONT source
 ```
 
 ### 5. T3 Register Re-capture (`criu/page-xfer.c`)
@@ -208,14 +200,10 @@ capture_and_send_t3_regs(source_pid, socket, dst_id)
 **After T3 regs sent, also re-send libc rw- from frozen source:**
 
 ```
-  ├─ g_t3_regs_sent = 1
-  │
   └─ converge_dispatch_parallel(img, source_pid, ..., &libc_rw_region, 1)
        Sends 2 pages of libc rw- data segment from SIGSTOP'd source
-       This is CRITICAL: libc rw- is file-backed (not MAP_ANONYMOUS)
-       so vma_entry_can_be_lazy() returns false → WP never applied
-       → dirty tracking never captures arena changes
-       → explicit re-send is the ONLY way to deliver T3 arena state
+       libc rw- is file-backed (not MAP_ANONYMOUS) so WP never tracks it
+       Explicit re-send from frozen source is the ONLY delivery path
 ```
 
 ### 6. Page Receiver (`tools/page-recv.c`)
@@ -262,15 +250,11 @@ restore_root_task()
   │
   ├─ if (g_t3_regs):
   │    "T3 regs: skipping arena reset + alloc cleanup"
-  │    SKIP: full arena reset (16 arenas)
-  │    SKIP: allocator re-send wait
-  │    SKIP: tcache null
-  │    SKIP: io_threads blob zero
-  │    SKIP: signal_handler_lock unlock
-  │    SKIP: FUTEX_WAKE injection
+  │    All workarounds skipped — registers match T3 memory
   │
   └─ else (fallback — T3 regs not available):
-       Run old cleanup code (arena reset, tcache null, etc.)
+       Arena mutex zero, tcache null, io_threads blob zero,
+       signal_handler_lock unlock, FUTEX_WAKE injection
 ```
 
 **B. Apply T3 regs before detach (~line 2981):**
