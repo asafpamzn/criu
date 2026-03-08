@@ -33,8 +33,8 @@ log "Clean up..."
 [ "$KEEP_SOURCE_RUNNING" = "1" ] || sudo pkill -9 valkey-server 2>/dev/null || true
 sudo pkill -9 -f "[v]alkey-benchmark" 2>/dev/null || true
 sudo pkill -9 criu 2>/dev/null || true
-$SSH ubuntu@$REPLICA "sudo pkill -9 valkey-server; sudo pkill -9 criu; sudo pkill -9 -f restore.sh; sudo rm -f /var/lib/valkey/temp-*.rdb" 2>/dev/null || true
-sleep 1
+$SSH ubuntu@$REPLICA "sudo pkill -9 valkey-server; sudo pkill -9 criu; sudo pkill -9 page-recv; sudo pkill -9 -f restore.sh; sudo rm -f /var/lib/valkey/temp-*.rdb; sudo rm -rf /tmp/criu-images" 2>/dev/null || true
+sleep 2
 
 # --- 2. Find Valkey ---
 PID=$(pgrep -x valkey-server | head -1 || true)

@@ -45,6 +45,8 @@ if ! valkey-cli ping &>/dev/null; then
 fi
 
 echo "Configuring as replica of ${PRIMARY_IP}:${VALKEY_PORT}..."
+# Disable RDB saves to prevent disk full during full sync
+valkey-cli config set save "" >/dev/null 2>&1 || true
 mark_phase_event "REPLICA_REPLICAOF_START"
 REPLICA_SET=0
 for i in $(seq 1 "$MAX_WAIT_REPLICA"); do
