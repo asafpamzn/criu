@@ -81,7 +81,7 @@ case "$REL" in *.service) CGROUP="/sys/fs/cgroup${REL}" ;; esac
 
 CRIU_ARGS=(
   sudo
-  COW_PRE_FREEZE_CMD="valkey-cli -p $VALKEY_PORT CLIENT PAUSE 10 ALL"
+  COW_PRE_FREEZE_CMD=""
   "$CRIU_BIN" dump
   --tree "$PID" --images-dir "$IMAGES_DIR"
   --cow-dump --lazy-pages

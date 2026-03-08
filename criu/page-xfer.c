@@ -3603,33 +3603,29 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 		/*
 		 * Pre-freeze hook: quiesce application writes so all
 		 * allocator locks are released before SIGSTOP.
-		 */
-		{
-			const char *pre_freeze_cmd = getenv("COW_PRE_FREEZE_CMD");
-			if (pre_freeze_cmd) {
-				int rc = system(pre_freeze_cmd);
-				pr_err("COW converge: pre-freeze hook rc=%d\n", rc);
-			}
-		}
-
-		/*
-		 * Wait for ALL threads to be idle (in a wait syscall).
-		 * Main thread: epoll_pwait (22) or ppoll (73)
-		 * Worker threads: futex (98) = pthread_cond_wait
-		 * If any thread is NOT in a wait syscall, it may be
-		 * mid-malloc with allocator locks held.
+		 *
+		 * SIGSTOP retry loop: stop the process, check if all
+		 * threads are in idle syscalls.  If any thread is
+		 * mid-operation, SIGCONT + brief wait + retry.
+		 * Each SIGSTOP is ~0.1ms (just the syscall check).
+		 * Clients see only the cumulative SIGSTOP time (~0.3ms
+		 * for 3 retries), NOT the SIGCONT settle time.
+		 * Much less visible than CLIENT PAUSE.
 		 */
 		{
 			char task_dir[64];
-			int attempts;
+			int retries;
 
 			snprintf(task_dir, sizeof(task_dir),
 				 "/proc/%d/task", source_pid);
 
-			for (attempts = 0; attempts < 1000; attempts++) {
+			for (retries = 0; retries < 10; retries++) {
 				DIR *dir;
 				struct dirent *de;
 				int all_idle = 1;
+
+				kill(source_pid, SIGSTOP);
+				usleep(100); /* let SIGSTOP propagate */
 
 				dir = opendir(task_dir);
 				if (!dir)
@@ -3659,9 +3655,10 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 					 * Idle syscalls on aarch64:
 					 *   22 = epoll_pwait
 					 *   73 = ppoll
-					 *   98 = futex (pthread_cond_wait)
+					 *   98 = futex
 					 *  101 = nanosleep
 					 *  115 = clock_nanosleep
+					 *  -1  = running (not in syscall)
 					 */
 					if (sc != 22 && sc != 73 &&
 					    sc != 98 && sc != 101 &&
@@ -3672,16 +3669,33 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 				}
 				closedir(dir);
 
-				if (all_idle)
+				if (all_idle) {
+					pr_err("COW converge: all threads "
+					       "idle after %d retries\n",
+					       retries);
 					break;
-				usleep(1000); /* 1ms between polls */
+				}
+
+				/* Not idle — resume and let threads
+				 * finish their current operations.
+				 */
+				kill(source_pid, SIGCONT);
+				usleep(1000); /* 1ms settle */
 			}
-			pr_err("COW converge: all threads settled "
-			       "after %d checks\n", attempts);
+
+			/* If loop exhausted, process is still SIGCONT'd.
+			 * Do one final SIGSTOP — T3 regs handle
+			 * mid-operation threads.
+			 */
+			if (retries >= 10) {
+				kill(source_pid, SIGSTOP);
+				usleep(100);
+				pr_err("COW converge: threads not idle "
+				       "after 10 retries, proceeding\n");
+			}
 		}
 
-		/* SIGSTOP — source should be idle after hook */
-		kill(source_pid, SIGSTOP);
+		/* Process is now SIGSTOP'd */
 		usleep(1000);
 
 		/* Step 4: Final scan — should be near-zero */
