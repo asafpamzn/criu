@@ -37,7 +37,7 @@ sub-millisecond cutover.
 | **Convergence** | After the bulk transfer, some pages may have been modified by Valkey. The convergence phase captures these final changes. We use a fork-snapshot to get a consistent view without freezing Valkey again. |
 | **Cutover** | The moment we switch traffic from source to replica. The source is frozen (SIGSTOP), a TCP signal tells the replica to wake up (SIGCONT), and the source is released. Total: ~1ms. |
 | **VMA** | Virtual Memory Area — a contiguous range of virtual addresses in a process. Valkey's 200GB heap is typically one large VMA. |
-| **FSx** | A shared filesystem (AWS FSx for Lustre) mounted on both machines. Used for CRIU image files and coordination. Not on the critical path for page transfer. |
+| **Images** | CRIU checkpoint files (process state metadata). Transferred via TCP from source to replica at dump time. Stored in `/tmp/criu-images`. |
 
 ---
 

@@ -53,11 +53,11 @@ Phase 3: Cutover (1ms)                  Finalize Restore
 The orchestrator script. Key steps:
 
 ```
-Line 70: CONFIG SET save "" (disable background saves)
-Line 72: No CLIENT PAUSE (T3 regs make this unnecessary)
-Line 82: PID=$(pgrep -x valkey-server)
-Line 108: CRIU_ARGS=(sudo ... criu dump --tree $PID --cow-dump --lazy-pages ...)
-Line 110: COW_PRE_FREEZE_CMD="" (no pre-freeze quiesce needed)
+CONFIG SET save "" (disable background saves)
+No CLIENT PAUSE (T3 regs make this unnecessary)
+PID=$(pgrep -x valkey-server)
+CRIU_ARGS=(sudo ... criu dump --tree $PID --cow-dump --lazy-pages ...)
+COW_PRE_FREEZE_CMD="" (no pre-freeze quiesce needed)
 ```
 
 The script launches CRIU dump, waits for the page server to be ready,
@@ -66,7 +66,7 @@ re-capture makes thread state at dump time irrelevant.
 
 ### 2. CRIU Dump — Phase 1 (`criu/cr-dump.c`)
 
-**File**: `criu/cr-dump.c`, function `cr_dump_tasks()` (~line 2387)
+**File**: `criu/cr-dump.c`, function `cr_dump_tasks()`
 
 **What happens during the 23ms freeze:**
 
@@ -79,18 +79,18 @@ cr_dump_tasks()
   ├─ collect_pstree()                   [seize.c]
   │    PTRACE_SEIZE all 21 threads
   │
-  ├─ dump_one_task()                    [cr-dump.c:1612]
+  ├─ dump_one_task()                    [cr-dump.c]
   │    ├─ collect_mappings()            Parse /proc/pid/maps → VMA list
   │    ├─ collect_fds()                 Read /proc/pid/fd → FD table
   │    ├─ parasite_infect_seized()      Inject parasite blob
-  │    ├─ cow_dump_init()              [cow-dump.c:734]
+  │    ├─ cow_dump_init()              [cow-dump.c]
   │    │    Register VMAs with userfaultfd for WP tracking
   │    ├─ parasite_dump_pages_seized()  Scan pagemap (~8ms)
   │    ├─ dump_task_threads()           Capture registers via ptrace
   │    ├─ compel_cure()                 Remove parasite
   │    └─ dump_task_mm()                Write MM image (VMA metadata)
   │
-  ├─ COW early resume                   [cr-dump.c:2562]
+  ├─ COW early resume                   [cr-dump.c]
   │    Process unfrozen — clients resume immediately
   │
   └─ cow_dump_start_wp() / finish_wp()  [cow-dump.c]
@@ -108,8 +108,8 @@ cr_dump_tasks()
 
 ```
 page_server_serve()
-  └─ Multi-TCP section (~line 4320)
-       ├─ fork_source_snapshot(source_pid)  [line 2960]
+  └─ Multi-TCP section
+       ├─ fork_source_snapshot(source_pid)
        │    PTRACE_SEIZE → inject clone() → fork child → PTRACE_DETACH
        │    Creates COW fork for consistent bulk read (T0 snapshot)
        │
@@ -135,11 +135,11 @@ pages that change after T0.
 ```
 cow_converge_dirty_pages_parallel()
   │
-  ├─ Fork T1 convergence snapshot           [line 3576]
+  ├─ Fork T1 convergence snapshot
   │    Source briefly SIGSTOP'd, fork, SIGCONT
   │    Reads dirty pages from fork (T1 consistency)
   │
-  ├─ Send T1 dirty pages                    [line 3647]
+  ├─ Send T1 dirty pages
   │    PAGEMAP_SCAN finds pages written since T0
   │    ~39 dirty pages typical for quiesced, ~30K for live
   │
@@ -164,7 +164,7 @@ cow_converge_dirty_pages_parallel()
 
 ### 5. T3 Register Re-capture (`criu/page-xfer.c`)
 
-**File**: `criu/page-xfer.c`, function `capture_and_send_t3_regs()` (~line 3125)
+**File**: `criu/page-xfer.c`, function `capture_and_send_t3_regs()`
 
 **The key innovation. Called while source is SIGSTOP'd at T3:**
 
@@ -277,7 +277,6 @@ finalize_restore_detach()
   │         Thread resumes with T3 registers + T3 memory
   │
   ├─ Workers detached first (resume into wait syscalls)
-  ├─ 10ms settle
   └─ Main thread detached last (enters event loop)
 ```
 

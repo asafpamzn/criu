@@ -31,14 +31,14 @@ For setup and how to run the Valkey harness, see `COW_DEVELOPER.md` and
 ```
 PRIMARY (source)                                    REPLICA (destination)
 ──────────────────────────────────────              ─────────────────────────────────────
-Valkey (running)                                     CRIU lazy-pages daemon
-  ↑  writes                                             ↑   receives page stream / faults
+Valkey (running)                                     page-recv (standalone, 8 streams)
+  ↑  writes                                             ↑   process_vm_writev into restored process
   │                                                      │
 CRIU dump process                                        CRIU restore
-  ├─ parasite RPC: create UFFD + register VMAs (WP)         └─ installs UFFD handlers
-  ├─ apply initial UFFDIO_WRITEPROTECT (parallel)              (faults routed via lazy-pages)
-  ├─ COW monitor thread: snapshot pages on WP fault
-  └─ page server + unified sender thread: stream pages
+  ├─ parasite RPC: create UFFD + register VMAs (WP)         ├─ fork process tree, map VMAs
+  ├─ apply UFFDIO_WRITEPROTECT (WP_ASYNC, post-resume)      ├─ apply T3 registers (PTRACE_SETREGSET)
+  ├─ page server: 8-stream bulk + convergence + T3 regs     └─ detach threads
+  └─ fork snapshot for consistent bulk read
 
 Valkey replication (REPLICAOF) ensures the destination catches up after restore.
 Scripts keep the replica read-only and gated until replication is configured.
@@ -139,20 +139,16 @@ Scripts keep the replica read-only and gated until replication is configured.
 
 ## Restore-side flow (REPLICA)
 
-The REPLICA runs two processes:
+The REPLICA runs:
 
-1. `criu lazy-pages --page-server ... --cow-dump`
-2. `criu restore --lazy-pages ... --cow-dump`
+1. `criu restore --lazy-pages ... --cow-dump` (forks page-recv internally)
+2. `page-recv` (standalone, forked by CRIU restore during ptrace-trap window)
 
-The lazy-pages daemon receives the page stream and satisfies faults for the
-restoring process.
+page-recv receives the page stream from source over 8 TCP connections and
+installs pages via `process_vm_writev`.  Handles `PS_IOV_T3_REGS` (writes
+`t3_regs.dat`) and `PS_IOV_VMA_DIFF` (writes `new_vmas.dat`).
 
-Bulk receiver implementation:
-
-- File: `criu/page-xfer.c:page_server_read_bulk_stream()`
-  - reads a continuous stream of `struct page_server_iov` headers + payload,
-  - supports compressed pages (`PS_IOV_ADD_F_COMPRESS`),
-  - treats `nr_pages == 0` as end-of-transfer and stops without sending ACK.
+Implementation: `tools/page-recv.c`
 
 ## Threading model (concrete)
 
