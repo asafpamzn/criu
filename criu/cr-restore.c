@@ -2328,7 +2328,10 @@ static void load_t3_regs(void)
 		return;
 	}
 	g_t3_regs = xmalloc(cnt * sizeof(*g_t3_regs));
-	if (!g_t3_regs) { close(fd); return; }
+	if (!g_t3_regs) {
+		close(fd);
+		return;
+	}
 	r = read(fd, g_t3_regs, cnt * sizeof(*g_t3_regs));
 	close(fd);
 	if (r != (ssize_t)(cnt * sizeof(*g_t3_regs))) {
@@ -2346,82 +2349,75 @@ static int finalize_restore_detach(void)
 
 	for_each_pstree_item(item) {
 		pid_t pid;
-		int i;
+		int i, main_idx = -1;
 
 		if (!task_alive(item))
 			continue;
 
-		/*
-		 * Workers first, main thread last (COW mode).
-		 * Workers resume into wait syscalls; 10ms settle
-		 * before main thread enters the event loop.
-		 */
-		{
-			int main_idx = -1;
-
-			for (i = 0; i < item->nr_threads; i++) {
-				pid = item->threads[i].real;
-				if (pid < 0)
-					continue;
-				if (arch_set_thread_regs_nosigrt(
-					    &item->threads[i])) {
-					pr_perror("Restoring regs for %d", pid);
-					return -1;
-				}
-				if (g_t3_regs && i < g_t3_regs_count) {
-					user_regs_struct_t gp_regs;
-					struct iovec gp_iov, tls_iov;
-					unsigned long tls_val;
+		/* Set regs + apply T3 regs, track main thread index */
+		for (i = 0; i < item->nr_threads; i++) {
+			pid = item->threads[i].real;
+			if (pid < 0)
+				continue;
+			if (arch_set_thread_regs_nosigrt(
+				    &item->threads[i])) {
+				pr_perror("Restoring regs for %d", pid);
+				return -1;
+			}
+			if (g_t3_regs && i < g_t3_regs_count) {
+				user_regs_struct_t gp_regs;
+				struct iovec gp_iov, tls_iov;
+				unsigned long tls_val;
 
 #ifdef __aarch64__
-					memcpy(gp_regs.regs, g_t3_regs[i].regs,
-					       31 * sizeof(unsigned long));
-					gp_regs.sp = g_t3_regs[i].sp;
-					gp_regs.pc = g_t3_regs[i].pc;
-					gp_regs.pstate = g_t3_regs[i].pstate;
+				memcpy(gp_regs.regs, g_t3_regs[i].regs,
+				       31 * sizeof(unsigned long));
+				gp_regs.sp = g_t3_regs[i].sp;
+				gp_regs.pc = g_t3_regs[i].pc;
+				gp_regs.pstate = g_t3_regs[i].pstate;
 #endif
-					gp_iov.iov_base = &gp_regs;
-					gp_iov.iov_len = sizeof(gp_regs);
-					if (ptrace(PTRACE_SETREGSET, pid,
-						   (void *)(unsigned long)
-						   NT_PRSTATUS, &gp_iov))
-						pr_perror("T3 regs: GP set "
-							  "failed for %d", pid);
+				gp_iov.iov_base = &gp_regs;
+				gp_iov.iov_len = sizeof(gp_regs);
+				if (ptrace(PTRACE_SETREGSET, pid,
+					   (void *)(unsigned long)
+					   NT_PRSTATUS, &gp_iov))
+					pr_perror("T3 regs: GP set "
+						  "failed for %d", pid);
 
-					tls_val = g_t3_regs[i].tls;
-					tls_iov.iov_base = &tls_val;
-					tls_iov.iov_len = sizeof(tls_val);
-					if (ptrace(PTRACE_SETREGSET, pid,
-						   (void *)0x401UL, &tls_iov))
-						pr_perror("T3 regs: TLS set "
-							  "failed for %d", pid);
+				tls_val = g_t3_regs[i].tls;
+				tls_iov.iov_base = &tls_val;
+				tls_iov.iov_len = sizeof(tls_val);
+				if (ptrace(PTRACE_SETREGSET, pid,
+					   (void *)0x401UL, &tls_iov))
+					pr_perror("T3 regs: TLS set "
+						  "failed for %d", pid);
 
-					pr_err("T3 regs: thread %d pid %d "
-					       "pc=%lx\n", i, pid,
-					       g_t3_regs[i].pc);
-				}
-				if (pid == item->pid->real)
-					main_idx = i;
+				pr_err("T3 regs: thread %d pid %d "
+				       "pc=%lx\n", i, pid,
+				       g_t3_regs[i].pc);
 			}
+			if (pid == item->pid->real)
+				main_idx = i;
+		}
 
-			for (i = 0; i < item->nr_threads; i++) {
-				if (i == main_idx)
-					continue;
-				pid = item->threads[i].real;
-				if (pid < 0)
-					continue;
-				if (ptrace(PTRACE_DETACH, pid, NULL, 0)) {
-					pr_perror("Unable to detach %d", pid);
-					return -1;
-				}
+		/* Detach workers first, main thread last */
+		for (i = 0; i < item->nr_threads; i++) {
+			if (i == main_idx)
+				continue;
+			pid = item->threads[i].real;
+			if (pid < 0)
+				continue;
+			if (ptrace(PTRACE_DETACH, pid, NULL, 0)) {
+				pr_perror("Unable to detach %d", pid);
+				return -1;
 			}
+		}
 
-			if (main_idx >= 0) {
-				pid = item->threads[main_idx].real;
-				if (ptrace(PTRACE_DETACH, pid, NULL, 0)) {
-					pr_perror("Unable to detach %d", pid);
-					return -1;
-				}
+		if (main_idx >= 0) {
+			pid = item->threads[main_idx].real;
+			if (ptrace(PTRACE_DETACH, pid, NULL, 0)) {
+				pr_perror("Unable to detach %d", pid);
+				return -1;
 			}
 		}
 	}

@@ -2192,9 +2192,6 @@ static int process_vma_pages_sk(struct active_image *img,
 	if (batch_buf && local_iovs && send_batch)
 		batch_alloc_ok = 1;
 
-	/* Detect libc rw- range for exclusion */
-	detect_libc_rw_range(source_pid);
-
 	for (vaddr = range_start; vaddr < range_end; ) {
 		unsigned long batch_start = vaddr;
 		unsigned long batch_pages;
@@ -3111,6 +3108,13 @@ detach:
 	return -1;
 }
 
+static int pid_cmp(const void *a, const void *b)
+{
+	pid_t pa = *(const pid_t *)a, pb = *(const pid_t *)b;
+
+	return (pa > pb) - (pa < pb);
+}
+
 static int capture_and_send_t3_regs(pid_t source_pid, int socket,
 				    u32 dst_id)
 {
@@ -3137,20 +3141,11 @@ static int capture_and_send_t3_regs(pid_t source_pid, int socket,
 	if (!nr_threads)
 		return -1;
 
-	for (i = 0; i < nr_threads - 1; i++) {
-		int j;
-		for (j = i + 1; j < nr_threads; j++)
-			if (tids[j] < tids[i]) {
-				pid_t tmp = tids[i];
-				tids[i] = tids[j];
-				tids[j] = tmp;
-			}
-	}
+	qsort(tids, nr_threads, sizeof(pid_t), pid_cmp);
 
-	t3 = xmalloc(nr_threads * sizeof(*t3));
+	t3 = xzalloc(nr_threads * sizeof(*t3));
 	if (!t3)
 		return -1;
-	memset(t3, 0, nr_threads * sizeof(*t3));
 
 	for (i = 0; i < nr_threads; i++) {
 		pid_t tid = tids[i];
@@ -4140,6 +4135,8 @@ static void *unified_page_server_thread(void *arg)
 				       nr_streams, nr_ranges,
 				       nr_vmas, total_pages);
 
+				detect_libc_rw_range(source_pid);
+
 				/* Fork for consistent bulk snapshot */
 				{
 				if (cow_is_wp_async())
@@ -4232,6 +4229,7 @@ static void *unified_page_server_thread(void *arg)
 
 single_stream:
 			/* Process each lazy VMA (single-stream fallback) */
+			detect_libc_rw_range(source_pid);
 			list_for_each_entry(lve, get_global_lazy_vmas(), list) {
 				if (lve->dst_id != img->dst_id)
 					continue;
