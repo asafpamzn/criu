@@ -3602,98 +3602,10 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 
 		/*
 		 * Pre-freeze hook: quiesce application writes so all
-		 * allocator locks are released before SIGSTOP.
-		 *
-		 * SIGSTOP retry loop: stop the process, check if all
-		 * threads are in idle syscalls.  If any thread is
-		 * mid-operation, SIGCONT + brief wait + retry.
-		 * Each SIGSTOP is ~0.1ms (just the syscall check).
-		 * Clients see only the cumulative SIGSTOP time (~0.3ms
-		 * for 3 retries), NOT the SIGCONT settle time.
-		 * Much less visible than CLIENT PAUSE.
+		 * T3 register re-capture makes thread state at
+		 * freeze time irrelevant — no idle check needed.
 		 */
-		{
-			char task_dir[64];
-			int retries;
-
-			snprintf(task_dir, sizeof(task_dir),
-				 "/proc/%d/task", source_pid);
-
-			for (retries = 0; retries < 10; retries++) {
-				DIR *dir;
-				struct dirent *de;
-				int all_idle = 1;
-
-				kill(source_pid, SIGSTOP);
-				usleep(100); /* let SIGSTOP propagate */
-
-				dir = opendir(task_dir);
-				if (!dir)
-					break;
-
-				while ((de = readdir(dir)) != NULL) {
-					char sc_path[PATH_MAX];
-					char buf[256];
-					int fd, n, sc;
-
-					if (de->d_name[0] == '.')
-						continue;
-
-					snprintf(sc_path, sizeof(sc_path),
-						 "/proc/%d/task/%s/syscall",
-						 source_pid, de->d_name);
-					fd = open(sc_path, O_RDONLY);
-					if (fd < 0)
-						continue;
-					n = read(fd, buf, sizeof(buf) - 1);
-					close(fd);
-					if (n <= 0)
-						continue;
-					buf[n] = '\0';
-					sc = atoi(buf);
-					/*
-					 * Idle syscalls on aarch64:
-					 *   22 = epoll_pwait
-					 *   73 = ppoll
-					 *   98 = futex
-					 *  101 = nanosleep
-					 *  115 = clock_nanosleep
-					 *  -1  = running (not in syscall)
-					 */
-					if (sc != 22 && sc != 73 &&
-					    sc != 98 && sc != 101 &&
-					    sc != 115) {
-						all_idle = 0;
-						break;
-					}
-				}
-				closedir(dir);
-
-				if (all_idle) {
-					pr_err("COW converge: all threads "
-					       "idle after %d retries\n",
-					       retries);
-					break;
-				}
-
-				/* Not idle — resume and let threads
-				 * finish their current operations.
-				 */
-				kill(source_pid, SIGCONT);
-				usleep(1000); /* 1ms settle */
-			}
-
-			/* If loop exhausted, process is still SIGCONT'd.
-			 * Do one final SIGSTOP — T3 regs handle
-			 * mid-operation threads.
-			 */
-			if (retries >= 10) {
-				kill(source_pid, SIGSTOP);
-				usleep(100);
-				pr_err("COW converge: threads not idle "
-				       "after 10 retries, proceeding\n");
-			}
-		}
+		kill(source_pid, SIGSTOP);
 
 		/* Process is now SIGSTOP'd */
 		usleep(1000);
