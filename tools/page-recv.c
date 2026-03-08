@@ -364,7 +364,7 @@ static void *stream_worker(void *arg)
 			size_t regs_sz = nr_threads *
 				sizeof(struct t3_thread_regs);
 			struct t3_thread_regs *tregs;
-			char path[4096];
+			char path[256];
 			int fd;
 
 			if (nr_threads > 1024 || nr_threads <= 0) {

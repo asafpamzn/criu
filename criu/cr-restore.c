@@ -2984,26 +2984,33 @@ static int finalize_restore_detach(void)
 					return -1;
 				}
 				if (g_t3_regs && i < g_t3_regs_count) {
-					user_regs_struct_t r;
-					struct iovec iv, tiv;
-					unsigned long tv;
+					user_regs_struct_t gp_regs;
+					struct iovec gp_iov, tls_iov;
+					unsigned long tls_val;
+
 #ifdef __aarch64__
-					memcpy(r.regs, g_t3_regs[i].regs,
+					memcpy(gp_regs.regs, g_t3_regs[i].regs,
 					       31 * sizeof(unsigned long));
-					r.sp = g_t3_regs[i].sp;
-					r.pc = g_t3_regs[i].pc;
-					r.pstate = g_t3_regs[i].pstate;
+					gp_regs.sp = g_t3_regs[i].sp;
+					gp_regs.pc = g_t3_regs[i].pc;
+					gp_regs.pstate = g_t3_regs[i].pstate;
 #endif
-					iv.iov_base = &r;
-					iv.iov_len = sizeof(r);
-					ptrace(PTRACE_SETREGSET, pid,
-					       (void *)(unsigned long)
-					       NT_PRSTATUS, &iv);
-					tv = g_t3_regs[i].tls;
-					tiv.iov_base = &tv;
-					tiv.iov_len = sizeof(tv);
-					ptrace(PTRACE_SETREGSET, pid,
-					       (void *)0x401UL, &tiv);
+					gp_iov.iov_base = &gp_regs;
+					gp_iov.iov_len = sizeof(gp_regs);
+					if (ptrace(PTRACE_SETREGSET, pid,
+						   (void *)(unsigned long)
+						   NT_PRSTATUS, &gp_iov))
+						pr_perror("T3 regs: GP set "
+							  "failed for %d", pid);
+
+					tls_val = g_t3_regs[i].tls;
+					tls_iov.iov_base = &tls_val;
+					tls_iov.iov_len = sizeof(tls_val);
+					if (ptrace(PTRACE_SETREGSET, pid,
+						   (void *)0x401UL, &tls_iov))
+						pr_perror("T3 regs: TLS set "
+							  "failed for %d", pid);
+
 					pr_err("T3 regs: thread %d pid %d "
 					       "pc=%lx\n", i, pid,
 					       g_t3_regs[i].pc);

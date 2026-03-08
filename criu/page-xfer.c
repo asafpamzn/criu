@@ -3132,6 +3132,7 @@ static int capture_and_send_t3_regs(pid_t source_pid, int socket,
 	int nr_threads = 0, i;
 	struct t3_thread_regs *t3;
 	struct page_server_iov hdr;
+	size_t total, sent = 0;
 
 	snprintf(task_dir, sizeof(task_dir),
 		 "/proc/%d/task", source_pid);
@@ -3206,15 +3207,16 @@ static int capture_and_send_t3_regs(pid_t source_pid, int socket,
 		xfree(t3);
 		return -1;
 	}
-	{
-		size_t total = nr_threads * sizeof(*t3);
-		size_t sent = 0;
-		while (sent < total) {
-			int w = __send(socket, (char *)t3 + sent,
-				       total - sent, 0);
-			if (w <= 0) { xfree(t3); return -1; }
-			sent += w;
+
+	total = nr_threads * sizeof(*t3);
+	while (sent < total) {
+		int w = __send(socket, (char *)t3 + sent,
+			       total - sent, 0);
+		if (w <= 0) {
+			xfree(t3);
+			return -1;
 		}
+		sent += w;
 	}
 	pr_err("T3 regs: sent %d threads (%zu bytes)\n",
 	       nr_threads, (size_t)(nr_threads * sizeof(*t3)));
@@ -3601,9 +3603,9 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 		pid_t fork_pid = -1;
 
 		/*
-		 * Pre-freeze hook: quiesce application writes so all
 		 * T3 register re-capture makes thread state at
 		 * freeze time irrelevant — no idle check needed.
+		 * Just SIGSTOP and proceed to capture.
 		 */
 		kill(source_pid, SIGSTOP);
 
