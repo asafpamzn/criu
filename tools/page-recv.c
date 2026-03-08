@@ -47,12 +47,21 @@ struct page_server_iov {
 #define PS_IOV_GET_ALL		8
 #define PS_IOV_ADD_F_COMPRESS	10
 #define PS_IOV_VMA_DIFF		11
+#define PS_IOV_T3_REGS		12
 
 struct vma_diff_entry {
 	unsigned long long start;
 	unsigned long long end;
 	unsigned int prot;
 	unsigned int pad;
+};
+
+struct t3_thread_regs {
+	unsigned long long regs[31];
+	unsigned long long sp;
+	unsigned long long pc;
+	unsigned long long pstate;
+	unsigned long long tls;
 };
 #define PS_CMD_BITS		16
 #define PS_CMD_MASK		((1 << PS_CMD_BITS) - 1)
@@ -346,6 +355,51 @@ static void *stream_worker(void *arg)
 				"resuming\n", ctx->id);
 
 			free(vmas);
+			continue;
+		}
+
+		/* Handle T3 register data */
+		if (cmd == PS_IOV_T3_REGS) {
+			int nr_threads = (int)npages;
+			size_t regs_sz = nr_threads *
+				sizeof(struct t3_thread_regs);
+			struct t3_thread_regs *tregs;
+			char path[4096];
+			int fd;
+
+			if (nr_threads > 1024 || nr_threads <= 0) {
+				ctx->error = 1;
+				break;
+			}
+			tregs = malloc(regs_sz);
+			if (!tregs) { ctx->error = 1; break; }
+			if (recv_full(ctx->sk, tregs, regs_sz) < 0) {
+				free(tregs);
+				ctx->error = 1;
+				break;
+			}
+			__sync_fetch_and_add(&ctx->bytes_received,
+					     regs_sz);
+			snprintf(path, sizeof(path),
+				 "%s/t3_regs.dat", g_images_dir);
+			fd = open(path,
+				  O_CREAT | O_WRONLY | O_TRUNC, 0644);
+			if (fd >= 0) {
+				int cnt = nr_threads;
+				ssize_t w1, w2;
+
+				w1 = write(fd, &cnt, sizeof(cnt));
+				w2 = write(fd, tregs, regs_sz);
+				close(fd);
+				if (w1 < 0 || w2 < 0)
+					fprintf(stderr, "stream %d: "
+						"t3_regs.dat write "
+						"error\n", ctx->id);
+			}
+			fprintf(stderr, "stream %d: T3 regs "
+				"received (%d threads)\n",
+				ctx->id, nr_threads);
+			free(tregs);
 			continue;
 		}
 
