@@ -34,8 +34,9 @@ Artifacts are written under `artifacts/<run_id>/` on PRIMARY.
 - **CRIU dump (PRIMARY)**: creates the base checkpoint and runs the page server.
 - **COW monitor (PRIMARY)**: background thread that snapshots pages on first
   write fault.
-- **CRIU lazy-pages (REPLICA)**: receives pages from PRIMARY and services faults.
-- **CRIU restore (REPLICA)**: restores the process and installs UFFD handlers.
+- **page-recv (REPLICA)**: standalone receiver, 8 TCP streams, installs pages
+  via `process_vm_writev`.
+- **CRIU restore (REPLICA)**: restores the process tree, applies T3 registers.
 - **Valkey replication**: `REPLICAOF` makes the replica catch up.
 
 ### Timeline (what happens)
@@ -89,54 +90,50 @@ checks), use:
 ./scripts/run_migration_scenario.sh 40
 ```
 
-## Performance results (aarch64, VPC 10-25Gbps)
+## Performance results (m7g.16xlarge, aarch64, VPC)
 
-Tested on AWS EC2 (aarch64), two instances in the same VPC, FSx shared
-storage for images.  Source runs Valkey filled with 64KB random values.
+Tested on AWS EC2 m7g.16xlarge (494GB RAM, 64 CPUs), two instances in the
+same VPC.  Source runs Valkey filled with 64KB random values.  All tests
+pass 7/7 verification (PONG, key count, memory, spot-check, BGSAVE,
+RANDOMKEY).
 
 ### Source unavailability (the number that matters)
 
-| Dataset | Benchmark traffic | Source frozen |
-|---------|-------------------|---------------|
-| 10 GB   | no                | **34 ms**     |
-| 40 GB   | yes (43K ops/s)   | **35 ms**     |
-| 100 GB  | yes (43K ops/s)   | **39 ms**     |
+| Dataset | Benchmark traffic | Freeze + cutover |
+|---------|-------------------|------------------|
+| 100 GB  | heavy (90K ops/s) | **24 ms**        |
+| 200 GB  | no                | **24 ms**        |
+| 200 GB  | yes (80K ops/s)   | **24 ms**        |
 
-Source freeze is the SIGSTOP→cutover→SIGCONT window.  It does not
+Source unavailability = dump freeze (23ms) + cutover (1ms).  Does not
 scale with dataset size because the bulk transfer runs while the
 source is live.
 
-### Stage-by-stage timing (100 GB + benchmark)
+### Stage-by-stage timing (200 GB + live traffic)
 
 | Stage | Duration | Notes |
 |-------|----------|-------|
-| Parasite infect + dump | 54 ms | Seize, snapshot metadata |
-| WP setup (userfaultfd) | 19 ms | 1560 ranges, 32 threads |
+| Parasite infect + dump | 23 ms | Seize, snapshot metadata |
+| WP setup (userfaultfd) | 56 ms | 3120 ranges, post-resume |
 | Source resumed | immediate | `--leave-running` |
-| Bulk transfer (network) | ~174 s | 25.3M pages, 578 MB/s |
-| Convergence (dirty resend) | < 1 s | 20-30 dirty pages |
-| Final freeze + cutover | **39 ms** | SIGSTOP → nc "GO" |
-| UFFDIO_COPY (receiver) | > 10 min | Post-cutover, on-demand |
+| Bulk transfer (8 streams) | ~62 s | 51M pages, 3279 MB/s |
+| Convergence (fork + dirty) | ~2 s | Fork snapshot + T3 dirty |
+| T3 register capture | ~5 ms | 21 threads, 5880 bytes |
+| Cutover | **1 ms** | SIGSTOP source → GO signal |
 
 ### Transfer configuration
 
-- **Streams**: 4 parallel TCP connections (`COW_TRANSFER_STREAMS`)
-- **Batch send**: 256 pages compressed (LZ4) into one `send()` call
-- **Socket buffers**: 4 MB SO_SNDBUF / SO_RCVBUF
-- **Cutover**: nc TCP listener (replaces SSH for sub-100ms latency)
-- **CLIENT PAUSE**: removed (breaks restored replica)
+- **Streams**: 8 parallel TCP connections (`COW_TRANSFER_STREAMS`)
+- **Batch send**: 512 pages compressed (LZ4) into one `send()` call
+- **Page delivery**: `process_vm_writev` (not UFFDIO_COPY)
+- **Cutover**: TCP listener (sub-ms latency)
+- **T3 register re-capture**: all thread registers re-sent at T3
 
 ### Known limitations
 
-- **VMA partitioning**: the large heap VMA lands on one stream, leaving
-  other streams idle.  Splitting the VMA across workers would give
-  4× throughput (~2.3 GB/s).
-- **UFFDIO_COPY bottleneck**: single-threaded kernel page installation
-  takes minutes for large datasets.  This is post-cutover (source is
-  already available) but delays replica readiness.
-- **100 GB replica crash**: the restored process page-faults faster
-  than UFFDIO_COPY can deliver, causing timeouts.  Needs pre-faulting
-  of critical pages or prioritized delivery.
+- **Disk space on replica**: REPLICAOF triggers full sync which writes
+  a temp RDB.  For 200GB datasets, replica needs >250GB free disk or
+  RDB saves must be disabled (`CONFIG SET save ""`).
 
 ## Requirements
 

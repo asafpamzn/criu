@@ -18,7 +18,7 @@
 | Test | Size | Workload | Transfer | Throughput | Freeze | Cutover | Result |
 |------|------|----------|----------|------------|--------|---------|--------|
 | 200GB quiesced | 190.6 GB | None | 62s | **3159 MB/s** | 23ms | 1ms | **7/7** |
-| 200GB live | 190.6 GB | SET/GET | 60s | **3255 MB/s** | 23ms | 1ms | **7/7** |
+| 200GB live | 202.3 GB | SET/GET | 63s | **3279 MB/s** | 23ms | 1ms | **7/7** |
 | 100GB + remote bench | 95.4 GB | 50-conn 64K ops/s | 32s | **3033 MB/s** | 23ms | 1ms | **7/7** |
 
 All tests pass all 7 verification checks including BGSAVE.

@@ -197,19 +197,12 @@ uses ptrace to inject `mmap(MAP_FIXED)` into the restored process,
 creating matching memory regions before the page data arrives. This
 ensures the replica's memory layout matches the source at cutover.
 
-**Allocator reset** (for multi-threaded Valkey): at restore time, CRIU
-performs three operations to prevent allocator corruption after SIGCONT:
-1. **All-arena reset**: walk glibc's arena linked list (`main_arena.next`)
-   and zero each arena's mutex+owner+fastbins+bins. With `io-threads 16`,
-   glibc creates 16 arenas — all must be reset.
-2. **Per-thread tcache null**: read each thread's TLS base (`tpidr_el0`
-   on aarch64), follow the DTV to the libc TLS block, and null the
-   tcache pointer. This forces malloc to skip the thread-local fast
-   path and use the (reset) arena directly.
-3. **Valkey mutex unlock**: find `io_threads_mutex[]` and
-   `signal_handler_lock` symbols in the Valkey ELF binary, zero
-   their lock+count+owner fields. IO threads use a mutex-gate sleep
-   pattern that would deadlock without this.
+**T3 register re-capture**: at the second freeze (T3), CRIU re-captures
+all thread registers via `PTRACE_SEIZE/INTERRUPT/GETREGSET` and sends them
+to the replica. The replica applies them via `PTRACE_SETREGSET` before
+detach. This ensures registers match T3 memory — no allocator reset,
+tcache null, or mutex unlock needed. T3 regs are required; restore aborts
+if they are unavailable.
 
 ### Phase 5: Cutover (1 millisecond)
 

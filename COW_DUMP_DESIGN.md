@@ -165,10 +165,9 @@ Dump process (PRIMARY):
 
 Restore side (REPLICA):
 
-- `lazy-pages` process: reads incoming pages and issues `UFFDIO_COPY` into the
-  restoring process as needed
-- `restore` process: executes restorer code path and transitions to the restored
-  workload
+- `page-recv` process: standalone receiver, 8 TCP streams, installs pages via
+  `process_vm_writev`, handles T3 regs and VMA diff
+- `restore` process: applies T3 registers, injects new VMAs, detaches threads
 
 ## Measurement and artifacts
 

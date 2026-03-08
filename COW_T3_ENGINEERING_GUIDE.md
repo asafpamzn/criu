@@ -238,26 +238,21 @@ stream_worker()
 
 **Two key locations:**
 
-**A. Load T3 regs + skip arena reset (~line 3461):**
+**A. Load T3 regs — required for COW restore:**
 
 ```
 restore_root_task()
   │
-  ├─ load_t3_regs()                         [line 2930]
+  ├─ load_t3_regs()
   │    Opens {imgs_dir}/t3_regs.dat
   │    Reads: count + array of t3_thread_regs
   │    Sets g_t3_regs + g_t3_regs_count
   │
-  ├─ if (g_t3_regs):
-  │    "T3 regs: skipping arena reset + alloc cleanup"
-  │    All workarounds skipped — registers match T3 memory
-  │
-  └─ else (fallback — T3 regs not available):
-       Arena mutex zero, tcache null, io_threads blob zero,
-       signal_handler_lock unlock, FUTEX_WAKE injection
+  └─ if (!g_t3_regs): abort restore
+       T3 regs are required — no fallback
 ```
 
-**B. Apply T3 regs before detach (~line 2981):**
+**B. Apply T3 regs before detach:**
 
 ```
 finalize_restore_detach()
@@ -347,9 +342,9 @@ T3 arena state to the replica.
 
 ## Files Modified
 
-| File | Lines Changed | Purpose |
-|------|--------------|---------|
-| `criu/page-xfer.c` | +149 | T3 capture, protocol, skip re-send |
-| `criu/cr-restore.c` | +71 | Load T3 regs, apply, skip cleanup |
-| `tools/page-recv.c` | +54 | Receive T3 regs, write t3_regs.dat |
-| `scripts/migrate.sh` | -30 | Remove CLIENT PAUSE |
+| File | Purpose |
+|------|---------|
+| `criu/page-xfer.c` | T3 capture (`capture_and_send_t3_regs`), libc rw- re-send |
+| `criu/cr-restore.c` | Load T3 regs, apply via PTRACE_SETREGSET, abort if missing |
+| `tools/page-recv.c` | Receive T3 regs, write `t3_regs.dat` |
+| `scripts/migrate.sh` | No CLIENT PAUSE, single SIGSTOP for T3 |
