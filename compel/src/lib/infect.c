@@ -602,10 +602,27 @@ static int parasite_trap(struct parasite_ctl *ctl, pid_t pid, user_regs_struct_t
 	}
 
 	if (WSTOPSIG(status) != SIGTRAP || siginfo.si_code != ARCH_SI_TRAP) {
-		pr_debug("** delivering signal %d si_code=%d\n", siginfo.si_signo, siginfo.si_code);
-
-		pr_err("Unexpected %d task interruption, aborting\n", pid);
-		goto err;
+		/*
+		 * Not our BRK trap.  This can happen when threads
+		 * were in SIGSTOP group-stop before being seized for
+		 * T3 parasite re-injection.  Suppress the signal
+		 * and retry — the BRK trap will come next.
+		 */
+		pr_debug("** suppressing signal %d si_code=%d, retrying\n",
+			 siginfo.si_signo, siginfo.si_code);
+		if (ptrace(PTRACE_CONT, pid, NULL, NULL)) {
+			pr_perror("Can't re-CONT %d after signal suppression", pid);
+			goto err;
+		}
+		if (wait4(pid, &status, __WALL, NULL) != pid) {
+			pr_perror("Waited pid mismatch after retry (pid: %d)", pid);
+			goto err;
+		}
+		if (!WIFSTOPPED(status) || WSTOPSIG(status) != SIGTRAP) {
+			pr_err("Unexpected %d task interruption after retry "
+			       "(status 0x%x), aborting\n", pid, status);
+			goto err;
+		}
 	}
 
 	/*

@@ -1959,11 +1959,6 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	 * On failure local map will be cured in cr_dump_finish()
 	 * for lazy pages.
 	 */
-	/*
-	 * COW mode: skip munmap of parasite blob — it's a private anon
-	 * mapping covered by COW WP tracking, harmless after detach.
-	 * Saves the ptrace syscall injection overhead.
-	 */
 	if (opts.cow_dump && opts.lazy_pages)
 		ret = compel_cure_local(parasite_ctl);
 	else if (opts.lazy_pages)

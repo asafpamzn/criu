@@ -32,6 +32,7 @@
 #include "fcntl.h"
 #include "pstree.h"
 #include "parasite-syscall.h"
+#include "parasite.h"
 #include "rst_info.h"
 #include "stats.h"
 #include "tls.h"
@@ -89,6 +90,9 @@ static void psi2iovec(struct page_server_iov *ps, struct iovec *iov)
 #define PS_IOV_VMA_DIFF       11
 #define PS_IOV_T3_REGS        12
 #define PS_IOV_T3_FDS         13
+#define PS_IOV_T3_SIGACTS     14
+
+extern struct pstree_item *root_item;
 
 struct t3_fd_entry {
 	u32 fd;
@@ -3126,64 +3130,130 @@ detach:
  * Layout per signal (aarch64): 32 bytes
  *   u64 sa_handler, sa_flags, sa_restorer, sa_mask
  */
-#define PS_IOV_T3_SIGACTS 14
 
 /*
- * Send T3 signal masks from /proc/pid/status.
- * Captures SigIgn + SigCgt (which signals are ignored/caught).
- * Handler function pointers require parasite injection — not done
- * here because ptrace syscall injection from PTRACE_EVENT_STOP
- * doesn't work reliably.  Handler pointers come from T_dump.
+ * T3 signal handler capture via parasite re-injection.
  *
- * The signal MASKS are what matter for correctness: if a signal
- * was caught at T_dump but ignored at T3 (or vice versa), the
- * restore must reflect T3 state.
+ * At T3 the source is SIGSTOP'd.  We SEIZE all threads, consume
+ * pending SIGSTOPs (PTRACE_CONT + wait4 cycle), then inject a
+ * fresh parasite.  One RPC gets all 64 signal handlers.
  */
-static int send_t3_sigmasks(pid_t source_pid, int socket,
-			    u32 dst_id)
+static int capture_and_send_t3_sigacts(pid_t source_pid, int socket,
+				       u32 dst_id)
 {
-	char status_path[64], line[128];
-	FILE *fp;
+	struct parasite_ctl *ctl;
+	struct parasite_dump_sa_args *args;
+	struct vm_area_list vmas;
 	struct page_server_iov hdr;
-	u64 masks[3] = { 0, 0, 0 }; /* SigPnd, SigIgn, SigCgt */
-	size_t sent = 0;
+	struct pstree_item *pi = root_item;
+	int sig, ret, t;
+	u64 sigdata[64 * 4];
+	size_t total, sent = 0;
 
-	snprintf(status_path, sizeof(status_path),
-		 "/proc/%d/status", source_pid);
-	fp = fopen(status_path, "r");
-	if (!fp)
+	vm_area_list_init(&vmas);
+	ret = collect_mappings(source_pid, &vmas, NULL);
+	if (ret) {
+		pr_err("T3 sigacts: collect_mappings failed\n");
 		return -1;
-	while (fgets(line, sizeof(line), fp)) {
-		sscanf(line, "SigPnd: %llx",
-		       (unsigned long long *)&masks[0]);
-		sscanf(line, "SigIgn: %llx",
-		       (unsigned long long *)&masks[1]);
-		sscanf(line, "SigCgt: %llx",
-		       (unsigned long long *)&masks[2]);
 	}
-	fclose(fp);
 
-	pr_err("T3 sigmasks: Pnd=%016llx Ign=%016llx Cgt=%016llx\n",
-	       (unsigned long long)masks[0],
-	       (unsigned long long)masks[1],
-	       (unsigned long long)masks[2]);
+	/* SEIZE all threads + consume pending SIGSTOPs */
+	for (t = 0; t < pi->nr_threads; t++) {
+		pid_t tid = pi->threads[t].real;
+		int status;
 
+		if (ptrace(PTRACE_SEIZE, tid, NULL, 0)) {
+			pr_perror("T3 sigacts: SEIZE tid %d", tid);
+			goto err_detach;
+		}
+		if (ptrace(PTRACE_INTERRUPT, tid, NULL, NULL)) {
+			ptrace(PTRACE_DETACH, tid, NULL, NULL);
+			goto err_detach;
+		}
+		if (waitpid(tid, &status, __WALL) != tid) {
+			ptrace(PTRACE_DETACH, tid, NULL, NULL);
+			goto err_detach;
+		}
+		/*
+		 * Consume pending SIGSTOP.  After PTRACE_INTERRUPT
+		 * from SIGSTOP group-stop, a pending SIGSTOP may
+		 * be queued.  PTRACE_CONT + wait4 consumes it,
+		 * leaving the thread in signal-delivery-stop which
+		 * is what compel expects.
+		 */
+		if (ptrace(PTRACE_CONT, tid, 0, 0)) {
+			ptrace(PTRACE_DETACH, tid, NULL, NULL);
+			goto err_detach;
+		}
+		if (waitpid(tid, &status, __WALL) != tid) {
+			ptrace(PTRACE_DETACH, tid, NULL, NULL);
+			goto err_detach;
+		}
+	}
+	pr_err("T3 sigacts: seized %d threads\n", pi->nr_threads);
+
+	ctl = parasite_infect_seized(source_pid, pi, &vmas);
+	if (!ctl) {
+		pr_err("T3 sigacts: parasite infect failed\n");
+		goto err_detach;
+	}
+
+	ret = compel_rpc_call_sync(PARASITE_CMD_DUMP_SIGACTS, ctl);
+	if (ret) {
+		pr_err("T3 sigacts: RPC failed (%d)\n", ret);
+		if (compel_cure(ctl))
+			pr_err("T3 sigacts: cure failed\n");
+		goto err_detach;
+	}
+
+	args = compel_parasite_args(ctl, struct parasite_dump_sa_args);
+
+	memset(sigdata, 0, sizeof(sigdata));
+	for (sig = 1; sig <= 64; sig++) {
+		int idx = sig - 1;
+
+		sigdata[idx * 4 + 0] = (u64)(unsigned long)
+			args->sas[idx].rt_sa_handler;
+		sigdata[idx * 4 + 1] = (u64)args->sas[idx].rt_sa_flags;
+		sigdata[idx * 4 + 2] = (u64)(unsigned long)
+			args->sas[idx].rt_sa_restorer;
+		sigdata[idx * 4 + 3] = args->sas[idx].rt_sa_mask.sig[0];
+	}
+
+	pr_err("T3 sigacts: captured 64 signal handlers\n");
+
+	/* Cure + detach */
+	if (compel_stop_daemon_fast(ctl))
+		pr_err("T3 sigacts: stop daemon failed\n");
+	if (compel_cure_local(ctl))
+		pr_err("T3 sigacts: cure failed\n");
+	for (t = 0; t < pi->nr_threads; t++)
+		ptrace(PTRACE_DETACH, pi->threads[t].real, NULL, NULL);
+
+	/* Send */
 	hdr.cmd = encode_ps_cmd(PS_IOV_T3_SIGACTS, 0);
-	hdr.nr_pages = 1; /* just the masks */
+	hdr.nr_pages = 64;
 	hdr.vaddr = 0;
 	hdr.dst_id = dst_id;
 	if (send_psi(socket, &hdr))
 		return -1;
-	while (sent < sizeof(masks)) {
-		int w = __send(socket, (char *)masks + sent,
-			       sizeof(masks) - sent, 0);
+
+	total = sizeof(sigdata);
+	while (sent < total) {
+		int w = __send(socket, (char *)sigdata + sent,
+			       total - sent, 0);
 		if (w <= 0)
 			return -1;
 		sent += w;
 	}
 
-	pr_err("T3 sigmasks: sent %zu bytes\n", sizeof(masks));
+	pr_err("T3 sigacts: sent %zu bytes\n", total);
 	return 0;
+
+err_detach:
+	for (t = 0; t < pi->nr_threads; t++)
+		ptrace(PTRACE_DETACH, pi->threads[t].real, NULL, NULL);
+	return -1;
 }
 
 /*
@@ -3658,11 +3728,6 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 		unsigned long freeze_pages = 0;
 		pid_t fork_pid = -1;
 
-		/*
-		 * T3 register re-capture makes thread state at
-		 * freeze time irrelevant — no idle check needed.
-		 * Just SIGSTOP and proceed to capture.
-		 */
 		kill(source_pid, SIGSTOP);
 
 		/* Process is now SIGSTOP'd */
@@ -3940,9 +4005,9 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 			capture_and_send_t3_fds(
 				source_pid, sockets[0], img->dst_id);
 
-			/* T3 signal masks */
-			send_t3_sigmasks(source_pid, sockets[0],
-					 img->dst_id);
+			/* T3 signal handlers via parasite */
+			capture_and_send_t3_sigacts(
+				source_pid, sockets[0], img->dst_id);
 
 		}
 
