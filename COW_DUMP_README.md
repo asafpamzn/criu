@@ -98,21 +98,22 @@ Tested on m7g.16xlarge (494GB RAM, 64 CPUs), same-AZ VPC.
 
 | Test | Size | Transfer | Throughput | Freeze | Cutover | Result |
 |------|------|----------|------------|--------|---------|--------|
-| Quiesced | 200GB | 62s | 3159 MB/s | 23ms | 1ms | **7/7** |
-| Live traffic | 200GB | 63s | 3279 MB/s | 23ms | 1ms | **7/7** |
-| Live + heavy bench | 100GB | 32s | 3054 MB/s | 23ms | 1ms | **7/7** |
+| Quiesced | 200GB | 62s | 3159 MB/s | 68ms | 1ms | **7/7** |
+| Live traffic | 200GB | 63s | 3279 MB/s | 68ms | 1ms | **7/7** |
+| Live + heavy bench | 100GB | 32s | 3054 MB/s | 68ms | 1ms | **7/7** |
 
-**Source unavailability: 23ms freeze + 1ms cutover = 24ms total.**
+**Source unavailability: 15ms dump + 52ms T3 + 1ms cutover = 68ms total.**
 
-### Stage Timing (200GB + live traffic)
+### Stage Timing (60GB + live traffic)
 
 | Stage | Duration | Notes |
 |-------|----------|-------|
-| Freeze (dump_one_task) | 23 ms | Seize + pagemap + parasite |
+| Freeze (dump_one_task) | 15 ms | Seize + pagemap + parasite |
 | WP setup (post-resume) | 56 ms | 3120 ranges, WP_ASYNC |
-| Bulk transfer (8 streams) | ~62 s | 51M pages, LZ4, process_vm_readv |
-| Convergence + T3 | ~2 s | Fork snapshot + dirty scan + T3 regs |
+| Bulk transfer (8 streams) | ~20 s | LZ4, process_vm_readv |
+| T3 freeze (convergence) | **52 ms** | Sigacts 7ms + regs <1ms + FDs <1ms + dirty read |
 | Cutover | 1 ms | SIGSTOP → TCP "GO" |
+| **Total source frozen** | **68 ms** | 15ms dump + 52ms T3 + 1ms cutover |
 
 ### vs REPLICAOF
 

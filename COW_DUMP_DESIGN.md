@@ -82,21 +82,19 @@ cow_converge_dirty_pages_parallel()
   │    Source briefly SIGSTOP'd, fork, SIGCONT
   │    Reads dirty pages from fork (T1 consistency)
   │
-  ├─ Send T1 dirty pages
-  │    PAGEMAP_SCAN finds pages written since T0
+  ├─ Pre-freeze dirty scan (source running)
+  │    PAGEMAP_SCAN finds dirty pages (~20 pages at T3)
   │
-  ├─ Post-fork T2 dirty pages
-  │    Pages dirtied while reading T1 fork
-  │
-  ├─ Second freeze (T3)
+  ├─ T3 freeze (52ms total, no fork)
   │    kill(source_pid, SIGSTOP)
-  │    Scan + send final dirty pages
+  │    ├─ Signal handlers via parasite re-inject (7ms)
+  │    ├─ Registers via PTRACE_GETREGSET (<1ms)
+  │    ├─ FD table from /proc/pid/fd (<1ms)
+  │    ├─ Dirty pages from frozen source (<1ms)
+  │    ├─ libc rw- re-send (<1ms)
+  │    └─ SIGCONT
   │
-  ├─ T3 register re-capture  (see §4)
-  │    capture_and_send_t3_regs()
-  │    Re-send libc rw- from frozen source
-  │
-  ├─ VMA diff detection
+  ├─ VMA diff detection (source running)
   │    Scan /proc/pid/maps for new VMAs
   │    Send PS_IOV_VMA_DIFF to replica
   │
