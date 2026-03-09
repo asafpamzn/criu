@@ -3157,40 +3157,60 @@ static int capture_and_send_t3_sigacts(pid_t source_pid, int socket,
 		return -1;
 	}
 
-	/* SEIZE all threads + consume pending SIGSTOPs */
-	for (t = 0; t < pi->nr_threads; t++) {
-		pid_t tid = pi->threads[t].real;
-		int status;
+	/*
+	 * SEIZE all LIVE threads from /proc/pid/task.
+	 * Do NOT use root_item->threads — it may include dead
+	 * child processes from the benchmark that were captured
+	 * at T_dump but exited since.
+	 */
+	{
+		char task_dir[64];
+		DIR *dir;
+		struct dirent *de;
+		pid_t tids[256];
+		int nr_tids = 0;
 
-		if (ptrace(PTRACE_SEIZE, tid, NULL, 0)) {
-			pr_perror("T3 sigacts: SEIZE tid %d", tid);
-			goto err_detach;
+		snprintf(task_dir, sizeof(task_dir),
+			 "/proc/%d/task", source_pid);
+		dir = opendir(task_dir);
+		if (!dir) {
+			pr_perror("T3 sigacts: opendir %s", task_dir);
+			return -1;
 		}
-		if (ptrace(PTRACE_INTERRUPT, tid, NULL, NULL)) {
-			ptrace(PTRACE_DETACH, tid, NULL, NULL);
-			goto err_detach;
+		while ((de = readdir(dir)) != NULL && nr_tids < 256) {
+			if (de->d_name[0] == '.')
+				continue;
+			tids[nr_tids++] = atoi(de->d_name);
 		}
-		if (waitpid(tid, &status, __WALL) != tid) {
-			ptrace(PTRACE_DETACH, tid, NULL, NULL);
-			goto err_detach;
+		closedir(dir);
+
+		for (t = 0; t < nr_tids; t++) {
+			int status;
+
+			if (ptrace(PTRACE_SEIZE, tids[t], NULL, 0)) {
+				pr_perror("T3 sigacts: SEIZE %d", tids[t]);
+				goto err_detach;
+			}
+			if (ptrace(PTRACE_INTERRUPT, tids[t], NULL, NULL)) {
+				ptrace(PTRACE_DETACH, tids[t], NULL, NULL);
+				goto err_detach;
+			}
+			if (waitpid(tids[t], &status, __WALL) != tids[t]) {
+				ptrace(PTRACE_DETACH, tids[t], NULL, NULL);
+				goto err_detach;
+			}
+			/* Consume pending SIGSTOP */
+			if (ptrace(PTRACE_CONT, tids[t], 0, 0)) {
+				ptrace(PTRACE_DETACH, tids[t], NULL, NULL);
+				goto err_detach;
+			}
+			if (waitpid(tids[t], &status, __WALL) != tids[t]) {
+				ptrace(PTRACE_DETACH, tids[t], NULL, NULL);
+				goto err_detach;
+			}
 		}
-		/*
-		 * Consume pending SIGSTOP.  After PTRACE_INTERRUPT
-		 * from SIGSTOP group-stop, a pending SIGSTOP may
-		 * be queued.  PTRACE_CONT + wait4 consumes it,
-		 * leaving the thread in signal-delivery-stop which
-		 * is what compel expects.
-		 */
-		if (ptrace(PTRACE_CONT, tid, 0, 0)) {
-			ptrace(PTRACE_DETACH, tid, NULL, NULL);
-			goto err_detach;
-		}
-		if (waitpid(tid, &status, __WALL) != tid) {
-			ptrace(PTRACE_DETACH, tid, NULL, NULL);
-			goto err_detach;
-		}
+		pr_err("T3 sigacts: seized %d threads\n", nr_tids);
 	}
-	pr_err("T3 sigacts: seized %d threads\n", pi->nr_threads);
 
 	ctl = parasite_infect_seized(source_pid, pi, &vmas);
 	if (!ctl) {
@@ -3222,13 +3242,28 @@ static int capture_and_send_t3_sigacts(pid_t source_pid, int socket,
 
 	pr_err("T3 sigacts: captured 64 signal handlers\n");
 
-	/* Cure + detach */
+	/* Cure + detach all live threads */
 	if (compel_stop_daemon_fast(ctl))
 		pr_err("T3 sigacts: stop daemon failed\n");
 	if (compel_cure_local(ctl))
 		pr_err("T3 sigacts: cure failed\n");
-	for (t = 0; t < pi->nr_threads; t++)
-		ptrace(PTRACE_DETACH, pi->threads[t].real, NULL, NULL);
+	{
+		char td[64];
+		DIR *d;
+		struct dirent *e;
+
+		snprintf(td, sizeof(td), "/proc/%d/task", source_pid);
+		d = opendir(td);
+		if (d) {
+			while ((e = readdir(d)) != NULL) {
+				if (e->d_name[0] != '.')
+					ptrace(PTRACE_DETACH,
+					       atoi(e->d_name),
+					       NULL, NULL);
+			}
+			closedir(d);
+		}
+	}
 
 	/* Send */
 	hdr.cmd = encode_ps_cmd(PS_IOV_T3_SIGACTS, 0);
@@ -3251,8 +3286,24 @@ static int capture_and_send_t3_sigacts(pid_t source_pid, int socket,
 	return 0;
 
 err_detach:
-	for (t = 0; t < pi->nr_threads; t++)
-		ptrace(PTRACE_DETACH, pi->threads[t].real, NULL, NULL);
+	/* Detach any threads we might have seized */
+	{
+		char td[64];
+		DIR *d;
+		struct dirent *e;
+
+		snprintf(td, sizeof(td), "/proc/%d/task", source_pid);
+		d = opendir(td);
+		if (d) {
+			while ((e = readdir(d)) != NULL) {
+				if (e->d_name[0] != '.')
+					ptrace(PTRACE_DETACH,
+					       atoi(e->d_name),
+					       NULL, NULL);
+			}
+			closedir(d);
+		}
+	}
 	return -1;
 }
 
@@ -3729,14 +3780,16 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 		pid_t fork_pid = -1;
 
 		{
-		struct timeval t3_start, t3_now, t3_delta;
+		struct timeval t3_start, t3_fork, t3_now, t3_delta;
 
 		gettimeofday(&t3_start, NULL);
 
-		kill(source_pid, SIGSTOP);
-		usleep(1000);
-
-		/* Step 4: Final scan — should be near-zero */
+		/*
+		 * Pre-freeze dirty scan: scan while source is LIVE.
+		 * PAGEMAP_SCAN is read-only — safe against the
+		 * running process.  This moves ~640ms of page-table
+		 * walks out of the frozen window.
+		 */
 		list_for_each_entry(lve, get_global_lazy_vmas(), list) {
 			unsigned long scan_pos;
 
@@ -3777,23 +3830,80 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 			}
 		}
 
+		pr_err("COW T3 pre-freeze scan: %lu dirty pages "
+		       "(%d regions)\n", freeze_pages, freeze_dirty_count);
+
 		/*
-		 * Fork snapshot: create a COW copy of the source for
-		 * consistent page reads, then resume the source.
-		 * The fork lives only ~2s while we read dirty pages.
-		 * COW overhead: ~672 MB (vs 60 GB for bgsave).
+		 * Freeze: SIGSTOP → T3 state capture → fork → SIGCONT.
+		 * Source frozen for: sigacts (~7ms) + regs (<1ms) +
+		 * FDs (<1ms) + fork (~5ms) ≈ 14ms.
 		 */
+		kill(source_pid, SIGSTOP);
+		usleep(1000);
+
+		/* T3 full state capture while source is frozen */
+		{
+			struct timeval ts, te, td;
+
+			gettimeofday(&ts, NULL);
+			capture_and_send_t3_sigacts(
+				source_pid, sockets[0], img->dst_id);
+			gettimeofday(&te, NULL);
+			timersub(&te, &ts, &td);
+			pr_err("COW T3 sigacts: %ldms\n",
+			       td.tv_sec * 1000 + td.tv_usec / 1000);
+
+			gettimeofday(&ts, NULL);
+			capture_and_send_t3_regs(
+				source_pid, sockets[0], img->dst_id);
+			gettimeofday(&te, NULL);
+			timersub(&te, &ts, &td);
+			pr_err("COW T3 regs: %ldms\n",
+			       td.tv_sec * 1000 + td.tv_usec / 1000);
+
+			gettimeofday(&ts, NULL);
+			capture_and_send_t3_fds(
+				source_pid, sockets[0], img->dst_id);
+			gettimeofday(&te, NULL);
+			timersub(&te, &ts, &td);
+			pr_err("COW T3 FDs: %ldms\n",
+			       td.tv_sec * 1000 + td.tv_usec / 1000);
+
+			/* libc rw- re-send */
+			if (g_libc_rw_start) {
+				struct converge_region lr;
+
+				lr.start = g_libc_rw_start;
+				lr.end = g_libc_rw_end;
+				lr.categories = 0;
+				converge_dispatch_parallel(
+					img, source_pid,
+					sockets, nr_streams,
+					&lr, 1);
+			}
+		}
+
 		{
 			pid_t read_pid;
+			struct timeval ts2, te2, td2;
 
-			fork_pid = -1;
-
-			if (freeze_dirty_count > 0)
-				fork_pid = fork_source_snapshot(source_pid);
+			gettimeofday(&ts2, NULL);
+			fork_pid = fork_source_snapshot(source_pid);
+			gettimeofday(&te2, NULL);
+			timersub(&te2, &ts2, &td2);
+			pr_err("COW T3 fork_snapshot: %ldms\n",
+			       td2.tv_sec * 1000 + td2.tv_usec / 1000);
 
 			if (fork_pid > 0) {
-				/* Resume source immediately — fork has the snapshot */
+				/* Resume source immediately */
 				kill(source_pid, SIGCONT);
+				gettimeofday(&t3_fork, NULL);
+				timersub(&t3_fork, &t3_start, &t3_delta);
+				pr_err("COW T3 freeze->fork: %ld.%03ldms "
+				       "(source resumed)\n",
+				       t3_delta.tv_sec * 1000 +
+				       t3_delta.tv_usec / 1000,
+				       t3_delta.tv_usec % 1000);
 				read_pid = fork_pid;
 				pr_err("COW converge: reading %lu dirty pages "
 				       "from fork %d (source resumed)\n",
@@ -3980,48 +4090,7 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 		 * libc rw- is file-backed (not MAP_ANONYMOUS) so WP never
 		 * tracks it.  Must re-send explicitly for T3 consistency.
 		 */
-		{
-			struct timeval ts, te, td;
-			int t3_ok;
-
-			gettimeofday(&ts, NULL);
-			t3_ok = capture_and_send_t3_regs(
-				source_pid, sockets[0], img->dst_id);
-			gettimeofday(&te, NULL);
-			timersub(&te, &ts, &td);
-			pr_err("COW T3 regs: %ldms\n",
-			       td.tv_sec * 1000 + td.tv_usec / 1000);
-
-			if (t3_ok == 0) {
-				if (g_libc_rw_start) {
-					struct converge_region lr;
-
-					lr.start = g_libc_rw_start;
-					lr.end = g_libc_rw_end;
-					lr.categories = 0;
-					converge_dispatch_parallel(
-						img, source_pid,
-						sockets, nr_streams,
-						&lr, 1);
-				}
-			}
-
-			gettimeofday(&ts, NULL);
-			capture_and_send_t3_fds(
-				source_pid, sockets[0], img->dst_id);
-			gettimeofday(&te, NULL);
-			timersub(&te, &ts, &td);
-			pr_err("COW T3 FDs: %ldms\n",
-			       td.tv_sec * 1000 + td.tv_usec / 1000);
-
-			gettimeofday(&ts, NULL);
-			capture_and_send_t3_sigacts(
-				source_pid, sockets[0], img->dst_id);
-			gettimeofday(&te, NULL);
-			timersub(&te, &ts, &td);
-			pr_err("COW T3 sigacts: %ldms\n",
-			       td.tv_sec * 1000 + td.tv_usec / 1000);
-		}
+		/* T3 state already captured before fork */
 
 		/*
 		 * Detect new VMAs (e.g. jemalloc mmap extents created
