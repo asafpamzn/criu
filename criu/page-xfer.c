@@ -3868,6 +3868,36 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 			/* T3 FD table capture */
 			capture_and_send_t3_fds(
 				source_pid, sockets[0], img->dst_id);
+
+			/* T3 signal mask snapshot for drift detection */
+			{
+				char status_path[64];
+				FILE *sfp;
+				unsigned long long sig_ign = 0;
+				unsigned long long sig_cgt = 0;
+
+				snprintf(status_path, sizeof(status_path),
+					 "/proc/%d/status", source_pid);
+				sfp = fopen(status_path, "r");
+				if (sfp) {
+					char sline[128];
+
+					while (fgets(sline, sizeof(sline),
+						     sfp)) {
+						sscanf(sline,
+						       "SigIgn: %llx",
+						       &sig_ign);
+						sscanf(sline,
+						       "SigCgt: %llx",
+						       &sig_cgt);
+					}
+					fclose(sfp);
+					pr_err("T3 signals: "
+					       "SigIgn=%016llx "
+					       "SigCgt=%016llx\n",
+					       sig_ign, sig_cgt);
+				}
+			}
 		}
 
 		/*
