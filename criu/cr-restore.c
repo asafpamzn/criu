@@ -1904,6 +1904,203 @@ static int vma_set_regs(pid_t pid, user_regs_struct_t *regs)
 	return 0;
 }
 
+static int inject_close_syscall(pid_t pid, int target_fd)
+{
+	user_regs_struct_t orig_regs, regs;
+	unsigned char orig_code[8];
+	unsigned long pc;
+	int status;
+
+	if (vma_get_regs(pid, &orig_regs))
+		return -1;
+#ifdef __aarch64__
+	pc = (unsigned long)orig_regs.pc;
+#else
+	pc = (unsigned long)orig_regs.ip;
+#endif
+	if (ptrace_peek_area(pid, orig_code, (void *)pc, sizeof(orig_code)))
+		return -1;
+	if (ptrace_poke_area(pid, (void *)vma_syscall_insn,
+			     (void *)pc, sizeof(vma_syscall_insn)))
+		goto err_close;
+
+	regs = orig_regs;
+#ifdef __aarch64__
+	regs.regs[8] = __NR_close;
+	regs.regs[0] = target_fd;
+	regs.pc = pc;
+#else
+	regs.ax = __NR_close;
+	regs.di = target_fd;
+	regs.ip = pc;
+#endif
+	if (vma_set_regs(pid, &regs))
+		goto err_close;
+	if (ptrace(PTRACE_CONT, pid, NULL, NULL))
+		goto err_close_r;
+	if (waitpid(pid, &status, __WALL) != pid)
+		goto err_close_r;
+	if (!WIFSTOPPED(status) || WSTOPSIG(status) != SIGTRAP)
+		goto err_close_r;
+
+	if (ptrace_poke_area(pid, orig_code, (void *)pc, sizeof(orig_code)))
+		pr_err("inject_close: restore code failed\n");
+	if (vma_set_regs(pid, &orig_regs))
+		pr_err("inject_close: restore regs failed\n");
+	return 0;
+
+err_close_r:
+	vma_set_regs(pid, &orig_regs);
+err_close:
+	if (ptrace_poke_area(pid, orig_code, (void *)pc, sizeof(orig_code)))
+		pr_err("inject_close: restore code failed\n");
+	return -1;
+}
+
+static int inject_open_syscall(pid_t pid, const char *path,
+			       int flags, int mode)
+{
+	user_regs_struct_t orig_regs, regs;
+	unsigned char orig_code[8];
+	unsigned char orig_stack[256];
+	unsigned long pc, sp;
+	int status, result;
+	size_t path_len = strlen(path) + 1;
+
+	if (path_len > 240)
+		return -1;
+	if (vma_get_regs(pid, &orig_regs))
+		return -1;
+#ifdef __aarch64__
+	pc = (unsigned long)orig_regs.pc;
+	sp = (unsigned long)orig_regs.sp;
+#else
+	pc = (unsigned long)orig_regs.ip;
+	sp = (unsigned long)orig_regs.sp;
+#endif
+	if (ptrace_peek_area(pid, orig_code, (void *)pc, sizeof(orig_code)))
+		return -1;
+	if (ptrace_peek_area(pid, orig_stack, (void *)(sp - 256), 256))
+		return -1;
+	if (ptrace_poke_area(pid, (void *)path, (void *)(sp - 256), path_len))
+		goto err_open;
+	if (ptrace_poke_area(pid, (void *)vma_syscall_insn,
+			     (void *)pc, sizeof(vma_syscall_insn)))
+		goto err_open;
+
+	regs = orig_regs;
+#ifdef __aarch64__
+	regs.regs[8] = __NR_openat;
+	regs.regs[0] = (unsigned long)-100; /* AT_FDCWD */
+	regs.regs[1] = sp - 256;
+	regs.regs[2] = flags;
+	regs.regs[3] = mode;
+	regs.pc = pc;
+#else
+	regs.ax = __NR_openat;
+	regs.di = (unsigned long)-100;
+	regs.si = sp - 256;
+	regs.dx = flags;
+	regs.r10 = mode;
+	regs.ip = pc;
+#endif
+	if (vma_set_regs(pid, &regs))
+		goto err_open;
+	if (ptrace(PTRACE_CONT, pid, NULL, NULL))
+		goto err_open;
+	if (waitpid(pid, &status, __WALL) != pid)
+		goto err_open;
+	if (!WIFSTOPPED(status) || WSTOPSIG(status) != SIGTRAP)
+		goto err_open;
+
+	if (vma_get_regs(pid, &regs))
+		goto err_open;
+#ifdef __aarch64__
+	result = (int)regs.regs[0];
+#else
+	result = (int)regs.ax;
+#endif
+	if (ptrace_poke_area(pid, orig_code, (void *)pc, sizeof(orig_code)))
+		pr_err("inject_open: restore code failed\n");
+	if (ptrace_poke_area(pid, orig_stack, (void *)(sp - 256), 256))
+		pr_err("inject_open: restore stack failed\n");
+	if (vma_set_regs(pid, &orig_regs))
+		pr_err("inject_open: restore regs failed\n");
+	return result;
+
+err_open:
+	vma_set_regs(pid, &orig_regs);
+	if (ptrace_poke_area(pid, orig_code, (void *)pc, sizeof(orig_code)))
+		pr_err("inject_open: restore code failed\n");
+	if (ptrace_poke_area(pid, orig_stack, (void *)(sp - 256), 256))
+		pr_err("inject_open: restore stack failed\n");
+	return -1;
+}
+
+static int inject_dup3_syscall(pid_t pid, int old_fd, int new_fd)
+{
+	user_regs_struct_t orig_regs, regs;
+	unsigned char orig_code[8];
+	unsigned long pc;
+	int status, result;
+
+	if (vma_get_regs(pid, &orig_regs))
+		return -1;
+#ifdef __aarch64__
+	pc = (unsigned long)orig_regs.pc;
+#else
+	pc = (unsigned long)orig_regs.ip;
+#endif
+	if (ptrace_peek_area(pid, orig_code, (void *)pc, sizeof(orig_code)))
+		return -1;
+	if (ptrace_poke_area(pid, (void *)vma_syscall_insn,
+			     (void *)pc, sizeof(vma_syscall_insn)))
+		goto err_dup3;
+
+	regs = orig_regs;
+#ifdef __aarch64__
+	regs.regs[8] = __NR_dup3;
+	regs.regs[0] = old_fd;
+	regs.regs[1] = new_fd;
+	regs.regs[2] = 0;
+	regs.pc = pc;
+#else
+	regs.ax = __NR_dup3;
+	regs.di = old_fd;
+	regs.si = new_fd;
+	regs.dx = 0;
+	regs.ip = pc;
+#endif
+	if (vma_set_regs(pid, &regs))
+		goto err_dup3;
+	if (ptrace(PTRACE_CONT, pid, NULL, NULL))
+		goto err_dup3_r;
+	if (waitpid(pid, &status, __WALL) != pid)
+		goto err_dup3_r;
+	if (!WIFSTOPPED(status) || WSTOPSIG(status) != SIGTRAP)
+		goto err_dup3_r;
+
+	if (vma_get_regs(pid, &regs))
+		goto err_dup3_r;
+#ifdef __aarch64__
+	result = (int)regs.regs[0];
+#else
+	result = (int)regs.ax;
+#endif
+	if (ptrace_poke_area(pid, orig_code, (void *)pc, sizeof(orig_code)))
+		pr_err("inject_dup3: restore code failed\n");
+	if (vma_set_regs(pid, &orig_regs))
+		pr_err("inject_dup3: restore regs failed\n");
+	return result;
+
+err_dup3_r:
+	vma_set_regs(pid, &orig_regs);
+err_dup3:
+	if (ptrace_poke_area(pid, orig_code, (void *)pc, sizeof(orig_code)))
+		pr_err("inject_dup3: restore code failed\n");
+	return -1;
+}
+
 static int inject_mmap_syscall(pid_t pid, unsigned long addr,
 			       unsigned long len, int prot,
 			       unsigned long *result)
@@ -2394,73 +2591,119 @@ static void apply_t3_fds(pid_t pid)
 	DIR *dir;
 	struct dirent *de;
 	int i, restored_count = 0;
-	int new_fds = 0, matched = 0;
+	int matched = 0, opened = 0, closed_cnt = 0, skipped = 0;
+	ssize_t len;
+	unsigned char t3_set[8192]; /* bitmap for fds 0..65535 */
 
 	if (!g_t3_fds || !g_t3_fds_count)
 		return;
 
-	/* Build set of restored FDs */
+	memset(t3_set, 0, sizeof(t3_set));
+	for (i = 0; i < g_t3_fds_count; i++) {
+		if (g_t3_fds[i].fd < 65536)
+			t3_set[g_t3_fds[i].fd / 8] |=
+				1 << (g_t3_fds[i].fd % 8);
+	}
+
 	snprintf(fd_dir, sizeof(fd_dir), "/proc/%d/fd", pid);
 	dir = opendir(fd_dir);
 	if (!dir)
 		return;
-
-	/* Count restored FDs and check each T3 FD */
 	while ((de = readdir(dir)) != NULL) {
-		if (de->d_name[0] == '.')
-			continue;
-		restored_count++;
+		if (de->d_name[0] != '.')
+			restored_count++;
 	}
 	closedir(dir);
 
-	/* Check for T3 FDs not in restored set */
+	/* Pass 1: T3 FDs — match, open missing files, skip sockets */
 	for (i = 0; i < g_t3_fds_count; i++) {
-		ssize_t len;
+		unsigned int fd_num = g_t3_fds[i].fd;
 
 		snprintf(fd_path, sizeof(fd_path),
-			 "/proc/%d/fd/%u", pid, g_t3_fds[i].fd);
+			 "/proc/%d/fd/%u", pid, fd_num);
 		len = readlink(fd_path, link, sizeof(link) - 1);
 		if (len < 0) {
-			/*
-			 * FD exists at T3 but not in restore.
-			 * For sockets: expected (--tcp-close discards clients).
-			 * For files: might indicate a real gap.
-			 */
-			if (strstr(g_t3_fds[i].path, "socket:"))
-				matched++; /* tcp-close handled it */
-			else {
-				new_fds++;
-				pr_err("T3 FDs: fd %u missing in restore "
-				       "(was %s)\n",
-				       g_t3_fds[i].fd, g_t3_fds[i].path);
+			if (strstr(g_t3_fds[i].path, "socket:") ||
+			    strstr(g_t3_fds[i].path, "pipe:") ||
+			    strstr(g_t3_fds[i].path, "anon_inode:")) {
+				skipped++;
+				continue;
+			}
+			if (g_t3_fds[i].path[0] == '/') {
+				int tmp_fd = inject_open_syscall(
+					pid, g_t3_fds[i].path,
+					g_t3_fds[i].flags & 03, 0);
+				if (tmp_fd >= 0) {
+					if ((unsigned int)tmp_fd != fd_num) {
+						inject_dup3_syscall(
+							pid, tmp_fd, fd_num);
+						inject_close_syscall(
+							pid, tmp_fd);
+					}
+					pr_err("T3 FDs: opened fd %u "
+					       "(%s)\n", fd_num,
+					       g_t3_fds[i].path);
+					opened++;
+				} else {
+					pr_err("T3 FDs: open failed "
+					       "fd %u (%s)\n", fd_num,
+					       g_t3_fds[i].path);
+				}
+			} else {
+				skipped++;
 			}
 		} else {
 			link[len] = '\0';
-			/*
-			 * Pipes/sockets get new inodes on restore.
-			 * Compare type prefix, not full inode path.
-			 */
-			if (strncmp(link, "pipe:", 5) == 0 &&
-			    strncmp(g_t3_fds[i].path, "pipe:", 5) == 0)
+			if ((strncmp(link, "pipe:", 5) == 0 &&
+			     strncmp(g_t3_fds[i].path, "pipe:", 5) == 0) ||
+			    (strncmp(link, "socket:", 7) == 0 &&
+			     strncmp(g_t3_fds[i].path, "socket:", 7) == 0) ||
+			    (strncmp(link, "anon_inode:", 11) == 0 &&
+			     strncmp(g_t3_fds[i].path,
+				     "anon_inode:", 11) == 0) ||
+			    strcmp(link, g_t3_fds[i].path) == 0)
 				matched++;
-			else if (strncmp(link, "socket:", 7) == 0 &&
-				 strncmp(g_t3_fds[i].path, "socket:", 7) == 0)
-				matched++;
-			else if (strcmp(link, g_t3_fds[i].path) == 0)
-				matched++;
-			else {
-				new_fds++;
-				pr_err("T3 FDs: fd %u type mismatch: "
+			else
+				pr_err("T3 FDs: fd %u changed: "
 				       "restored=%s T3=%s\n",
-				       g_t3_fds[i].fd, link,
+				       fd_num, link,
 				       g_t3_fds[i].path);
-			}
 		}
 	}
 
-	pr_err("T3 FDs: %d matched, %d new (missing in restore), "
-	       "%d restored total, %d T3 total\n",
-	       matched, new_fds, restored_count, g_t3_fds_count);
+	/* Pass 2: close restored FDs not in T3 (stale from T_dump) */
+	dir = opendir(fd_dir);
+	if (dir) {
+		while ((de = readdir(dir)) != NULL) {
+			int fd_num;
+
+			if (de->d_name[0] == '.')
+				continue;
+			fd_num = atoi(de->d_name);
+			if (fd_num < 3 || fd_num >= 65536)
+				continue;
+			if (t3_set[fd_num / 8] & (1 << (fd_num % 8)))
+				continue;
+			snprintf(fd_path, sizeof(fd_path),
+				 "/proc/%d/fd/%d", pid, fd_num);
+			len = readlink(fd_path, link, sizeof(link) - 1);
+			if (len <= 0)
+				continue;
+			link[len] = '\0';
+			if (strstr(link, "eventpoll"))
+				continue;
+			pr_err("T3 FDs: closing stale fd %d (%s)\n",
+			       fd_num, link);
+			inject_close_syscall(pid, fd_num);
+			closed_cnt++;
+		}
+		closedir(dir);
+	}
+
+	pr_err("T3 FDs: %d matched, %d opened, %d closed, "
+	       "%d skipped, %d restored, %d T3\n",
+	       matched, opened, closed_cnt, skipped,
+	       restored_count, g_t3_fds_count);
 }
 
 static int finalize_restore_detach(void)
