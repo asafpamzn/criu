@@ -426,39 +426,6 @@ static int uffd_open_proc(pid_t pid)
 	return fd;
 }
 
-static int uffd_open_proc_async(pid_t pid)
-{
-	char path[64];
-	struct uffdio_api api;
-	int fd;
-
-	snprintf(path, sizeof(path), "/proc/%d/userfaultfd", pid);
-	fd = open(path, O_RDWR | O_CLOEXEC | O_NONBLOCK);
-	if (fd < 0) {
-		pr_perror("Cannot open %s", path);
-		return -1;
-	}
-
-	memset(&api, 0, sizeof(api));
-	api.api = UFFD_API;
-	api.features = UFFD_FEATURE_WP_ASYNC;
-
-	if (ioctl(fd, UFFDIO_API, &api)) {
-		pr_perror("UFFDIO_API WP_ASYNC on %s failed", path);
-		close(fd);
-		return -1;
-	}
-	if (!(api.features & UFFD_FEATURE_WP_ASYNC)) {
-		pr_err("userfaultfd from %s lacks WP_ASYNC feature\n", path);
-		close(fd);
-		return -1;
-	}
-
-	pr_info("Opened %s with WP_ASYNC: fd=%d features=0x%llx\n",
-		path, fd, (unsigned long long)api.features);
-	return fd;
-}
-
 /* ------------------------------------------------------------------ */
 /*  VMA registration                                                   */
 /* ------------------------------------------------------------------ */
