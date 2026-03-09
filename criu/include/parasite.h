@@ -264,6 +264,7 @@ struct parasite_cow_dump_args {
 	unsigned int nr_vmas;
 	unsigned long total_pages;	/* Output: total pages registered */
 	unsigned int nr_failed_vmas;	/* Output: number of VMAs that couldn't be registered */
+	unsigned long uffd_features;	/* Input: UFFD features to request (e.g. WP or WP_ASYNC) */
 	int ret;			/* Output: return code */
 };
 

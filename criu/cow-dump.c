@@ -634,6 +634,7 @@ int cow_dump_init(struct pstree_item *item, struct vm_area_list *vma_area_list,
 		args->nr_vmas = 0;
 		args->total_pages = 0;
 		args->nr_failed_vmas = 0;
+		args->uffd_features = 0; /* Default: WP_SYNC (UFFD_FEATURE_PAGEFAULT_FLAG_WP) */
 		args->ret = -1;
 
 		ret = compel_rpc_call(PARASITE_CMD_COW_DUMP_INIT, ctl);
@@ -1293,20 +1294,15 @@ int cow_dump_init_async(struct pstree_item *item,
 			struct parasite_ctl *ctl)
 {
 	struct cow_dump_info *cdi;
+	struct parasite_cow_dump_args *args = NULL;
+	unsigned long args_size;
 	int ret;
-
-	(void)ctl; /* Unused in async mode */
 
 	pr_info("Initializing COW dump ASYNC for pid %d\n", item->pid->real);
 
 	if (g_cow_info) {
 		pr_warn("COW tracking already initialized\n");
 		return 0;
-	}
-
-	if (!kdat.has_uffd_proc) {
-		pr_err("WP_ASYNC mode requires /proc/<pid>/userfaultfd support\n");
-		return -1;
 	}
 
 	cdi = xzalloc(sizeof(*cdi));
@@ -1336,10 +1332,49 @@ int cow_dump_init_async(struct pstree_item *item,
 		goto err;
 	}
 
-	/* Open UFFD with WP_ASYNC */
-	cdi->uffd = uffd_open_proc_async(item->pid->real);
-	if (cdi->uffd < 0)
+	/*
+	 * Create UFFD with WP_ASYNC via the parasite running inside
+	 * the target process.  This avoids /proc/<pid>/userfaultfd
+	 * which is deprecated / missing on some kernels.
+	 */
+	if (!ctl) {
+		pr_err("Parasite control required for WP_ASYNC uffd creation\n");
 		goto err;
+	}
+
+	args_size = sizeof(*args);
+	args = compel_parasite_args_s(ctl, args_size);
+	if (!args) {
+		pr_err("Failed to allocate parasite args for WP_ASYNC\n");
+		goto err;
+	}
+
+	args->nr_vmas = 0;
+	args->total_pages = 0;
+	args->nr_failed_vmas = 0;
+	args->uffd_features = UFFD_FEATURE_WP_ASYNC;
+	args->ret = -1;
+
+	ret = compel_rpc_call(PARASITE_CMD_COW_DUMP_INIT, ctl);
+	if (ret < 0) {
+		pr_err("Failed to initiate COW dump ASYNC RPC\n");
+		goto err;
+	}
+
+	compel_util_recv_fd(ctl, &cdi->uffd);
+	if (cdi->uffd < 0) {
+		pr_err("Failed to receive WP_ASYNC uffd from parasite: %d\n",
+		       cdi->uffd);
+		goto err;
+	}
+
+	ret = compel_rpc_sync(PARASITE_CMD_COW_DUMP_INIT, ctl);
+	if (ret < 0 || args->ret != 0) {
+		pr_err("Parasite COW dump ASYNC init failed: %d (ret=%d)\n",
+		       ret, args->ret);
+		goto err;
+	}
+
 	cdi->uffd_async = cdi->uffd;
 
 	/* Register VMAs — reuse cow_register_vmas() */

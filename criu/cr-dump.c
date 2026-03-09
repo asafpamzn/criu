@@ -1529,24 +1529,26 @@ static int pre_dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie
 		goto err;
 	}
 
-	/*
-	 * For COW phased migration: set up WP_ASYNC tracking before infecting.
-	 * This allows the process to run with async write tracking during bulk
-	 * page transfer. Dirty pages are later discovered via PAGEMAP_SCAN.
-	 */
-	if (opts.cow_dump) {
-		ret = cow_dump_init_async(item, &vmas, NULL);
-		if (ret) {
-			pr_err("Failed to init COW ASYNC (pid: %d)\n", pid);
-			goto err_free;
-		}
-	}
-
 	ret = -1;
 	parasite_ctl = parasite_infect_seized(pid, item, &vmas);
 	if (!parasite_ctl) {
 		pr_err("Can't infect (pid: %d) with parasite\n", pid);
 		goto err_free;
+	}
+
+	/*
+	 * For COW phased migration: set up WP_ASYNC tracking after infecting.
+	 * The parasite creates the userfaultfd inside the target process context
+	 * (since /proc/<pid>/userfaultfd is deprecated/unavailable on some kernels).
+	 * This allows the process to run with async write tracking during bulk
+	 * page transfer. Dirty pages are later discovered via PAGEMAP_SCAN.
+	 */
+	if (opts.cow_dump) {
+		ret = cow_dump_init_async(item, &vmas, parasite_ctl);
+		if (ret) {
+			pr_err("Failed to init COW ASYNC (pid: %d)\n", pid);
+			goto err_cure;
+		}
 	}
 
 	ret = parasite_fixup_vdso(parasite_ctl, pid, &vmas);
