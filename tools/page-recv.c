@@ -465,17 +465,22 @@ static void *stream_worker(void *arg)
 		}
 
 		if (cmd == PS_IOV_T3_SIGACTS) {
-			/* Signal masks: 3 × u64 (SigPnd, SigIgn, SigCgt) */
-			unsigned long long masks[3];
+			/* 64 signals × 4 u64 (handler, flags, restorer, mask) */
+			size_t sig_sz = T3_NSIG * 4 *
+				sizeof(unsigned long long);
+			unsigned long long *sigdata;
 			char path[256];
 			int fd;
 
-			if (recv_full(ctx->sk, masks, sizeof(masks)) < 0) {
+			sigdata = malloc(sig_sz);
+			if (!sigdata) { ctx->error = 1; break; }
+			if (recv_full(ctx->sk, sigdata, sig_sz) < 0) {
+				free(sigdata);
 				ctx->error = 1;
 				break;
 			}
 			__sync_fetch_and_add(&ctx->bytes_received,
-					     sizeof(masks));
+					     sig_sz);
 			snprintf(path, sizeof(path),
 				 "%s/t3_sigacts.dat", g_images_dir);
 			fd = open(path,
@@ -483,15 +488,17 @@ static void *stream_worker(void *arg)
 			if (fd >= 0) {
 				ssize_t w;
 
-				w = write(fd, masks, sizeof(masks));
+				w = write(fd, sigdata, sig_sz);
 				close(fd);
 				if (w < 0)
 					fprintf(stderr, "stream %d: "
 						"t3_sigacts.dat write "
 						"error\n", ctx->id);
 			}
-			fprintf(stderr, "stream %d: T3 sigmasks "
-				"received\n", ctx->id);
+			fprintf(stderr, "stream %d: T3 sigacts "
+				"received (64 signals, %zu bytes)\n",
+				ctx->id, sig_sz);
+			free(sigdata);
 			continue;
 		}
 

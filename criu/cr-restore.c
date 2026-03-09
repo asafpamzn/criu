@@ -2580,38 +2580,126 @@ static void load_t3_fds(void)
 	pr_err("Loaded T3 FD table: %d file descriptors\n", cnt);
 }
 
-/*
- * T3 signal masks.  Loaded from t3_sigacts.dat (which contains
- * SigPnd + SigIgn + SigCgt from /proc/pid/status at T3).
- *
- * Signal handler POINTERS come from T_dump images (sigaction
- * requires parasite injection which can't run from PTRACE_EVENT_STOP).
- * The masks tell us which signals are caught — if the caught set
- * changed between T_dump and T3, it's logged as drift.
- */
-static u64 g_t3_sigmasks[3]; /* SigPnd, SigIgn, SigCgt */
-static int g_t3_sigmasks_loaded;
+/* T3 signal handler table: 64 signals × {handler, flags, restorer, mask} */
+struct t3_sigact {
+	unsigned long handler;
+	unsigned long flags;
+	unsigned long restorer;
+	unsigned long mask;
+};
 
-static void load_t3_sigmasks(void)
+#define T3_NSIG 64
+
+static struct t3_sigact *g_t3_sigacts;
+
+static void load_t3_sigacts(void)
 {
 	char path[PATH_MAX];
 	int fd;
 	ssize_t r;
+	size_t sz = T3_NSIG * sizeof(struct t3_sigact);
 
 	snprintf(path, sizeof(path), "%s/t3_sigacts.dat",
 		 opts.imgs_dir);
 	fd = open(path, O_RDONLY);
 	if (fd < 0)
 		return;
-	r = read(fd, g_t3_sigmasks, sizeof(g_t3_sigmasks));
-	close(fd);
-	if (r != (ssize_t)sizeof(g_t3_sigmasks))
+	g_t3_sigacts = xmalloc(sz);
+	if (!g_t3_sigacts) {
+		close(fd);
 		return;
-	g_t3_sigmasks_loaded = 1;
-	pr_err("T3 sigmasks: Pnd=%016llx Ign=%016llx Cgt=%016llx\n",
-	       (unsigned long long)g_t3_sigmasks[0],
-	       (unsigned long long)g_t3_sigmasks[1],
-	       (unsigned long long)g_t3_sigmasks[2]);
+	}
+	r = read(fd, g_t3_sigacts, sz);
+	close(fd);
+	if (r != (ssize_t)sz) {
+		xfree(g_t3_sigacts);
+		g_t3_sigacts = NULL;
+		return;
+	}
+	pr_err("Loaded T3 signal handlers for %d signals\n", T3_NSIG);
+}
+
+static void apply_t3_sigacts(pid_t pid)
+{
+	user_regs_struct_t orig_regs, regs;
+	unsigned char orig_code[8];
+	unsigned char orig_stack[64];
+	unsigned long pc, sp;
+	int sig, applied = 0, status;
+
+	if (!g_t3_sigacts)
+		return;
+
+	if (vma_get_regs(pid, &orig_regs))
+		return;
+
+#ifdef __aarch64__
+	pc = (unsigned long)orig_regs.pc;
+	sp = (unsigned long)orig_regs.sp;
+#else
+	pc = (unsigned long)orig_regs.ip;
+	sp = (unsigned long)orig_regs.sp;
+#endif
+
+	if (ptrace_peek_area(pid, orig_code, (void *)pc,
+			     sizeof(orig_code)))
+		return;
+	if (ptrace_peek_area(pid, orig_stack,
+			     (void *)(sp - 64), 64))
+		return;
+
+	for (sig = 1; sig <= T3_NSIG; sig++) {
+		struct t3_sigact *sa = &g_t3_sigacts[sig - 1];
+
+		if (sig == SIGKILL || sig == SIGSTOP)
+			continue;
+		if (!sa->handler && !sa->flags)
+			continue;
+
+		/* Write sigact struct to stack */
+		if (ptrace_poke_area(pid, sa, (void *)(sp - 64),
+				     sizeof(*sa)))
+			continue;
+		if (ptrace_poke_area(pid, (void *)vma_syscall_insn,
+				     (void *)pc, sizeof(vma_syscall_insn)))
+			break;
+
+		regs = orig_regs;
+#ifdef __aarch64__
+		regs.regs[8] = __NR_rt_sigaction;
+		regs.regs[0] = sig;
+		regs.regs[1] = sp - 64;	/* act */
+		regs.regs[2] = 0;		/* oldact = NULL */
+		regs.regs[3] = 8;		/* sigsetsize */
+		regs.pc = pc;
+#else
+		regs.ax = __NR_rt_sigaction;
+		regs.di = sig;
+		regs.si = sp - 64;
+		regs.dx = 0;
+		regs.r10 = 8;
+		regs.ip = pc;
+#endif
+		if (vma_set_regs(pid, &regs))
+			break;
+		if (ptrace(PTRACE_CONT, pid, NULL, NULL))
+			break;
+		if (waitpid(pid, &status, __WALL) != pid)
+			break;
+		if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP)
+			applied++;
+	}
+
+	/* Restore original code + stack + regs */
+	if (ptrace_poke_area(pid, orig_code, (void *)pc,
+			     sizeof(orig_code)))
+		pr_err("apply_sigacts: restore code failed\n");
+	if (ptrace_poke_area(pid, orig_stack, (void *)(sp - 64), 64))
+		pr_err("apply_sigacts: restore stack failed\n");
+	if (vma_set_regs(pid, &orig_regs))
+		pr_err("apply_sigacts: restore regs failed\n");
+
+	pr_err("T3 sigacts: applied %d signal handlers\n", applied);
 }
 
 /*
@@ -2750,11 +2838,13 @@ static int finalize_restore_detach(void)
 		if (!task_alive(item))
 			continue;
 
-		/* Validate thread count: T3 vs restore */
-		if (g_t3_regs && item->nr_threads != g_t3_regs_count)
+		/* Thread count must match — abort if structure changed */
+		if (g_t3_regs && item->nr_threads != g_t3_regs_count) {
 			pr_err("T3 threads: count mismatch — "
-			       "restore has %d, T3 had %d\n",
+			       "restore has %d, T3 had %d, aborting\n",
 			       item->nr_threads, g_t3_regs_count);
+			return -1;
+		}
 
 		/* Set regs + apply T3 regs, track main thread index */
 		for (i = 0; i < item->nr_threads; i++) {
@@ -3168,7 +3258,9 @@ skip_ns_bouncing:
 		if (g_t3_fds)
 			apply_t3_fds(root_item->pid->real);
 
-		load_t3_sigmasks();
+		load_t3_sigacts();
+		if (g_t3_sigacts)
+			apply_t3_sigacts(root_item->pid->real);
 	}
 
 	/* just before releasing threads we have to restore rseq_cs */

@@ -3728,9 +3728,12 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 		unsigned long freeze_pages = 0;
 		pid_t fork_pid = -1;
 
-		kill(source_pid, SIGSTOP);
+		{
+		struct timeval t3_start, t3_now, t3_delta;
 
-		/* Process is now SIGSTOP'd */
+		gettimeofday(&t3_start, NULL);
+
+		kill(source_pid, SIGSTOP);
 		usleep(1000);
 
 		/* Step 4: Final scan — should be near-zero */
@@ -3978,10 +3981,18 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 		 * tracks it.  Must re-send explicitly for T3 consistency.
 		 */
 		{
-			int t3_ok = capture_and_send_t3_regs(
+			struct timeval ts, te, td;
+			int t3_ok;
+
+			gettimeofday(&ts, NULL);
+			t3_ok = capture_and_send_t3_regs(
 				source_pid, sockets[0], img->dst_id);
+			gettimeofday(&te, NULL);
+			timersub(&te, &ts, &td);
+			pr_err("COW T3 regs: %ldms\n",
+			       td.tv_sec * 1000 + td.tv_usec / 1000);
+
 			if (t3_ok == 0) {
-				pr_err("COW converge: T3 regs sent\n");
 				if (g_libc_rw_start) {
 					struct converge_region lr;
 
@@ -3992,23 +4003,24 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 						img, source_pid,
 						sockets, nr_streams,
 						&lr, 1);
-					pr_err("COW converge: sent libc "
-					       "rw- from frozen source "
-					       "(%lu pages)\n",
-					       (g_libc_rw_end -
-						g_libc_rw_start) /
-					       PAGE_SIZE);
 				}
 			}
 
-			/* T3 FD table capture */
+			gettimeofday(&ts, NULL);
 			capture_and_send_t3_fds(
 				source_pid, sockets[0], img->dst_id);
+			gettimeofday(&te, NULL);
+			timersub(&te, &ts, &td);
+			pr_err("COW T3 FDs: %ldms\n",
+			       td.tv_sec * 1000 + td.tv_usec / 1000);
 
-			/* T3 signal handlers via parasite */
+			gettimeofday(&ts, NULL);
 			capture_and_send_t3_sigacts(
 				source_pid, sockets[0], img->dst_id);
-
+			gettimeofday(&te, NULL);
+			timersub(&te, &ts, &td);
+			pr_err("COW T3 sigacts: %ldms\n",
+			       td.tv_sec * 1000 + td.tv_usec / 1000);
 		}
 
 		/*
@@ -4151,6 +4163,14 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 		}
 
 		kill(source_pid, SIGCONT);
+
+		gettimeofday(&t3_now, NULL);
+		timersub(&t3_now, &t3_start, &t3_delta);
+		pr_err("COW T3 TOTAL: %ld.%03ldms source frozen\n",
+		       t3_delta.tv_sec * 1000 + t3_delta.tv_usec / 1000,
+		       t3_delta.tv_usec % 1000);
+		}
+
 		xfree(freeze_dirty);
 	}
 
