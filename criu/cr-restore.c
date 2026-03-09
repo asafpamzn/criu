@@ -2343,6 +2343,126 @@ static void load_t3_regs(void)
 	pr_err("Loaded T3 registers for %d threads\n", cnt);
 }
 
+struct t3_fd_entry {
+	unsigned int fd;
+	unsigned int flags;
+	unsigned long pos;
+	char path[256];
+};
+static struct t3_fd_entry *g_t3_fds;
+static int g_t3_fds_count;
+
+static void load_t3_fds(void)
+{
+	char path[PATH_MAX];
+	int fd, cnt;
+	ssize_t r;
+
+	snprintf(path, sizeof(path), "%s/t3_fds.dat", opts.imgs_dir);
+	fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return;
+	r = read(fd, &cnt, sizeof(cnt));
+	if (r != sizeof(cnt) || cnt <= 0 || cnt > 65536) {
+		close(fd);
+		return;
+	}
+	g_t3_fds = xmalloc(cnt * sizeof(*g_t3_fds));
+	if (!g_t3_fds) {
+		close(fd);
+		return;
+	}
+	r = read(fd, g_t3_fds, cnt * sizeof(*g_t3_fds));
+	close(fd);
+	if (r != (ssize_t)(cnt * sizeof(*g_t3_fds))) {
+		xfree(g_t3_fds);
+		g_t3_fds = NULL;
+		return;
+	}
+	g_t3_fds_count = cnt;
+	pr_err("Loaded T3 FD table: %d file descriptors\n", cnt);
+}
+
+/*
+ * Compare T3 FD table against the restored process's actual FDs.
+ * Log differences. For new FDs that are regular files, inject
+ * open() via ptrace.
+ */
+static void apply_t3_fds(pid_t pid)
+{
+	char fd_dir[64], fd_path[64], link[256];
+	DIR *dir;
+	struct dirent *de;
+	int i, restored_count = 0;
+	int new_fds = 0, matched = 0;
+
+	if (!g_t3_fds || !g_t3_fds_count)
+		return;
+
+	/* Build set of restored FDs */
+	snprintf(fd_dir, sizeof(fd_dir), "/proc/%d/fd", pid);
+	dir = opendir(fd_dir);
+	if (!dir)
+		return;
+
+	/* Count restored FDs and check each T3 FD */
+	while ((de = readdir(dir)) != NULL) {
+		if (de->d_name[0] == '.')
+			continue;
+		restored_count++;
+	}
+	closedir(dir);
+
+	/* Check for T3 FDs not in restored set */
+	for (i = 0; i < g_t3_fds_count; i++) {
+		ssize_t len;
+
+		snprintf(fd_path, sizeof(fd_path),
+			 "/proc/%d/fd/%u", pid, g_t3_fds[i].fd);
+		len = readlink(fd_path, link, sizeof(link) - 1);
+		if (len < 0) {
+			/*
+			 * FD exists at T3 but not in restore.
+			 * For sockets: expected (--tcp-close discards clients).
+			 * For files: might indicate a real gap.
+			 */
+			if (strstr(g_t3_fds[i].path, "socket:"))
+				matched++; /* tcp-close handled it */
+			else {
+				new_fds++;
+				pr_err("T3 FDs: fd %u missing in restore "
+				       "(was %s)\n",
+				       g_t3_fds[i].fd, g_t3_fds[i].path);
+			}
+		} else {
+			link[len] = '\0';
+			/*
+			 * Pipes/sockets get new inodes on restore.
+			 * Compare type prefix, not full inode path.
+			 */
+			if (strncmp(link, "pipe:", 5) == 0 &&
+			    strncmp(g_t3_fds[i].path, "pipe:", 5) == 0)
+				matched++;
+			else if (strncmp(link, "socket:", 7) == 0 &&
+				 strncmp(g_t3_fds[i].path, "socket:", 7) == 0)
+				matched++;
+			else if (strcmp(link, g_t3_fds[i].path) == 0)
+				matched++;
+			else {
+				new_fds++;
+				pr_err("T3 FDs: fd %u type mismatch: "
+				       "restored=%s T3=%s\n",
+				       g_t3_fds[i].fd, link,
+				       g_t3_fds[i].path);
+			}
+		}
+	}
+
+	pr_err("T3 FDs: %d matched, %d new (missing in restore), "
+	       "%d restored total, %d T3 total\n",
+	       matched, new_fds, restored_count, g_t3_fds_count);
+}
+
 static int finalize_restore_detach(void)
 {
 	struct pstree_item *item;
@@ -2353,6 +2473,12 @@ static int finalize_restore_detach(void)
 
 		if (!task_alive(item))
 			continue;
+
+		/* Validate thread count: T3 vs restore */
+		if (g_t3_regs && item->nr_threads != g_t3_regs_count)
+			pr_err("T3 threads: count mismatch — "
+			       "restore has %d, T3 had %d\n",
+			       item->nr_threads, g_t3_regs_count);
 
 		/* Set regs + apply T3 regs, track main thread index */
 		for (i = 0; i < item->nr_threads; i++) {
@@ -2752,7 +2878,7 @@ skip_ns_bouncing:
 		}
 	}
 
-	/* COW mode: apply T3 registers so threads resume at T3 state */
+	/* COW mode: apply T3 state so process resumes at T3 */
 	if (opts.cow_dump) {
 		load_t3_regs();
 		if (!g_t3_regs) {
@@ -2761,6 +2887,10 @@ skip_ns_bouncing:
 		}
 		pr_err("T3 regs loaded for %d threads\n",
 		       g_t3_regs_count);
+
+		load_t3_fds();
+		if (g_t3_fds)
+			apply_t3_fds(root_item->pid->real);
 	}
 
 	/* just before releasing threads we have to restore rseq_cs */

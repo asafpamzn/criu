@@ -48,6 +48,14 @@ struct page_server_iov {
 #define PS_IOV_ADD_F_COMPRESS	10
 #define PS_IOV_VMA_DIFF		11
 #define PS_IOV_T3_REGS		12
+#define PS_IOV_T3_FDS		13
+
+struct t3_fd_entry {
+	unsigned int fd;
+	unsigned int flags;
+	unsigned long long pos;
+	char path[256];
+};
 
 struct vma_diff_entry {
 	unsigned long long start;
@@ -400,6 +408,50 @@ static void *stream_worker(void *arg)
 				"received (%d threads)\n",
 				ctx->id, nr_threads);
 			free(tregs);
+			continue;
+		}
+
+		if (cmd == PS_IOV_T3_FDS) {
+			int nr_fds = (int)npages;
+			size_t fds_sz = nr_fds *
+				sizeof(struct t3_fd_entry);
+			struct t3_fd_entry *tfds;
+			char path[256];
+			int fd;
+
+			if (nr_fds > 65536 || nr_fds <= 0) {
+				ctx->error = 1;
+				break;
+			}
+			tfds = malloc(fds_sz);
+			if (!tfds) { ctx->error = 1; break; }
+			if (recv_full(ctx->sk, tfds, fds_sz) < 0) {
+				free(tfds);
+				ctx->error = 1;
+				break;
+			}
+			__sync_fetch_and_add(&ctx->bytes_received,
+					     fds_sz);
+			snprintf(path, sizeof(path),
+				 "%s/t3_fds.dat", g_images_dir);
+			fd = open(path,
+				  O_CREAT | O_WRONLY | O_TRUNC, 0644);
+			if (fd >= 0) {
+				int cnt = nr_fds;
+				ssize_t w1, w2;
+
+				w1 = write(fd, &cnt, sizeof(cnt));
+				w2 = write(fd, tfds, fds_sz);
+				close(fd);
+				if (w1 < 0 || w2 < 0)
+					fprintf(stderr, "stream %d: "
+						"t3_fds.dat write "
+						"error\n", ctx->id);
+			}
+			fprintf(stderr, "stream %d: T3 FDs "
+				"received (%d fds)\n",
+				ctx->id, nr_fds);
+			free(tfds);
 			continue;
 		}
 

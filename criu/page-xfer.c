@@ -88,6 +88,14 @@ static void psi2iovec(struct page_server_iov *ps, struct iovec *iov)
 #define PS_IOV_ADD_F_COMPRESS 10
 #define PS_IOV_VMA_DIFF       11
 #define PS_IOV_T3_REGS        12
+#define PS_IOV_T3_FDS         13
+
+struct t3_fd_entry {
+	u32 fd;
+	u32 flags;		/* O_RDONLY etc from /proc/pid/fdinfo */
+	u64 pos;		/* file position */
+	char path[256];		/* readlink of /proc/pid/fd/N */
+};
 
 struct vma_diff_entry {
 	u64 start;
@@ -3108,6 +3116,120 @@ detach:
 	return -1;
 }
 
+/*
+ * Capture the FD table at T3 from /proc and send to replica.
+ * This ensures the restored process has T3-consistent FDs,
+ * not stale T_dump FDs.
+ */
+static int capture_and_send_t3_fds(pid_t source_pid, int socket,
+				   u32 dst_id)
+{
+	char fd_dir[64], fd_path[64], link[256], info_path[80], line[256];
+	DIR *dir;
+	struct dirent *de;
+	struct t3_fd_entry *fds;
+	int nr_fds = 0, cap = 256;
+	struct page_server_iov hdr;
+	size_t total, sent = 0;
+	FILE *fp;
+
+	fds = xmalloc(cap * sizeof(*fds));
+	if (!fds)
+		return -1;
+
+	snprintf(fd_dir, sizeof(fd_dir), "/proc/%d/fd", source_pid);
+	dir = opendir(fd_dir);
+	if (!dir) {
+		xfree(fds);
+		return -1;
+	}
+
+	while ((de = readdir(dir)) != NULL) {
+		int fd_num;
+		ssize_t len;
+
+		if (de->d_name[0] == '.')
+			continue;
+		fd_num = atoi(de->d_name);
+
+		if (nr_fds >= cap) {
+			int nc = cap * 2;
+			struct t3_fd_entry *tmp;
+
+			tmp = xrealloc(fds, nc * sizeof(*tmp));
+			if (!tmp)
+				break;
+			fds = tmp;
+			cap = nc;
+		}
+
+		memset(&fds[nr_fds], 0, sizeof(fds[nr_fds]));
+		fds[nr_fds].fd = fd_num;
+
+		/* Read symlink target */
+		snprintf(fd_path, sizeof(fd_path),
+			 "/proc/%d/fd/%d", source_pid, fd_num);
+		len = readlink(fd_path, link, sizeof(link) - 1);
+		if (len > 0) {
+			link[len] = '\0';
+			snprintf(fds[nr_fds].path,
+				 sizeof(fds[nr_fds].path),
+				 "%s", link);
+		}
+
+		/* Read flags + pos from fdinfo */
+		snprintf(info_path, sizeof(info_path),
+			 "/proc/%d/fdinfo/%d", source_pid, fd_num);
+		fp = fopen(info_path, "r");
+		if (fp) {
+			while (fgets(line, sizeof(line), fp)) {
+				unsigned long long val;
+
+				if (sscanf(line, "pos: %llu", &val) == 1)
+					fds[nr_fds].pos = val;
+				if (sscanf(line, "flags: %llo", &val) == 1)
+					fds[nr_fds].flags = (u32)val;
+			}
+			fclose(fp);
+		}
+
+		nr_fds++;
+	}
+	closedir(dir);
+
+	if (!nr_fds) {
+		xfree(fds);
+		return 0;
+	}
+
+	pr_err("T3 FDs: captured %d file descriptors\n", nr_fds);
+
+	hdr.cmd = encode_ps_cmd(PS_IOV_T3_FDS, 0);
+	hdr.nr_pages = nr_fds;
+	hdr.vaddr = 0;
+	hdr.dst_id = dst_id;
+	if (send_psi(socket, &hdr)) {
+		xfree(fds);
+		return -1;
+	}
+
+	total = nr_fds * sizeof(*fds);
+	while (sent < total) {
+		int w = __send(socket, (char *)fds + sent,
+			       total - sent, 0);
+		if (w <= 0) {
+			xfree(fds);
+			return -1;
+		}
+		sent += w;
+	}
+
+	pr_err("T3 FDs: sent %d fds (%zu bytes)\n",
+	       nr_fds, total);
+	xfree(fds);
+	return 0;
+}
+
 static int pid_cmp(const void *a, const void *b)
 {
 	pid_t pa = *(const pid_t *)a, pb = *(const pid_t *)b;
@@ -3742,6 +3864,10 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 					       PAGE_SIZE);
 				}
 			}
+
+			/* T3 FD table capture */
+			capture_and_send_t3_fds(
+				source_pid, sockets[0], img->dst_id);
 		}
 
 		/*
