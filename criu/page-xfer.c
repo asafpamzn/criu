@@ -3777,10 +3777,9 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 		struct converge_region *freeze_dirty = NULL;
 		int freeze_dirty_count = 0, freeze_dirty_cap = 0;
 		unsigned long freeze_pages = 0;
-		pid_t fork_pid = -1;
 
 		{
-		struct timeval t3_start, t3_fork, t3_now, t3_delta;
+		struct timeval t3_start, t3_fork, t3_delta;
 
 		gettimeofday(&t3_start, NULL);
 
@@ -3834,14 +3833,21 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 		       "(%d regions)\n", freeze_pages, freeze_dirty_count);
 
 		/*
-		 * Freeze: SIGSTOP → T3 state capture → fork → SIGCONT.
-		 * Source frozen for: sigacts (~7ms) + regs (<1ms) +
-		 * FDs (<1ms) + fork (~5ms) ≈ 14ms.
+		 * T3 freeze: SIGSTOP → state capture → dirty read → SIGCONT.
+		 *
+		 * No fork. The dirty set at T3 is small (pre-scanned above).
+		 * Read dirty pages directly from the frozen source via
+		 * process_vm_readv. This avoids the 600+ms clone() cost
+		 * of forking a 60GB process.
+		 *
+		 * Budget: sigacts (7ms) + regs (<1ms) + FDs (<1ms) +
+		 *         dirty read (<1ms for ~20 pages) + libc rw- (<1ms)
+		 *         ≈ 10ms total frozen.
 		 */
 		kill(source_pid, SIGSTOP);
 		usleep(1000);
 
-		/* T3 full state capture while source is frozen */
+		/* T3 full state capture */
 		{
 			struct timeval ts, te, td;
 
@@ -3868,229 +3874,52 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 			timersub(&te, &ts, &td);
 			pr_err("COW T3 FDs: %ldms\n",
 			       td.tv_sec * 1000 + td.tv_usec / 1000);
-
-			/* libc rw- re-send */
-			if (g_libc_rw_start) {
-				struct converge_region lr;
-
-				lr.start = g_libc_rw_start;
-				lr.end = g_libc_rw_end;
-				lr.categories = 0;
-				converge_dispatch_parallel(
-					img, source_pid,
-					sockets, nr_streams,
-					&lr, 1);
-			}
 		}
 
-		{
-			pid_t read_pid;
-			struct timeval ts2, te2, td2;
-
-			gettimeofday(&ts2, NULL);
-			fork_pid = fork_source_snapshot(source_pid);
-			gettimeofday(&te2, NULL);
-			timersub(&te2, &ts2, &td2);
-			pr_err("COW T3 fork_snapshot: %ldms\n",
-			       td2.tv_sec * 1000 + td2.tv_usec / 1000);
-
-			if (fork_pid > 0) {
-				/* Resume source immediately */
-				kill(source_pid, SIGCONT);
-				gettimeofday(&t3_fork, NULL);
-				timersub(&t3_fork, &t3_start, &t3_delta);
-				pr_err("COW T3 freeze->fork: %ld.%03ldms "
-				       "(source resumed)\n",
-				       t3_delta.tv_sec * 1000 +
-				       t3_delta.tv_usec / 1000,
-				       t3_delta.tv_usec % 1000);
-				read_pid = fork_pid;
-				pr_err("COW converge: reading %lu dirty pages "
-				       "from fork %d (source resumed)\n",
-				       freeze_pages, fork_pid);
-			} else {
-				/* Fork failed — fall back to reading from frozen source */
-				read_pid = source_pid;
-				if (freeze_dirty_count > 0)
-					pr_err("COW converge: fork failed, "
-					       "reading from frozen source\n");
-			}
-
-			if (freeze_dirty_count > 0) {
-				long sent = converge_dispatch_parallel(
-					img, read_pid, sockets, nr_streams,
-					freeze_dirty, freeze_dirty_count);
-				if (sent >= 0)
-					freeze_pages = sent;
-			}
-
-			/*
-			 * Re-send libc rw- pages from fork.
-			 * The bulk transfer may have read these
-			 * mid-traffic with stale arena state.
-			 * Reading from the fork (quiesced snapshot)
-			 * gives consistent arena bins/fastbins.
-			 */
+		/* Send dirty pages directly from frozen source */
+		if (freeze_dirty_count > 0) {
+			long sent = converge_dispatch_parallel(
+				img, source_pid, sockets, nr_streams,
+				freeze_dirty, freeze_dirty_count);
+			if (sent >= 0)
+				freeze_pages = sent;
 		}
 
-		pr_err("COW converge fork-snapshot: %lu dirty pages "
+		/* libc rw- re-send from frozen source */
+		if (g_libc_rw_start) {
+			struct converge_region lr;
+
+			lr.start = g_libc_rw_start;
+			lr.end = g_libc_rw_end;
+			lr.categories = 0;
+			converge_dispatch_parallel(
+				img, source_pid,
+				sockets, nr_streams,
+				&lr, 1);
+		}
+
+		/* Resume source */
+		kill(source_pid, SIGCONT);
+		gettimeofday(&t3_fork, NULL);
+		timersub(&t3_fork, &t3_start, &t3_delta);
+		pr_err("COW T3 FREEZE: %ld.%03ldms source frozen "
+		       "(%lu dirty pages, no fork)\n",
+		       t3_delta.tv_sec * 1000 +
+		       t3_delta.tv_usec / 1000,
+		       t3_delta.tv_usec % 1000,
+		       freeze_pages);
+
+		pr_err("COW converge T3: %lu dirty pages "
 		       "across %d streams (%d regions)\n",
 		       freeze_pages, nr_streams, freeze_dirty_count);
 
-		/*
-		 * Post-fork convergence round: pick up pages dirtied
-		 * while we read from the fork (~2s, ~86K pages).
-		 * Source is running at this point.
-		 */
-		if (freeze_dirty_count > 0) {
-			struct lazy_vma_entry *lve2;
-			struct converge_region *post_dirty = NULL;
-			int post_count = 0, post_cap = 0;
-			unsigned long post_pages = 0;
-
-			list_for_each_entry(lve2, get_global_lazy_vmas(), list) {
-				unsigned long scan_pos;
-
-				if (lve2->dst_id != img->dst_id)
-					continue;
-
-				scan_pos = lve2->start;
-				while (scan_pos < lve2->end) {
-					unsigned long walk_end = 0;
-					int nr_r, rr;
-
-					nr_r = cow_scan_dirty_pages(
-						source_pid, scan_pos,
-						lve2->end, regions,
-						CONVERGE_MAX_REGIONS,
-						&walk_end);
-					if (nr_r <= 0)
-						break;
-
-					if (post_count + nr_r > post_cap) {
-						int nc = (post_cap + nr_r) * 2;
-						struct converge_region *tmp;
-
-						tmp = xrealloc(post_dirty,
-							nc * sizeof(*tmp));
-						if (!tmp)
-							break;
-						post_dirty = tmp;
-						post_cap = nc;
-					}
-					for (rr = 0; rr < nr_r; rr++) {
-						post_dirty[post_count++] =
-							regions[rr];
-						post_pages +=
-							(regions[rr].end -
-							 regions[rr].start) /
-							PAGE_SIZE;
-					}
-
-					scan_pos = walk_end;
-					if (walk_end >= lve2->end)
-						break;
-				}
-			}
-
-			if (post_count > 0) {
-				long sent;
-
-				pr_err("COW converge post-fork: %lu dirty "
-				       "pages (%d regions)\n",
-				       post_pages, post_count);
-
-				sent = converge_dispatch_parallel(
-					img, source_pid, sockets,
-					nr_streams, post_dirty,
-					post_count);
-				if (sent >= 0)
-					pr_err("COW converge post-fork: "
-					       "sent %ld pages\n", sent);
-			}
-			xfree(post_dirty);
+		/* No post-fork scan needed — source was frozen for
+		 * the entire dirty read, so no new dirty pages. */
 		}
 
-		/*
-		 * Second freeze: capture remaining dirty pages from
-		 * the post-fork convergence window.
-		 */
-		kill(source_pid, SIGSTOP);
-		usleep(1000);
-
-		{
-			struct lazy_vma_entry *lve3;
-			struct converge_region *final_dirty = NULL;
-			int final_count = 0, final_cap = 0;
-			unsigned long final_pages = 0;
-
-			list_for_each_entry(lve3, get_global_lazy_vmas(), list) {
-				unsigned long scan_pos;
-
-				if (lve3->dst_id != img->dst_id)
-					continue;
-
-				scan_pos = lve3->start;
-				while (scan_pos < lve3->end) {
-					unsigned long walk_end = 0;
-					int nr_r, rr;
-
-					nr_r = cow_scan_dirty_pages(
-						source_pid, scan_pos,
-						lve3->end, regions,
-						CONVERGE_MAX_REGIONS,
-						&walk_end);
-					if (nr_r <= 0)
-						break;
-
-					if (final_count + nr_r > final_cap) {
-						int nc = (final_cap + nr_r) * 2;
-						struct converge_region *tmp;
-
-						tmp = xrealloc(final_dirty,
-							nc * sizeof(*tmp));
-						if (!tmp)
-							break;
-						final_dirty = tmp;
-						final_cap = nc;
-					}
-					for (rr = 0; rr < nr_r; rr++) {
-						final_dirty[final_count++] =
-							regions[rr];
-						final_pages +=
-							(regions[rr].end -
-							 regions[rr].start) /
-							PAGE_SIZE;
-					}
-
-					scan_pos = walk_end;
-					if (walk_end >= lve3->end)
-						break;
-				}
-			}
-
-			if (final_count > 0) {
-				long sent = converge_dispatch_parallel(
-					img, source_pid, sockets,
-					nr_streams, final_dirty,
-					final_count);
-				if (sent >= 0)
-					pr_err("COW converge second-freeze: "
-					       "%ld pages\n", sent);
-			}
-			xfree(final_dirty);
-
-			pr_err("COW converge second-freeze: %lu dirty "
-			       "pages (%d regions)\n",
-			       final_pages, final_count);
-		}
-
-		/*
-		 * T3 register re-capture + libc rw- from frozen source.
-		 * libc rw- is file-backed (not MAP_ANONYMOUS) so WP never
-		 * tracks it.  Must re-send explicitly for T3 consistency.
-		 */
-		/* T3 state already captured before fork */
+		/* No second freeze — dirty pages were read from the
+		 * frozen source in the single SIGSTOP window above.
+		 * No fork means no post-fork dirty delta. */
 
 		/*
 		 * Detect new VMAs (e.g. jemalloc mmap extents created
@@ -4146,9 +3975,6 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 				}
 				fclose(mfp);
 			}
-
-			if (fork_pid > 0)
-				kill(fork_pid, SIGKILL);
 
 			/*
 			 * Send VMA diff + page data for new VMAs
@@ -4231,15 +4057,7 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 			xfree(new_vmas);
 		}
 
-		kill(source_pid, SIGCONT);
-
-		gettimeofday(&t3_now, NULL);
-		timersub(&t3_now, &t3_start, &t3_delta);
-		pr_err("COW T3 TOTAL: %ld.%03ldms source frozen\n",
-		       t3_delta.tv_sec * 1000 + t3_delta.tv_usec / 1000,
-		       t3_delta.tv_usec % 1000);
-		}
-
+		/* Source already SIGCONT'd after T3 capture */
 		xfree(freeze_dirty);
 	}
 
