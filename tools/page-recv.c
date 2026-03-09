@@ -49,6 +49,15 @@ struct page_server_iov {
 #define PS_IOV_VMA_DIFF		11
 #define PS_IOV_T3_REGS		12
 #define PS_IOV_T3_FDS		13
+#define PS_IOV_T3_SIGACTS	14
+#define T3_NSIG			64
+
+struct t3_sigaction {
+	unsigned long long handler;
+	unsigned long long flags;
+	unsigned long long restorer;
+	unsigned long long mask;
+};
 
 struct t3_fd_entry {
 	unsigned int fd;
@@ -452,6 +461,37 @@ static void *stream_worker(void *arg)
 				"received (%d fds)\n",
 				ctx->id, nr_fds);
 			free(tfds);
+			continue;
+		}
+
+		if (cmd == PS_IOV_T3_SIGACTS) {
+			/* Signal masks: 3 × u64 (SigPnd, SigIgn, SigCgt) */
+			unsigned long long masks[3];
+			char path[256];
+			int fd;
+
+			if (recv_full(ctx->sk, masks, sizeof(masks)) < 0) {
+				ctx->error = 1;
+				break;
+			}
+			__sync_fetch_and_add(&ctx->bytes_received,
+					     sizeof(masks));
+			snprintf(path, sizeof(path),
+				 "%s/t3_sigacts.dat", g_images_dir);
+			fd = open(path,
+				  O_CREAT | O_WRONLY | O_TRUNC, 0644);
+			if (fd >= 0) {
+				ssize_t w;
+
+				w = write(fd, masks, sizeof(masks));
+				close(fd);
+				if (w < 0)
+					fprintf(stderr, "stream %d: "
+						"t3_sigacts.dat write "
+						"error\n", ctx->id);
+			}
+			fprintf(stderr, "stream %d: T3 sigmasks "
+				"received\n", ctx->id);
 			continue;
 		}
 

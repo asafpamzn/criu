@@ -3117,6 +3117,76 @@ detach:
 }
 
 /*
+ * T3 signal handler + timer capture.
+ *
+ * Inject rt_sigaction() for each signal via ptrace to read the
+ * current handler.  No parasite needed — direct syscall injection.
+ * Also read itimers via /proc/pid/status signal masks.
+ *
+ * Layout per signal (aarch64): 32 bytes
+ *   u64 sa_handler, sa_flags, sa_restorer, sa_mask
+ */
+#define PS_IOV_T3_SIGACTS 14
+
+/*
+ * Send T3 signal masks from /proc/pid/status.
+ * Captures SigIgn + SigCgt (which signals are ignored/caught).
+ * Handler function pointers require parasite injection — not done
+ * here because ptrace syscall injection from PTRACE_EVENT_STOP
+ * doesn't work reliably.  Handler pointers come from T_dump.
+ *
+ * The signal MASKS are what matter for correctness: if a signal
+ * was caught at T_dump but ignored at T3 (or vice versa), the
+ * restore must reflect T3 state.
+ */
+static int send_t3_sigmasks(pid_t source_pid, int socket,
+			    u32 dst_id)
+{
+	char status_path[64], line[128];
+	FILE *fp;
+	struct page_server_iov hdr;
+	u64 masks[3] = { 0, 0, 0 }; /* SigPnd, SigIgn, SigCgt */
+	size_t sent = 0;
+
+	snprintf(status_path, sizeof(status_path),
+		 "/proc/%d/status", source_pid);
+	fp = fopen(status_path, "r");
+	if (!fp)
+		return -1;
+	while (fgets(line, sizeof(line), fp)) {
+		sscanf(line, "SigPnd: %llx",
+		       (unsigned long long *)&masks[0]);
+		sscanf(line, "SigIgn: %llx",
+		       (unsigned long long *)&masks[1]);
+		sscanf(line, "SigCgt: %llx",
+		       (unsigned long long *)&masks[2]);
+	}
+	fclose(fp);
+
+	pr_err("T3 sigmasks: Pnd=%016llx Ign=%016llx Cgt=%016llx\n",
+	       (unsigned long long)masks[0],
+	       (unsigned long long)masks[1],
+	       (unsigned long long)masks[2]);
+
+	hdr.cmd = encode_ps_cmd(PS_IOV_T3_SIGACTS, 0);
+	hdr.nr_pages = 1; /* just the masks */
+	hdr.vaddr = 0;
+	hdr.dst_id = dst_id;
+	if (send_psi(socket, &hdr))
+		return -1;
+	while (sent < sizeof(masks)) {
+		int w = __send(socket, (char *)masks + sent,
+			       sizeof(masks) - sent, 0);
+		if (w <= 0)
+			return -1;
+		sent += w;
+	}
+
+	pr_err("T3 sigmasks: sent %zu bytes\n", sizeof(masks));
+	return 0;
+}
+
+/*
  * Capture the FD table at T3 from /proc and send to replica.
  * This ensures the restored process has T3-consistent FDs,
  * not stale T_dump FDs.
@@ -3300,6 +3370,7 @@ static int capture_and_send_t3_regs(pid_t source_pid, int socket,
 		iov.iov_len = sizeof(tls_val);
 		if (!ptrace(PTRACE_GETREGSET, tid, (void *)0x401UL, &iov))
 			t3[i].tls = tls_val;
+
 		ptrace(PTRACE_DETACH, tid, NULL, NULL);
 	}
 
@@ -3869,35 +3940,10 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 			capture_and_send_t3_fds(
 				source_pid, sockets[0], img->dst_id);
 
-			/* T3 signal mask snapshot for drift detection */
-			{
-				char status_path[64];
-				FILE *sfp;
-				unsigned long long sig_ign = 0;
-				unsigned long long sig_cgt = 0;
+			/* T3 signal masks */
+			send_t3_sigmasks(source_pid, sockets[0],
+					 img->dst_id);
 
-				snprintf(status_path, sizeof(status_path),
-					 "/proc/%d/status", source_pid);
-				sfp = fopen(status_path, "r");
-				if (sfp) {
-					char sline[128];
-
-					while (fgets(sline, sizeof(sline),
-						     sfp)) {
-						sscanf(sline,
-						       "SigIgn: %llx",
-						       &sig_ign);
-						sscanf(sline,
-						       "SigCgt: %llx",
-						       &sig_cgt);
-					}
-					fclose(sfp);
-					pr_err("T3 signals: "
-					       "SigIgn=%016llx "
-					       "SigCgt=%016llx\n",
-					       sig_ign, sig_cgt);
-				}
-			}
 		}
 
 		/*

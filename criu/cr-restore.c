@@ -2581,9 +2581,42 @@ static void load_t3_fds(void)
 }
 
 /*
+ * T3 signal masks.  Loaded from t3_sigacts.dat (which contains
+ * SigPnd + SigIgn + SigCgt from /proc/pid/status at T3).
+ *
+ * Signal handler POINTERS come from T_dump images (sigaction
+ * requires parasite injection which can't run from PTRACE_EVENT_STOP).
+ * The masks tell us which signals are caught — if the caught set
+ * changed between T_dump and T3, it's logged as drift.
+ */
+static u64 g_t3_sigmasks[3]; /* SigPnd, SigIgn, SigCgt */
+static int g_t3_sigmasks_loaded;
+
+static void load_t3_sigmasks(void)
+{
+	char path[PATH_MAX];
+	int fd;
+	ssize_t r;
+
+	snprintf(path, sizeof(path), "%s/t3_sigacts.dat",
+		 opts.imgs_dir);
+	fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return;
+	r = read(fd, g_t3_sigmasks, sizeof(g_t3_sigmasks));
+	close(fd);
+	if (r != (ssize_t)sizeof(g_t3_sigmasks))
+		return;
+	g_t3_sigmasks_loaded = 1;
+	pr_err("T3 sigmasks: Pnd=%016llx Ign=%016llx Cgt=%016llx\n",
+	       (unsigned long long)g_t3_sigmasks[0],
+	       (unsigned long long)g_t3_sigmasks[1],
+	       (unsigned long long)g_t3_sigmasks[2]);
+}
+
+/*
  * Compare T3 FD table against the restored process's actual FDs.
- * Log differences. For new FDs that are regular files, inject
- * open() via ptrace.
+ * Fix mismatches via ptrace syscall injection.
  */
 static void apply_t3_fds(pid_t pid)
 {
@@ -3134,6 +3167,8 @@ skip_ns_bouncing:
 		load_t3_fds();
 		if (g_t3_fds)
 			apply_t3_fds(root_item->pid->real);
+
+		load_t3_sigmasks();
 	}
 
 	/* just before releasing threads we have to restore rseq_cs */
