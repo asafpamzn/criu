@@ -8,7 +8,7 @@ with Valkey live migration.
 - **Two machines** (PRIMARY and REPLICA) with network connectivity
 - **Ubuntu 22.04+ or 24.04** (tested on 24.04 LTS)
 - **Linux kernel 5.7+** (for userfaultfd write-protect support)
-- **Shared storage** accessible from both machines (e.g., AWS FSx, NFS)
+- **TCP connectivity** between machines (ports 9002-9005)
 - **SSH access** between machines
 
 ---
@@ -207,55 +207,19 @@ python3 scripts/analyze_phase_latency.py artifacts/<run_id>
 
 ---
 
-## 5. Setup Shared Storage
+## 5. Network Requirements
 
-COW dump requires shared storage accessible from both PRIMARY and REPLICA for
-CRIU image files and coordination signals.
-
-### Option A: AWS FSx for Lustre
+No shared storage needed. CRIU images and pages are transferred over TCP.
 
 ```bash
-# Mount FSx (example)
-sudo mkdir -p /fsx
-sudo mount -t lustre fs-xxxxx.fsx.us-east-1.amazonaws.com@tcp:/xxxxx /fsx
-
-# Create lazy directory
-sudo mkdir -p /fsx/lazy
-sudo chmod 777 /fsx/lazy
-
-# Add to fstab for persistence
-echo "fs-xxxxx.fsx.us-east-1.amazonaws.com@tcp:/xxxxx /fsx lustre defaults,_netdev 0 0" | sudo tee -a /etc/fstab
+# Open required ports on both machines (or configure security groups):
+# 9002 — page server (8-stream bulk transfer)
+# 9003 — cutover "GO" signal
+# 9004 — staged signal (replica → source)
+# 9005 — CRIU image file transfer
 ```
 
-### Option B: NFS
-
-```bash
-# On NFS server
-sudo apt install -y nfs-kernel-server
-sudo mkdir -p /srv/criu-images
-sudo chown nobody:nogroup /srv/criu-images
-echo "/srv/criu-images *(rw,sync,no_subtree_check,no_root_squash)" | sudo tee -a /etc/exports
-sudo exportfs -a
-
-# On both PRIMARY and REPLICA
-sudo apt install -y nfs-common
-sudo mkdir -p /fsx/lazy
-sudo mount -t nfs nfs-server:/srv/criu-images /fsx/lazy
-```
-
-### Verify Shared Storage
-
-```bash
-# On PRIMARY
-echo "test" > /fsx/lazy/test.txt
-
-# On REPLICA
-cat /fsx/lazy/test.txt
-# Should show: test
-
-# Cleanup
-rm /fsx/lazy/test.txt
-```
+Images are stored locally in `/tmp/criu-images` on each machine.
 
 ---
 
@@ -285,7 +249,7 @@ ssh -i ~/.ssh/replica.pem ubuntu@<REPLICA_HOST> "hostname"
 
 ### Create .env File
 
-Create `scripts/.env` on both machines (or on shared storage):
+Create `scripts/.env` on the source machine:
 
 ```bash
 cat > scripts/.env << 'EOF'
@@ -300,11 +264,11 @@ PRIMARY_IP="<PRIMARY_PRIVATE_IP>"
 REPLICA_HOST="<REPLICA_PUBLIC_HOSTNAME>"
 REPLICA_IP="<REPLICA_PRIVATE_IP>"
 
-# CRIU lazy-pages port
+# CRIU page server port
 CRIU_PORT=9002
 
-# Shared storage for CRIU images
-IMAGES_DIR="/fsx/lazy"
+# Local images directory (no shared storage needed)
+IMAGES_DIR="/tmp/criu-images"
 
 # SSH key for cross-machine access
 SSH_KEY="/home/ubuntu/.ssh/replica.pem"
@@ -375,8 +339,8 @@ cat /proc/sys/vm/unprivileged_userfaultfd  # Should be 1
 # 4. Check Valkey
 valkey-server --version
 
-# 5. Check shared storage
-ls -la /fsx/lazy/
+# 5. Check network
+ls -la /tmp/criu-images/
 
 # 6. Check network connectivity
 nc -zv <OTHER_MACHINE_IP> 9002
@@ -402,7 +366,7 @@ cd /path/to/criu
   PID: 12345
 [HH:MM:SS] Step 3: Fill ~1GB using valkey-benchmark...
   Memory: 1.05G
-[HH:MM:SS] Step 4: Clean /fsx/lazy...
+[HH:MM:SS] Step 4: Clean /tmp/criu-images...
 [HH:MM:SS] Step 5: Start replica (will wait for page server)...
 [HH:MM:SS] Step 5b: Wait for replica ready signal...
   Replica ready
@@ -431,7 +395,7 @@ Use this checklist **every time** to avoid hangs:
 - `scripts/.env` **identical** on both machines (copy it to replica).
 - **PRIMARY Valkey**: `systemctl enable --now valkey-server` (must be running).
 - **REPLICA Valkey**: **not running** before the run.
-- Shared storage mounted on both (`/fsx/lazy`).
+- Shared storage mounted on both (`/tmp/criu-images`).
 - Ports open: `9002` (CRIU page server), `6379` (Valkey replication).
 
 **Run (PRIMARY):**
@@ -440,15 +404,15 @@ Use this checklist **every time** to avoid hangs:
   - Step 1 kills Valkey + CRIU on both.
   - Step 2 waits for Valkey on PRIMARY to restart (systemd handles it).
   - Step 5 starts `restore.sh` on REPLICA (kills replica Valkey and waits for page server).
-  - Replica runs `criu lazy-pages` + `criu restore` **with `--cow-dump`**.
+  - Replica runs `criu restore --cow-dump` (forks page-recv internally).
 
 **After the run:**
 - Replica Valkey should respond (`valkey-cli ping`).
 - If it hangs:
-  - Check `/fsx/lazy/lazy-restore.log` and `/fsx/lazy/lazy-server.log`.
+  - Check `/tmp/criu-images/lazy-restore.log` and `/tmp/criu-images/lazy-server.log`.
   - **Symptom of missing `--cow-dump`:** `lazy-restore.log` empty and `lazy-server.log`
     ends with `page_server_start_read`. Fix by ensuring `--cow-dump` is present in
-    `scripts/restore.sh` for both `lazy-pages` and `restore`.
+    `scripts/restore.sh` for restore + page-recv.
 
 ---
 
@@ -476,22 +440,20 @@ sudo ufw status
 sudo iptables -L -n
 ```
 
-### Shared Storage Not Accessible
+### Network Connectivity
 
 ```bash
-# Check mount
-mount | grep fsx
-df -h /fsx/lazy
+# Test TCP ports between machines
+nc -zv $REPLICA_IP 9002 9003 9004 9005
 
-# Remount if needed
-sudo mount -a
+# Check firewall / security groups allow ports 9002-9005
 ```
 
 ### Valkey Not Responding After Restore
 
 ```bash
 # Check logs
-cat /fsx/lazy/lazy-restore.log
+cat /tmp/criu-images/lazy-restore.log
 
 # Common issues:
 # - TCP sockets not closed → Use --tcp-close flag
@@ -573,7 +535,7 @@ valkey-cli info memory | grep used_memory_human
 # Manual CRIU dump with COW
 sudo ./criu/criu dump \
     --tree $PID \
-    --images-dir /fsx/lazy \
+    --images-dir /tmp/criu-images \
     --cow-dump \
     --lazy-pages \
     --address $PRIMARY_IP \
@@ -583,20 +545,12 @@ sudo ./criu/criu dump \
     --leave-running \
     -v4
 
-# Manual CRIU restore with lazy-pages
-sudo ./criu/criu lazy-pages \
-    --images-dir /fsx/lazy \
-    --page-server \
-    --address $PRIMARY_IP \
-    --port 9002 \
-    --cow-dump \
-    -v4 &
-
+# Manual CRIU restore (page-recv forked internally)
 sudo ./criu/criu restore \
-    --images-dir /fsx/lazy \
-    --lazy-pages \
-    --tcp-close \
-    --cow-dump \
-    --skip-file-rwx-check \
+    --images-dir /tmp/criu-images \
+    --fetch-images $PRIMARY_IP:9005 \
+    --lazy-pages --tcp-close --cow-dump \
+    --restore-detached --leave-stopped \
+    --skip-file-rwx-check --file-validation filesize \
     -v4
 ```

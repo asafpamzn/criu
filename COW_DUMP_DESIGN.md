@@ -1,265 +1,277 @@
 # CRIU COW Dump: Design + Code Map
 
-This document describes the current COW (copy-on-write) live migration design in
-this fork, and points to the concrete code paths that implement it.
-
-For setup and how to run the Valkey harness, see `COW_DEVELOPER.md` and
+Design and code walkthrough for the COW live migration with T3 register
+re-capture. For setup see `COW_DEVELOPER.md`, for overview see
 `COW_DUMP_README.md`.
 
-## Goals
-
-1. **Minimize source downtime**: keep the source process running during memory
-   transfer (`--leave-running`), instead of freezing it for the full lazy-pages
-   duration.
-2. **Bring up the replica quickly**: restore and start servicing faults early
-   (same core idea as CRIU lazy-pages).
-3. **Preserve dump-time semantics**: if the source writes to a page after the
-   dump, the replica must receive the **pre-write** contents for the snapshot,
-   and later (Valkey) replication catches up.
-
-## Terms (short)
-
-- **PRIMARY / source**: machine running the live workload (e.g. Valkey).
-- **REPLICA / destination**: machine restoring from CRIU images.
-- **VMA**: a virtual memory area (one mapping range in a process).
-- **UFFD WP**: `userfaultfd` write-protect mode; first write generates a fault
-  event (`UFFD_PAGEFAULT_FLAG_WP`).
-- **lazy-pages / page-server**: CRIU mechanism for transferring pages on-demand.
-
-## Architecture (high level)
+## Architecture
 
 ```
 PRIMARY (source)                                    REPLICA (destination)
 ──────────────────────────────────────              ─────────────────────────────────────
 Valkey (running)                                     page-recv (standalone, 8 streams)
-  ↑  writes                                             ↑   process_vm_writev into restored process
+  ↑  writes                                             ↑   process_vm_writev
   │                                                      │
 CRIU dump process                                        CRIU restore
   ├─ parasite RPC: create UFFD + register VMAs (WP)         ├─ fork process tree, map VMAs
-  ├─ apply UFFDIO_WRITEPROTECT (WP_ASYNC, post-resume)      ├─ apply T3 registers (PTRACE_SETREGSET)
+  ├─ apply UFFDIO_WRITEPROTECT (WP_ASYNC, post-resume)      ├─ apply T3 registers
   ├─ page server: 8-stream bulk + convergence + T3 regs     └─ detach threads
   └─ fork snapshot for consistent bulk read
-
-Valkey replication (REPLICAOF) ensures the destination catches up after restore.
-Scripts keep the replica read-only and gated until replication is configured.
 ```
 
-## Implementation contracts (current branch)
+## Dump-Side Flow (Source)
 
-1. **COW session ownership**
-   - COW state is dump-session scoped (`g_cow_info`).
-   - Each task in the process tree registers its eligible VMAs and contributes a
-     `userfaultfd` to the session.
-   - The COW monitor thread is global and started once. It may start during the
-     first task dump to service parasite-side write faults.
+### 1. Freeze + Dump (23ms)
 
-2. **VMA eligibility and fallback**
-   - Only VMAs matching the same filters as lazy-pages page generation are
-     eligible for COW tracking (see `criu/cow-dump.c:cow_register_vmas()`).
-   - VMAs that cannot be WP-registered are skipped and dumped via the normal
-     path.
-   - `UFFDIO_REGISTER` is called from the CRIU process (not the parasite);
-     the ioctl operates on the uffd's associated `mm_struct`.
+**File**: `criu/cr-dump.c`, function `cr_dump_tasks()`
 
-3. **Bulk stream termination (no ACK)**
-   - The sender ends the bulk page stream with an end marker: `PS_IOV_CLOSE`
-     header with `nr_pages == 0`.
-   - The receiver treats end marker as completion and does not send any ACK back
-     on the same socket.
-   - The sender tolerates receiver close after the marker (`EPIPE`/`ECONNRESET`
-     on send is treated as clean completion).
-
-4. **Teardown ordering**
-   - `wait_for_page_server_thread()` happens before `cow_dump_fini()` to avoid
-     freeing hash/locks while the sender thread is still running.
-
-## Dump-side flow (PRIMARY)
-
-### CLI entry points
-
-- Option parsing: `criu/config.c` (`--cow-dump` → `opts.cow_dump`)
-- Dump coordinator: `criu/cr-dump.c:cr_dump_tasks()`
-
-### Timeline
-
-1. **Seize/freeze**
-   - CRIU seizes the process tree (stop-the-world) to build a consistent base.
-
-2. **Per-task COW registration (`dump_one_task()` → `cow_dump_init()`)**
-   - File: `criu/cr-dump.c` calls `criu/cow-dump.c:cow_dump_init()`.
-   - `cow_dump_init()`:
-     - calls parasite RPC only to create a `userfaultfd` and negotiate
-       `UFFDIO_API` inside the target process (the parasite sends the fd back
-       via `SCM_RIGHTS` and does no VMA registration),
-     - registers eligible VMAs with `UFFDIO_REGISTER_MODE_WP` directly from
-       the CRIU process (`cow_register_vmas()`); this works because the
-       ioctl operates on the uffd's associated `mm_struct`, not `current->mm`,
-     - applies initial `UFFDIO_WRITEPROTECT` **from the CRIU process** and
-       parallelizes it in 256MB chunks (`COW_WP_CHUNK_SIZE`) using worker threads
-       (`cow_task_apply_writeprotect()`),
-     - adds the task's `userfaultfd` to the global tracked list.
-   - On kernels with `/proc/<pid>/userfaultfd` (6.11+, detected via
-     `kdat.has_uffd_proc`), the parasite RPC is skipped entirely.
-
-3. **Start/keep the COW monitor thread**
-   - Monitor thread: `criu/cow-dump.c:cow_monitor_thread()` (started via
-     `cow_start_monitor_thread()`).
-   - Why it can start early: once WP is armed, parasite code can trigger WP
-     faults (e.g. TLS/rseq writes). The monitor must service those to avoid
-     deadlock in further parasite RPC.
-
-4. **On first write to a protected page**
-   - Path: `cow_process_events()` → `cow_handle_write_fault()`.
-   - Action:
-     1. snapshot the page using `process_vm_readv()` (pre-write contents),
-     2. store it in a per-page hash (`cow_hash[...]`),
-     3. clear WP via `UFFDIO_WRITEPROTECT(mode=0)`,
-     4. wake the faulting thread via `UFFDIO_WAKE`.
-
-5. **Resume early and start page transfer**
-   - After the base dump finishes, `criu/cr-dump.c:cr_dump_tasks()` prints
-     `PAGE SERVER READY TO SERVE`, resumes the process tree, and runs
-     `cr_lazy_mem_dump()` to start lazy transfer with the source running.
-
-6. **Page transfer in bulk mode (page server unified sender thread)**
-   - File: `criu/page-xfer.c` (`unified_page_server_thread()`).
-   - For each destination image (`dst_id`), the sender walks lazy VMAs and sends
-     pages using a 3-tier priority:
-     1. queued COW pages (pages that faulted on write),
-     2. explicit page requests from the destination (fault-driven),
-     3. regular pages (sequential walk of the lazy VMA ranges).
-   - Each page send (`send_lazy_vma_page()`):
-     - re-checks the COW hash after `process_vm_readv()` to preserve dump-time
-       semantics under races,
-     - sends a compressed record (`PS_IOV_ADD_F_COMPRESS`) plus payload.
-
-7. **End of stream**
-   - The sender sends `PS_IOV_CLOSE` with `nr_pages == 0`
-     (`send_image_complete()`), and the receiver closes without ACK.
-
-## Restore-side flow (REPLICA)
-
-The REPLICA runs:
-
-1. `criu restore --lazy-pages ... --cow-dump` (forks page-recv internally)
-2. `page-recv` (standalone, forked by CRIU restore during ptrace-trap window)
-
-page-recv receives the page stream from source over 8 TCP connections and
-installs pages via `process_vm_writev`.  Handles `PS_IOV_T3_REGS` (writes
-`t3_regs.dat`) and `PS_IOV_VMA_DIFF` (writes `new_vmas.dat`).
-
-Implementation: `tools/page-recv.c`
-
-## Threading model (concrete)
-
-Dump process (PRIMARY):
-
-- main thread: orchestrates dump + resumes process + starts lazy transfer
-- `cow-monitor` thread: blocks on `userfaultfd` events and snapshots pages
-- `criu-page-srv` thread: streams pages for all active `dst_id` images
-- `cow-wp` worker threads: apply initial `UFFDIO_WRITEPROTECT` in parallel
-
-Restore side (REPLICA):
-
-- `page-recv` process: standalone receiver, 8 TCP streams, installs pages via
-  `process_vm_writev`, handles T3 regs and VMA diff
-- `restore` process: applies T3 registers, injects new VMAs, detaches threads
-
-## Measurement and artifacts
-
-`scripts/migrate.sh` creates `artifacts/<run_id>/` with:
-
-- `stats-dump(.json)`: CRIU internal dump stats (`freezing_time`, `frozen_time`,
-  pages scanned/written, etc.)
-- `source-ping.log` + `source_markers.log`: source PING latency samples +
-  phase markers
-- `lazy-*.log`: CRIU logs from dump/restore/lazy-pages
-
-Phase analysis:
-
-```bash
-python3 scripts/analyze_phase_latency.py artifacts/<run_id>
+```
+cr_dump_tasks()
+  ├─ cow_inject_userfaultfd(pid)        [cow-dump.c]
+  │    Creates userfaultfd via ptrace syscall injection
+  │    PTRACE_SEIZE → inject SVC(userfaultfd) → pidfd_getfd
+  │
+  ├─ collect_pstree()                   [seize.c]
+  │    PTRACE_SEIZE all threads
+  │
+  ├─ dump_one_task()                    [cr-dump.c]
+  │    ├─ collect_mappings()            Parse /proc/pid/maps
+  │    ├─ parasite_infect_seized()      Inject parasite blob
+  │    ├─ cow_dump_init()              [cow-dump.c]
+  │    │    Register VMAs with UFFDIO_REGISTER_MODE_WP
+  │    ├─ parasite_dump_pages_seized()  Scan pagemap
+  │    ├─ dump_task_threads()           Capture registers
+  │    ├─ compel_cure()                 Remove parasite
+  │    └─ dump_task_mm()                Write MM image
+  │
+  ├─ COW early resume                   [cr-dump.c]
+  │    Process unfrozen — clients resume immediately
+  │
+  └─ cow_dump_start_wp() / finish_wp()  [cow-dump.c]
+       Apply write-protect AFTER unfreeze (WP_ASYNC mode)
+       UFFDIO_WRITEPROTECT in 256MB chunks, worker threads
 ```
 
-Important nuance: CRIU “frozen time” and client-observed stalls are different
-metrics. A local monitor can also be affected by CPU starvation on the same
-host; use the traffic harness for app-like KPIs.
+### 2. Bulk Transfer (~60s for 200GB)
 
-## Kernel requirements
+**File**: `criu/page-xfer.c`, function `unified_page_server_thread()`
 
-- Linux 5.7+ (needs `UFFD_FEATURE_PAGEFAULT_FLAG_WP`)
-- root, or `vm.unprivileged_userfaultfd=1`
-
-## Future work (short list)
-
-- Explore `UFFD_FEATURE_WP_ASYNC` for alternative dirty tracking semantics.
-- Improve fork/remap handling (`UFFD_EVENT_FORK`, `UFFD_EVENT_REMAP`) for
-  process-tree workloads.
-- Reduce overhead in hot paths (hash management, allocations, compression).
-
-
-### Usage
-```bash
-criu dump --cow-dump --lazy-pages ...
+```
+page_server_serve()
+  └─ Multi-TCP section
+       ├─ fork_source_snapshot(source_pid)
+       │    PTRACE_SEIZE → inject clone() → fork child
+       │    Creates COW fork for consistent bulk read (T0)
+       │
+       ├─ 8 stream worker threads  [stream_worker_func]
+       │    Each reads assigned VMA ranges via process_vm_readv
+       │    Compresses with LZ4, sends over TCP
+       │    VMAs > pages_per_worker are pre-split across workers
+       │
+       └─ Signal bulk_send_done
 ```
 
-## Appendix - Statistics and Monitoring
+### 3. Convergence
 
-### COW Tracking Statistics
+**File**: `criu/page-xfer.c`, function `cow_converge_dirty_pages_parallel()`
 
-**Per-Second Logging:**
 ```
-[COW_STATS] events: wr=1234 fork=0 remap=0 unk=0 | 
-            ops: copied=1234 unprot=1234 woken=1234 | 
-            errs: alloc=0 read=0 unprot_err=0 wake_err=0 
-                  read_err=0 eagain_err=0
-```
-
-**Metrics:**
-
-| Metric | Description | Good Value | Alert If |
-|--------|-------------|------------|----------|
-| `wr` | Write faults | Varies | - |
-| `copied` | Pages copied | = wr | < wr |
-| `unprot` | Pages unprotected | = wr | < wr |
-| `woken` | Threads woken | = wr | < wr |
-| `alloc_failures` | Allocation failures | 0 | > 0 |
-| `read_failures` | Read failures | 0 | > 0 |
-| `eagain_errors` | EAGAIN on read | Low | High |
-
-### Page Server Statistics
-
-**Per-Second Logging:**
-```
-[PAGE_SERVER_STATS] get_pages: reqs=500 with_cow=50 no_cow=450 
-                               pages=8000 cow=400 errs=0 | 
-                    serve: open2=1 parent=0 add_f=7950 get=500 
-                          close=1
+cow_converge_dirty_pages_parallel()
+  │
+  ├─ Fork T1 convergence snapshot
+  │    Source briefly SIGSTOP'd, fork, SIGCONT
+  │    Reads dirty pages from fork (T1 consistency)
+  │
+  ├─ Send T1 dirty pages
+  │    PAGEMAP_SCAN finds pages written since T0
+  │
+  ├─ Post-fork T2 dirty pages
+  │    Pages dirtied while reading T1 fork
+  │
+  ├─ Second freeze (T3)
+  │    kill(source_pid, SIGSTOP)
+  │    Scan + send final dirty pages
+  │
+  ├─ T3 register re-capture  (see §4)
+  │    capture_and_send_t3_regs()
+  │    Re-send libc rw- from frozen source
+  │
+  ├─ VMA diff detection
+  │    Scan /proc/pid/maps for new VMAs
+  │    Send PS_IOV_VMA_DIFF to replica
+  │
+  └─ SIGCONT source
 ```
 
-**Metrics:**
+### 4. T3 Register Re-capture
 
-| Metric | Description | Indicates |
-|--------|-------------|-----------|
-| `reqs` | Total requests | Transfer activity |
-| `with_cow` | Slow path taken | COW overlay needed |
-| `no_cow` | Fast path taken | Zero-copy efficiency |
-| `pages` | Total pages transferred | Bandwidth |
-| `cow` | COW pages overlaid | Write activity |
+**File**: `criu/page-xfer.c`, function `capture_and_send_t3_regs()`
 
-### UFFD Daemon Statistics
+Called while source is SIGSTOP'd at T3:
 
-**Per-Second Logging:**
 ```
-[UFFD_STATS] reqs=1000(pf:50,bg:950) pages=8000 pipe_avg=180
-  PF:  4K=30 64K=15 128K=5
-  BG:  4K=100 64K=500 128K=200 256K=100 512K=50
+capture_and_send_t3_regs(source_pid, socket, dst_id)
+  │
+  ├─ opendir("/proc/{pid}/task/")
+  │    Enumerate all thread TIDs
+  │    qsort ascending (matches dump-time thread index)
+  │
+  ├─ For each thread (~21 threads, ~5ms total):
+  │    ├─ ptrace(PTRACE_SEIZE, tid)
+  │    ├─ ptrace(PTRACE_INTERRUPT, tid)
+  │    ├─ waitpid(tid)
+  │    ├─ ptrace(PTRACE_GETREGSET, tid, NT_PRSTATUS, &gp_regs)
+  │    │    Captures: x0-x30, sp, pc, pstate (272 bytes)
+  │    ├─ ptrace(PTRACE_GETREGSET, tid, 0x401, &tls)
+  │    │    Captures: tpidr_el0 (8 bytes)
+  │    └─ ptrace(PTRACE_DETACH, tid)
+  │
+  ├─ Send PS_IOV_T3_REGS header
+  │    { cmd=12, nr_pages=nr_threads, vaddr=0, dst_id }
+  │
+  └─ Send payload: nr_threads × struct t3_thread_regs
 ```
 
-**Histograms:**
-- **PF (Page Fault):** Destination-initiated requests
-- **BG (Background):** Proactive prefetch
+After T3 regs, re-send libc rw- from frozen source:
 
-**Pipeline Depth:**
-- `pipe_avg`: Average in-flight requests
-- Target: Close to `max_pipeline_depth` (256)
+```
+  └─ converge_dispatch_parallel(img, source_pid, ..., &libc_rw_region, 1)
+       Sends 2 pages of libc rw- data segment from SIGSTOP'd source
+       libc rw- is file-backed (not MAP_ANONYMOUS) so WP never tracks it
+       Explicit re-send is the ONLY delivery path
+```
+
+## Restore-Side Flow (Replica)
+
+### 5. CRIU Restore + page-recv
+
+**Files**: `criu/cr-restore.c`, `tools/page-recv.c`
+
+```
+restore_root_task()
+  ├─ Fork process tree, map VMAs, start restorer
+  │    All threads stopped in ptrace-trap
+  │
+  ├─ run_page_recv()
+  │    Fork page-recv in the ptrace-trap window
+  │    page-recv connects 8 TCP streams to source
+  │    Receives pages via process_vm_writev
+  │    Writes t3_regs.dat and new_vmas.dat
+  │
+  ├─ inject_new_vmas()
+  │    Read new_vmas.dat
+  │    For each new VMA: ptrace inject mmap(MAP_FIXED)
+  │
+  ├─ load_t3_regs()
+  │    Read t3_regs.dat → g_t3_regs + g_t3_regs_count
+  │    If missing: abort restore
+  │
+  └─ restore_rseq_cs()
+```
+
+### 6. Apply T3 Registers + Detach
+
+**File**: `criu/cr-restore.c`, function `finalize_restore_detach()`
+
+```
+finalize_restore_detach()
+  │
+  ├─ For each thread i:
+  │    ├─ arch_set_thread_regs_nosigrt()
+  │    │
+  │    ├─ if (g_t3_regs && i < g_t3_regs_count):
+  │    │    ├─ Build user_regs_struct from g_t3_regs[i]
+  │    │    ├─ ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &regs)
+  │    │    └─ ptrace(PTRACE_SETREGSET, pid, 0x401, &tls)
+  │    │
+  │    └─ Track main_idx
+  │
+  ├─ Detach workers first (resume into wait syscalls)
+  └─ Detach main thread last (enters event loop)
+```
+
+## Wire Protocol
+
+### PS_IOV_T3_REGS (command 12)
+
+```c
+struct page_server_iov {
+    u32 cmd;        // encode_ps_cmd(PS_IOV_T3_REGS, 0)
+    u32 nr_pages;   // number of threads (reused field)
+    u64 vaddr;      // 0
+    u64 dst_id;     // process identifier
+};
+
+// Payload: nr_pages × sizeof(t3_thread_regs)
+struct t3_thread_regs {
+    u64 regs[31];   // x0-x30 general purpose registers
+    u64 sp;         // stack pointer
+    u64 pc;         // program counter
+    u64 pstate;     // processor state
+    u64 tls;        // tpidr_el0
+};
+// 280 bytes per thread × 21 threads = 5880 bytes total
+```
+
+### PS_IOV_VMA_DIFF (command 11)
+
+```c
+// Header: page_server_iov with cmd=PS_IOV_VMA_DIFF
+// Payload: nr_pages × sizeof(vma_diff_entry)
+struct vma_diff_entry {
+    u64 start;
+    u64 end;
+    u32 prot;
+    u32 pad;
+};
+```
+
+### Thread Index Invariance
+
+```
+Source (dump time):   readdir(/proc/pid/task/) sorted ascending → threads[i]
+Source (T3 capture):  readdir(/proc/pid/task/) sorted ascending → t3_regs[i]
+Replica (restore):    pstree_item->threads[i] → same order
+
+threads[0] = main thread (lowest TID)
+threads[1..N] = worker threads
+```
+
+## Why T3 Regs Work
+
+**Before T3 re-capture:**
+- Registers: T_dump (time 0)
+- Memory: T3 (60 seconds later)
+- Result: 60s mismatch → deadlocks, data corruption
+
+**After T3 re-capture:**
+- Registers: T3 (re-captured from frozen source)
+- Memory: T3 (bulk + convergence + dirty)
+- Arena: T3 (libc rw- re-sent from frozen source)
+- Result: everything at T3 → consistent → deterministic 7/7
+
+## Implementation Contracts
+
+1. **COW session**: scoped to `g_cow_info`, per dump session.
+2. **VMA eligibility**: same filters as lazy-pages. Non-eligible VMAs
+   dumped via normal path.
+3. **Stream termination**: `PS_IOV_CLOSE` with `nr_pages == 0`. No ACK.
+   Receiver close after marker treated as clean (`EPIPE` ok).
+4. **Teardown**: `wait_for_page_server_thread()` before `cow_dump_fini()`.
+5. **T3 regs required**: restore aborts if `t3_regs.dat` missing.
+
+## Threading Model
+
+**Source (dump process):**
+- main thread: orchestrates dump + resumes process
+- `criu-page-srv` thread: 8-stream bulk transfer + convergence
+- `cow-wp` worker threads: parallel UFFDIO_WRITEPROTECT
+
+**Replica:**
+- `page-recv` process: 8 TCP streams, process_vm_writev
+- `restore` process: applies T3 registers, injects VMAs, detaches
+
+## Kernel Requirements
+
+- Linux 6.1+ (userfaultfd WP_ASYNC requires 6.7+)
+- `sysctl vm.unprivileged_userfaultfd=1`

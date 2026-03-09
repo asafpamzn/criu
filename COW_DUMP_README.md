@@ -1,171 +1,218 @@
-# CRIU COW Dump (Copy-on-Write live migration)
+# CRIU COW Dump — Live Migration for Valkey
 
-## Summary
+Near-zero-downtime live migration using copy-on-write page tracking.
+23ms freeze, 1ms cutover, 200GB at 3.3 GB/s.
 
-`--cow-dump` is an experimental CRIU mode that keeps the source process running
-while memory is transferred, by tracking writes with `userfaultfd` write-protect
-(WP) and shipping the **pre-write** contents of dirtied pages.
-
-This fork is tested with **Valkey**: the restored instance is configured as a
-Valkey replica of the source, so it catches up after the point-in-time
-snapshot.
-
-## Quick start (Valkey)
-
-1. Follow `COW_DEVELOPER.md` to set up PRIMARY+REPLICA, shared `IMAGES_DIR`
-   (e.g. `/fsx/lazy`), and `scripts/.env`.
-2. On PRIMARY:
+## Quick Start
 
 ```bash
-# Basic migration (fills dataset, then migrates)
-sudo ./scripts/migrate.sh 40
+# Build on both machines
+make -j$(nproc)
+cd tools && gcc -O2 -o page-recv page-recv.c -llz4 -lpthread && cd ..
+sudo cp criu/criu /usr/local/sbin/criu
+echo 1 | sudo tee /proc/sys/vm/unprivileged_userfaultfd
 
-# Real scenario with traffic + integrity checks (recommended)
-./scripts/run_migration_scenario.sh 40
+# Configure scripts/.env with IPs and SSH key
+
+# Fill 100GB + migrate with live traffic + verify 7 tests:
+sudo ./scripts/verify-migration.sh 100
+
+# Or run migrate.sh directly (data already loaded):
+sudo env SKIP_FILL=1 KEEP_SOURCE_RUNNING=1 \
+  RUN_WORKLOAD_DURING_MIGRATION=1 \
+  bash scripts/migrate.sh 200
 ```
 
-Artifacts are written under `artifacts/<run_id>/` on PRIMARY.
+## How It Works
 
-## Architecture (human view)
+```
+  SOURCE MACHINE                           REPLICA MACHINE
 
-### Actors
-
-- **Valkey (PRIMARY)**: the live source process.
-- **CRIU dump (PRIMARY)**: creates the base checkpoint and runs the page server.
-- **COW monitor (PRIMARY)**: background thread that snapshots pages on first
-  write fault.
-- **page-recv (REPLICA)**: standalone receiver, 8 TCP streams, installs pages
-  via `process_vm_writev`.
-- **CRIU restore (REPLICA)**: restores the process tree, applies T3 registers.
-- **Valkey replication**: `REPLICAOF` makes the replica catch up.
-
-### Timeline (what happens)
-
-1. **Stop-the-world (short):** CRIU seizes the process tree to build a consistent
-   base snapshot.
-2. **Arm COW tracking:**
-   - parasite creates a `userfaultfd` inside the target process and sends it
-     back to CRIU (or CRIU opens `/proc/<pid>/userfaultfd` on kernel 6.11+),
-   - CRIU registers eligible VMAs with `UFFDIO_REGISTER_MODE_WP` and applies
-     `UFFDIO_WRITEPROTECT` to those ranges (parallelized),
-   - the COW monitor thread starts (or is kept running) to handle write faults.
-3. **Base dump completes:** CRIU writes images and prints `PAGE SERVER READY TO SERVE`.
-4. **Source resumes:** the source keeps running under WP tracking.
-5. **Page transfer:** the page server streams lazy pages to the replica; if a
-   page was modified after the dump, the streamed content is the pre-write
-   snapshot captured by the monitor.
-6. **Replica becomes usable:**
-   - restore starts Valkey from images,
-   - scripts configure it as a replica and verify it rejects writes (`READONLY`),
-   - only then external clients are allowed in (iptables gate removed).
-
-### Bulk stream termination (no hangs)
-
-The page stream ends with an end marker: a `PS_IOV_CLOSE` header with
-`nr_pages == 0`. The receiver does **not** send an ACK back on the same socket
-(mixing control bytes with the bulk stream desynchronizes the protocol).
-
-## Measuring downtime (what numbers mean)
-
-There are two different measurements:
-
-- **CRIU frozen time**: from `stats-dump` (`freezing_time` + `frozen_time`).
-- **Client-observed latency/outage**: from ping/traffic monitors.
-
-Useful commands:
-
-```bash
-# Per-phase latency using artifacts/<run_id>/source_markers.log + source-ping.log
-python3 scripts/analyze_phase_latency.py artifacts/<run_id>
-
-# CRIU internal timings (archived by migrate.sh)
-cat artifacts/<run_id>/stats-dump.json
-cat artifacts/<run_id>/stats-restore.json
+  Valkey running, serving clients
+        │
+  ┌─────▼──────────────────────┐
+  │  1. FREEZE (23ms)          │    ┌──────────────────────────┐
+  │  - Seize process (ptrace)  │───▶│  Start restore.sh        │
+  │  - Capture: VMAs, pagemap  │    │  CRIU restore + page-recv│
+  │  - Setup WP tracking       │    └──────────────────────────┘
+  │  - Resume (--leave-running)│
+  │  ◄ Valkey running again ►  │
+  └─────┬──────────────────────┘
+        │
+  ┌─────▼──────────────────────┐    ┌──────────────────────────┐
+  │  2. BULK TRANSFER (~60s)   │    │  RECEIVE                 │
+  │  - Fork COW snapshot       │───▶│  - 8 TCP streams         │
+  │  - 8 TCP streams, LZ4     │    │  - process_vm_writev     │
+  │  - 3.3 GB/s throughput     │    │    into restored process │
+  │  - Valkey still serving ►  │    │  - Restored Valkey is    │
+  │  (writes tracked by WP)    │    │    stopped (ptrace-trap) │
+  └─────┬──────────────────────┘    └──────────┬───────────────┘
+        │                                      │
+  ┌─────▼──────────────────────┐               │
+  │  3. CONVERGENCE (<2s)      │───────────────┘
+  │  - Fork snapshot (T1)      │    (sends dirty + T3 pages)
+  │  - SIGSTOP (T3)            │
+  │  - T3 register capture     │───▶  Saves t3_regs.dat
+  │  - libc rw- re-send        │───▶  Installs arena pages
+  │  - VMA diff (new mmaps)    │───▶  Injects mmap
+  │  - SIGCONT source          │
+  └─────┬──────────────────────┘
+        │
+  ┌─────▼──────────────────────┐    ┌──────────────────────────┐
+  │  4. CUTOVER (1ms)          │    │  CUTOVER                 │
+  │  - SIGSTOP source          │    │  - Apply T3 regs         │
+  │  - Send TCP "GO" ──────────│───▶│  - PTRACE_DETACH all     │
+  │  - SIGCONT source          │    │  - Valkey is live!       │
+  └────────────────────────────┘    └──────────────────────────┘
 ```
 
-For app-like KPIs (p99 read/write latency, max outage windows, data-integrity
-checks), use:
+### T3 Register Re-capture
 
-```bash
-./scripts/run_migration_scenario.sh 40
-```
+The key innovation. Without it, registers are from dump time (T0) but
+memory is from T3 (60 seconds later) — every thread resumes at the wrong
+instruction. T3 re-capture fixes this:
 
-## Performance results (m7g.16xlarge, aarch64, VPC)
+At the second freeze, `capture_and_send_t3_regs()` does PTRACE_SEIZE +
+PTRACE_GETREGSET on every thread, sends the registers to the replica.
+The replica applies them via PTRACE_SETREGSET before detach. Registers
+match T3 memory — deterministic 7/7.
 
-Tested on AWS EC2 m7g.16xlarge (494GB RAM, 64 CPUs), two instances in the
-same VPC.  Source runs Valkey filled with 64KB random values.  All tests
-pass 7/7 verification (PONG, key count, memory, spot-check, BGSAVE,
-RANDOMKEY).
+**Critical detail**: libc's rw- data segment is file-backed (not
+MAP_ANONYMOUS), so WP never tracks it. The explicit 2-page re-send from
+the frozen source is the only mechanism that delivers arena state.
 
-### Source unavailability (the number that matters)
+### What Gets Transferred
 
-| Dataset | Benchmark traffic | Freeze + cutover |
-|---------|-------------------|------------------|
-| 100 GB  | heavy (90K ops/s) | **24 ms**        |
-| 200 GB  | no                | **24 ms**        |
-| 200 GB  | yes (80K ops/s)   | **24 ms**        |
+| Resource | How |
+|----------|-----|
+| Memory (heap, stack, mmap) | 8-stream bulk + convergence via page-recv |
+| CPU registers | T3 re-capture via PTRACE_SETREGSET |
+| File descriptors | CRIU image files |
+| TCP sockets | Closed (`--tcp-close`), clients reconnect |
+| Signal handlers, thread state | CRIU image files, restored via sigreturn |
+| New VMAs (jemalloc extents) | VMA diff protocol + ptrace mmap injection |
 
-Source unavailability = dump freeze (23ms) + cutover (1ms).  Does not
-scale with dataset size because the bulk transfer runs while the
-source is live.
+## Performance
 
-### Stage-by-stage timing (200 GB + live traffic)
+Tested on m7g.16xlarge (494GB RAM, 64 CPUs), same-AZ VPC.
+
+| Test | Size | Transfer | Throughput | Freeze | Cutover | Result |
+|------|------|----------|------------|--------|---------|--------|
+| Quiesced | 200GB | 62s | 3159 MB/s | 23ms | 1ms | **7/7** |
+| Live traffic | 200GB | 63s | 3279 MB/s | 23ms | 1ms | **7/7** |
+| Live + heavy bench | 100GB | 32s | 3054 MB/s | 23ms | 1ms | **7/7** |
+
+**Source unavailability: 23ms freeze + 1ms cutover = 24ms total.**
+
+### Stage Timing (200GB + live traffic)
 
 | Stage | Duration | Notes |
 |-------|----------|-------|
-| Parasite infect + dump | 23 ms | Seize, snapshot metadata |
-| WP setup (userfaultfd) | 56 ms | 3120 ranges, post-resume |
-| Source resumed | immediate | `--leave-running` |
-| Bulk transfer (8 streams) | ~62 s | 51M pages, 3279 MB/s |
-| Convergence (fork + dirty) | ~2 s | Fork snapshot + T3 dirty |
-| T3 register capture | ~5 ms | 21 threads, 5880 bytes |
-| Cutover | **1 ms** | SIGSTOP source → GO signal |
+| Freeze (dump_one_task) | 23 ms | Seize + pagemap + parasite |
+| WP setup (post-resume) | 56 ms | 3120 ranges, WP_ASYNC |
+| Bulk transfer (8 streams) | ~62 s | 51M pages, LZ4, process_vm_readv |
+| Convergence + T3 | ~2 s | Fork snapshot + dirty scan + T3 regs |
+| Cutover | 1 ms | SIGSTOP → TCP "GO" |
 
-### Transfer configuration
+### vs REPLICAOF
 
-- **Streams**: 8 parallel TCP connections (`COW_TRANSFER_STREAMS`)
-- **Batch send**: 512 pages compressed (LZ4) into one `send()` call
-- **Page delivery**: `process_vm_writev` (not UFFDIO_COPY)
-- **Cutover**: TCP listener (sub-ms latency)
-- **T3 register re-capture**: all thread registers re-sent at T3
+| Metric | COW Migration | REPLICAOF |
+|--------|--------------|-----------|
+| 200GB transfer | **63s** | >20min (62GB incomplete) |
+| Throughput | **3.3 GB/s** | ~500 MB/s |
+| Source freeze | **23ms** | ~200ms (BGSAVE fork) |
+| Replica downtime | **24ms** | Entire sync duration |
+| Memory spike | None | 2× RSS (fork COW) |
 
-### Known limitations
+## Verification Tests (7/7)
 
-- **Disk space on replica**: REPLICAOF triggers full sync which writes
-  a temp RDB.  For 200GB datasets, replica needs >250GB free disk or
-  RDB saves must be disabled (`CONFIG SET save ""`).
+1. **Migration completed** — full flow without errors
+2. **Replica PONG** — responds to commands
+3. **Key count match** — same keys as source
+4. **Memory within 10%** — 0.0% divergence in practice
+5. **500-key spot check** — random keys compared byte-by-byte
+6. **BGSAVE success** — heap consistent, no corruption
+7. **RANDOMKEY type check** — can read and identify key types
+
+## Running
+
+### CRIU Commands (inside migrate.sh / restore.sh)
+
+**Source:**
+```bash
+criu dump \
+  --tree $PID --images-dir /tmp/criu-images \
+  --cow-dump --lazy-pages \
+  --address $SOURCE_IP --port 9002 \
+  --serve-images 9005 \
+  --tcp-close --skip-in-flight --ext-unix-sk \
+  --leave-running --freeze-cgroup $CGROUP \
+  --display-stats
+```
+
+**Replica:**
+```bash
+criu restore \
+  --images-dir /tmp/criu-images \
+  --fetch-images $SOURCE_IP:9005 \
+  --lazy-pages --tcp-close --cow-dump \
+  --restore-detached --leave-stopped \
+  --skip-file-rwx-check --file-validation filesize
+```
+
+### Ports
+
+| Port | Purpose |
+|------|---------|
+| 9002 | Page server (8-stream bulk transfer) |
+| 9003 | Cutover "GO" signal |
+| 9004 | Staged signal (page-recv → source) |
+| 9005 | CRIU image file transfer |
+
+## Key Files
+
+| File | Role |
+|------|------|
+| `scripts/migrate.sh` | Source orchestration |
+| `scripts/restore.sh` | Replica orchestration |
+| `scripts/verify-migration.sh` | 7-test verification suite |
+| `criu/page-xfer.c` | Page server, 8-stream bulk, convergence, T3 capture |
+| `criu/cow-dump.c` | WP_ASYNC tracking, userfaultfd injection |
+| `criu/cr-dump.c` | Dump orchestration, early resume |
+| `criu/cr-restore.c` | Restore, T3 reg application, VMA injection |
+| `tools/page-recv.c` | Standalone receiver, process_vm_writev |
 
 ## Requirements
 
-- **Kernel**: Linux 5.7+ (for `UFFD_FEATURE_PAGEFAULT_FLAG_WP`)
-- **Privileges**: root, or `vm.unprivileged_userfaultfd=1`
+- Linux kernel 6.1+ (userfaultfd WP_ASYNC requires 6.7+)
+- `sysctl vm.unprivileged_userfaultfd=1`
+- aarch64 or x86_64
+- Both machines reachable over TCP
 
 ## Troubleshooting
 
 ### Permission denied for userfaultfd
-
-```
-userfaultfd requires CAP_SYS_PTRACE or sysctl vm.unprivileged_userfaultfd=1
-```
-
-Run as root, or:
-
 ```bash
-sudo sysctl -w vm.unprivileged_userfaultfd=1
+echo 1 | sudo tee /proc/sys/vm/unprivileged_userfaultfd
+```
+
+### Disk full on replica during BGSAVE
+The REPLICAOF command triggers a full sync RDB write. Disable saves:
+```bash
+valkey-cli config set save ""
 ```
 
 ### Replica accepts writes
-
-The replica must be configured via `REPLICAOF` before opening it to clients.
-Check:
-
-- `scripts/wait_and_replicate.sh`
-- `/fsx/lazy/lazy-restore.log`
-- `/fsx/lazy/lazy-server.log`
-
-If Valkey can't persist replication state, ensure permissions:
-
+The `wait_and_replicate.sh` script sets `REPLICAOF` which makes the
+replica read-only. If this didn't run, manually:
 ```bash
-sudo chown -R ubuntu:ubuntu /var/lib/valkey
-sudo chmod 750 /var/lib/valkey
+valkey-cli replicaof $SOURCE_IP 6379
 ```
+
+## Limitations
+
+1. **Transfer speed**: ~3.3 GB/s, limited by `process_vm_readv` bandwidth.
+2. **Replica RAM**: must fit the full dataset.
+3. **Client connections**: closed on dump (`--tcp-close`), clients reconnect.
+4. **x86_64**: tested on aarch64. x86_64 expected to work (T3 regs have
+   x86 paths) but not yet validated at scale.
