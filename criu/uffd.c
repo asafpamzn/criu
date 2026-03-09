@@ -176,6 +176,9 @@ static int page_buffer_init(void)
 	return 0;
 }
 
+/* Forward declaration — needed by page_buffer_add's dedup check */
+static struct page_buffer_entry *page_buffer_lookup(unsigned long vaddr);
+
 static int page_buffer_add(unsigned long vaddr, void *data)
 {
 	struct page_buffer_entry *entry;
@@ -2445,8 +2448,8 @@ static unsigned int pending_nr_dirty_ranges = 0;
  * Pre-buffer callback: pages arrive before criu restore connects.
  * Just store in hash table — no uffd/lpi available yet.
  */
-static int prebuffer_io_complete(int dst_id, unsigned long vaddr,
-				 int nr_pages, void *priv)
+static int prebuffer_io_complete(unsigned long dst_id, unsigned long vaddr,
+				 unsigned long nr_pages, void *priv)
 {
 	void *buf = priv;
 	int i;
@@ -2459,7 +2462,7 @@ static int prebuffer_io_complete(int dst_id, unsigned long vaddr,
 			return -1;
 		}
 	}
-	pr_debug("Pre-buffered %d pages at 0x%lx\n", nr_pages, vaddr);
+	pr_debug("Pre-buffered %lu pages at 0x%lx\n", nr_pages, vaddr);
 	return 0;
 }
 
