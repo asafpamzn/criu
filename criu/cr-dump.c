@@ -2665,6 +2665,37 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 			goto err;
 	}
 
+	/*
+	 * Write pagemap images to disk. pre_dump_one_task() populated
+	 * dmpi(item)->mem_pp with lazy VMA entries. We must serialize
+	 * them now so the restore side can find them.
+	 *
+	 * This is the same loop that cr_pre_dump_finish() uses in the
+	 * normal pre-dump path, but adapted for the phased flow where
+	 * we don't call cr_pre_dump_finish().
+	 */
+	pr_info("Writing pagemap images for phased COW dump\n");
+	for_each_pstree_item(item) {
+		struct parasite_ctl *ctl = dmpi(item)->parasite_ctl;
+		struct page_pipe *mem_pp;
+		struct page_xfer xfer;
+
+		if (!ctl)
+			continue;
+
+		pr_info("\tWriting pagemap for %d\n", vpid(item));
+		ret = open_page_xfer(&xfer, CR_FD_PAGEMAP, vpid(item));
+		if (ret < 0)
+			goto err;
+
+		mem_pp = dmpi(item)->mem_pp;
+		ret = page_xfer_dump_pages(&xfer, mem_pp);
+		xfer.close(&xfer);
+
+		if (ret)
+			goto err;
+	}
+
 	/* Unfreeze — process runs with WP_ASYNC */
 	ret = arch_set_thread_regs(root_item, false);
 	if (ret)
