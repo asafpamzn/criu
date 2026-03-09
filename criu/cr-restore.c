@@ -16,8 +16,14 @@
 #include <sys/shm.h>
 #include <sys/mount.h>
 #include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <sys/uio.h>
 #include <sched.h>
 #include <linux/elf.h>
+
+#ifndef SYS_process_madvise
+#define SYS_process_madvise 440
+#endif
 
 #include "types.h"
 #include <compel/ptrace.h>
@@ -248,6 +254,9 @@ static int crtools_prepare_shared(void)
 
 	/* Connections are unlocked from criu */
 	if (!files_collected() && collect_image(&inet_sk_cinfo))
+		return -1;
+
+	if (collect_binfmt_misc())
 		return -1;
 
 	if (tty_prep_fds())
@@ -1572,12 +1581,7 @@ static int __restore_task_with_children(void *_arg)
 		/* Wait prepare_userns */
 		if (restore_finish_ns_stage(CR_STATE_ROOT_TASK, CR_STATE_PREPARE_NAMESPACES) < 0)
 			goto err;
-	}
 
-	if (needs_prep_creds(current) && (prepare_userns_creds()))
-		goto err;
-
-	if (current->parent == NULL) {
 		/*
 		 * Since we don't support nesting of cgroup namespaces, let's
 		 * only set up the cgns (if it exists) in the init task.
@@ -1585,6 +1589,9 @@ static int __restore_task_with_children(void *_arg)
 		if (prepare_cgroup_namespace(current) < 0)
 			goto err;
 	}
+
+	if (needs_prep_creds(current) && (prepare_userns_creds()))
+		goto err;
 
 	/*
 	 * Call this _before_ forking to optimize cgroups
@@ -1669,11 +1676,6 @@ static int __restore_task_with_children(void *_arg)
 	restore_pgid();
 
 	if (current->parent == NULL) {
-		if (root_ns_mask & CLONE_NEWUSER)
-			/* Do this after user ns and mnt ns have been set up */
-			if (restore_userns_binfmt_misc(current))
-				goto err;
-
 		/*
 		 * Wait when all tasks passed the CR_STATE_FORKING stage.
 		 * The stage was started by criu, but now it waits for
@@ -1861,6 +1863,580 @@ static int catch_tasks(bool root_seized)
 	return 0;
 }
 
+/* ---- VMA mirroring: inject mmap(MAP_FIXED) via ptrace ---- */
+
+struct vma_diff_entry {
+	u64 start;
+	u64 end;
+	u32 prot;
+	u32 pad;
+};
+
+#ifdef __aarch64__
+/* SVC #0; BRK #0 */
+static const unsigned char vma_syscall_insn[8] = {
+	0x01, 0x00, 0x00, 0xd4,	/* svc #0 */
+	0x00, 0x00, 0x20, 0xd4		/* brk #0 */
+};
+#elif defined(__x86_64__)
+/* syscall; int3 (padded to 8 bytes) */
+static const unsigned char vma_syscall_insn[8] = {
+	0x0f, 0x05,			/* syscall */
+	0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc	/* int3 padding */
+};
+#endif
+
+static int vma_get_regs(pid_t pid, user_regs_struct_t *regs)
+{
+	struct iovec iov = { .iov_base = regs, .iov_len = sizeof(*regs) };
+
+	if (ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov))
+		return -1;
+	return 0;
+}
+
+static int vma_set_regs(pid_t pid, user_regs_struct_t *regs)
+{
+	struct iovec iov = { .iov_base = regs, .iov_len = sizeof(*regs) };
+
+	if (ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov))
+		return -1;
+	return 0;
+}
+
+static int inject_close_syscall(pid_t pid, int target_fd)
+{
+	user_regs_struct_t orig_regs, regs;
+	unsigned char orig_code[8];
+	unsigned long pc;
+	int status;
+
+	if (vma_get_regs(pid, &orig_regs))
+		return -1;
+#ifdef __aarch64__
+	pc = (unsigned long)orig_regs.pc;
+#else
+	pc = (unsigned long)orig_regs.ip;
+#endif
+	if (ptrace_peek_area(pid, orig_code, (void *)pc, sizeof(orig_code)))
+		return -1;
+	if (ptrace_poke_area(pid, (void *)vma_syscall_insn,
+			     (void *)pc, sizeof(vma_syscall_insn)))
+		goto err_close;
+
+	regs = orig_regs;
+#ifdef __aarch64__
+	regs.regs[8] = __NR_close;
+	regs.regs[0] = target_fd;
+	regs.pc = pc;
+#else
+	regs.ax = __NR_close;
+	regs.di = target_fd;
+	regs.ip = pc;
+#endif
+	if (vma_set_regs(pid, &regs))
+		goto err_close;
+	if (ptrace(PTRACE_CONT, pid, NULL, NULL))
+		goto err_close_r;
+	if (waitpid(pid, &status, __WALL) != pid)
+		goto err_close_r;
+	if (!WIFSTOPPED(status) || WSTOPSIG(status) != SIGTRAP)
+		goto err_close_r;
+
+	if (ptrace_poke_area(pid, orig_code, (void *)pc, sizeof(orig_code)))
+		pr_err("inject_close: restore code failed\n");
+	if (vma_set_regs(pid, &orig_regs))
+		pr_err("inject_close: restore regs failed\n");
+	return 0;
+
+err_close_r:
+	vma_set_regs(pid, &orig_regs);
+err_close:
+	if (ptrace_poke_area(pid, orig_code, (void *)pc, sizeof(orig_code)))
+		pr_err("inject_close: restore code failed\n");
+	return -1;
+}
+
+static int inject_open_syscall(pid_t pid, const char *path,
+			       int flags, int mode)
+{
+	user_regs_struct_t orig_regs, regs;
+	unsigned char orig_code[8];
+	unsigned char orig_stack[256];
+	unsigned long pc, sp;
+	int status, result;
+	size_t path_len = strlen(path) + 1;
+
+	if (path_len > 240)
+		return -1;
+	if (vma_get_regs(pid, &orig_regs))
+		return -1;
+#ifdef __aarch64__
+	pc = (unsigned long)orig_regs.pc;
+	sp = (unsigned long)orig_regs.sp;
+#else
+	pc = (unsigned long)orig_regs.ip;
+	sp = (unsigned long)orig_regs.sp;
+#endif
+	if (ptrace_peek_area(pid, orig_code, (void *)pc, sizeof(orig_code)))
+		return -1;
+	if (ptrace_peek_area(pid, orig_stack, (void *)(sp - 256), 256))
+		return -1;
+	if (ptrace_poke_area(pid, (void *)path, (void *)(sp - 256), path_len))
+		goto err_open;
+	if (ptrace_poke_area(pid, (void *)vma_syscall_insn,
+			     (void *)pc, sizeof(vma_syscall_insn)))
+		goto err_open;
+
+	regs = orig_regs;
+#ifdef __aarch64__
+	regs.regs[8] = __NR_openat;
+	regs.regs[0] = (unsigned long)-100; /* AT_FDCWD */
+	regs.regs[1] = sp - 256;
+	regs.regs[2] = flags;
+	regs.regs[3] = mode;
+	regs.pc = pc;
+#else
+	regs.ax = __NR_openat;
+	regs.di = (unsigned long)-100;
+	regs.si = sp - 256;
+	regs.dx = flags;
+	regs.r10 = mode;
+	regs.ip = pc;
+#endif
+	if (vma_set_regs(pid, &regs))
+		goto err_open;
+	if (ptrace(PTRACE_CONT, pid, NULL, NULL))
+		goto err_open;
+	if (waitpid(pid, &status, __WALL) != pid)
+		goto err_open;
+	if (!WIFSTOPPED(status) || WSTOPSIG(status) != SIGTRAP)
+		goto err_open;
+
+	if (vma_get_regs(pid, &regs))
+		goto err_open;
+#ifdef __aarch64__
+	result = (int)regs.regs[0];
+#else
+	result = (int)regs.ax;
+#endif
+	if (ptrace_poke_area(pid, orig_code, (void *)pc, sizeof(orig_code)))
+		pr_err("inject_open: restore code failed\n");
+	if (ptrace_poke_area(pid, orig_stack, (void *)(sp - 256), 256))
+		pr_err("inject_open: restore stack failed\n");
+	if (vma_set_regs(pid, &orig_regs))
+		pr_err("inject_open: restore regs failed\n");
+	return result;
+
+err_open:
+	vma_set_regs(pid, &orig_regs);
+	if (ptrace_poke_area(pid, orig_code, (void *)pc, sizeof(orig_code)))
+		pr_err("inject_open: restore code failed\n");
+	if (ptrace_poke_area(pid, orig_stack, (void *)(sp - 256), 256))
+		pr_err("inject_open: restore stack failed\n");
+	return -1;
+}
+
+static int inject_dup3_syscall(pid_t pid, int old_fd, int new_fd)
+{
+	user_regs_struct_t orig_regs, regs;
+	unsigned char orig_code[8];
+	unsigned long pc;
+	int status, result;
+
+	if (vma_get_regs(pid, &orig_regs))
+		return -1;
+#ifdef __aarch64__
+	pc = (unsigned long)orig_regs.pc;
+#else
+	pc = (unsigned long)orig_regs.ip;
+#endif
+	if (ptrace_peek_area(pid, orig_code, (void *)pc, sizeof(orig_code)))
+		return -1;
+	if (ptrace_poke_area(pid, (void *)vma_syscall_insn,
+			     (void *)pc, sizeof(vma_syscall_insn)))
+		goto err_dup3;
+
+	regs = orig_regs;
+#ifdef __aarch64__
+	regs.regs[8] = __NR_dup3;
+	regs.regs[0] = old_fd;
+	regs.regs[1] = new_fd;
+	regs.regs[2] = 0;
+	regs.pc = pc;
+#else
+	regs.ax = __NR_dup3;
+	regs.di = old_fd;
+	regs.si = new_fd;
+	regs.dx = 0;
+	regs.ip = pc;
+#endif
+	if (vma_set_regs(pid, &regs))
+		goto err_dup3;
+	if (ptrace(PTRACE_CONT, pid, NULL, NULL))
+		goto err_dup3_r;
+	if (waitpid(pid, &status, __WALL) != pid)
+		goto err_dup3_r;
+	if (!WIFSTOPPED(status) || WSTOPSIG(status) != SIGTRAP)
+		goto err_dup3_r;
+
+	if (vma_get_regs(pid, &regs))
+		goto err_dup3_r;
+#ifdef __aarch64__
+	result = (int)regs.regs[0];
+#else
+	result = (int)regs.ax;
+#endif
+	if (ptrace_poke_area(pid, orig_code, (void *)pc, sizeof(orig_code)))
+		pr_err("inject_dup3: restore code failed\n");
+	if (vma_set_regs(pid, &orig_regs))
+		pr_err("inject_dup3: restore regs failed\n");
+	return result;
+
+err_dup3_r:
+	vma_set_regs(pid, &orig_regs);
+err_dup3:
+	if (ptrace_poke_area(pid, orig_code, (void *)pc, sizeof(orig_code)))
+		pr_err("inject_dup3: restore code failed\n");
+	return -1;
+}
+
+static int inject_mmap_syscall(pid_t pid, unsigned long addr,
+			       unsigned long len, int prot,
+			       unsigned long *result)
+{
+	user_regs_struct_t orig_regs, regs;
+	unsigned char orig_code[8];
+	unsigned long pc;
+	int status;
+
+	if (vma_get_regs(pid, &orig_regs))
+		return -1;
+
+#ifdef __aarch64__
+	pc = (unsigned long)orig_regs.pc;
+#else
+	pc = (unsigned long)orig_regs.ip;
+#endif
+
+	if (ptrace_peek_area(pid, orig_code, (void *)pc,
+			     sizeof(orig_code)))
+		return -1;
+
+	if (ptrace_poke_area(pid, (void *)vma_syscall_insn,
+			     (void *)pc, sizeof(vma_syscall_insn)))
+		goto restore_code;
+
+	regs = orig_regs;
+#ifdef __aarch64__
+	regs.regs[8] = __NR_mmap;
+	regs.regs[0] = addr;
+	regs.regs[1] = len;
+	regs.regs[2] = prot;
+	regs.regs[3] = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED;
+	regs.regs[4] = (unsigned long)-1;
+	regs.regs[5] = 0;
+	regs.pc = pc;
+#else
+	regs.ax = __NR_mmap;
+	regs.di = addr;
+	regs.si = len;
+	regs.dx = prot;
+	regs.r10 = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED;
+	regs.r8 = (unsigned long)-1;
+	regs.r9 = 0;
+	regs.ip = pc;
+#endif
+
+	if (vma_set_regs(pid, &regs))
+		goto restore_code;
+
+	if (ptrace(PTRACE_CONT, pid, NULL, NULL)) {
+		pr_perror("VMA mmap: PTRACE_CONT failed");
+		goto restore_all;
+	}
+
+	if (waitpid(pid, &status, __WALL) != pid) {
+		pr_perror("VMA mmap: waitpid failed");
+		goto restore_all;
+	}
+
+	if (!WIFSTOPPED(status)) {
+		pr_err("VMA mmap: not stopped (status=0x%x)\n", status);
+		goto restore_all;
+	}
+
+	if (WSTOPSIG(status) != SIGTRAP) {
+		pr_err("VMA mmap: got signal %d (expected SIGTRAP), "
+		       "suppressing and retrying\n", WSTOPSIG(status));
+		/*
+		 * Suppress the unexpected signal by re-injecting
+		 * with PTRACE_CONT data=0, wait for BRK trap.
+		 */
+		if (ptrace(PTRACE_CONT, pid, NULL, NULL) == 0 &&
+		    waitpid(pid, &status, __WALL) == pid &&
+		    WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP) {
+			pr_err("VMA mmap: retry succeeded after "
+			       "signal suppression\n");
+			goto read_result;
+		}
+		goto restore_all;
+	}
+
+read_result:
+	if (vma_get_regs(pid, &regs))
+		goto restore_all;
+
+#ifdef __aarch64__
+	*result = regs.regs[0];
+	if ((long)*result < 0 && (long)*result > -4096) {
+		pr_err("VMA mmap: kernel returned error %ld "
+		       "for addr=0x%lx len=%lu\n",
+		       (long)*result, addr, len);
+		goto restore_all;
+	}
+#else
+	*result = regs.ax;
+	if ((long)*result < 0 && (long)*result > -4096) {
+		pr_err("VMA mmap: kernel returned error %ld "
+		       "for addr=0x%lx len=%lu\n",
+		       (long)*result, addr, len);
+		goto restore_all;
+	}
+#endif
+
+	if (ptrace_poke_area(pid, orig_code, (void *)pc,
+			     sizeof(orig_code)))
+		pr_err("VMA mirror: failed to restore code\n");
+	if (vma_set_regs(pid, &orig_regs))
+		pr_err("VMA mirror: failed to restore regs\n");
+	return 0;
+
+restore_all:
+	vma_set_regs(pid, &orig_regs);
+restore_code:
+	if (ptrace_poke_area(pid, orig_code, (void *)pc,
+			     sizeof(orig_code)))
+		pr_err("VMA mirror: failed to restore code\n");
+	return -1;
+}
+
+static int inject_new_vmas(struct pstree_item *item,
+			   const char *dat_path)
+{
+	pid_t pid = item->pid->real;
+	int fd, count, i;
+	struct vma_diff_entry *vmas;
+
+	fd = open(dat_path, O_RDONLY);
+	if (fd < 0) {
+		pr_perror("open %s", dat_path);
+		return -1;
+	}
+
+	if (read(fd, &count, sizeof(count)) != sizeof(count)) {
+		pr_err("Failed to read VMA count from %s\n", dat_path);
+		close(fd);
+		return -1;
+	}
+
+	if (count <= 0 || count > 100000) {
+		pr_err("Invalid VMA count: %d\n", count);
+		close(fd);
+		return 0; /* not fatal */
+	}
+
+	vmas = xmalloc(count * sizeof(*vmas));
+	if (!vmas) {
+		close(fd);
+		return -1;
+	}
+
+	if (read(fd, vmas, count * sizeof(*vmas)) !=
+	    (ssize_t)(count * sizeof(*vmas))) {
+		pr_err("Failed to read VMA entries from %s\n", dat_path);
+		xfree(vmas);
+		close(fd);
+		return -1;
+	}
+	close(fd);
+
+	pr_err("VMA mirror: injecting %d new VMAs into pid %d\n",
+	       count, pid);
+
+	for (i = 0; i < count; i++) {
+		unsigned long result;
+		unsigned long vaddr = (unsigned long)vmas[i].start;
+		unsigned long vlen = (unsigned long)(vmas[i].end - vmas[i].start);
+		int retry, ok = 0;
+
+		for (retry = 0; retry < 3; retry++) {
+			if (inject_mmap_syscall(pid, vaddr, vlen,
+						vmas[i].prot,
+						&result) < 0) {
+				pr_err("VMA mirror: inject mmap(%lx, %lu) "
+				       "failed (attempt %d)\n",
+				       vaddr, vlen, retry + 1);
+				continue;
+			}
+
+			if (result != vaddr) {
+				pr_err("VMA mirror: mmap returned %lx, "
+				       "expected %lx\n", result, vaddr);
+			} else {
+				pr_info("VMA mirror: created %lx-%lx\n",
+					vaddr, vaddr + vlen);
+			}
+			ok = 1;
+			break;
+		}
+		if (!ok)
+			pr_err("VMA mirror: giving up on %lx-%lx "
+			       "after 3 attempts\n", vaddr, vaddr + vlen);
+	}
+
+	xfree(vmas);
+	return 0;
+}
+
+/*
+ * In COW dump mode, fork page-recv to install all pages via
+ * process_vm_writev while threads are still ptrace-trapped on
+ * the exit from rt_sigreturn.  Pages must be present before
+ * restore_rseq_cs() which writes rseq pointers via ptrace_poke
+ * on top of the installed TLS pages.
+ *
+ * Uses a poll loop instead of blocking waitpid so we can
+ * handle VMA diff signals from page-recv: when page-recv
+ * receives a VMA_DIFF message, it writes new_vmas.dat and
+ * pauses.  We inject mmap(MAP_FIXED) for each new VMA, then
+ * signal page-recv to continue.
+ */
+static int run_page_recv(struct pstree_item *item)
+{
+	const char *bin, *addr, *port_env, *streams;
+	char pid_s[16], vpid_s[16], port_s[16];
+	pid_t child;
+	int status;
+
+	bin = getenv("PAGE_RECV_BIN");
+	if (!bin)
+		bin = "page-recv";
+
+	addr = opts.addr ? opts.addr : getenv("PAGE_RECV_ADDR");
+	port_env = getenv("PAGE_RECV_PORT");
+	streams = getenv("PAGE_RECV_STREAMS");
+	if (!streams)
+		streams = "8";
+
+	if (!addr) {
+		pr_err("page-recv: no address (set --address or PAGE_RECV_ADDR)\n");
+		return -1;
+	}
+
+	snprintf(pid_s, sizeof(pid_s), "%d", item->pid->real);
+	snprintf(vpid_s, sizeof(vpid_s), "%d", vpid(item));
+	if (opts.port)
+		snprintf(port_s, sizeof(port_s), "%d", opts.port);
+	else if (port_env)
+		snprintf(port_s, sizeof(port_s), "%s", port_env);
+	else {
+		pr_err("page-recv: no port (set --port or PAGE_RECV_PORT)\n");
+		return -1;
+	}
+
+	pr_info("Running page-recv: pid=%s vpid=%s addr=%s port=%s streams=%s\n",
+		pid_s, vpid_s, addr, port_s, streams);
+
+	child = fork();
+	if (child < 0) {
+		pr_perror("fork for page-recv");
+		return -1;
+	}
+
+	if (child == 0) {
+		execvp(bin, (char *[]){
+			(char *)bin,
+			"--pid", pid_s,
+			"--vpid", vpid_s,
+			"--address", (char *)addr,
+			"--port", port_s,
+			"--images-dir", opts.imgs_dir,
+			"--streams", (char *)streams,
+			NULL
+		});
+		pr_perror("execvp page-recv (%s)", bin);
+		_exit(1);
+	}
+
+	/*
+	 * Poll loop: monitor page-recv while handling VMA diff
+	 * signals.  When page-recv receives a VMA_DIFF message,
+	 * it writes new_vmas.dat and pauses.  We inject mmap for
+	 * each new VMA, then signal page-recv to continue.
+	 */
+	{
+		char ready_path[PATH_MAX], created_path[PATH_MAX];
+		char dat_path[PATH_MAX];
+		bool vma_diff_done = false;
+		pid_t w;
+
+		snprintf(ready_path, sizeof(ready_path),
+			 "%s/vma_diff_ready", opts.imgs_dir);
+		snprintf(created_path, sizeof(created_path),
+			 "%s/vma_created", opts.imgs_dir);
+		snprintf(dat_path, sizeof(dat_path),
+			 "%s/new_vmas.dat", opts.imgs_dir);
+
+		pr_err("VMA poll: imgs_dir=%s ready=%s\n",
+		       opts.imgs_dir, ready_path);
+
+		unlink(ready_path);
+		unlink(created_path);
+		unlink(dat_path);
+
+		while (1) {
+			w = waitpid(child, &status, WNOHANG);
+			if (w < 0) {
+				pr_perror("waitpid page-recv");
+				return -1;
+			}
+
+			if (!vma_diff_done &&
+			    access(ready_path, F_OK) == 0) {
+				int rc = inject_new_vmas(item, dat_path);
+				int fd;
+
+				if (rc < 0)
+					pr_err("VMA mirror: injection "
+					       "failed (non-fatal)\n");
+
+				fd = open(created_path,
+					  O_CREAT | O_WRONLY | O_TRUNC,
+					  0644);
+				if (fd >= 0)
+					close(fd);
+				vma_diff_done = true;
+				pr_err("VMA mirror: creation done, "
+				       "signaled page-recv\n");
+			}
+
+			if (w > 0)
+				break;
+
+			usleep(10000);
+		}
+	}
+
+	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+		pr_err("page-recv failed (status %d)\n", status);
+		return -1;
+	}
+
+	pr_info("page-recv completed successfully\n");
+	return 0;
+}
+
 static void finalize_restore(void)
 {
 	struct pstree_item *item;
@@ -1873,16 +2449,44 @@ static void finalize_restore(void)
 		if (!task_alive(item))
 			continue;
 
-		/* Unmap the restorer blob */
-		ctl = compel_prepare_noctx(pid);
-		if (ctl == NULL)
-			continue;
+		if (opts.cow_dump) {
+			/*
+			 * COW mode: release bootstrap physical pages via
+			 * process_madvise instead of compel_unmap.  The
+			 * ptrace thread-hijack in compel_unmap corrupts
+			 * jemalloc/glibc allocator state on aarch64.
+			 *
+			 * MADV_DONTNEED releases all physical pages (the
+			 * ~200K bootstrap blob).  The VMA stays as a
+			 * zero-fill-on-demand shell (~200 bytes of kernel
+			 * vm_area_struct metadata).
+			 */
+			struct iovec iov = {
+				.iov_base = rsti(item)->bootstrap_start,
+				.iov_len = rsti(item)->bootstrap_unmap_len,
+			};
+			int pidfd = syscall(SYS_pidfd_open, pid, 0);
+			if (pidfd < 0) {
+				pr_perror("pidfd_open(%d) for bootstrap cleanup", pid);
+			} else {
+				if (syscall(SYS_process_madvise, pidfd, &iov,
+					    (unsigned long)1, MADV_DONTNEED,
+					    (unsigned int)0))
+					pr_perror("process_madvise DONTNEED for %d bootstrap", pid);
+				close(pidfd);
+			}
+		} else {
+			/* Unmap the restorer blob via ptrace */
+			ctl = compel_prepare_noctx(pid);
+			if (ctl == NULL)
+				continue;
 
-		restorer_addr = (unsigned long)rsti(item)->munmap_restorer;
-		if (compel_unmap(ctl, restorer_addr))
-			pr_err("Failed to unmap restorer from %d\n", pid);
+			restorer_addr = (unsigned long)rsti(item)->munmap_restorer;
+			if (compel_unmap(ctl, restorer_addr))
+				pr_err("Failed to unmap restorer from %d\n", pid);
 
-		xfree(ctl);
+			xfree(ctl);
+		}
 
 		if (opts.final_state == TASK_STOPPED)
 			kill(item->pid->real, SIGSTOP);
@@ -1895,28 +2499,414 @@ static void finalize_restore(void)
 	}
 }
 
+struct t3_thread_regs {
+	unsigned long regs[31];
+	unsigned long sp;
+	unsigned long pc;
+	unsigned long pstate;
+	unsigned long tls;
+};
+static struct t3_thread_regs *g_t3_regs;
+static int g_t3_regs_count;
+
+static void load_t3_regs(void)
+{
+	char path[PATH_MAX];
+	int fd, cnt;
+	ssize_t r;
+
+	snprintf(path, sizeof(path), "%s/t3_regs.dat", opts.imgs_dir);
+	fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return;
+	r = read(fd, &cnt, sizeof(cnt));
+	if (r != sizeof(cnt) || cnt <= 0 || cnt > 1024) {
+		close(fd);
+		return;
+	}
+	g_t3_regs = xmalloc(cnt * sizeof(*g_t3_regs));
+	if (!g_t3_regs) {
+		close(fd);
+		return;
+	}
+	r = read(fd, g_t3_regs, cnt * sizeof(*g_t3_regs));
+	close(fd);
+	if (r != (ssize_t)(cnt * sizeof(*g_t3_regs))) {
+		xfree(g_t3_regs);
+		g_t3_regs = NULL;
+		return;
+	}
+	g_t3_regs_count = cnt;
+	pr_err("Loaded T3 registers for %d threads\n", cnt);
+}
+
+struct t3_fd_entry {
+	unsigned int fd;
+	unsigned int flags;
+	unsigned long pos;
+	char path[256];
+};
+static struct t3_fd_entry *g_t3_fds;
+static int g_t3_fds_count;
+
+static void load_t3_fds(void)
+{
+	char path[PATH_MAX];
+	int fd, cnt;
+	ssize_t r;
+
+	snprintf(path, sizeof(path), "%s/t3_fds.dat", opts.imgs_dir);
+	fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return;
+	r = read(fd, &cnt, sizeof(cnt));
+	if (r != sizeof(cnt) || cnt <= 0 || cnt > 65536) {
+		close(fd);
+		return;
+	}
+	g_t3_fds = xmalloc(cnt * sizeof(*g_t3_fds));
+	if (!g_t3_fds) {
+		close(fd);
+		return;
+	}
+	r = read(fd, g_t3_fds, cnt * sizeof(*g_t3_fds));
+	close(fd);
+	if (r != (ssize_t)(cnt * sizeof(*g_t3_fds))) {
+		xfree(g_t3_fds);
+		g_t3_fds = NULL;
+		return;
+	}
+	g_t3_fds_count = cnt;
+	pr_err("Loaded T3 FD table: %d file descriptors\n", cnt);
+}
+
+/* T3 signal handler table: 64 signals × {handler, flags, restorer, mask} */
+struct t3_sigact {
+	unsigned long handler;
+	unsigned long flags;
+	unsigned long restorer;
+	unsigned long mask;
+};
+
+#define T3_NSIG 64
+
+static struct t3_sigact *g_t3_sigacts;
+
+static void load_t3_sigacts(void)
+{
+	char path[PATH_MAX];
+	int fd;
+	ssize_t r;
+	size_t sz = T3_NSIG * sizeof(struct t3_sigact);
+
+	snprintf(path, sizeof(path), "%s/t3_sigacts.dat",
+		 opts.imgs_dir);
+	fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return;
+	g_t3_sigacts = xmalloc(sz);
+	if (!g_t3_sigacts) {
+		close(fd);
+		return;
+	}
+	r = read(fd, g_t3_sigacts, sz);
+	close(fd);
+	if (r != (ssize_t)sz) {
+		xfree(g_t3_sigacts);
+		g_t3_sigacts = NULL;
+		return;
+	}
+	pr_err("Loaded T3 signal handlers for %d signals\n", T3_NSIG);
+}
+
+static void apply_t3_sigacts(pid_t pid)
+{
+	user_regs_struct_t orig_regs, regs;
+	unsigned char orig_code[8];
+	unsigned char orig_stack[64];
+	unsigned long pc, sp;
+	int sig, applied = 0, status;
+
+	if (!g_t3_sigacts)
+		return;
+
+	if (vma_get_regs(pid, &orig_regs))
+		return;
+
+#ifdef __aarch64__
+	pc = (unsigned long)orig_regs.pc;
+	sp = (unsigned long)orig_regs.sp;
+#else
+	pc = (unsigned long)orig_regs.ip;
+	sp = (unsigned long)orig_regs.sp;
+#endif
+
+	if (ptrace_peek_area(pid, orig_code, (void *)pc,
+			     sizeof(orig_code)))
+		return;
+	if (ptrace_peek_area(pid, orig_stack,
+			     (void *)(sp - 64), 64))
+		return;
+
+	for (sig = 1; sig <= T3_NSIG; sig++) {
+		struct t3_sigact *sa = &g_t3_sigacts[sig - 1];
+
+		if (sig == SIGKILL || sig == SIGSTOP)
+			continue;
+		if (!sa->handler && !sa->flags)
+			continue;
+
+		/* Write sigact struct to stack */
+		if (ptrace_poke_area(pid, sa, (void *)(sp - 64),
+				     sizeof(*sa)))
+			continue;
+		if (ptrace_poke_area(pid, (void *)vma_syscall_insn,
+				     (void *)pc, sizeof(vma_syscall_insn)))
+			break;
+
+		regs = orig_regs;
+#ifdef __aarch64__
+		regs.regs[8] = __NR_rt_sigaction;
+		regs.regs[0] = sig;
+		regs.regs[1] = sp - 64;	/* act */
+		regs.regs[2] = 0;		/* oldact = NULL */
+		regs.regs[3] = 8;		/* sigsetsize */
+		regs.pc = pc;
+#else
+		regs.ax = __NR_rt_sigaction;
+		regs.di = sig;
+		regs.si = sp - 64;
+		regs.dx = 0;
+		regs.r10 = 8;
+		regs.ip = pc;
+#endif
+		if (vma_set_regs(pid, &regs))
+			break;
+		if (ptrace(PTRACE_CONT, pid, NULL, NULL))
+			break;
+		if (waitpid(pid, &status, __WALL) != pid)
+			break;
+		if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP)
+			applied++;
+	}
+
+	/* Restore original code + stack + regs */
+	if (ptrace_poke_area(pid, orig_code, (void *)pc,
+			     sizeof(orig_code)))
+		pr_err("apply_sigacts: restore code failed\n");
+	if (ptrace_poke_area(pid, orig_stack, (void *)(sp - 64), 64))
+		pr_err("apply_sigacts: restore stack failed\n");
+	if (vma_set_regs(pid, &orig_regs))
+		pr_err("apply_sigacts: restore regs failed\n");
+
+	pr_err("T3 sigacts: applied %d signal handlers\n", applied);
+}
+
+/*
+ * Compare T3 FD table against the restored process's actual FDs.
+ * Fix mismatches via ptrace syscall injection.
+ */
+static void apply_t3_fds(pid_t pid)
+{
+	char fd_dir[64], fd_path[64], link[256];
+	DIR *dir;
+	struct dirent *de;
+	int i, restored_count = 0;
+	int matched = 0, opened = 0, closed_cnt = 0, skipped = 0;
+	ssize_t len;
+	unsigned char t3_set[8192]; /* bitmap for fds 0..65535 */
+
+	if (!g_t3_fds || !g_t3_fds_count)
+		return;
+
+	memset(t3_set, 0, sizeof(t3_set));
+	for (i = 0; i < g_t3_fds_count; i++) {
+		if (g_t3_fds[i].fd < 65536)
+			t3_set[g_t3_fds[i].fd / 8] |=
+				1 << (g_t3_fds[i].fd % 8);
+	}
+
+	snprintf(fd_dir, sizeof(fd_dir), "/proc/%d/fd", pid);
+	dir = opendir(fd_dir);
+	if (!dir)
+		return;
+	while ((de = readdir(dir)) != NULL) {
+		if (de->d_name[0] != '.')
+			restored_count++;
+	}
+	closedir(dir);
+
+	/* Pass 1: T3 FDs — match, open missing files, skip sockets */
+	for (i = 0; i < g_t3_fds_count; i++) {
+		unsigned int fd_num = g_t3_fds[i].fd;
+
+		snprintf(fd_path, sizeof(fd_path),
+			 "/proc/%d/fd/%u", pid, fd_num);
+		len = readlink(fd_path, link, sizeof(link) - 1);
+		if (len < 0) {
+			if (strstr(g_t3_fds[i].path, "socket:") ||
+			    strstr(g_t3_fds[i].path, "pipe:") ||
+			    strstr(g_t3_fds[i].path, "anon_inode:")) {
+				skipped++;
+				continue;
+			}
+			if (g_t3_fds[i].path[0] == '/') {
+				int tmp_fd = inject_open_syscall(
+					pid, g_t3_fds[i].path,
+					g_t3_fds[i].flags & 03, 0);
+				if (tmp_fd >= 0) {
+					if ((unsigned int)tmp_fd != fd_num) {
+						inject_dup3_syscall(
+							pid, tmp_fd, fd_num);
+						inject_close_syscall(
+							pid, tmp_fd);
+					}
+					pr_err("T3 FDs: opened fd %u "
+					       "(%s)\n", fd_num,
+					       g_t3_fds[i].path);
+					opened++;
+				} else {
+					pr_err("T3 FDs: open failed "
+					       "fd %u (%s)\n", fd_num,
+					       g_t3_fds[i].path);
+				}
+			} else {
+				skipped++;
+			}
+		} else {
+			link[len] = '\0';
+			if ((strncmp(link, "pipe:", 5) == 0 &&
+			     strncmp(g_t3_fds[i].path, "pipe:", 5) == 0) ||
+			    (strncmp(link, "socket:", 7) == 0 &&
+			     strncmp(g_t3_fds[i].path, "socket:", 7) == 0) ||
+			    (strncmp(link, "anon_inode:", 11) == 0 &&
+			     strncmp(g_t3_fds[i].path,
+				     "anon_inode:", 11) == 0) ||
+			    strcmp(link, g_t3_fds[i].path) == 0)
+				matched++;
+			else
+				pr_err("T3 FDs: fd %u changed: "
+				       "restored=%s T3=%s\n",
+				       fd_num, link,
+				       g_t3_fds[i].path);
+		}
+	}
+
+	/* Pass 2: close restored FDs not in T3 (stale from T_dump) */
+	dir = opendir(fd_dir);
+	if (dir) {
+		while ((de = readdir(dir)) != NULL) {
+			int fd_num;
+
+			if (de->d_name[0] == '.')
+				continue;
+			fd_num = atoi(de->d_name);
+			if (fd_num < 3 || fd_num >= 65536)
+				continue;
+			if (t3_set[fd_num / 8] & (1 << (fd_num % 8)))
+				continue;
+			snprintf(fd_path, sizeof(fd_path),
+				 "/proc/%d/fd/%d", pid, fd_num);
+			len = readlink(fd_path, link, sizeof(link) - 1);
+			if (len <= 0)
+				continue;
+			link[len] = '\0';
+			if (strstr(link, "eventpoll"))
+				continue;
+			pr_err("T3 FDs: closing stale fd %d (%s)\n",
+			       fd_num, link);
+			inject_close_syscall(pid, fd_num);
+			closed_cnt++;
+		}
+		closedir(dir);
+	}
+
+	pr_err("T3 FDs: %d matched, %d opened, %d closed, "
+	       "%d skipped, %d restored, %d T3\n",
+	       matched, opened, closed_cnt, skipped,
+	       restored_count, g_t3_fds_count);
+}
+
 static int finalize_restore_detach(void)
 {
 	struct pstree_item *item;
 
 	for_each_pstree_item(item) {
 		pid_t pid;
-		int i;
+		int i, main_idx = -1;
 
 		if (!task_alive(item))
 			continue;
 
+		/* Thread count must match — abort if structure changed */
+		if (g_t3_regs && item->nr_threads != g_t3_regs_count) {
+			pr_err("T3 threads: count mismatch — "
+			       "restore has %d, T3 had %d, aborting\n",
+			       item->nr_threads, g_t3_regs_count);
+			return -1;
+		}
+
+		/* Set regs + apply T3 regs, track main thread index */
 		for (i = 0; i < item->nr_threads; i++) {
 			pid = item->threads[i].real;
-			if (pid < 0) {
-				pr_err("pstree item has invalid pid %d\n", pid);
+			if (pid < 0)
 				continue;
-			}
-
-			if (arch_set_thread_regs_nosigrt(&item->threads[i])) {
-				pr_perror("Restoring regs for %d failed", pid);
+			if (arch_set_thread_regs_nosigrt(
+				    &item->threads[i])) {
+				pr_perror("Restoring regs for %d", pid);
 				return -1;
 			}
+			if (g_t3_regs && i < g_t3_regs_count) {
+				user_regs_struct_t gp_regs;
+				struct iovec gp_iov, tls_iov;
+				unsigned long tls_val;
+
+#ifdef __aarch64__
+				memcpy(gp_regs.regs, g_t3_regs[i].regs,
+				       31 * sizeof(unsigned long));
+				gp_regs.sp = g_t3_regs[i].sp;
+				gp_regs.pc = g_t3_regs[i].pc;
+				gp_regs.pstate = g_t3_regs[i].pstate;
+#endif
+				gp_iov.iov_base = &gp_regs;
+				gp_iov.iov_len = sizeof(gp_regs);
+				if (ptrace(PTRACE_SETREGSET, pid,
+					   (void *)(unsigned long)
+					   NT_PRSTATUS, &gp_iov))
+					pr_perror("T3 regs: GP set "
+						  "failed for %d", pid);
+
+				tls_val = g_t3_regs[i].tls;
+				tls_iov.iov_base = &tls_val;
+				tls_iov.iov_len = sizeof(tls_val);
+				if (ptrace(PTRACE_SETREGSET, pid,
+					   (void *)0x401UL, &tls_iov))
+					pr_perror("T3 regs: TLS set "
+						  "failed for %d", pid);
+
+				pr_err("T3 regs: thread %d pid %d "
+				       "pc=%lx\n", i, pid,
+				       g_t3_regs[i].pc);
+			}
+			if (pid == item->pid->real)
+				main_idx = i;
+		}
+
+		/* Detach workers first, main thread last */
+		for (i = 0; i < item->nr_threads; i++) {
+			if (i == main_idx)
+				continue;
+			pid = item->threads[i].real;
+			if (pid < 0)
+				continue;
+			if (ptrace(PTRACE_DETACH, pid, NULL, 0)) {
+				pr_perror("Unable to detach %d", pid);
+				return -1;
+			}
+		}
+
+		if (main_idx >= 0) {
+			pid = item->threads[main_idx].real;
 			if (ptrace(PTRACE_DETACH, pid, NULL, 0)) {
 				pr_perror("Unable to detach %d", pid);
 				return -1;
@@ -2240,9 +3230,43 @@ skip_ns_bouncing:
 
 	finalize_restore();
 
+	/*
+	 * COW mode: install all pages via page-recv while threads are
+	 * ptrace-trapped.  Must happen BEFORE restore_rseq_cs() which
+	 * writes rseq pointers on top of the installed TLS pages.
+	 */
+	if (opts.cow_dump && opts.lazy_pages &&
+	    (opts.addr || getenv("PAGE_RECV_ADDR"))) {
+		ret = run_page_recv(root_item);
+		if (ret) {
+			pr_err("page-recv failed, aborting restore\n");
+			goto out_kill_network_unlocked;
+		}
+	}
+
+	/* COW mode: apply T3 state so process resumes at T3 */
+	if (opts.cow_dump) {
+		load_t3_regs();
+		if (!g_t3_regs) {
+			pr_err("T3 regs not available, aborting\n");
+			goto out_kill_network_unlocked;
+		}
+		pr_err("T3 regs loaded for %d threads\n",
+		       g_t3_regs_count);
+
+		load_t3_fds();
+		if (g_t3_fds)
+			apply_t3_fds(root_item->pid->real);
+
+		load_t3_sigacts();
+		if (g_t3_sigacts)
+			apply_t3_sigacts(root_item->pid->real);
+	}
+
 	/* just before releasing threads we have to restore rseq_cs */
 	if (restore_rseq_cs())
 		pr_err("Unable to restore rseq_cs state\n");
+
 
 	/*
 	 * Some external devices such as GPUs might need a very late
@@ -3251,6 +4275,8 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 	task_args->clone_restore_fn = restorer_sym(mem, arch_export_restore_thread);
 	restore_task_exec_start = restorer_sym(mem, arch_export_restore_task);
 	rsti(current)->munmap_restorer = restorer_munmap_addr(core, mem);
+	rsti(current)->bootstrap_start = mem;
+	rsti(current)->bootstrap_unmap_len = task_args->bootstrap_len - vdso_rt_size;
 
 	task_args->bootstrap_start = mem;
 	mem += restorer_len;

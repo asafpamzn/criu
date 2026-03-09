@@ -152,7 +152,7 @@ int collect_mappings(pid_t pid, struct vm_area_list *vma_area_list, dump_filemap
 	 *
 	 * Also, we don't need to dump them during pre-dump.
 	 */
-	if (dump_file) {
+	if (dump_file && !opts.cow_dump) {
 		ret = collect_madv_guards(pid, vma_area_list);
 		gettimeofday(&t_now, NULL);
 		timersub(&t_now, &t_checkpoint, &t_delta);
@@ -995,7 +995,8 @@ static int fixup_thread_rseq(const struct pstree_item *item, int i)
 	return 0;
 }
 
-static int dump_task_thread(struct parasite_ctl *parasite_ctl, const struct pstree_item *item, int id)
+static int dump_task_thread(struct parasite_ctl *parasite_ctl, const struct pstree_item *item,
+			    int id, bool defer_image_write)
 {
 	struct parasite_thread_ctl *tctl = dmpi(item)->thread_ctls[id];
 	struct pid *tid = &item->threads[id];
@@ -1024,17 +1025,44 @@ static int dump_task_thread(struct parasite_ctl *parasite_ctl, const struct pstr
 		goto err;
 	}
 
-	img = open_image(CR_FD_CORE, O_DUMP, tid->ns[0].virt);
-	if (!img)
-		goto err;
+	if (!defer_image_write) {
+		img = open_image(CR_FD_CORE, O_DUMP, tid->ns[0].virt);
+		if (!img)
+			goto err;
+		ret = pb_write_one(img, core, PB_CORE);
+		close_image(img);
+	} else {
+		ret = 0;
+	}
 
-	ret = pb_write_one(img, core, PB_CORE);
-
-	close_image(img);
 err:
 	compel_release_thread(tctl);
 	pr_info("----------------------------------------\n");
 	return ret;
+}
+
+/* Write deferred thread core images (after early resume, off critical path) */
+static int write_deferred_thread_cores(const struct pstree_item *item)
+{
+	int i, ret = 0;
+
+	for (i = 0; i < item->nr_threads; i++) {
+		struct pid *tid = &item->threads[i];
+		CoreEntry *core = item->core[i];
+		struct cr_img *img;
+
+		if (item->pid->real == tid->real)
+			continue;
+
+		img = open_image(CR_FD_CORE, O_DUMP, tid->ns[0].virt);
+		if (!img)
+			return -1;
+		ret = pb_write_one(img, core, PB_CORE);
+		close_image(img);
+		if (ret)
+			return ret;
+	}
+	return 0;
 }
 
 static int dump_one_zombie(const struct pstree_item *item, const struct proc_pid_stat *pps)
@@ -1312,7 +1340,9 @@ free_rseq:
 
 static struct proc_pid_stat pps_buf;
 
-static int dump_task_threads(struct parasite_ctl *parasite_ctl, const struct pstree_item *item)
+static int dump_task_threads(struct parasite_ctl *parasite_ctl,
+			     const struct pstree_item *item,
+			     bool defer_image_write)
 {
 	int i, ret = 0;
 
@@ -1322,7 +1352,8 @@ static int dump_task_threads(struct parasite_ctl *parasite_ctl, const struct pst
 			item->threads[i].ns[0].virt = vpid(item);
 			continue;
 		}
-		ret = dump_task_thread(parasite_ctl, item, i);
+		ret = dump_task_thread(parasite_ctl, item, i,
+				       defer_image_write);
 		if (ret)
 			break;
 	}
@@ -1782,20 +1813,14 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 			pr_err("Failed to initialize COW dump for VMAs\n");
 			goto err_cure;
 		}
-
-		/*
-		 * COW tracking applies UFFD write-protect to writable VMAs.
-		 * The parasite itself can fault on protected pages (e.g. rseq/TLS
-		 * writes) while we are still in dump_one_task(), so start monitor
-		 * early to service those faults and avoid deadlock in RPC commands.
-		 */
-		if (opts.lazy_pages && cow_start_monitor_thread()) {
-			pr_err("Failed to start COW monitor thread\n");
-			ret = -1;
-			goto err_cure;
-		}
 	}
 
+	/*
+	 * Pagemap scan BEFORE WP threads to avoid mmap_lock
+	 * contention.  Sequential: pagemap ~8ms then WP ~68ms
+	 * = ~76ms total.  Parallel caused 174ms from lock
+	 * bouncing between 33 threads.
+	 */
 	ret = parasite_dump_pages_seized(item, &vmas, &mdc, parasite_ctl);
 	gettimeofday(&t_now, NULL);
 	timersub(&t_now, &t_checkpoint, &t_delta);
@@ -1803,6 +1828,31 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	t_checkpoint = t_now;
 	if (ret)
 		goto err_cure;
+
+	/*
+	 * WP_SYNC: start WP during freeze (overlaps with dump work).
+	 * WP_ASYNC: defer WP to after unfreeze — saves ~70ms from
+	 * the freeze window.  WP applied while process runs; the
+	 * process may briefly stall on mmap_lock but isn't frozen.
+	 */
+	if (opts.cow_dump && !cow_is_wp_async()) {
+		ret = cow_dump_start_wp();
+		if (ret) {
+			pr_err("Failed to start async write-protect\n");
+			goto err_cure;
+		}
+		if (opts.lazy_pages &&
+		    cow_start_monitor_thread()) {
+			pr_err("Failed to start COW monitor thread\n");
+			ret = -1;
+			goto err_cure;
+		}
+		gettimeofday(&t_now, NULL);
+		timersub(&t_now, &t_checkpoint, &t_delta);
+		pr_err("TIMING: cow_dump_start_wp took %ld.%06ld seconds\n",
+		       t_delta.tv_sec, t_delta.tv_usec);
+		t_checkpoint = t_now;
+	}
 
 	ret = parasite_dump_sigacts_seized(parasite_ctl, item);
 	gettimeofday(&t_now, NULL);
@@ -1854,7 +1904,20 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 		goto err_cure;
 	}
 
-	ret = compel_stop_daemon(parasite_ctl);
+	/*
+	 * compel_stop_daemon and dump_task_threads use ptrace, which is
+	 * independent of the UFFDIO_WRITEPROTECT ioctls still running
+	 * in the WP worker threads.  Run them in parallel so the ~25ms
+	 * of ptrace work overlaps with any remaining WP time.
+	 */
+	/*
+	 * COW fast path: skip rt_sigreturn single-stepping (~14ms).
+	 * We detach and overwrite registers anyway.
+	 */
+	if (opts.cow_dump && opts.lazy_pages)
+		ret = compel_stop_daemon_fast(parasite_ctl);
+	else
+		ret = compel_stop_daemon(parasite_ctl);
 	gettimeofday(&t_now, NULL);
 	timersub(&t_now, &t_checkpoint, &t_delta);
 	pr_err("TIMING: compel_stop_daemon took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
@@ -1864,7 +1927,8 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 		goto err_cure;
 	}
 
-	ret = dump_task_threads(parasite_ctl, item);
+	ret = dump_task_threads(parasite_ctl, item,
+			       opts.cow_dump && opts.lazy_pages);
 	gettimeofday(&t_now, NULL);
 	timersub(&t_now, &t_checkpoint, &t_delta);
 	pr_err("TIMING: dump_task_threads took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
@@ -1875,10 +1939,29 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	}
 
 	/*
+	 * WP_SYNC: join WP threads during freeze.
+	 * WP_ASYNC: WP not started yet, nothing to join.
+	 */
+	if (opts.cow_dump && !cow_is_wp_async()) {
+		ret = cow_dump_finish_wp();
+		gettimeofday(&t_now, NULL);
+		timersub(&t_now, &t_checkpoint, &t_delta);
+		pr_err("TIMING: cow_dump_finish_wp took %ld.%06ld seconds\n",
+		       t_delta.tv_sec, t_delta.tv_usec);
+		t_checkpoint = t_now;
+		if (ret) {
+			pr_err("Async write-protect failed\n");
+			goto err_cure;
+		}
+	}
+
+	/*
 	 * On failure local map will be cured in cr_dump_finish()
 	 * for lazy pages.
 	 */
-	if (opts.lazy_pages)
+	if (opts.cow_dump && opts.lazy_pages)
+		ret = compel_cure_local(parasite_ctl);
+	else if (opts.lazy_pages)
 		ret = compel_cure_remote(parasite_ctl);
 	else
 		ret = compel_cure(parasite_ctl);
@@ -2233,29 +2316,23 @@ static int cr_dump_finish(int ret)
 		unsuspend_lsm();
 		network_unlock();
 		delete_link_remaps();
+		clean_cr_time_mounts();
 	}
 
 	/* Resume process early if using COW dump with lazy pages */
 	if (!ret && opts.lazy_pages && opts.cow_dump) {
-		pr_info("Resuming process with COW protection active\n");
+		pr_err("PAGE SERVER READY TO SERVE\n");
 
-		if (cow_start_monitor_thread()) {
+		if (!cow_is_wp_async() && cow_start_monitor_thread()) {
 			pr_err("Failed to start COW monitor thread\n");
 			ret = -1;
 			goto out_release_cow;
 		}
 
-		if (arch_set_thread_regs(root_item, true) < 0) {
-			ret = -1;
-			goto out_release_cow;
-		}
-
-		cr_plugin_fini(CR_PLUGIN_STAGE__DUMP, ret);
-
-		pstree_switch_state(root_item, TASK_ALIVE);
-		timing_stop(TIME_FROZEN);
-		
-		/* Now start lazy page transfer with process running */
+		/*
+		 * Process was already resumed in cr_dump_tasks() right
+		 * after dump_one_task.  Just start the page transfer.
+		 */
 		ret = cr_lazy_mem_dump();
 	} else {
 		/* Standard path: transfer pages then resume */
@@ -2284,7 +2361,7 @@ out_release_cow:
 	free_file_locks();
 	free_link_remaps();
 	free_aufs_branches();
-	free_userns_data();
+	free_userns_maps();
 
 	close_service_fd(CR_PROC_FD_OFF);
 	close_image_dir();
@@ -2372,6 +2449,35 @@ int cr_dump_tasks(pid_t pid)
 		goto err;
 
 	/*
+	 * COW pre-freeze: collect sockets and create uffd before the
+	 * process is ptrace-seized.  These operations don't need the
+	 * process frozen and save ~12ms from the frozen window.
+	 */
+	if (opts.cow_dump) {
+		if (cow_pre_collect_net_sockets())
+			goto err;
+		if (cow_dump_pre_init(pid))
+			goto err;
+
+		/*
+		 * Hybrid pre-copy: inject userfaultfd via brief
+		 * ptrace (~5ms), then apply WP while running.
+		 * This enables dirty tracking BEFORE the freeze,
+		 * so the dump only needs to send the delta.
+		 */
+		if (cow_is_wp_async() && !kdat.has_uffd_proc) {
+			if (cow_inject_userfaultfd(pid)) {
+				pr_err("Failed to inject userfaultfd\n");
+				goto err;
+			}
+			if (cow_pre_copy_apply_wp(pid)) {
+				pr_err("Failed to apply pre-copy WP\n");
+				goto err;
+			}
+		}
+	}
+
+	/*
 	 * The collect_pstree will also stop (PTRACE_SEIZE) the tasks
 	 * thus ensuring that they don't modify anything we collect
 	 * afterwards.
@@ -2380,40 +2486,109 @@ int cr_dump_tasks(pid_t pid)
 	if (collect_pstree())
 		goto err;
 
-	if (checkpoint_devices())
-		goto err;
+	{
+		struct timeval t_pre_s, t_pre_e, t_pre_d, t_fn_s, t_fn_e, t_fn_d;
+		gettimeofday(&t_pre_s, NULL);
 
-	if (collect_pstree_ids())
-		goto err;
+#define TIME_FN(call, label) do { \
+	gettimeofday(&t_fn_s, NULL); \
+	call; \
+	gettimeofday(&t_fn_e, NULL); \
+	timersub(&t_fn_e, &t_fn_s, &t_fn_d); \
+	pr_err("TIMING: pre-dump " label " took %ld.%06ld seconds\n", \
+	       t_fn_d.tv_sec, t_fn_d.tv_usec); \
+} while (0)
 
-	if (network_lock())
-		goto err;
+		TIME_FN(ret = checkpoint_devices() ? -1 : 0, "checkpoint_devices");
+		if (ret) goto err;
 
-	if (rpc_query_external_files())
-		goto err;
+		TIME_FN(ret = collect_pstree_ids() ? -1 : 0, "collect_pstree_ids");
+		if (ret) goto err;
 
-	if (collect_file_locks())
-		goto err;
+		if (!opts.cow_dump) {
+			TIME_FN(ret = network_lock() ? -1 : 0, "network_lock");
+			if (ret) goto err;
+		}
 
-	if (collect_namespaces(true) < 0)
-		goto err;
+		TIME_FN(ret = rpc_query_external_files() ? -1 : 0, "rpc_query_ext");
+		if (ret) goto err;
 
-	glob_imgset = cr_glob_imgset_open(O_DUMP);
-	if (!glob_imgset)
-		goto err;
+		TIME_FN(ret = collect_file_locks() ? -1 : 0, "collect_file_locks");
+		if (ret) goto err;
 
-	if (seccomp_collect_dump_filters() < 0)
-		goto err;
+		TIME_FN(ret = (collect_namespaces(true) < 0) ? -1 : 0, "collect_namespaces");
+		if (ret) goto err;
 
-	/* Errors handled later in detect_pid_reuse */
-	parent_ie = get_parent_inventory();
+		TIME_FN(glob_imgset = cr_glob_imgset_open(O_DUMP), "cr_glob_imgset_open");
+		if (!glob_imgset) goto err;
 
-	if (collect_and_suspend_lsm() < 0)
-		goto err;
+		TIME_FN(ret = (seccomp_collect_dump_filters() < 0) ? -1 : 0, "seccomp_filters");
+		if (ret) goto err;
+
+		TIME_FN(parent_ie = get_parent_inventory(), "get_parent_inventory");
+
+		TIME_FN(ret = (collect_and_suspend_lsm() < 0) ? -1 : 0, "collect_lsm");
+		if (ret) goto err;
+
+#undef TIME_FN
+
+		gettimeofday(&t_pre_e, NULL);
+		timersub(&t_pre_e, &t_pre_s, &t_pre_d);
+		pr_err("TIMING: pre_dump_one_task overhead took %ld.%06ld seconds\n",
+		       t_pre_d.tv_sec, t_pre_d.tv_usec);
+	}
 
 	for_each_pstree_item(item) {
 		if (dump_one_task(item, parent_ie))
 			goto err;
+	}
+
+	/*
+	 * COW early resume: the process tree dump, mount info, file locks,
+	 * and other image writes below use already-collected data and don't
+	 * need the process frozen.  Resume now to minimize unresponsive time.
+	 * The page server starts after resume in cr_dump_finish().
+	 */
+	if (opts.lazy_pages && opts.cow_dump) {
+		if (arch_set_thread_regs(root_item, true) < 0)
+			goto err;
+
+		cr_plugin_fini(CR_PLUGIN_STAGE__DUMP, 0);
+		pstree_switch_state(root_item, TASK_ALIVE);
+		timing_stop(TIME_FROZEN);
+		pr_err("COW early resume: process unfrozen after dump_one_task\n");
+
+		/*
+		 * WP_ASYNC: apply write-protect NOW, while the process
+		 * is running.  This saves ~70ms from the freeze window.
+		 * The process may briefly stall on mmap_lock during
+		 * UFFDIO_WRITEPROTECT ioctls but is not frozen.
+		 */
+		if (cow_is_wp_async()) {
+			struct timeval t_wp_s, t_wp_e, t_wp_d;
+
+			gettimeofday(&t_wp_s, NULL);
+			ret = cow_dump_start_wp();
+			if (!ret)
+				ret = cow_dump_finish_wp();
+			gettimeofday(&t_wp_e, NULL);
+			timersub(&t_wp_e, &t_wp_s, &t_wp_d);
+			pr_err("TIMING: post-unfreeze WP took "
+			       "%ld.%06ld seconds\n",
+			       t_wp_d.tv_sec, t_wp_d.tv_usec);
+			if (ret) {
+				pr_err("Post-unfreeze WP failed\n");
+				goto err;
+			}
+		}
+
+		/* Write deferred thread core images (off critical path) */
+		for_each_pstree_item(item) {
+			if (write_deferred_thread_cores(item)) {
+				pr_err("Failed to write deferred thread cores\n");
+				goto err;
+			}
+		}
 	}
 
 	ret = run_plugins(DUMP_DEVICES_LATE, pid);
