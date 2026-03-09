@@ -4,13 +4,16 @@ set -euo pipefail
 # =============================================================================
 # Restore script — run on REPLICA machine
 #
-# Orchestrates the replica side of a CRIU COW live migration:
+# Orchestrates the replica side of a CRIU COW phased live migration:
 #   1. Kills any existing valkey, applies a network gate
 #   2. Signals readiness to the primary
-#   3. Waits for the source dump/page-server to be ready
-#   4. Starts lazy-pages daemon + CRIU restore (with retry)
-#   5. Waits for the restored process, configures replication
-#   6. Verifies write protection, removes network gate
+#   3. Waits for the source page-server to be ready
+#   4. Starts lazy-pages daemon (pre-buffer mode: buffers pages before restore)
+#   4b. Starts background replication setup
+#   5. Waits for Phase 3 skeleton dump to complete
+#   6. Starts CRIU restore (process starts immediately, pages from buffer)
+#   7. Waits for the restored process, configures replication
+#   8. Verifies write protection, removes network gate
 # =============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -139,29 +142,87 @@ while true; do
 	sleep 0.5
 done
 
-# --- Step 4: Background replication setup ------------------------------------
-# Start wait_and_replicate.sh which waits for valkey to respond, then
-# runs REPLICAOF to configure this instance as a replica of the source.
-# Runs in background so it doesn't block the restore.
+# --- Step 4: Start lazy-pages early (pre-buffer mode) -----------------------
+# In COW phased migration, lazy-pages connects to the primary's page server
+# IMMEDIATELY and starts buffering pages in a hash table. This happens BEFORE
+# criu restore runs — skeleton images don't exist yet (they come in Phase 3).
+# Lazy-pages stays running across restore retries.
+echo "Step 4: Starting lazy-pages daemon (pre-buffer mode)..."
+sudo rm -f "$IMAGES_DIR/lazy-server.log"
+
+sudo "$CRIU_BIN" lazy-pages \
+	--images-dir "$IMAGES_DIR" \
+	--page-server \
+	--address "$PRIMARY_IP" \
+	--port "$CRIU_PORT" \
+	--cow-dump \
+	--tcp-close \
+	-v1 -o "$IMAGES_DIR/lazy-server.log" &
+LAZY_PAGES_PID=$!
+mark_phase_event "REPLICA_LAZY_PAGES_STARTED"
+
+# Poll for the Unix socket (appears when lazy-pages calls listen())
+LAZY_SOCK="$IMAGES_DIR/lazy-pages.socket"
+for _i in $(seq 1 200); do
+	[ -S "$LAZY_SOCK" ] && break
+	sleep 0.005
+done
+
+# Verify lazy-pages started successfully
+if ! kill -0 "$LAZY_PAGES_PID" 2>/dev/null; then
+	echo "ERROR: lazy-pages exited early"
+	sudo tail -n 120 "$IMAGES_DIR/lazy-server.log" 2>/dev/null || true
+	exit 1
+fi
+echo "Lazy-pages started (PID: $LAZY_PAGES_PID), pre-buffering pages..."
+mark_phase_event "REPLICA_PREBUFFER_STARTED"
+
+# --- Step 4b: Background replication setup -----------------------------------
 REPLICATE_PID=""
 if [ "$FAST_CUTOVER" != "1" ]; then
-	echo "Step 4: Starting wait_and_replicate.sh in background"
+	echo "Step 4b: Starting wait_and_replicate.sh in background"
 	"$SCRIPT_DIR/wait_and_replicate.sh" &
 	REPLICATE_PID=$!
 	echo "wait_and_replicate.sh started (PID: $REPLICATE_PID)"
 	mark_phase_event "REPLICA_REPLICATE_TASK_STARTED"
 else
-	echo "Step 4: FAST_CUTOVER=1: defer replicaof configuration until after SIGCONT"
+	echo "Step 4b: FAST_CUTOVER=1: defer replicaof configuration until after SIGCONT"
 fi
 
-# --- Step 5/6: Lazy-pages + restore with retry ------------------------------
-# Start the lazy-pages daemon (connects to source page server over TCP)
-# and CRIU restore (connects to lazy-pages via local Unix socket).
-#
-# Retry loop handles transient "Unexpected EOF on (empty-image)" failures
-# that occur when dump images aren't fully flushed to shared storage yet.
-# Each retry restarts both lazy-pages and restore from scratch.
-echo "Step 5: Starting lazy-pages + restore"
+# --- Step 5: Wait for Phase 3 skeleton dump ----------------------------------
+# The primary freezes the process again, runs dump_one_task() to produce
+# skeleton images (everything except memory pages which are already being
+# streamed), then writes "PHASE 3 SKELETON DUMP COMPLETE" to the log.
+# We must wait for this before starting criu restore.
+SKELETON_READY_PATTERN="PHASE 3 SKELETON DUMP COMPLETE"
+echo "Step 5: Waiting for Phase 3 skeleton dump..."
+START_TIME=$(date +%s)
+while true; do
+	if [ -f "$LOG_FILE" ] && sudo grep -q "$SKELETON_READY_PATTERN" "$LOG_FILE" 2>/dev/null; then
+		echo "Phase 3 skeleton dump ready"
+		mark_phase_event "REPLICA_SKELETON_DUMP_READY"
+		break
+	fi
+	# Also check that lazy-pages is still alive
+	if ! kill -0 "$LAZY_PAGES_PID" 2>/dev/null; then
+		echo "ERROR: lazy-pages died while waiting for skeleton dump"
+		sudo tail -n 120 "$IMAGES_DIR/lazy-server.log" 2>/dev/null || true
+		exit 1
+	fi
+	ELAPSED=$(($(date +%s) - START_TIME))
+	if [ "$ELAPSED" -ge "$WAIT_TIMEOUT" ]; then
+		echo "Timeout waiting for Phase 3 skeleton dump"
+		exit 1
+	fi
+	sleep 0.1
+done
+
+# --- Step 6: CRIU restore with retry ----------------------------------------
+# Start CRIU restore which recreates the process from Phase 3 skeleton images.
+# The process starts running immediately — page faults are served from the
+# pre-buffer hash table or demand-faulted from the primary.
+# Lazy-pages stays running across retries (only restore is retried).
+echo "Step 6: Starting CRIU restore"
 RESTORE_ARGS=(
 	--images-dir "$IMAGES_DIR"
 	--lazy-pages
@@ -178,38 +239,7 @@ fi
 RESTORE_OK=0
 for attempt in $(seq 1 "$RESTORE_RETRY_ATTEMPTS"); do
 	echo "  Restore attempt $attempt/$RESTORE_RETRY_ATTEMPTS"
-	sudo rm -f "$IMAGES_DIR/lazy-server.log" "$IMAGES_DIR/lazy-restore.log"
-
-	# Start lazy-pages daemon: bridges page faults to source page server
-	sudo "$CRIU_BIN" lazy-pages \
-		--images-dir "$IMAGES_DIR" \
-		--page-server \
-		--address "$PRIMARY_IP" \
-		--port "$CRIU_PORT" \
-		--cow-dump \
-		--tcp-close \
-		-v1 -o "$IMAGES_DIR/lazy-server.log" &
-	LAZY_PAGES_PID=$!
-	mark_phase_event "REPLICA_LAZY_PAGES_STARTED"
-
-	# Poll for the Unix socket instead of a fixed sleep.
-	# The socket appears when lazy-pages calls listen(), typically in ~5-20ms.
-	LAZY_SOCK="$IMAGES_DIR/lazy-pages.socket"
-	for _i in $(seq 1 200); do
-		[ -S "$LAZY_SOCK" ] && break
-		sleep 0.005
-	done
-
-	# Check if lazy-pages died during startup (empty-image race)
-	if ! kill -0 "$LAZY_PAGES_PID" 2>/dev/null; then
-		if sudo grep -qi "Unexpected EOF on (empty-image)" "$IMAGES_DIR/lazy-server.log" 2>/dev/null; then
-			sleep "$RESTORE_RETRY_INTERVAL_S"
-			continue
-		fi
-		echo "ERROR: lazy-pages exited early"
-		sudo tail -n 120 "$IMAGES_DIR/lazy-server.log" 2>/dev/null || true
-		exit 1
-	fi
+	sudo rm -f "$IMAGES_DIR/lazy-restore.log"
 
 	# Run CRIU restore: recreates the process from dump images.
 	# In FAST_CUTOVER mode, the process is left in SIGSTOP state.
@@ -220,9 +250,7 @@ for attempt in $(seq 1 "$RESTORE_RETRY_ATTEMPTS"); do
 	fi
 
 	# Retry on transient empty-image race in restore
-	if sudo grep -qi "Unexpected EOF on (empty-image)" "$IMAGES_DIR/lazy-restore.log" 2>/dev/null ||
-	   sudo grep -qi "Unexpected EOF on (empty-image)" "$IMAGES_DIR/lazy-server.log" 2>/dev/null; then
-		sudo kill -9 "$LAZY_PAGES_PID" 2>/dev/null || true
+	if sudo grep -qi "Unexpected EOF on (empty-image)" "$IMAGES_DIR/lazy-restore.log" 2>/dev/null; then
 		sleep "$RESTORE_RETRY_INTERVAL_S"
 		continue
 	fi

@@ -20,6 +20,15 @@ struct cow_page_queue_entry {
 	struct cow_page_queue_entry *next;   /* Used by consumer-side putback list */
 };
 
+/* COW dump phases for phased migration */
+enum cow_dump_phase {
+	COW_PHASE_IDLE = 0,
+	COW_PHASE_ASYNC_BULK,      /* WP_ASYNC active, bulk transfer in progress */
+	COW_PHASE_SCAN,            /* Process frozen, scanning dirty pages */
+	COW_PHASE_SYNC_CONVERGE,   /* WP_SYNC on dirty pages, convergence */
+	COW_PHASE_DONE,
+};
+
 /**
  * cow_dump_init - Initialize COW dump for a process
  * @item: Process tree item to set up COW tracking for
@@ -131,5 +140,63 @@ extern void cow_put_back_page(struct cow_page_queue_entry *entry);
  * Returns: Number of entries in the COW page queue
  */
 extern unsigned long cow_get_pages_queue_size(void);
+
+/**
+ * cow_dump_init_async - Initialize COW dump with WP_ASYNC mode
+ * @item: Process tree item to set up COW tracking for
+ * @vma_area_list: List of VMAs to track
+ * @ctl: Parasite control structure (unused, kept for API consistency)
+ *
+ * Sets up userfaultfd with WP_ASYNC for non-blocking write tracking.
+ * Does NOT start the monitor thread since WP_ASYNC doesn't generate faults.
+ * Dirty pages are later discovered via PAGEMAP_SCAN.
+ *
+ * Returns: 0 on success, -1 on error
+ */
+extern int cow_dump_init_async(struct pstree_item *item,
+			       struct vm_area_list *vma_area_list,
+			       struct parasite_ctl *ctl);
+
+/**
+ * cow_scan_dirty_pages - Scan for pages written during WP_ASYNC phase
+ * @dirty_ranges: Output array of [start, len, start, len, ...] pairs
+ * @nr_dirty_ranges: Output count of ranges
+ * @total_dirty_pages: Output total number of dirty pages
+ *
+ * Uses PAGEMAP_SCAN with PAGE_IS_WRITTEN to find pages dirtied
+ * during the WP_ASYNC bulk transfer phase.
+ * Caller must xfree() the dirty_ranges array.
+ *
+ * Returns: 0 on success, -1 on error
+ */
+extern int cow_scan_dirty_pages(unsigned long **dirty_ranges,
+				unsigned int *nr_dirty_ranges,
+				unsigned long *total_dirty_pages);
+
+/**
+ * cow_setup_sync_for_dirty - Switch to WP_SYNC mode for dirty pages
+ * @dirty_ranges: Array of [start, len] pairs from cow_scan_dirty_pages()
+ * @nr_dirty_ranges: Number of ranges
+ *
+ * Creates a new uffd with WP_SYNC, registers and write-protects only
+ * the dirty ranges, and starts the monitor thread for convergence.
+ *
+ * Returns: 0 on success, -1 on error
+ */
+extern int cow_setup_sync_for_dirty(unsigned long *dirty_ranges,
+				    unsigned int nr_dirty_ranges);
+
+/**
+ * cow_get_phase - Get the current COW dump phase
+ *
+ * Returns: Current cow_dump_phase value
+ */
+extern enum cow_dump_phase cow_get_phase(void);
+
+/**
+ * cow_set_phase - Set the current COW dump phase
+ * @phase: New phase to set
+ */
+extern void cow_set_phase(enum cow_dump_phase phase);
 
 #endif /* __CR_COW_DUMP_H_ */

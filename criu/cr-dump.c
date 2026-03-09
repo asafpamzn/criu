@@ -1529,6 +1529,19 @@ static int pre_dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie
 		goto err;
 	}
 
+	/*
+	 * For COW phased migration: set up WP_ASYNC tracking before infecting.
+	 * This allows the process to run with async write tracking during bulk
+	 * page transfer. Dirty pages are later discovered via PAGEMAP_SCAN.
+	 */
+	if (opts.cow_dump) {
+		ret = cow_dump_init_async(item, &vmas, NULL);
+		if (ret) {
+			pr_err("Failed to init COW ASYNC (pid: %d)\n", pid);
+			goto err_free;
+		}
+	}
+
 	ret = -1;
 	parasite_ctl = parasite_infect_seized(pid, item, &vmas);
 	if (!parasite_ctl) {
@@ -1556,8 +1569,14 @@ static int pre_dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie
 
 	item->pid->ns[0].virt = misc.pid;
 
-	mdc.pre_dump = true;
-	mdc.lazy = false;
+	/*
+	 * COW phased migration:
+	 *   pre_dump = false: treat as real dump for page collection
+	 *   lazy = true: use lazy VMA path in generate_iovs() to mark pages
+	 *                for deferred transfer instead of immediate dump
+	 */
+	mdc.pre_dump = !opts.cow_dump;
+	mdc.lazy = opts.cow_dump;
 	mdc.stat = NULL;
 	mdc.parent_ie = parent_ie;
 
@@ -1576,6 +1595,242 @@ err_cure:
 	if (compel_cure(parasite_ctl))
 		pr_err("Can't cure (pid: %d) from parasite\n", pid);
 	goto err_free;
+}
+
+/*
+ * dump_skeleton_one_task - Dump task state without memory pages
+ *
+ * This is a variant of dump_one_task() used in COW phased migration.
+ * It dumps all task state (registers, FDs, signals, etc.) EXCEPT memory
+ * pages, which have already been transferred during the async bulk phase.
+ */
+static int dump_skeleton_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
+{
+	pid_t pid = item->pid->real;
+	struct vm_area_list vmas;
+	struct parasite_ctl *parasite_ctl;
+	int ret, exit_code = -1;
+	struct parasite_dump_misc misc;
+	struct cr_imgset *cr_imgset = NULL;
+	struct parasite_drain_fd *dfds = NULL;
+	struct proc_posix_timers_stat proc_args;
+
+	vm_area_list_init(&vmas);
+
+	pr_info("========================================\n");
+	pr_info("Dumping task skeleton (pid: %d comm: %s)\n", pid, __task_comm_info(pid));
+	pr_info("========================================\n");
+
+	if (item->pid->state == TASK_DEAD)
+		return 0;
+
+	ret = parse_pid_stat(pid, &pps_buf);
+	if (ret < 0)
+		goto err;
+
+	ret = collect_mappings(pid, &vmas, dump_filemap);
+	if (ret) {
+		pr_err("Collect mappings (pid: %d) failed with %d\n", pid, ret);
+		goto err;
+	}
+
+	if (!shared_fdtable(item)) {
+		dfds = xmalloc(sizeof(*dfds));
+		if (!dfds)
+			goto err;
+
+		ret = collect_fds(pid, &dfds);
+		if (ret) {
+			pr_err("Collect fds (pid: %d) failed with %d\n", pid, ret);
+			goto err;
+		}
+
+		parasite_ensure_args_size(drain_fds_size(dfds));
+	}
+
+	ret = parse_posix_timers(pid, &proc_args);
+	if (ret < 0) {
+		pr_err("Can't read posix timers file (pid: %d)\n", pid);
+		goto err;
+	}
+
+	parasite_ensure_args_size(posix_timers_dump_size(proc_args.timer_n));
+
+	ret = dump_task_signals(pid, item);
+	if (ret) {
+		pr_err("Dump %d signals failed %d\n", pid, ret);
+		goto err;
+	}
+
+	ret = dump_task_rseq(pid, item);
+	if (ret) {
+		pr_err("Dump %d rseq failed %d\n", pid, ret);
+		goto err;
+	}
+
+	parasite_ctl = parasite_infect_seized(pid, item, &vmas);
+	if (!parasite_ctl) {
+		pr_err("Can't infect (pid: %d) with parasite\n", pid);
+		goto err;
+	}
+
+	ret = fixup_thread_rseq(item, 0);
+	if (ret) {
+		pr_err("Fixup rseq for %d failed %d\n", pid, ret);
+		goto err_cure;
+	}
+
+	if (root_ns_mask & CLONE_NEWPID && root_item == item) {
+		int pfd;
+
+		pfd = parasite_get_proc_fd_seized(parasite_ctl);
+		if (pfd < 0) {
+			pr_err("Can't get proc fd (pid: %d)\n", pid);
+			goto err_cure;
+		}
+
+		if (install_service_fd(CR_PROC_FD_OFF, pfd) < 0)
+			goto err_cure;
+	}
+
+	ret = parasite_fixup_vdso(parasite_ctl, pid, &vmas);
+	if (ret) {
+		pr_err("Can't fixup vdso VMAs (pid: %d)\n", pid);
+		goto err_cure;
+	}
+
+	ret = parasite_collect_aios(parasite_ctl, &vmas);
+	if (ret) {
+		pr_err("Failed to check aio rings (pid: %d)\n", pid);
+		goto err_cure;
+	}
+
+	ret = parasite_dump_misc_seized(parasite_ctl, &misc);
+	if (ret) {
+		pr_err("Can't dump misc (pid: %d)\n", pid);
+		goto err_cure;
+	}
+
+	item->pid->ns[0].virt = misc.pid;
+	item->threads[0].ns[0].virt = misc.pid;
+	pstree_insert_pid(item->pid);
+	item->sid = misc.sid;
+	item->pgid = misc.pgid;
+
+	pr_info("sid=%d pgid=%d pid=%d\n", item->sid, item->pgid, vpid(item));
+
+	if (item->sid == 0) {
+		pr_err("A session leader of %d(%d) is outside of its pid namespace\n",
+		       item->pid->real, vpid(item));
+		goto err_cure;
+	}
+
+	cr_imgset = cr_task_imgset_open(vpid(item), O_DUMP);
+	if (!cr_imgset)
+		goto err_cure;
+
+	ret = dump_task_ids(item, cr_imgset);
+	if (ret) {
+		pr_err("Dump ids (pid: %d) failed with %d\n", pid, ret);
+		goto err_cure;
+	}
+
+	if (dfds) {
+		ret = dump_task_files_seized(parasite_ctl, item, dfds);
+		if (ret) {
+			pr_err("Dump files (pid: %d) failed with %d\n", pid, ret);
+			goto err_cure;
+		}
+		ret = flush_eventpoll_dinfo_queue();
+		if (ret) {
+			pr_err("Dump eventpoll (pid: %d) failed with %d\n", pid, ret);
+			goto err_cure;
+		}
+	}
+
+	/*
+	 * NOTE: We skip parasite_dump_pages_seized() here since pages have
+	 * already been sent during the async bulk phase. We also skip
+	 * cow_dump_init() since WP_ASYNC was set up in pre_dump_one_task().
+	 */
+
+	ret = parasite_dump_sigacts_seized(parasite_ctl, item);
+	if (ret) {
+		pr_err("Can't dump sigactions (pid: %d) with parasite\n", pid);
+		goto err_cure;
+	}
+
+	ret = parasite_dump_itimers_seized(parasite_ctl, item);
+	if (ret) {
+		pr_err("Can't dump itimers (pid: %d)\n", pid);
+		goto err_cure;
+	}
+
+	ret = parasite_dump_posix_timers_seized(&proc_args, parasite_ctl, item);
+	if (ret) {
+		pr_err("Can't dump posix timers (pid: %d)\n", pid);
+		goto err_cure;
+	}
+
+	ret = dump_task_core_all(parasite_ctl, item, &pps_buf, cr_imgset, &misc);
+	if (ret) {
+		pr_err("Dump core (pid: %d) failed with %d\n", pid, ret);
+		goto err_cure;
+	}
+
+	ret = dump_task_cgroup(parasite_ctl, item);
+	if (ret) {
+		pr_err("Dump cgroup (pid: %d) failed with %d\n", pid, ret);
+		goto err_cure;
+	}
+
+	ret = compel_stop_daemon(parasite_ctl);
+	if (ret) {
+		pr_err("Can't stop daemon in parasite (pid: %d)\n", pid);
+		goto err_cure;
+	}
+
+	ret = dump_task_threads(parasite_ctl, item);
+	if (ret) {
+		pr_err("Can't dump threads\n");
+		goto err_cure;
+	}
+
+	/*
+	 * For COW phased migration, we use compel_cure_remote() to keep
+	 * the local mappings for lazy pages handling during convergence.
+	 */
+	ret = compel_cure_remote(parasite_ctl);
+	if (ret) {
+		pr_err("Can't cure (pid: %d) from parasite\n", pid);
+		goto err;
+	}
+
+	ret = dump_task_mm(pid, &pps_buf, &misc, &vmas, cr_imgset);
+	if (ret) {
+		pr_err("Dump mappings (pid: %d) failed with %d\n", pid, ret);
+		goto err;
+	}
+
+	ret = dump_task_fs(pid, &misc, cr_imgset);
+	if (ret) {
+		pr_err("Dump fs (pid: %d) failed with %d\n", pid, ret);
+		goto err;
+	}
+
+	exit_code = 0;
+err:
+	close_cr_imgset(&cr_imgset);
+	close_pid_proc();
+	free_mappings(&vmas);
+	xfree(dfds);
+	return exit_code;
+
+err_cure:
+	ret = compel_cure(parasite_ctl);
+	if (ret)
+		pr_err("Can't cure (pid: %d) from parasite\n", pid);
+	goto err;
 }
 
 static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
@@ -2303,6 +2558,308 @@ out_release_cow:
 	return post_dump_ret ?: (ret != 0);
 }
 
+/*
+ * cr_dump_tasks_cow_phased - COW phased migration orchestration
+ *
+ * Implements the WP_ASYNC → WP_SYNC phased migration flow:
+ *   Phase 1: pre_dump → WP_ASYNC all VMAs → resume immediately
+ *   Phase 2: bulk page transfer (process running, writes tracked async)
+ *   Phase 3: freeze → dump skeleton (no pages) → PAGEMAP_SCAN dirty pages
+ *   Phase 4: WP_SYNC on dirty pages → resume → convergence
+ */
+static int cr_dump_tasks_cow_phased(pid_t pid)
+{
+	InventoryEntry he = INVENTORY_ENTRY__INIT;
+	InventoryEntry *parent_ie = NULL;
+	struct pstree_item *item;
+	unsigned long *dirty_ranges = NULL;
+	unsigned int nr_dirty_ranges = 0;
+	unsigned long total_dirty_pages = 0;
+	int ret;
+	int exit_code = -1;
+
+	kerndat_warn_about_madv_guards();
+
+	pr_info("========================================\n");
+	pr_info("COW Phased dump (pid: %d comm: %s)\n", pid, __task_comm_info(pid));
+	pr_info("========================================\n");
+
+	rlimit_unlimit_nofile();
+
+	root_item = alloc_pstree_item();
+	if (!root_item)
+		goto err;
+	root_item->pid->real = pid;
+
+	ret = run_scripts(ACT_PRE_DUMP);
+	if (ret != 0) {
+		pr_err("Pre dump script failed with %d!\n", ret);
+		goto err;
+	}
+
+	if (init_stats(DUMP_STATS))
+		goto err;
+
+	if (cr_plugin_init(CR_PLUGIN_STAGE__DUMP))
+		goto err;
+
+	if (lsm_check_opts())
+		goto err;
+
+	if (irmap_load_cache())
+		goto err;
+
+	if (cpu_init())
+		goto err;
+
+	if (vdso_init_dump())
+		goto err;
+
+	if (cgp_init(opts.cgroup_props,
+		     opts.cgroup_props ? strlen(opts.cgroup_props) : 0,
+		     opts.cgroup_props_file))
+		goto err;
+
+	if (parse_cg_info())
+		goto err;
+
+	if (prepare_inventory(&he))
+		goto err;
+
+	if (opts.cpu_cap & CPU_CAP_IMAGE) {
+		if (cpu_dump_cpuinfo())
+			goto err;
+	}
+
+	if (connect_to_page_server_to_send() < 0)
+		goto err;
+
+	if (setup_alarm_handler())
+		goto err;
+
+	/* === PHASE 1: Seize + Pre-dump + WP_ASYNC === */
+	pr_info("=== PHASE 1: Seize + Pre-dump + WP_ASYNC ===\n");
+
+	if (collect_pstree())
+		goto err;
+
+	if (checkpoint_devices())
+		goto err;
+
+	if (collect_pstree_ids_predump())
+		goto err;
+
+	if (collect_namespaces(false) < 0)
+		goto err;
+
+	/* Errors handled later in detect_pid_reuse */
+	parent_ie = get_parent_inventory();
+
+	if (collect_and_suspend_lsm() < 0)
+		goto err;
+
+	for_each_pstree_item(item) {
+		if (pre_dump_one_task(item, parent_ie))
+			goto err;
+	}
+
+	/* Unfreeze — process runs with WP_ASYNC */
+	ret = arch_set_thread_regs(root_item, false);
+	if (ret)
+		goto err;
+
+	pstree_switch_state(root_item, TASK_ALIVE);
+
+	/* === PHASE 2: Bulk page transfer === */
+	pr_info("=== PHASE 2: Bulk page transfer ===\n");
+
+	/*
+	 * Start the page server to send all pages while the process runs.
+	 * WP_ASYNC tracks writes without generating faults.
+	 */
+	ret = cr_page_server(false, true, -1);
+	if (ret) {
+		pr_err("Bulk page transfer failed\n");
+		goto err_refreeze;
+	}
+
+	wait_for_page_server_thread();
+
+	/*
+	 * Clean up page_pipes and local parasite mappings from Phase 1.
+	 * The bulk transfer is complete, so we no longer need these.
+	 */
+	for_each_pstree_item(item) {
+		if (item->pid->state != TASK_DEAD && dmpi(item)->mem_pp) {
+			destroy_page_pipe(dmpi(item)->mem_pp);
+			dmpi(item)->mem_pp = NULL;
+			if (dmpi(item)->parasite_ctl) {
+				if (compel_cure_local(dmpi(item)->parasite_ctl))
+					pr_err("Can't cure local (pid: %d)\n",
+					       item->pid->real);
+				dmpi(item)->parasite_ctl = NULL;
+			}
+		}
+	}
+
+	/* === PHASE 3: Re-freeze + skeleton dump + dirty scan === */
+	pr_info("=== PHASE 3: Re-freeze + skeleton dump + dirty scan ===\n");
+
+	/*
+	 * Re-seize all tasks. After Phase 1, tasks were released via
+	 * pstree_switch_state(TASK_ALIVE) which detached from ptrace.
+	 * We need to re-attach to perform the skeleton dump.
+	 */
+	ret = reseize_pstree();
+	if (ret) {
+		pr_err("Failed to re-seize tasks\n");
+		goto err;
+	}
+
+	ret = cow_scan_dirty_pages(&dirty_ranges, &nr_dirty_ranges, &total_dirty_pages);
+	if (ret) {
+		pr_err("Failed to scan dirty pages\n");
+		goto err;
+	}
+
+	pr_info("Found %u dirty ranges, %lu total dirty pages\n",
+		nr_dirty_ranges, total_dirty_pages);
+
+	/*
+	 * Now perform full dump setup. Phase 1 used predump variants,
+	 * but skeleton dump needs full collection.
+	 */
+	if (collect_pstree_ids())
+		goto err;
+
+	if (network_lock())
+		goto err;
+
+	if (rpc_query_external_files())
+		goto err;
+
+	if (collect_file_locks())
+		goto err;
+
+	if (collect_namespaces(true) < 0)
+		goto err;
+
+	glob_imgset = cr_glob_imgset_open(O_DUMP);
+	if (!glob_imgset)
+		goto err;
+
+	if (seccomp_collect_dump_filters() < 0)
+		goto err;
+
+	/* Dump skeleton (everything except pages) */
+	for_each_pstree_item(item) {
+		if (dump_skeleton_one_task(item, parent_ie))
+			goto err;
+	}
+
+	if (parent_ie) {
+		inventory_entry__free_unpacked(parent_ie, NULL);
+		parent_ie = NULL;
+	}
+
+	/* Standard post-skeleton dumps */
+	if (dead_pid_conflict())
+		goto err;
+
+	if (dump_mnt_namespaces() < 0)
+		goto err;
+
+	if (dump_file_locks())
+		goto err;
+
+	if (dump_verify_tty_sids())
+		goto err;
+
+	if (dump_zombies())
+		goto err;
+
+	if (dump_pstree(root_item))
+		goto err;
+
+	if (cr_dump_shmem())
+		goto err;
+
+	if (root_ns_mask) {
+		if (dump_namespaces(root_item, root_ns_mask))
+			goto err;
+	}
+
+	if ((root_ns_mask & CLONE_NEWTIME) == 0) {
+		if (dump_time_ns(0))
+			goto err;
+	}
+
+	if (dump_aa_namespaces() < 0)
+		goto err;
+
+	if (dump_cgroups())
+		goto err;
+
+	if (fix_external_unix_sockets())
+		goto err;
+
+	if (tty_post_actions())
+		goto err;
+
+	if (inventory_save_uptime(&he))
+		goto err;
+
+	/* === PHASE 4: WP_SYNC on dirty + unfreeze === */
+	pr_info("=== PHASE 4: WP_SYNC on dirty + unfreeze ===\n");
+
+	ret = cow_setup_sync_for_dirty(dirty_ranges, nr_dirty_ranges);
+	if (ret) {
+		pr_err("Failed to set up WP_SYNC for dirty pages\n");
+		goto err;
+	}
+
+	pstree_switch_state(root_item, TASK_ALIVE);
+
+	/* TODO: Send dirty bitmap to replica */
+
+	/* === PHASE 5-6: Convergence === */
+	pr_info("=== PHASE 5-6: Convergence ===\n");
+
+	/*
+	 * Start page server again for convergence phase.
+	 * WP_SYNC faults on dirty pages will be handled by the COW monitor.
+	 */
+	ret = cr_page_server(false, true, -1);
+	if (ret)
+		pr_err("Convergence phase failed\n");
+
+	he.has_pre_dump_mode = false;
+	if (found_uprobes_vma()) {
+		he.has_allow_uprobes = true;
+		he.allow_uprobes = true;
+	}
+
+	exit_code = write_img_inventory(&he);
+	xfree(dirty_ranges);
+	goto finish;
+
+err_refreeze:
+	/*
+	 * If we failed during bulk transfer, try to re-seize tasks before
+	 * cleanup. Tasks were detached in Phase 1, so pstree_switch_state
+	 * alone won't work.
+	 */
+	if (reseize_pstree())
+		pr_warn("Failed to re-seize tasks during error cleanup\n");
+err:
+	if (parent_ie)
+		inventory_entry__free_unpacked(parent_ie, NULL);
+	xfree(dirty_ranges);
+
+finish:
+	return cr_dump_finish(exit_code);
+}
+
 int cr_dump_tasks(pid_t pid)
 {
 	InventoryEntry he = INVENTORY_ENTRY__INIT;
@@ -2310,6 +2867,14 @@ int cr_dump_tasks(pid_t pid)
 	struct pstree_item *item;
 	int ret;
 	int exit_code = -1;
+
+	/*
+	 * COW phased migration: when both --cow-dump and --lazy-pages are
+	 * enabled, use the phased WP_ASYNC → WP_SYNC flow for minimal
+	 * source downtime.
+	 */
+	if (opts.cow_dump && opts.lazy_pages)
+		return cr_dump_tasks_cow_phased(pid);
 
 	kerndat_warn_about_madv_guards();
 

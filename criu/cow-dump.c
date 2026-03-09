@@ -19,6 +19,8 @@
 #include "cow-dump.h"
 #include "mman.h"
 #include "uffd.h"
+#include "pagemap_scan.h"
+#include "proc_parse.h"
 #include "page-xfer.h"
 #include "page-pipe.h"
 #include "parasite-syscall.h"
@@ -53,10 +55,12 @@ struct cow_page_queue {
 struct cow_dump_info {
 	pid_t source_pid;
 	int uffd;
+	int uffd_async;        /* WP_ASYNC uffd fd (kept for cleanup) */
 	unsigned long total_pages;
 	unsigned long iteration;
 	unsigned int nr_tracked_vmas;
 	struct cow_tracked_vma *tracked_vmas;
+	enum cow_dump_phase phase;  /* Current phase */
 
 	struct cow_page_queue page_queue;
 };
@@ -422,6 +426,39 @@ static int uffd_open_proc(pid_t pid)
 	return fd;
 }
 
+static int uffd_open_proc_async(pid_t pid)
+{
+	char path[64];
+	struct uffdio_api api;
+	int fd;
+
+	snprintf(path, sizeof(path), "/proc/%d/userfaultfd", pid);
+	fd = open(path, O_RDWR | O_CLOEXEC | O_NONBLOCK);
+	if (fd < 0) {
+		pr_perror("Cannot open %s", path);
+		return -1;
+	}
+
+	memset(&api, 0, sizeof(api));
+	api.api = UFFD_API;
+	api.features = UFFD_FEATURE_WP_ASYNC;
+
+	if (ioctl(fd, UFFDIO_API, &api)) {
+		pr_perror("UFFDIO_API WP_ASYNC on %s failed", path);
+		close(fd);
+		return -1;
+	}
+	if (!(api.features & UFFD_FEATURE_WP_ASYNC)) {
+		pr_err("userfaultfd from %s lacks WP_ASYNC feature\n", path);
+		close(fd);
+		return -1;
+	}
+
+	pr_info("Opened %s with WP_ASYNC: fd=%d features=0x%llx\n",
+		path, fd, (unsigned long long)api.features);
+	return fd;
+}
+
 /* ------------------------------------------------------------------ */
 /*  VMA registration                                                   */
 /* ------------------------------------------------------------------ */
@@ -558,6 +595,8 @@ int cow_dump_init(struct pstree_item *item, struct vm_area_list *vma_area_list,
 
 	cdi->source_pid = item->pid->real;
 	cdi->uffd = -1;
+	cdi->uffd_async = -1;
+	cdi->phase = COW_PHASE_IDLE;
 
 	if (mpsc_init(cdi->page_queue.head, cdi->page_queue.tail,
 		      cdi->page_queue.size, struct cow_page_mpsc_node)) {
@@ -689,6 +728,8 @@ void cow_dump_fini(void)
 
 	if (g_cow_info->uffd >= 0)
 		close(g_cow_info->uffd);
+	if (g_cow_info->uffd_async >= 0 && g_cow_info->uffd_async != g_cow_info->uffd)
+		close(g_cow_info->uffd_async);
 	xfree(g_cow_info->tracked_vmas);
 	xfree(g_cow_info);
 	g_cow_info = NULL;
@@ -1224,4 +1265,304 @@ unsigned long cow_get_pages_queue_size(void)
 	if (!g_cow_info)
 		return 0;
 	return mpsc_size(g_cow_info->page_queue.size);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Phase management                                                   */
+/* ------------------------------------------------------------------ */
+
+enum cow_dump_phase cow_get_phase(void)
+{
+	if (!g_cow_info)
+		return COW_PHASE_IDLE;
+	return g_cow_info->phase;
+}
+
+void cow_set_phase(enum cow_dump_phase phase)
+{
+	if (g_cow_info)
+		g_cow_info->phase = phase;
+}
+
+/* ------------------------------------------------------------------ */
+/*  WP_ASYNC phased migration support                                  */
+/* ------------------------------------------------------------------ */
+
+int cow_dump_init_async(struct pstree_item *item,
+			struct vm_area_list *vma_area_list,
+			struct parasite_ctl *ctl)
+{
+	struct cow_dump_info *cdi;
+	int ret;
+
+	(void)ctl; /* Unused in async mode */
+
+	pr_info("Initializing COW dump ASYNC for pid %d\n", item->pid->real);
+
+	if (g_cow_info) {
+		pr_warn("COW tracking already initialized\n");
+		return 0;
+	}
+
+	if (!kdat.has_uffd_proc) {
+		pr_err("WP_ASYNC mode requires /proc/<pid>/userfaultfd support\n");
+		return -1;
+	}
+
+	cdi = xzalloc(sizeof(*cdi));
+	if (!cdi)
+		return -1;
+
+	cdi->source_pid = item->pid->real;
+	cdi->uffd = -1;
+	cdi->uffd_async = -1;
+	cdi->phase = COW_PHASE_ASYNC_BULK;
+
+	if (mpsc_init(cdi->page_queue.head, cdi->page_queue.tail,
+		      cdi->page_queue.size, struct cow_page_mpsc_node)) {
+		xfree(cdi);
+		return -1;
+	}
+
+	g_cow_info = cdi;
+
+	if (g_monitor_eventfd >= 0) {
+		close(g_monitor_eventfd);
+		g_monitor_eventfd = -1;
+	}
+	g_monitor_eventfd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+	if (g_monitor_eventfd < 0) {
+		pr_perror("Failed to create cow monitor eventfd");
+		goto err;
+	}
+
+	/* Open UFFD with WP_ASYNC */
+	cdi->uffd = uffd_open_proc_async(item->pid->real);
+	if (cdi->uffd < 0)
+		goto err;
+	cdi->uffd_async = cdi->uffd;
+
+	/* Register VMAs — reuse cow_register_vmas() */
+	ret = cow_register_vmas(cdi, vma_area_list, &cdi->total_pages);
+	if (ret)
+		goto err;
+
+	/* Apply write-protect — reuse cow_apply_writeprotect() */
+	if (cow_apply_writeprotect(cdi))
+		goto err;
+
+	/* DO NOT start monitor thread — WP_ASYNC doesn't generate faults */
+	pr_info("COW ASYNC initialized for pid %d: tracked=%u pages=%lu uffd=%d\n",
+		item->pid->real, cdi->nr_tracked_vmas,
+		cdi->total_pages, cdi->uffd);
+	return 0;
+
+err:
+	if (cdi->uffd >= 0)
+		close(cdi->uffd);
+	xfree(cdi->tracked_vmas);
+	if (cdi->page_queue.head) {
+		mpsc_drain(cdi->page_queue.head, free_cow_page_entry);
+		cdi->page_queue.tail = NULL;
+	}
+	xfree(cdi);
+	g_cow_info = NULL;
+	if (g_monitor_eventfd >= 0) {
+		close(g_monitor_eventfd);
+		g_monitor_eventfd = -1;
+	}
+	return -1;
+}
+
+int cow_scan_dirty_pages(unsigned long **dirty_ranges,
+			 unsigned int *nr_dirty_ranges,
+			 unsigned long *total_dirty_pages)
+{
+	struct cow_dump_info *cdi = g_cow_info;
+	int pagemap_fd = -1;
+	struct page_region *regs = NULL;
+	unsigned long *ranges = NULL;
+	unsigned int nr_ranges = 0;
+	unsigned int ranges_capacity = 0;
+	unsigned long total_pages = 0;
+	unsigned int i, j;
+	int ret = -1;
+	char path[64];
+
+	struct pm_scan_arg args = {
+		.size = sizeof(struct pm_scan_arg),
+		.flags = 0,
+		.start = 0,
+		.end = 0,
+		.walk_end = 0,
+		.vec_len = 1000,
+		.max_pages = 0,
+		.category_anyof_mask = PAGE_IS_WRITTEN,
+		.return_mask = PAGE_IS_WRITTEN,
+	};
+
+	if (!cdi) {
+		pr_err("COW dump not initialized\n");
+		return -1;
+	}
+
+	*dirty_ranges = NULL;
+	*nr_dirty_ranges = 0;
+	*total_dirty_pages = 0;
+
+	snprintf(path, sizeof(path), "/proc/%d/pagemap", cdi->source_pid);
+	pagemap_fd = open(path, O_RDONLY);
+	if (pagemap_fd < 0) {
+		pr_perror("Cannot open %s", path);
+		return -1;
+	}
+
+	regs = xmalloc(args.vec_len * sizeof(struct page_region));
+	if (!regs)
+		goto out;
+	args.vec = (u64)(unsigned long)regs;
+
+	/* Scan each tracked VMA for dirty pages */
+	for (i = 0; i < cdi->nr_tracked_vmas; i++) {
+		unsigned long vma_start = cdi->tracked_vmas[i].start;
+		unsigned long vma_end = cdi->tracked_vmas[i].end;
+		long regs_len;
+
+		args.start = vma_start;
+		args.end = vma_end;
+		args.walk_end = vma_start;
+
+		do {
+			args.start = args.walk_end;
+			regs_len = ioctl(pagemap_fd, PAGEMAP_SCAN, &args);
+			if (regs_len == -1) {
+				pr_perror("PAGEMAP_SCAN for VMA 0x%lx-0x%lx",
+					  vma_start, vma_end);
+				goto out;
+			}
+
+			/* Safety: if no regions returned, avoid infinite loop */
+			if (regs_len == 0)
+				break;
+
+			for (j = 0; j < (unsigned int)regs_len; j++) {
+				unsigned long start = regs[j].start;
+				unsigned long len = regs[j].end - regs[j].start;
+				unsigned long pages = len / PAGE_SIZE;
+
+				/* Grow ranges array if needed */
+				if (nr_ranges >= ranges_capacity) {
+					unsigned int new_cap = ranges_capacity ?
+							       ranges_capacity * 2 : 64;
+					unsigned long *new_ranges;
+
+					new_ranges = xrealloc(ranges,
+							      new_cap * 2 * sizeof(unsigned long));
+					if (!new_ranges)
+						goto out;
+					ranges = new_ranges;
+					ranges_capacity = new_cap;
+				}
+
+				ranges[nr_ranges * 2] = start;
+				ranges[nr_ranges * 2 + 1] = len;
+				nr_ranges++;
+				total_pages += pages;
+			}
+		} while (args.walk_end != vma_end);
+	}
+
+	*dirty_ranges = ranges;
+	*nr_dirty_ranges = nr_ranges;
+	*total_dirty_pages = total_pages;
+	ranges = NULL; /* Caller owns it now */
+
+	cdi->phase = COW_PHASE_SCAN;
+	pr_info("Scanned %u dirty ranges, %lu pages total\n",
+		nr_ranges, total_pages);
+	ret = 0;
+
+out:
+	xfree(regs);
+	xfree(ranges);
+	if (pagemap_fd >= 0)
+		close(pagemap_fd);
+	return ret;
+}
+
+int cow_setup_sync_for_dirty(unsigned long *dirty_ranges,
+			     unsigned int nr_dirty_ranges)
+{
+	struct cow_dump_info *cdi = g_cow_info;
+	struct uffdio_register reg;
+	struct uffdio_writeprotect wp;
+	int new_uffd;
+	unsigned int i;
+
+	if (!cdi) {
+		pr_err("COW dump not initialized\n");
+		return -1;
+	}
+
+	if (!kdat.has_uffd_proc) {
+		pr_err("WP_SYNC mode requires /proc/<pid>/userfaultfd support\n");
+		return -1;
+	}
+
+	/* Fast path: no dirty pages means nothing to converge */
+	if (nr_dirty_ranges == 0) {
+		pr_info("No dirty pages, skipping WP_SYNC convergence\n");
+		cdi->phase = COW_PHASE_DONE;
+		return 0;
+	}
+
+	pr_info("Setting up WP_SYNC for %u dirty ranges\n", nr_dirty_ranges);
+
+	/* Create new uffd with WP_SYNC */
+	new_uffd = uffd_open_proc(cdi->source_pid);
+	if (new_uffd < 0)
+		return -1;
+
+	/* Close old async uffd */
+	if (cdi->uffd >= 0)
+		close(cdi->uffd);
+	cdi->uffd = new_uffd;
+	cdi->uffd_async = -1;
+
+	/* Register and write-protect each dirty range */
+	for (i = 0; i < nr_dirty_ranges; i++) {
+		unsigned long start = dirty_ranges[i * 2];
+		unsigned long len = dirty_ranges[i * 2 + 1];
+
+		reg.range.start = start;
+		reg.range.len = len;
+		reg.mode = UFFDIO_REGISTER_MODE_WP;
+
+		if (ioctl(cdi->uffd, UFFDIO_REGISTER, &reg)) {
+			pr_perror("UFFDIO_REGISTER WP_SYNC 0x%lx-%lx failed",
+				  start, start + len);
+			continue; /* Best effort */
+		}
+
+		wp.range.start = start;
+		wp.range.len = len;
+		wp.mode = UFFDIO_WRITEPROTECT_MODE_WP;
+
+		if (ioctl(cdi->uffd, UFFDIO_WRITEPROTECT, &wp)) {
+			pr_perror("UFFDIO_WRITEPROTECT 0x%lx-%lx failed",
+				  start, start + len);
+			continue; /* Best effort */
+		}
+	}
+
+	cdi->phase = COW_PHASE_SYNC_CONVERGE;
+
+	/* Start monitor thread for convergence */
+	if (cow_start_monitor_thread()) {
+		pr_err("Failed to start monitor thread for convergence\n");
+		return -1;
+	}
+
+	pr_info("WP_SYNC convergence mode active\n");
+	return 0;
 }

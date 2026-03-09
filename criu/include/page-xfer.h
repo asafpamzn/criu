@@ -1,6 +1,7 @@
 #ifndef __CR_PAGE_XFER__H__
 #define __CR_PAGE_XFER__H__
 #include "pagemap.h"
+#include "types.h"
 
 struct ps_info {
 	int pid;
@@ -76,5 +77,10 @@ extern int request_all_remote_pages(unsigned long img_id);
 
 typedef int (*ps_async_read_complete)(unsigned long img_id, unsigned long vaddr, unsigned long nr_pages, void *);
 extern int page_server_start_read(void *buf, unsigned long nr_pages, ps_async_read_complete complete, void *priv, unsigned flags);
+
+/* COW phased migration: send dirty bitmap from primary to replica */
+extern int send_dirty_bitmap_to_replica(int sk, u64 dst_id,
+					unsigned long *ranges,
+					unsigned int nr_ranges);
 
 #endif /* __CR_PAGE_XFER__H__ */

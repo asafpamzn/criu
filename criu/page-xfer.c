@@ -84,6 +84,8 @@ static void psi2iovec(struct page_server_iov *ps, struct iovec *iov)
 #define PS_IOV_GET_ALL 8
 #define PS_IOV_ADD_F_PF 9
 #define PS_IOV_ADD_F_COMPRESS 10
+#define PS_IOV_DIRTY_BITMAP   11   /* Primary sends dirty bitmap to replica */
+#define PS_IOV_START_RESTORE  12   /* Signal replica to start process */
 
 #define PS_IOV_CLOSE	   0x1023
 
@@ -93,6 +95,7 @@ enum compress_read_state {
 	COMPRESS_STATE_READING_SIZE,          /* Reading compressed_size (4 bytes) */
 	COMPRESS_STATE_READING_COMPRESSED,    /* Reading compressed data */
 	COMPRESS_STATE_READING_UNCOMPRESSED,  /* Reading uncompressed page data */
+	COMPRESS_STATE_READING_DIRTY_BITMAP,  /* Reading dirty bitmap ranges */
 };
 #define PS_IOV_FORCE_CLOSE 0x1024
 
@@ -270,6 +273,38 @@ static __maybe_unused int send_page_uncompressed(int sk, const void *data,
 	ret = __send(sk, send_buf, total_len, 0);
 	if (ret != total_len) {
 		pr_perror("Failed to send page (sent %d/%d)", ret, total_len);
+		return -1;
+	}
+
+	return 0;
+}
+
+/*
+ * Send dirty bitmap to replica (COW phased migration).
+ * Called by primary after Phase 3 dirty scan completes.
+ * Format: header with cmd=PS_IOV_DIRTY_BITMAP, nr_pages=nr_ranges,
+ * followed by ranges array: [start0, len0, start1, len1, ...]
+ */
+int send_dirty_bitmap_to_replica(int sk, u64 dst_id,
+				 unsigned long *ranges,
+				 unsigned int nr_ranges)
+{
+	struct page_server_iov pi = {
+		.cmd = encode_ps_cmd(PS_IOV_DIRTY_BITMAP, 0),
+		.nr_pages = nr_ranges,
+		.vaddr = 0,
+		.dst_id = dst_id,
+	};
+	size_t ranges_size = nr_ranges * 2 * sizeof(unsigned long);
+
+	pr_info("Sending dirty bitmap: %u ranges (%zu bytes)\n",
+		nr_ranges, ranges_size);
+
+	if (send_psi(sk, &pi))
+		return -1;
+
+	if (nr_ranges > 0 && __send(sk, ranges, ranges_size, 0) != ranges_size) {
+		pr_perror("Failed to send dirty ranges");
 		return -1;
 	}
 
@@ -2416,6 +2451,52 @@ static int page_server_serve(int sk)
 			ps_stats.serve_get++;
 			ret = page_server_get_all_pages(sk, &pi);
 			break;
+		case PS_IOV_DIRTY_BITMAP: {
+			/*
+			 * Receive dirty bitmap from primary for COW phased migration.
+			 * nr_pages is overloaded to contain the number of dirty ranges.
+			 * Each range is a (start, len) pair of unsigned longs.
+			 */
+			unsigned int nr_ranges = pi.nr_pages;
+			unsigned long *ranges = NULL;
+			size_t ranges_size = nr_ranges * 2 * sizeof(unsigned long);
+
+			pr_info("Receiving dirty bitmap: %u ranges\n", nr_ranges);
+
+			if (nr_ranges > 0) {
+				ranges = xmalloc(ranges_size);
+				if (!ranges) {
+					pr_err("Failed to allocate dirty ranges\n");
+					ret = -1;
+					break;
+				}
+
+				if (__recv(sk, ranges, ranges_size, MSG_WAITALL) != ranges_size) {
+					pr_perror("Failed to receive dirty ranges");
+					xfree(ranges);
+					ret = -1;
+					break;
+				}
+			}
+
+			/*
+			 * TODO: Apply buffered pages using the dirty bitmap.
+			 * For now, just store the ranges for later use.
+			 * The actual application happens via apply_buffered_pages()
+			 * called from the lazy pages daemon.
+			 */
+			pr_info("Dirty bitmap received: %u ranges\n", nr_ranges);
+
+			if (ranges)
+				xfree(ranges);
+			ret = 0;
+			break;
+		}
+		case PS_IOV_START_RESTORE:
+			/* Signal to start the restore process */
+			pr_info("Received start restore signal\n");
+			ret = 0;
+			break;
 		default:
 			pr_err("Unknown command %u\n", pi.cmd);
 			ps_stats.serve_unknown++;
@@ -2730,6 +2811,12 @@ struct ps_async_read {
 	int compressed_rb;       /* Bytes read of compressed data */
 	char *compressed_buf;    /* Buffer for compressed data */
 	int compress_state;      /* 0=reading header, 1=reading size, 2=reading data */
+
+	/* Dirty bitmap support (COW phased migration) */
+	unsigned int nr_dirty_ranges;
+	unsigned long dirty_ranges_size;
+	unsigned long *dirty_ranges;
+	unsigned long dirty_rb;
 };
 
 static LIST_HEAD(async_reads);
@@ -2815,15 +2902,46 @@ static int page_server_read_bulk_stream(struct ps_async_read *ar, int flags)
 		if (ar->rb == sizeof(ar->pi)) {
 			cmd = decode_ps_cmd(ar->pi.cmd);
 
-				if (ar->pi.nr_pages == 0) {
-					pr_info("Received end-of-transfer marker (cmd=%u dst_id=%lu)\n", cmd,
-						(unsigned long)ar->pi.dst_id);
-					bulk_stream_done = true;
+			if (ar->pi.nr_pages == 0 && cmd != PS_IOV_DIRTY_BITMAP) {
+				pr_info("Received end-of-transfer marker (cmd=%u dst_id=%lu)\n", cmd,
+					(unsigned long)ar->pi.dst_id);
+				bulk_stream_done = true;
 
-					return BULK_STREAM_COMPLETE;
+				return BULK_STREAM_COMPLETE;
+			}
+
+			if (cmd == PS_IOV_DIRTY_BITMAP) {
+				/* Dirty bitmap from primary (COW phased migration) */
+				ar->nr_dirty_ranges = ar->pi.nr_pages;  /* overloaded */
+				ar->dirty_ranges_size = ar->nr_dirty_ranges * 2 * sizeof(unsigned long);
+
+				if (ar->dirty_ranges_size == 0) {
+					/* No dirty ranges — apply all buffered pages as clean */
+					if (is_restore_connected()) {
+						int uffd = get_first_lpi_uffd();
+						if (uffd >= 0)
+							apply_buffered_pages(uffd, NULL, 0);
+					} else {
+						/* Store for later — restore not connected yet */
+						store_pending_dirty_bitmap(NULL, 0);
+					}
+					ar->rb = 0;
+					ar->compress_state = COMPRESS_STATE_READING_HEADER;
+					pr_info("Dirty bitmap: 0 ranges, all pages clean\n");
+					return BULK_STREAM_PROGRESS;
 				}
 
-			if (cmd == PS_IOV_ADD_F_COMPRESS) {
+				ar->dirty_ranges = xmalloc(ar->dirty_ranges_size);
+				if (!ar->dirty_ranges) {
+					pr_err("Failed to allocate dirty ranges buffer\n");
+					return -1;
+				}
+				ar->dirty_rb = 0;
+				ar->compress_state = COMPRESS_STATE_READING_DIRTY_BITMAP;
+				pr_info("Dirty bitmap: expecting %u ranges (%lu bytes)\n",
+					ar->nr_dirty_ranges, ar->dirty_ranges_size);
+				return BULK_STREAM_PROGRESS;
+			} else if (cmd == PS_IOV_ADD_F_COMPRESS) {
 				ar->compress_state = COMPRESS_STATE_READING_SIZE;
 				ar->compressed_size = 0;
 				ar->compressed_rb = 0;
@@ -2981,6 +3099,52 @@ static int page_server_read_bulk_stream(struct ps_async_read *ar, int flags)
 		return BULK_STREAM_PROGRESS;
 	}
 
+	/* Reading dirty bitmap data (COW phased migration) */
+	if (ar->compress_state == COMPRESS_STATE_READING_DIRTY_BITMAP) {
+		need = ar->dirty_ranges_size - ar->dirty_rb;
+		buf = ((char *)ar->dirty_ranges) + ar->dirty_rb;
+
+		ret = __recv(page_server_sk, buf, need, flags);
+		if (ret < 0) {
+			if (flags == MSG_DONTWAIT && (errno == EAGAIN || errno == EINTR))
+				return BULK_STREAM_WOULD_BLOCK;
+			pr_perror("Error reading dirty bitmap");
+			xfree(ar->dirty_ranges);
+			ar->dirty_ranges = NULL;
+			return -1;
+		}
+		ar->dirty_rb += ret;
+
+		if (ar->dirty_rb == ar->dirty_ranges_size) {
+			pr_info("Dirty bitmap received: %u ranges\n",
+				ar->nr_dirty_ranges);
+
+			if (is_restore_connected()) {
+				int uffd = get_first_lpi_uffd();
+
+				pr_info("Restore connected, applying buffered pages\n");
+				if (uffd >= 0)
+					apply_buffered_pages(uffd, ar->dirty_ranges,
+							     ar->nr_dirty_ranges);
+				xfree(ar->dirty_ranges);
+			} else {
+				/*
+				 * Restore not connected yet — store bitmap for later.
+				 * handle_lazy_accept() will apply it when restore connects.
+				 */
+				pr_info("Restore not connected, storing dirty bitmap\n");
+				store_pending_dirty_bitmap(ar->dirty_ranges,
+							   ar->nr_dirty_ranges);
+				xfree(ar->dirty_ranges);
+			}
+
+			ar->dirty_ranges = NULL;
+			ar->rb = 0;
+			ar->compress_state = COMPRESS_STATE_READING_HEADER;
+		}
+		return BULK_STREAM_PROGRESS;
+	}
+
 	return BULK_STREAM_PROGRESS;
 }
 
@@ -3070,7 +3234,13 @@ int page_server_start_async_read_bulk(void *buf, unsigned long nr_pages,
 	ar->compressed_size = 0;
 	ar->compressed_rb = 0;
 	ar->compressed_buf = NULL;
-	
+
+	/* Initialize dirty bitmap state */
+	ar->nr_dirty_ranges = 0;
+	ar->dirty_ranges_size = 0;
+	ar->dirty_ranges = NULL;
+	ar->dirty_rb = 0;
+
 	list_add_tail(&ar->l, &async_reads);
 	return 0;
 }
