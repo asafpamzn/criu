@@ -44,6 +44,7 @@
 #include "namespaces.h"
 #include "pagemap.h"
 #include "pf-tracker.h"
+#include "cow-lazy-pages.h"
 #undef LOG_PREFIX
 #define LOG_PREFIX "uffd: "
 
@@ -2606,6 +2607,13 @@ int cr_lazy_pages(bool daemon)
 
 	if (!kdat.has_uffd)
 		return -1;
+
+	/*
+	 * COW Phase 2: No inventory/pstree yet, just buffer pages.
+	 * Use separate code path with minimal dependencies.
+	 */
+	if (opts.cow_dump && opts.use_page_server)
+		return cr_lazy_pages_cow_phase2(daemon);
 
 	if (prepare_dummy_pstree())
 		return -1;
