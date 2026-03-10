@@ -1298,18 +1298,26 @@ static int cow_clear_written_bits(struct cow_dump_info *cdi)
 	}
 
 	for (i = 0; i < cdi->nr_tracked_vmas; i++) {
-		args.start = cdi->tracked_vmas[i].start;
-		args.end = cdi->tracked_vmas[i].end;
-		args.walk_end = args.start;
+		unsigned long vma_start = cdi->tracked_vmas[i].start;
+		unsigned long vma_end = cdi->tracked_vmas[i].end;
 
-		if (ioctl(pagemap_fd, PAGEMAP_SCAN, &args) < 0) {
-			pr_perror("PAGEMAP_SCAN WP_MATCHING clear for VMA "
-				  "0x%lx-0x%lx failed",
-				  cdi->tracked_vmas[i].start,
-				  cdi->tracked_vmas[i].end);
-			ret = -1;
+		args.start = vma_start;
+		args.end = vma_end;
+		args.walk_end = vma_start;
+
+		do {
+			args.start = args.walk_end;
+			if (ioctl(pagemap_fd, PAGEMAP_SCAN, &args) < 0) {
+				pr_perror("PAGEMAP_SCAN WP_MATCHING clear for "
+					  "VMA 0x%lx-0x%lx failed",
+					  vma_start, vma_end);
+				ret = -1;
+				break;
+			}
+		} while (args.walk_end != vma_end);
+
+		if (ret)
 			break;
-		}
 	}
 
 	close(pagemap_fd);
