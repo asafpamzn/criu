@@ -1628,7 +1628,6 @@ static pthread_once_t active_images_lock_once = PTHREAD_ONCE_INIT;
 static pthread_t g_unified_thread;
 static _Atomic bool g_unified_thread_running = false;
 static _Atomic bool g_unified_thread_stop = false;
-static int g_page_server_main_sk = -1;  /* Main socket for page_server_serve() */
 
 /* Forward declaration */
 static void cleanup_active_images_queue(void);
@@ -2312,17 +2311,6 @@ static void *unified_page_server_thread(void *arg)
 	}
 	print_thread_stats(&stats);
 	pr_err("Unified page server thread stopped\n");
-
-	/*
-	 * Shutdown main socket to wake up page_server_serve() from __recv().
-	 * This allows the primary to continue to Phase 3 (skeleton dump).
-	 */
-	if (g_page_server_main_sk >= 0) {
-		pr_info("Shutting down main socket to signal completion\n");
-		shutdown(g_page_server_main_sk, SHUT_RDWR);
-		g_page_server_main_sk = -1;
-	}
-
 	g_unified_thread_running = false;
 	return NULL;
 }
@@ -2342,9 +2330,6 @@ static int page_server_get_all_pages(int sk, struct page_server_iov *pi)
 	if (ret < 0)
 		return -1;
 	
-	/* Store main socket so thread can shutdown it on completion */
-	g_page_server_main_sk = sk;
-
 	/* Start unified thread if not already running */
 	if (!g_unified_thread_running) {
 		pr_info("Starting unified page server thread\n");
