@@ -1786,6 +1786,19 @@ static int dump_skeleton_one_task(struct pstree_item *item, InventoryEntry *pare
 		goto err_cure;
 	}
 
+		/*
+	 * Pre-create WP_SYNC uffd while parasite is still alive.
+	 * On kernels without /proc/<pid>/userfaultfd, Phase 4 needs
+	 * a uffd created inside the target process via parasite RPC.
+	 */
+	if (opts.cow_dump) {
+		ret = cow_precreate_sync_uffd(parasite_ctl);
+		if (ret) {
+			pr_err("Failed to pre-create WP_SYNC uffd (pid: %d)\n", pid);
+			goto err_cure;
+		}
+	}
+
 	ret = compel_stop_daemon(parasite_ctl);
 	if (ret) {
 		pr_err("Can't stop daemon in parasite (pid: %d)\n", pid);
@@ -1798,18 +1811,7 @@ static int dump_skeleton_one_task(struct pstree_item *item, InventoryEntry *pare
 		goto err_cure;
 	}
 
-	/*
-	 * Pre-create WP_SYNC uffd while parasite is still alive.
-	 * On kernels without /proc/<pid>/userfaultfd, Phase 4 needs
-	 * a uffd created inside the target process via parasite RPC.
-	 */
-	if (opts.cow_dump) {
-		ret = cow_precreate_sync_uffd(parasite_ctl);
-		if (ret) {
-			pr_err("Failed to pre-create WP_SYNC uffd (pid: %d)\n", pid);
-			goto err_cure;
-		}
-	}
+
 
 	/*
 	 * For COW phased migration, we use compel_cure_remote() to keep
