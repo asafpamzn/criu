@@ -86,6 +86,7 @@ static void psi2iovec(struct page_server_iov *ps, struct iovec *iov)
 #define PS_IOV_ADD_F_COMPRESS 10
 #define PS_IOV_DIRTY_BITMAP   11   /* Primary sends dirty bitmap to replica */
 #define PS_IOV_START_RESTORE  12   /* Signal replica to start process */
+#define PS_IOV_BULK_COMPLETE_ACK 13 /* Replica → Primary: all bulk pages received */
 
 #define PS_IOV_CLOSE	   0x1023
 
@@ -2533,6 +2534,16 @@ static int page_server_serve(int sk)
 			pr_info("Received start restore signal\n");
 			ret = 0;
 			break;
+		case PS_IOV_BULK_COMPLETE_ACK:
+			/*
+			 * Replica acknowledges all bulk pages received.
+			 * Break out of the serve loop so the primary can
+			 * proceed to Phase 3 (skeleton dump + dirty scan).
+			 */
+			pr_info("Received bulk complete ACK from replica\n");
+			ret = 0;
+			flushed = true;
+			break;
 		default:
 			pr_err("Unknown command %u\n", pi.cmd);
 			ps_stats.serve_unknown++;
@@ -2543,8 +2554,8 @@ static int page_server_serve(int sk)
 		if (ret){
 			break;
 		}
-		if (pi.cmd == PS_IOV_CLOSE || pi.cmd == PS_IOV_FORCE_CLOSE){
-		
+		if (pi.cmd == PS_IOV_CLOSE || pi.cmd == PS_IOV_FORCE_CLOSE ||
+		    decode_ps_cmd(pi.cmd) == PS_IOV_BULK_COMPLETE_ACK) {
 			break;
 		}
 	}
@@ -2942,6 +2953,25 @@ static int page_server_read_bulk_stream(struct ps_async_read *ar, int flags)
 				pr_info("Received end-of-transfer marker (cmd=%u dst_id=%lu)\n", cmd,
 					(unsigned long)ar->pi.dst_id);
 				bulk_stream_done = true;
+
+				/*
+				 * Send ACK back to primary so it can
+				 * break out of page_server_serve() and
+				 * proceed to Phase 3 (skeleton dump).
+				 */
+				{
+					struct page_server_iov ack = {
+						.cmd = PS_IOV_BULK_COMPLETE_ACK,
+						.nr_pages = 0,
+						.vaddr = 0,
+						.dst_id = 0,
+					};
+					tcp_nodelay(page_server_sk, true);
+					if (__send(page_server_sk, &ack, sizeof(ack), 0) != sizeof(ack))
+						pr_perror("Failed to send bulk complete ACK");
+					else
+						pr_info("Sent bulk complete ACK to primary\n");
+				}
 
 				return BULK_STREAM_COMPLETE;
 			}
