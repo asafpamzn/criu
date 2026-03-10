@@ -1,10 +1,8 @@
 /*
- * COW Phase 2 Lazy Pages - Page buffering for phased migration
+ * COW Phase 2/3 Lazy Pages - Phased migration page handling
  *
- * In COW phased migration, Phase 2 runs before the skeleton dump.
- * At this point we only have pagemap/pages images - no inventory.img
- * or pstree.img yet. This file implements a minimal lazy-pages mode
- * that just buffers incoming pages without requiring the full pstree.
+ * Phase 2: Buffer pages from primary before skeleton dump exists
+ * Phase 3: After dirty bitmap arrives, start restore with buffered pages
  */
 
 #include <sys/epoll.h>
@@ -26,6 +24,8 @@
 #include "common/list.h"
 #include "servicefd.h"
 #include "uffd.h"
+#include "pstree.h"
+#include "rst_info.h"
 #include "cow-lazy-pages.h"
 
 #undef LOG_PREFIX
@@ -107,16 +107,17 @@ static void free_cow_tasks(void)
 }
 
 /*
- * COW Phase 2 lazy-pages entry point.
+ * COW Phase 2/3 lazy-pages entry point.
  *
- * This is called instead of the normal cr_lazy_pages() when
- * --cow-dump --page-server are both specified. It:
+ * Phase 2:
  *   1. Discovers tasks from pagemap files (no pstree needed)
- *   2. Initializes page buffer (using existing g_page_buffer in uffd.c)
- *   3. Connects to the page server
- *   4. Sets up async bulk reader for receiving pages
- *   5. Requests all pages for each task
- *   6. Runs event loop to receive and buffer pages
+ *   2. Connects to page server, buffers all pages
+ *   3. Waits for dirty bitmap (signals Phase 3 skeleton dump ready)
+ *
+ * Phase 3:
+ *   4. Now inventory.img exists - call prepare_dummy_pstree()
+ *   5. Start restore with buffered pages
+ *   6. Handle page faults (WP_SYNC convergence)
  */
 int cr_lazy_pages_cow_phase2(bool daemon)
 {
@@ -160,8 +161,8 @@ int cr_lazy_pages_cow_phase2(bool daemon)
 		/* Child continues */
 	}
 
-	/* 4. Set up epoll - page server + margin */
-	nr_fds = 4;
+	/* 4. Set up epoll - page server + restore socket + margin */
+	nr_fds = 8;
 	epollfd = epoll_prepare(nr_fds, &events);
 	if (epollfd < 0)
 		goto err_tasks;
@@ -189,10 +190,41 @@ int cr_lazy_pages_cow_phase2(bool daemon)
 
 	pr_info("Waiting to receive pages from primary...\n");
 
-	/* 8. Event loop - receive and buffer pages */
+	/* 8. Phase 2 event loop - buffer pages until dirty bitmap arrives */
 	ret = cow_phase2_handle_pages(epollfd, events, nr_fds);
+	if (ret < 0) {
+		pr_err("Phase 2 failed\n");
+		goto err_disconnect;
+	}
 
-	pr_info("Phase 2 complete\n");
+	pr_info("=== COW Phase 3: Starting restore ===\n");
+
+	/*
+	 * Phase 3: Dirty bitmap received, skeleton dump is ready.
+	 * Now inventory.img and pstree.img exist on disk.
+	 */
+	if (prepare_dummy_pstree()) {
+		pr_err("Failed to prepare pstree (inventory.img missing?)\n");
+		goto err_disconnect;
+	}
+
+	pr_info("Pstree loaded, ready to accept restore connection\n");
+
+	/*
+	 * Recalculate nr_fds now that pstree is loaded.
+	 * We need: task uffd fds + page server + lazy socket + margin
+	 */
+	nr_fds = task_entries->nr_tasks + 4;
+
+	/*
+	 * Phase 3 continues in the normal lazy-pages flow.
+	 * The buffered pages in g_page_buffer will be:
+	 *   - Applied via UFFD_COPY when restore connects (apply_buffered_pages)
+	 *   - Served to page faults (handle_page_fault checks buffer first)
+	 */
+	ret = cow_phase3_restore_loop(epollfd, &events, nr_fds);
+	if (ret < 0)
+		pr_err("Phase 3 restore loop failed\n");
 
 err_disconnect:
 	disconnect_from_page_server();
@@ -204,11 +236,13 @@ err_tasks:
 }
 
 /*
- * Event loop for Phase 2 - receive pages until bulk transfer complete.
+ * Phase 2 event loop - receive pages until dirty bitmap arrives.
+ * Dirty bitmap signals that Phase 3 skeleton dump is complete.
  */
 int cow_phase2_handle_pages(int epollfd, struct epoll_event *events, int nr_fds)
 {
 	int ret;
+	bool bulk_done = false;
 
 	while (1) {
 		ret = epoll_run_rfds(epollfd, events, nr_fds, -1);
@@ -217,9 +251,15 @@ int cow_phase2_handle_pages(int epollfd, struct epoll_event *events, int nr_fds)
 			return -1;
 		}
 
-		/* Check if bulk transfer is complete */
-		if (page_server_bulk_stream_done()) {
-			pr_info("Bulk stream complete\n");
+		/* Track bulk transfer completion */
+		if (!bulk_done && page_server_bulk_stream_done()) {
+			pr_info("Bulk page transfer complete, waiting for dirty bitmap...\n");
+			bulk_done = true;
+		}
+
+		/* Dirty bitmap signals Phase 3 is ready */
+		if (is_dirty_bitmap_received()) {
+			pr_info("Dirty bitmap received - Phase 3 ready\n");
 			return 0;
 		}
 	}

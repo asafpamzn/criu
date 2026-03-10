@@ -2444,6 +2444,7 @@ static bool restore_connected = false;
  */
 static unsigned long *pending_dirty_ranges = NULL;
 static unsigned int pending_nr_dirty_ranges = 0;
+static bool dirty_bitmap_received = false;
 
 /*
  * Pre-buffer callback: pages arrive before criu restore connects.
@@ -2589,12 +2590,61 @@ void store_pending_dirty_bitmap(unsigned long *ranges, unsigned int nr_ranges)
 			memcpy(pending_dirty_ranges, ranges, size);
 	}
 	pr_info("Stored pending dirty bitmap: %u ranges\n", nr_ranges);
+	dirty_bitmap_received = true;
+}
+
+/* Check if dirty bitmap has been received from primary */
+bool is_dirty_bitmap_received(void)
+{
+	return dirty_bitmap_received;
 }
 
 /* Check if restore has connected (uffd available) */
 bool is_restore_connected(void)
 {
 	return restore_connected;
+}
+
+/*
+ * COW Phase 3: Enter restore loop after pages are buffered and pstree loaded.
+ * Called from cow-lazy-pages.c after Phase 2 completes.
+ *
+ * This sets up the lazy socket for restore to connect and enters the
+ * main event loop to handle page faults (WP_SYNC convergence).
+ */
+int cow_phase3_restore_loop(int ep_fd, struct epoll_event **events, int nr_fds)
+{
+	int lazy_sk;
+	int flags;
+	int ret;
+
+	/* Set global epollfd for use by handle_lazy_accept() */
+	epollfd = ep_fd;
+
+	/* Create lazy socket for restore to connect */
+	lazy_sk = prepare_lazy_socket();
+	if (lazy_sk < 0) {
+		pr_err("Failed to create lazy socket for Phase 3\n");
+		return -1;
+	}
+
+	/* Make listen socket non-blocking and add to epoll */
+	flags = fcntl(lazy_sk, F_GETFL, 0);
+	fcntl(lazy_sk, F_SETFL, flags | O_NONBLOCK);
+
+	lazy_listen_rfd.fd = lazy_sk;
+	lazy_listen_rfd.read_event = handle_lazy_accept;
+	if (epoll_add_rfd(epollfd, &lazy_listen_rfd)) {
+		close(lazy_sk);
+		return -1;
+	}
+
+	pr_info("COW Phase 3: Waiting for restore to connect\n");
+
+	/* Enter main event loop - handle page faults until restore finishes */
+	ret = handle_requests(epollfd, events, nr_fds);
+
+	return ret;
 }
 
 int cr_lazy_pages(bool daemon)

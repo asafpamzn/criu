@@ -2,6 +2,7 @@
 #define __CR_UFFD_H_
 
 struct task_restore_args;
+struct epoll_event;
 
 extern int uffd_open(int flags, unsigned long *features, int *err);
 extern bool uffd_noncooperative(void);
@@ -23,10 +24,16 @@ extern void store_pending_dirty_bitmap(unsigned long *ranges, unsigned int nr_ra
 /* Check if restore has connected (uffd available) */
 extern bool is_restore_connected(void);
 
+/* Check if dirty bitmap has been received from primary (Phase 3 signal) */
+extern bool is_dirty_bitmap_received(void);
+
 /* COW Phase 2: Initialize page buffer for pre-buffering */
 extern int page_buffer_init(void);
 
 /* COW Phase 2: Set up async bulk reader for pre-buffering pages */
 extern int setup_prebuffer_reader(void);
+
+/* COW Phase 3: Enter restore loop after pages buffered and pstree loaded */
+extern int cow_phase3_restore_loop(int epollfd, struct epoll_event **events, int nr_fds);
 
 #endif /* __CR_UFFD_H_ */
