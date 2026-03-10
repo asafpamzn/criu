@@ -1257,6 +1257,70 @@ void cow_set_phase(enum cow_dump_phase phase)
 }
 
 /* ------------------------------------------------------------------ */
+/*  Baseline written-bit clearing                                      */
+/* ------------------------------------------------------------------ */
+
+/*
+ * cow_clear_written_bits - Clear PAGE_IS_WRITTEN on all tracked VMAs
+ *
+ * After setting up WP_ASYNC write-protect, pages that were already
+ * dirty still have their "written" bit set.  We use PAGEMAP_SCAN with
+ * PM_SCAN_WP_MATCHING to re-apply write-protect on those pages and
+ * clear their written bits.  After this, only pages actually written
+ * during Phase 2 (while the process runs) will show PAGE_IS_WRITTEN
+ * in the Phase 3 dirty scan.
+ */
+static int cow_clear_written_bits(struct cow_dump_info *cdi)
+{
+	char path[64];
+	int pagemap_fd;
+	unsigned int i;
+	int ret = 0;
+
+	struct pm_scan_arg args = {
+		.size = sizeof(struct pm_scan_arg),
+		.flags = PM_SCAN_WP_MATCHING,
+		.start = 0,
+		.end = 0,
+		.walk_end = 0,
+		.vec = 0,
+		.vec_len = 0,
+		.max_pages = 0,
+		.category_anyof_mask = PAGE_IS_WRITTEN,
+		.return_mask = 0,
+	};
+
+	snprintf(path, sizeof(path), "/proc/%d/pagemap", cdi->source_pid);
+	pagemap_fd = open(path, O_RDONLY);
+	if (pagemap_fd < 0) {
+		pr_perror("Cannot open %s for clearing written bits", path);
+		return -1;
+	}
+
+	for (i = 0; i < cdi->nr_tracked_vmas; i++) {
+		args.start = cdi->tracked_vmas[i].start;
+		args.end = cdi->tracked_vmas[i].end;
+		args.walk_end = args.start;
+
+		if (ioctl(pagemap_fd, PAGEMAP_SCAN, &args) < 0) {
+			pr_perror("PAGEMAP_SCAN WP_MATCHING clear for VMA "
+				  "0x%lx-0x%lx failed",
+				  cdi->tracked_vmas[i].start,
+				  cdi->tracked_vmas[i].end);
+			ret = -1;
+			break;
+		}
+	}
+
+	close(pagemap_fd);
+
+	if (!ret)
+		pr_info("Cleared written bits on %u tracked VMAs (baseline)\n",
+			cdi->nr_tracked_vmas);
+	return ret;
+}
+
+/* ------------------------------------------------------------------ */
 /*  WP_ASYNC phased migration support                                  */
 /* ------------------------------------------------------------------ */
 
@@ -1356,6 +1420,14 @@ int cow_dump_init_async(struct pstree_item *item,
 
 	/* Apply write-protect — reuse cow_apply_writeprotect() */
 	if (cow_apply_writeprotect(cdi))
+		goto err;
+
+	/*
+	 * Clear pre-existing PAGE_IS_WRITTEN bits so that the Phase 3
+	 * dirty scan only finds pages written during Phase 2 (while
+	 * the process runs with WP_ASYNC active).
+	 */
+	if (cow_clear_written_bits(cdi))
 		goto err;
 
 	/* DO NOT start monitor thread — WP_ASYNC doesn't generate faults */
