@@ -2366,6 +2366,7 @@ static int page_server_serve(int sk)
 {
 	int ret = -1;
 	bool flushed = false;
+	bool bulk_ack_received = false;
 	bool receiving_pages = !opts.lazy_pages;
 
 	if (receiving_pages) {
@@ -2543,6 +2544,7 @@ static int page_server_serve(int sk)
 			pr_info("Received bulk complete ACK from replica\n");
 			ret = 0;
 			flushed = true;
+			bulk_ack_received = true;
 			break;
 		default:
 			pr_err("Unknown command %u\n", pi.cmd);
@@ -2563,6 +2565,19 @@ static int page_server_serve(int sk)
 	if (receiving_pages && !ret && !flushed) {
 		pr_err("The data were not flushed\n");
 		ret = -1;
+	}
+
+	/*
+	 * COW phased migration: after receiving bulk complete ACK,
+	 * close the socket immediately without waiting for EOF.
+	 * The replica keeps its end open for future use, so the
+	 * normal EOF wait would block forever.
+	 */
+	if (bulk_ack_received) {
+		pr_info("Bulk ACK received, closing session without EOF wait\n");
+		page_server_close();
+		close(sk);
+		return 0;
 	}
 
 	tls_terminate_session(ret != 0);
