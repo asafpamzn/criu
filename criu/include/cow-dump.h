@@ -183,6 +183,7 @@ extern int cow_scan_dirty_pages(unsigned long **dirty_ranges,
  *
  * Returns: 0 on success, -1 on error
  */
+extern int cow_precreate_sync_uffd(struct parasite_ctl *ctl);
 extern int cow_setup_sync_for_dirty(unsigned long *dirty_ranges,
 				    unsigned int nr_dirty_ranges);
 

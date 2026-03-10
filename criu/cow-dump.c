@@ -56,6 +56,7 @@ struct cow_dump_info {
 	pid_t source_pid;
 	int uffd;
 	int uffd_async;        /* WP_ASYNC uffd fd (kept for cleanup) */
+	int uffd_sync;         /* Pre-created WP_SYNC uffd (via parasite) */
 	unsigned long total_pages;
 	unsigned long iteration;
 	unsigned int nr_tracked_vmas;
@@ -563,6 +564,7 @@ int cow_dump_init(struct pstree_item *item, struct vm_area_list *vma_area_list,
 	cdi->source_pid = item->pid->real;
 	cdi->uffd = -1;
 	cdi->uffd_async = -1;
+	cdi->uffd_sync = -1;
 	cdi->phase = COW_PHASE_IDLE;
 
 	if (mpsc_init(cdi->page_queue.head, cdi->page_queue.tail,
@@ -698,6 +700,8 @@ void cow_dump_fini(void)
 		close(g_cow_info->uffd);
 	if (g_cow_info->uffd_async >= 0 && g_cow_info->uffd_async != g_cow_info->uffd)
 		close(g_cow_info->uffd_async);
+	if (g_cow_info->uffd_sync >= 0)
+		close(g_cow_info->uffd_sync);
 	xfree(g_cow_info->tracked_vmas);
 	xfree(g_cow_info);
 	g_cow_info = NULL;
@@ -1279,6 +1283,7 @@ int cow_dump_init_async(struct pstree_item *item,
 	cdi->source_pid = item->pid->real;
 	cdi->uffd = -1;
 	cdi->uffd_async = -1;
+	cdi->uffd_sync = -1;
 	cdi->phase = COW_PHASE_ASYNC_BULK;
 
 	if (mpsc_init(cdi->page_queue.head, cdi->page_queue.tail,
@@ -1492,6 +1497,78 @@ out:
 	return ret;
 }
 
+/*
+ * cow_precreate_sync_uffd - Pre-create a WP_SYNC uffd via the parasite
+ *
+ * Must be called while the parasite is still alive (before compel_cure).
+ * On kernels with /proc/<pid>/userfaultfd this is a no-op since Phase 4
+ * can create the uffd directly.  On older kernels, the parasite creates
+ * a userfaultfd(2) inside the target and passes it back via SCM_RIGHTS.
+ */
+int cow_precreate_sync_uffd(struct parasite_ctl *ctl)
+{
+	struct cow_dump_info *cdi = g_cow_info;
+	struct parasite_cow_dump_args *args;
+	unsigned long args_size;
+	int ret;
+
+	if (!cdi) {
+		pr_err("COW dump not initialized\n");
+		return -1;
+	}
+
+	if (kdat.has_uffd_proc) {
+		pr_info("Kernel has /proc/<pid>/userfaultfd, skipping pre-create\n");
+		return 0;
+	}
+
+	if (!ctl) {
+		pr_err("Parasite required for WP_SYNC uffd pre-creation\n");
+		return -1;
+	}
+
+	pr_info("Pre-creating WP_SYNC uffd via parasite for pid %d\n",
+		cdi->source_pid);
+
+	args_size = sizeof(*args);
+	args = compel_parasite_args_s(ctl, args_size);
+	if (!args) {
+		pr_err("Failed to allocate parasite args for WP_SYNC\n");
+		return -1;
+	}
+
+	args->nr_vmas = 0;
+	args->total_pages = 0;
+	args->nr_failed_vmas = 0;
+	args->uffd_features = 0; /* WP_SYNC: UFFD_FEATURE_PAGEFAULT_FLAG_WP */
+	args->ret = -1;
+
+	ret = compel_rpc_call(PARASITE_CMD_COW_DUMP_INIT, ctl);
+	if (ret < 0) {
+		pr_err("Failed to initiate WP_SYNC uffd RPC\n");
+		return -1;
+	}
+
+	compel_util_recv_fd(ctl, &cdi->uffd_sync);
+	if (cdi->uffd_sync < 0) {
+		pr_err("Failed to receive WP_SYNC uffd from parasite: %d\n",
+		       cdi->uffd_sync);
+		return -1;
+	}
+
+	ret = compel_rpc_sync(PARASITE_CMD_COW_DUMP_INIT, ctl);
+	if (ret < 0 || args->ret != 0) {
+		pr_err("Parasite WP_SYNC uffd creation failed: %d (ret=%d)\n",
+		       ret, args->ret);
+		close(cdi->uffd_sync);
+		cdi->uffd_sync = -1;
+		return -1;
+	}
+
+	pr_info("Pre-created WP_SYNC uffd: fd=%d\n", cdi->uffd_sync);
+	return 0;
+}
+
 int cow_setup_sync_for_dirty(unsigned long *dirty_ranges,
 			     unsigned int nr_dirty_ranges)
 {
@@ -1506,11 +1583,6 @@ int cow_setup_sync_for_dirty(unsigned long *dirty_ranges,
 		return -1;
 	}
 
-	if (!kdat.has_uffd_proc) {
-		pr_err("WP_SYNC mode requires /proc/<pid>/userfaultfd support\n");
-		return -1;
-	}
-
 	/* Fast path: no dirty pages means nothing to converge */
 	if (nr_dirty_ranges == 0) {
 		pr_info("No dirty pages, skipping WP_SYNC convergence\n");
@@ -1520,10 +1592,20 @@ int cow_setup_sync_for_dirty(unsigned long *dirty_ranges,
 
 	pr_info("Setting up WP_SYNC for %u dirty ranges\n", nr_dirty_ranges);
 
-	/* Create new uffd with WP_SYNC */
-	new_uffd = uffd_open_proc(cdi->source_pid);
-	if (new_uffd < 0)
+	if (kdat.has_uffd_proc) {
+		/* Create new uffd with WP_SYNC via /proc */
+		new_uffd = uffd_open_proc(cdi->source_pid);
+		if (new_uffd < 0)
+			return -1;
+	} else if (cdi->uffd_sync >= 0) {
+		/* Use pre-created WP_SYNC uffd from parasite */
+		new_uffd = cdi->uffd_sync;
+		cdi->uffd_sync = -1; /* Ownership transferred */
+		pr_info("Using pre-created WP_SYNC uffd: fd=%d\n", new_uffd);
+	} else {
+		pr_err("No WP_SYNC uffd available (no /proc support and no pre-created fd)\n");
 		return -1;
+	}
 
 	/* Close old async uffd */
 	if (cdi->uffd >= 0)
