@@ -1049,76 +1049,30 @@ static int cgroup_version(void)
  * reseize_pstree - Re-seize tasks after they were released
  *
  * Used in COW phased migration to re-attach to tasks after Phase 1
- * released them (via pstree_switch_state(TASK_ALIVE)). This is a
- * lighter version of collect_pstree() that re-attaches to already
- * known PIDs without rediscovering the process tree.
+ * released them (via pstree_switch_state(TASK_ALIVE)). Threads may
+ * have changed (created/destroyed) while the process was running,
+ * so we reset the thread lists and delegate to collect_pstree()
+ * which re-discovers threads from /proc/<pid>/task/.
  */
 int reseize_pstree(void)
 {
 	struct pstree_item *item;
-	int ret;
 
 	pr_info("Re-seizing tasks for COW phased migration\n");
 
-	timing_start(TIME_FREEZING);
-
 	/*
-	 * Re-seize each task. We use compel_interrupt_task() to send
-	 * PTRACE_SEIZE + PTRACE_INTERRUPT, then compel_wait_task() to
-	 * wait for the task to stop.
+	 * Reset thread lists so collect_pstree() -> collect_threads()
+	 * re-discovers them from /proc. Keep only the thread leader
+	 * (threads[0]) — stale thread entries would cause
+	 * thread_collected() to skip them without re-seizing.
 	 */
 	for_each_pstree_item(item) {
-		pid_t pid = item->pid->real;
-		struct proc_status_creds creds = {};
-		int i;
-
 		if (item->pid->state == TASK_DEAD)
 			continue;
-
-		pr_info("Re-seizing task %d\n", pid);
-
-		ret = compel_interrupt_task(pid);
-		if (ret) {
-			pr_err("Failed to re-seize task %d\n", pid);
-			goto err;
-		}
-
-		ret = compel_wait_task(pid, -1, parse_pid_status, NULL,
-				       &creds.s, NULL);
-		if (ret < 0) {
-			pr_err("Failed to wait for task %d\n", pid);
-			goto err;
-		}
-
-		item->pid->state = ret;
-
-		/* Re-seize threads */
-		for (i = 1; i < item->nr_threads; i++) {
-			pid_t tid = item->threads[i].real;
-
-			pr_info("Re-seizing thread %d of task %d\n", tid, pid);
-
-			ret = compel_interrupt_task(tid);
-			if (ret) {
-				pr_err("Failed to re-seize thread %d\n", tid);
-				goto err;
-			}
-
-			ret = compel_wait_task(tid, pid, parse_pid_status, NULL,
-					       &creds.s, NULL);
-			if (ret < 0) {
-				pr_err("Failed to wait for thread %d\n", tid);
-				goto err;
-			}
-		}
+		item->nr_threads = 0;
 	}
 
-	timing_stop(TIME_FREEZING);
-	return 0;
-
-err:
-	timing_stop(TIME_FREEZING);
-	return -1;
+	return collect_pstree();
 }
 
 int collect_pstree(void)
