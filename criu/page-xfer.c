@@ -2903,222 +2903,9 @@ static bool addr_in_dump_vmas(u64 start, u64 end, u64 dst_id)
 	return false;
 }
 
-/* ---- Fork snapshot: ptrace helpers for convergence ---- */
-
 #include <sys/ptrace.h>
 #include <linux/elf.h>
 #include <sys/syscall.h>
-
-/*
- * Fork injection code: 16 bytes.
- *
- * After clone(), the parent (x0 = child_pid > 0) falls through
- * to BRK which ptrace catches.  The child (x0 = 0) branches to
- * an infinite loop, staying alive for process_vm_readv.
- *
- * aarch64:  SVC #0         → clone syscall
- *           CBZ x0, +8     → child: skip BRK, go to loop
- *           BRK #0         → parent: ptrace trap
- *           B .            → child: infinite loop (SIGSTOP'd later)
- *
- * x86-64:   syscall        → clone
- *           test eax,eax   → check return
- *           jz +1          → child: jump to loop
- *           int3           → parent: ptrace trap
- *           jmp -2         → child: infinite loop
- */
-#ifdef __aarch64__
-static const unsigned char fork_syscall_insn[16] = {
-	0x01, 0x00, 0x00, 0xd4,	/* svc #0           */
-	0x40, 0x00, 0x00, 0xb4,	/* cbz x0, +8 (→B.) */
-	0x00, 0x00, 0x20, 0xd4,	/* brk #0           */
-	0x00, 0x00, 0x00, 0x14		/* b .   (loop)     */
-};
-#elif defined(__x86_64__)
-static const unsigned char fork_syscall_insn[16] = {
-	0x0f, 0x05,			/* syscall      */
-	0x85, 0xc0,			/* test eax,eax */
-	0x74, 0x01,			/* jz +1 (→jmp) */
-	0xcc,				/* int3 (parent)*/
-	0xeb, 0xfe,			/* jmp -2 (loop)*/
-	0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc
-};
-#endif
-
-static int xfer_get_regs(pid_t pid, user_regs_struct_t *regs)
-{
-	struct iovec iov = { .iov_base = regs, .iov_len = sizeof(*regs) };
-
-	return ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov) ? -1 : 0;
-}
-
-static int xfer_set_regs(pid_t pid, user_regs_struct_t *regs)
-{
-	struct iovec iov = { .iov_base = regs, .iov_len = sizeof(*regs) };
-
-	return ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov) ? -1 : 0;
-}
-
-/*
- * Fork the source process by injecting clone(SIGCHLD) via ptrace.
- * The source MUST be SIGSTOP'd before calling this.
- * Returns the fork child PID, or -1 on failure.
- * On success, the child is SIGSTOP'd and the source is still stopped
- * (caller must SIGCONT the source after setting up the fork read).
- */
-static pid_t fork_source_snapshot(pid_t source_pid)
-{
-	user_regs_struct_t orig_regs, regs;
-	unsigned char orig_code[16];
-	unsigned long pc;
-	pid_t fork_pid;
-	int status;
-
-	/* Attach via ptrace */
-	if (ptrace(PTRACE_SEIZE, source_pid, NULL, 0)) {
-		pr_perror("fork_snapshot: PTRACE_SEIZE %d", source_pid);
-		return -1;
-	}
-
-	if (ptrace(PTRACE_INTERRUPT, source_pid, NULL, NULL)) {
-		pr_perror("fork_snapshot: PTRACE_INTERRUPT %d", source_pid);
-		goto detach;
-	}
-
-	if (waitpid(source_pid, &status, __WALL) != source_pid) {
-		pr_perror("fork_snapshot: waitpid after interrupt");
-		goto detach;
-	}
-
-	if (xfer_get_regs(source_pid, &orig_regs)) {
-		pr_err("fork_snapshot: get regs failed\n");
-		goto detach;
-	}
-
-#ifdef __aarch64__
-	pc = (unsigned long)orig_regs.pc;
-#else
-	pc = (unsigned long)orig_regs.ip;
-#endif
-
-	if (ptrace_peek_area(source_pid, orig_code, (void *)pc,
-			     sizeof(orig_code))) {
-		pr_err("fork_snapshot: peek code failed\n");
-		goto detach;
-	}
-
-	if (ptrace_poke_area(source_pid, (void *)fork_syscall_insn,
-			     (void *)pc, sizeof(fork_syscall_insn))) {
-		pr_err("fork_snapshot: poke code failed\n");
-		goto restore_code;
-	}
-
-	/* Set up clone(SIGCHLD) — equivalent to fork() */
-	regs = orig_regs;
-#ifdef __aarch64__
-	regs.regs[8] = __NR_clone;
-	regs.regs[0] = SIGCHLD;
-	regs.regs[1] = 0;
-	regs.regs[2] = 0;
-	regs.regs[3] = 0;
-	regs.regs[4] = 0;
-	regs.pc = pc;
-#else
-	regs.ax = __NR_clone;
-	regs.di = SIGCHLD;
-	regs.si = 0;
-	regs.dx = 0;
-	regs.r10 = 0;
-	regs.r8 = 0;
-	regs.ip = pc;
-#endif
-
-	if (xfer_set_regs(source_pid, &regs)) {
-		pr_err("fork_snapshot: set regs failed\n");
-		goto restore_code;
-	}
-
-	if (ptrace(PTRACE_CONT, source_pid, NULL, NULL)) {
-		pr_perror("fork_snapshot: PTRACE_CONT");
-		goto restore_all;
-	}
-
-	/*
-	 * The source was SIGSTOP'd before PTRACE_SEIZE.  After
-	 * PTRACE_CONT, the kernel may re-deliver the pending
-	 * group-stop before the clone executes.  If we see
-	 * SIGSTOP, suppress it and continue.
-	 */
-	while (1) {
-		if (waitpid(source_pid, &status, __WALL) != source_pid) {
-			pr_perror("fork_snapshot: waitpid after clone");
-			goto restore_all;
-		}
-
-		if (WIFSTOPPED(status) &&
-		    WSTOPSIG(status) == SIGTRAP)
-			break;  /* clone executed, hit BRK trap */
-
-		if (WIFSTOPPED(status) &&
-		    (WSTOPSIG(status) == SIGSTOP ||
-		     WSTOPSIG(status) == (SIGTRAP | 0x80))) {
-			/* Suppress and retry */
-			if (ptrace(PTRACE_CONT, source_pid, NULL, NULL)) {
-				pr_perror("fork_snapshot: re-CONT");
-				goto restore_all;
-			}
-			continue;
-		}
-
-		pr_err("fork_snapshot: unexpected status %x\n", status);
-		goto restore_all;
-	}
-
-	/* Read fork PID from return value */
-	if (xfer_get_regs(source_pid, &regs)) {
-		pr_err("fork_snapshot: get result regs failed\n");
-		goto restore_all;
-	}
-
-#ifdef __aarch64__
-	fork_pid = (pid_t)regs.regs[0];
-#else
-	fork_pid = (pid_t)regs.ax;
-#endif
-
-	if (fork_pid <= 0) {
-		pr_err("fork_snapshot: clone returned %d\n", fork_pid);
-		goto restore_all;
-	}
-
-	/* Stop the child immediately */
-	kill(fork_pid, SIGSTOP);
-	usleep(1000);
-
-	/* Restore original code and registers */
-	if (ptrace_poke_area(source_pid, orig_code, (void *)pc,
-			     sizeof(orig_code)))
-		pr_err("fork_snapshot: restore code failed\n");
-	if (xfer_set_regs(source_pid, &orig_regs))
-		pr_err("fork_snapshot: restore regs failed\n");
-
-	ptrace(PTRACE_DETACH, source_pid, NULL, NULL);
-
-	pr_err("COW converge: forked snapshot PID=%d from source %d\n",
-	       fork_pid, source_pid);
-
-	return fork_pid;
-
-restore_all:
-	xfer_set_regs(source_pid, &orig_regs);
-restore_code:
-	if (ptrace_poke_area(source_pid, orig_code, (void *)pc,
-			     sizeof(orig_code)))
-		pr_err("fork_snapshot: restore code failed (cleanup)\n");
-detach:
-	ptrace(PTRACE_DETACH, source_pid, NULL, NULL);
-	return -1;
-}
 
 /*
  * T3 signal handler + timer capture.
@@ -3754,8 +3541,7 @@ static long converge_dispatch_parallel(struct active_image *img,
  */
 static int cow_converge_dirty_pages_parallel(struct active_image *img,
 					     pid_t source_pid,
-					     int *sockets, int nr_streams,
-					     pid_t bulk_fork_pid)
+					     int *sockets, int nr_streams)
 {
 	struct converge_region *regions;
 
@@ -3769,25 +3555,84 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 		return -1;
 
 	/*
-	 * Final freeze: SIGSTOP source, fork a COW snapshot, scan
-	 * dirty pages, send across all streams, then capture T3 regs.
+	 * T3 freeze: SIGSTOP → scan → capture → send → SIGCONT.
 	 */
 	{
 		struct lazy_vma_entry *lve;
 		struct converge_region *freeze_dirty = NULL;
 		int freeze_dirty_count = 0, freeze_dirty_cap = 0;
 		unsigned long freeze_pages = 0;
-
-		{
 		struct timeval t3_start, t3_fork, t3_delta;
 
-		gettimeofday(&t3_start, NULL);
+		/*
+		 * Wait for all threads to be idle (in a wait syscall)
+		 * before scanning.  This ensures no thread holds
+		 * jemalloc locks (mid-malloc) when we take mmap_lock
+		 * for PAGEMAP_SCAN, avoiding the cascading stall on
+		 * SIGCONT.
+		 */
+		{
+			char task_dir[64];
+			int attempts;
+
+			snprintf(task_dir, sizeof(task_dir),
+				 "/proc/%d/task", source_pid);
+
+			for (attempts = 0; attempts < 200; attempts++) {
+				DIR *dir;
+				struct dirent *de;
+				int all_idle = 1;
+
+				dir = opendir(task_dir);
+				if (!dir)
+					break;
+
+				while ((de = readdir(dir)) != NULL) {
+					char sc_path[PATH_MAX];
+					char buf[256];
+					int fd, n, sc;
+
+					if (de->d_name[0] == '.')
+						continue;
+
+					snprintf(sc_path, sizeof(sc_path),
+						 "/proc/%d/task/%s/syscall",
+						 source_pid, de->d_name);
+					fd = open(sc_path, O_RDONLY);
+					if (fd < 0)
+						continue;
+					n = read(fd, buf, sizeof(buf) - 1);
+					close(fd);
+					if (n <= 0)
+						continue;
+					buf[n] = '\0';
+					sc = atoi(buf);
+					/* Idle syscalls (aarch64):
+					 * 22=epoll_pwait 73=ppoll
+					 * 98=futex 101=nanosleep
+					 * 115=clock_nanosleep */
+					if (sc != 22 && sc != 73 &&
+					    sc != 98 && sc != 101 &&
+					    sc != 115) {
+						all_idle = 0;
+						break;
+					}
+				}
+				closedir(dir);
+
+				if (all_idle)
+					break;
+				usleep(500);
+			}
+			pr_err("COW T3: threads settled after "
+			       "%d checks\n", attempts);
+		}
 
 		/*
-		 * Pre-freeze dirty scan: scan while source is LIVE.
-		 * PAGEMAP_SCAN is read-only — safe against the
-		 * running process.  This moves ~640ms of page-table
-		 * walks out of the frozen window.
+		 * Pre-freeze dirty scan while source is LIVE.
+		 * All threads are idle (no jemalloc locks held),
+		 * so PAGEMAP_SCAN's mmap_lock read won't cause
+		 * contention.
 		 */
 		list_for_each_entry(lve, get_global_lazy_vmas(), list) {
 			unsigned long scan_pos;
@@ -3829,23 +3674,19 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 			}
 		}
 
-		pr_err("COW T3 pre-freeze scan: %lu dirty pages "
+		pr_err("COW T3 pre-scan: %lu dirty pages "
 		       "(%d regions)\n", freeze_pages, freeze_dirty_count);
 
 		/*
-		 * T3 freeze: SIGSTOP → state capture → dirty read → SIGCONT.
-		 *
-		 * No fork. The dirty set at T3 is small (pre-scanned above).
-		 * Read dirty pages directly from the frozen source via
-		 * process_vm_readv. This avoids the 600+ms clone() cost
-		 * of forking a 60GB process.
-		 *
-		 * Budget: sigacts (7ms) + regs (<1ms) + FDs (<1ms) +
-		 *         dirty read (<1ms for ~20 pages) + libc rw- (<1ms)
-		 *         ≈ 10ms total frozen.
+		 * T3 freeze: only state capture + dirty dispatch.
+		 * ~22ms frozen (sigacts 21ms + regs <1ms + FDs <1ms
+		 * + dispatch <1ms for ~300 pages).
 		 */
 		kill(source_pid, SIGSTOP);
 		usleep(1000);
+		gettimeofday(&t3_start, NULL);
+
+		{
 
 		/* T3 full state capture */
 		{
@@ -3898,11 +3739,11 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 				&lr, 1);
 		}
 
-		/* Resume source */
+		/* Resume source after T3 capture */
 		kill(source_pid, SIGCONT);
 		gettimeofday(&t3_fork, NULL);
 		timersub(&t3_fork, &t3_start, &t3_delta);
-		pr_err("COW T3 FREEZE: %ld.%03ldms source frozen "
+		pr_err("COW T3 FREEZE: %ld.%03ldms SIGSTOP→SIGCONT "
 		       "(%lu dirty pages, no fork)\n",
 		       t3_delta.tv_sec * 1000 +
 		       t3_delta.tv_usec / 1000,
@@ -3915,7 +3756,6 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 
 		/* No post-fork scan needed — source was frozen for
 		 * the entire dirty read, so no new dirty pages. */
-		}
 
 		/* No second freeze — dirty pages were read from the
 		 * frozen source in the single SIGSTOP window above.
@@ -3926,12 +3766,14 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 		 * during transfer) and send VMA diff to replica.
 		 */
 		{
+			struct timeval vd_start, vd_end, vd_delta;
 			char maps_path[64];
 			FILE *mfp;
 			struct vma_diff_entry *new_vmas = NULL;
 			int new_vma_count = 0, new_vma_cap = 0;
 			unsigned long new_vma_pages = 0;
 
+			gettimeofday(&vd_start, NULL);
 			snprintf(maps_path, sizeof(maps_path),
 				 "/proc/%d/maps", source_pid);
 			mfp = fopen(maps_path, "r");
@@ -4055,10 +3897,18 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 			}
 
 			xfree(new_vmas);
+			gettimeofday(&vd_end, NULL);
+			timersub(&vd_end, &vd_start, &vd_delta);
+			pr_err("COW VMA diff: %ld.%03ldms\n",
+			       vd_delta.tv_sec * 1000 +
+			       vd_delta.tv_usec / 1000,
+			       vd_delta.tv_usec % 1000);
 		}
 
 		/* Source already SIGCONT'd after T3 capture */
 		xfree(freeze_dirty);
+	} /* end freeze block */
+
 	}
 
 	xfree(regions);
@@ -4168,9 +4018,8 @@ static void *unified_page_server_thread(void *arg)
 				pthread_t threads[COW_TRANSFER_STREAMS];
 				struct lazy_vma_entry **all_vmas;
 				struct vma_range *all_ranges = NULL;
-				pid_t bulk_fork = -1;
-				int nr_vmas = 0, vi = 0, s;
 				int nr_ranges = 0;
+				int nr_vmas = 0, vi = 0, s;
 				unsigned long total_pages = 0;
 				unsigned long pages_per_worker;
 
@@ -4311,17 +4160,14 @@ static void *unified_page_server_thread(void *arg)
 
 				detect_libc_rw_range(source_pid);
 
-				/* Fork for consistent bulk snapshot */
+				/*
+				 * No bulk fork in WP_ASYNC mode.
+				 * WP tracking + PAGEMAP_SCAN detects
+				 * all dirty pages — convergence re-sends
+				 * any pages modified during bulk transfer.
+				 * Workers read directly from live source.
+				 */
 				{
-				if (cow_is_wp_async())
-					bulk_fork = fork_source_snapshot(
-							source_pid);
-				if (bulk_fork > 0) {
-					pr_err("Bulk: fork %d\n", bulk_fork);
-					for (s = 0; s < nr_streams; s++)
-						workers[s].source_pid =
-							bulk_fork;
-				}
 				for (s = 0; s < nr_streams; s++) {
 					if (pthread_create(&threads[s], NULL,
 							   stream_worker_func,
@@ -4333,7 +4179,6 @@ static void *unified_page_server_thread(void *arg)
 
 				for (s = 0; s < nr_streams; s++)
 					pthread_join(threads[s], NULL);
-				/* Keep bulk_fork alive for convergence */
 				}
 
 				for (s = 0; s < nr_streams; s++) {
@@ -4374,15 +4219,11 @@ static void *unified_page_server_thread(void *arg)
 							conv_sks[s] = workers[s].sk;
 						if (cow_converge_dirty_pages_parallel(
 							    img, source_pid,
-							    conv_sks, nr_streams,
-							    bulk_fork) < 0)
+							    conv_sks, nr_streams) < 0)
 							pr_warn("COW convergence had errors (non-fatal)\n");
 						xfree(conv_sks);
 					}
 				}
-
-				if (bulk_fork > 0)
-					kill(bulk_fork, SIGKILL);
 
 				/* Send final close + close sockets */
 				for (s = 0; s < nr_streams; s++) {

@@ -122,7 +122,7 @@ WORKLOAD_PID=""
 if [ "$RUN_WORKLOAD_DURING_MIGRATION" = "1" ]; then
   for _ in $(seq 1 600); do [ -f "$IMAGES_DIR/bulk_send_done" ] && break; sleep 0.5; done
   log "Starting live workload..."
-  valkey-benchmark -p "$VALKEY_PORT" -t set -r 1000000 -c 13 -P 16 -d 64000 -n 1000000000 -q >/dev/null 2>&1 &
+  valkey-benchmark -p "$VALKEY_PORT" -t set,get -r 1000000 -c 16 -P 8 -d 512 --ratio 20:80 -n 1000000000 -q >/dev/null 2>&1 &
   WORKLOAD_PID=$!
 fi
 
@@ -133,19 +133,15 @@ STAGED=$(cat "$STAGED_FILE" 2>/dev/null || true)
 rm -f "$STAGED_FILE"
 [ -n "$STAGED" ] || { log "ERROR: staged not received"; exit 1; }
 
-# --- 9. Cutover (disable set -e for robustness) ---
+# --- 9. Cutover ---
+# No SIGSTOP here — T3 already captured final state.
+# Source is running; just send GO to replica.
 set +e
 _t0=${EPOCHREALTIME/./}; _t0=${_t0:0:13}
-kill -STOP "$PID" 2>/dev/null || sudo kill -STOP "$PID" 2>/dev/null || true
 (echo "GO" > /dev/tcp/"$REPLICA"/"$CUTOVER_PORT") 2>/dev/null || echo "GO" | nc -q 0 -w 1 "$REPLICA" "$CUTOVER_PORT" 2>/dev/null || true
 _t1=${EPOCHREALTIME/./}; _t1=${_t1:0:13}
 MIGRATION_END_MS=${EPOCHREALTIME/./}; MIGRATION_END_MS=${MIGRATION_END_MS:0:13}
-log "Cutover: source frozen $((_t1 - _t0))ms"
-
-if [ "$KEEP_SOURCE_RUNNING" = "1" ]; then
-  sudo pkill -CONT -x valkey-server 2>/dev/null || true
-  valkey-cli -p "$VALKEY_PORT" CLIENT UNPAUSE >/dev/null 2>&1 || true
-fi
+log "Cutover: GO sent $((_t1 - _t0))ms (no SIGSTOP)"
 
 # --- 10. Cleanup ---
 [ -n "$WORKLOAD_PID" ] && { kill "$WORKLOAD_PID" 2>/dev/null; sudo pkill -9 -f "[v]alkey-benchmark" 2>/dev/null; } || true

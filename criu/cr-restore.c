@@ -2449,32 +2449,11 @@ static void finalize_restore(void)
 		if (!task_alive(item))
 			continue;
 
-		if (opts.cow_dump) {
-			/*
-			 * COW mode: release bootstrap physical pages via
-			 * process_madvise instead of compel_unmap.  The
-			 * ptrace thread-hijack in compel_unmap corrupts
-			 * jemalloc/glibc allocator state on aarch64.
-			 *
-			 * MADV_DONTNEED releases all physical pages (the
-			 * ~200K bootstrap blob).  The VMA stays as a
-			 * zero-fill-on-demand shell (~200 bytes of kernel
-			 * vm_area_struct metadata).
-			 */
-			struct iovec iov = {
-				.iov_base = rsti(item)->bootstrap_start,
-				.iov_len = rsti(item)->bootstrap_unmap_len,
-			};
-			int pidfd = syscall(SYS_pidfd_open, pid, 0);
-			if (pidfd < 0) {
-				pr_perror("pidfd_open(%d) for bootstrap cleanup", pid);
-			} else {
-				if (syscall(SYS_process_madvise, pidfd, &iov,
-					    (unsigned long)1, MADV_DONTNEED,
-					    (unsigned int)0))
-					pr_perror("process_madvise DONTNEED for %d bootstrap", pid);
-				close(pidfd);
-			}
+		if (0 && opts.cow_dump) {
+			/* Disabled: process_madvise fails with EINVAL
+			 * on stopped processes, leaving bootstrap
+			 * memory mapped → crash on resume.
+			 * Fall through to compel_unmap path. */
 		} else {
 			/* Unmap the restorer blob via ptrace */
 			ctl = compel_prepare_noctx(pid);
