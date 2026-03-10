@@ -1621,7 +1621,7 @@ int cow_setup_sync_for_dirty(unsigned long *dirty_ranges,
 		reg.range.start = start;
 		reg.range.len = len;
 		reg.mode = UFFDIO_REGISTER_MODE_WP;
-
+		pr_info("UFFDIO_REGISTER WP_SYNC 0x%lx-%lx\n",start, start +len);
 		if (ioctl(cdi->uffd, UFFDIO_REGISTER, &reg)) {
 			pr_perror("UFFDIO_REGISTER WP_SYNC 0x%lx-%lx failed",
 				  start, start + len);
