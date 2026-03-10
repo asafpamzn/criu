@@ -2273,7 +2273,7 @@ static void *unified_page_server_thread(void *arg)
 		g_unified_thread_stop = list_empty(&active_images_queue);
 		pthread_spin_unlock(&active_images_lock);
 	}
-	print_thread_stats(stats);
+	print_thread_stats(&stats);
 	pr_err("Unified page server thread stopped\n");
 	g_unified_thread_running = false;
 	return NULL;
