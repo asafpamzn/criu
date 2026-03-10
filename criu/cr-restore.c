@@ -2449,11 +2449,15 @@ static void finalize_restore(void)
 		if (!task_alive(item))
 			continue;
 
-		if (0 && opts.cow_dump) {
-			/* Disabled: process_madvise fails with EINVAL
-			 * on stopped processes, leaving bootstrap
-			 * memory mapped → crash on resume.
-			 * Fall through to compel_unmap path. */
+		if (opts.cow_dump) {
+			/*
+			 * COW mode: skip bootstrap cleanup entirely.
+			 * process_madvise(DONTNEED) fails with EINVAL
+			 * on ptrace-stopped processes.  compel_unmap
+			 * corrupts jemalloc allocator state on aarch64.
+			 * The ~200KB bootstrap VMA is harmless — CRIU
+			 * places it at a non-conflicting address.
+			 */
 		} else {
 			/* Unmap the restorer blob via ptrace */
 			ctl = compel_prepare_noctx(pid);

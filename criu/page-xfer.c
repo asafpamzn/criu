@@ -3565,75 +3565,18 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 		struct timeval t3_start, t3_fork, t3_delta;
 
 		/*
-		 * Wait for all threads to be idle (in a wait syscall)
-		 * before scanning.  This ensures no thread holds
-		 * jemalloc locks (mid-malloc) when we take mmap_lock
-		 * for PAGEMAP_SCAN, avoiding the cascading stall on
-		 * SIGCONT.
+		 * T3 freeze: SIGSTOP → scan → capture → dispatch.
+		 *
+		 * Dirty scan MUST be inside the SIGSTOP window:
+		 * cow_scan_dirty_pages uses PM_SCAN_WP_MATCHING
+		 * which clears the write-protect marker. A pre-scan
+		 * while live would lose writes between scan and
+		 * SIGSTOP (WP already cleared → not re-tracked).
 		 */
-		{
-			char task_dir[64];
-			int attempts;
+		kill(source_pid, SIGSTOP);
+		usleep(1000);
+		gettimeofday(&t3_start, NULL);
 
-			snprintf(task_dir, sizeof(task_dir),
-				 "/proc/%d/task", source_pid);
-
-			for (attempts = 0; attempts < 200; attempts++) {
-				DIR *dir;
-				struct dirent *de;
-				int all_idle = 1;
-
-				dir = opendir(task_dir);
-				if (!dir)
-					break;
-
-				while ((de = readdir(dir)) != NULL) {
-					char sc_path[PATH_MAX];
-					char buf[256];
-					int fd, n, sc;
-
-					if (de->d_name[0] == '.')
-						continue;
-
-					snprintf(sc_path, sizeof(sc_path),
-						 "/proc/%d/task/%s/syscall",
-						 source_pid, de->d_name);
-					fd = open(sc_path, O_RDONLY);
-					if (fd < 0)
-						continue;
-					n = read(fd, buf, sizeof(buf) - 1);
-					close(fd);
-					if (n <= 0)
-						continue;
-					buf[n] = '\0';
-					sc = atoi(buf);
-					/* Idle syscalls (aarch64):
-					 * 22=epoll_pwait 73=ppoll
-					 * 98=futex 101=nanosleep
-					 * 115=clock_nanosleep */
-					if (sc != 22 && sc != 73 &&
-					    sc != 98 && sc != 101 &&
-					    sc != 115) {
-						all_idle = 0;
-						break;
-					}
-				}
-				closedir(dir);
-
-				if (all_idle)
-					break;
-				usleep(500);
-			}
-			pr_err("COW T3: threads settled after "
-			       "%d checks\n", attempts);
-		}
-
-		/*
-		 * Pre-freeze dirty scan while source is LIVE.
-		 * All threads are idle (no jemalloc locks held),
-		 * so PAGEMAP_SCAN's mmap_lock read won't cause
-		 * contention.
-		 */
 		list_for_each_entry(lve, get_global_lazy_vmas(), list) {
 			unsigned long scan_pos;
 
@@ -3674,17 +3617,8 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 			}
 		}
 
-		pr_err("COW T3 pre-scan: %lu dirty pages "
+		pr_err("COW T3 dirty scan: %lu dirty pages "
 		       "(%d regions)\n", freeze_pages, freeze_dirty_count);
-
-		/*
-		 * T3 freeze: only state capture + dirty dispatch.
-		 * ~22ms frozen (sigacts 21ms + regs <1ms + FDs <1ms
-		 * + dispatch <1ms for ~300 pages).
-		 */
-		kill(source_pid, SIGSTOP);
-		usleep(1000);
-		gettimeofday(&t3_start, NULL);
 
 		{
 
