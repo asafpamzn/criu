@@ -311,6 +311,42 @@ int send_dirty_bitmap_to_replica(int sk, u64 dst_id,
 	return 0;
 }
 
+/*
+ * Send dirty bitmap to replica using the current page server connection.
+ * Called from cr-dump.c after skeleton dump completes.
+ */
+int send_cow_dirty_bitmap(unsigned long *ranges, unsigned int nr_ranges)
+{
+	struct pstree_item *item;
+
+	if (page_server_sk < 0) {
+		pr_err("Page server not connected, cannot send dirty bitmap\n");
+		return -1;
+	}
+
+	/*
+	 * Send dirty bitmap for each task. The replica needs to know
+	 * which pages are dirty so it can apply WP_SYNC for convergence.
+	 */
+	for_each_pstree_item(item) {
+		u64 dst_id;
+
+		if (!task_alive(item))
+			continue;
+
+		dst_id = encode_pm(CR_FD_PAGEMAP, vpid(item));
+
+		pr_info("Sending dirty bitmap for pid=%d (dst_id=%lu)\n",
+			vpid(item), (unsigned long)dst_id);
+
+		if (send_dirty_bitmap_to_replica(page_server_sk, dst_id,
+						 ranges, nr_ranges))
+			return -1;
+	}
+
+	return 0;
+}
+
 static void tcp_cork(int sk, bool on)
 {
 	int val = on ? 1 : 0;

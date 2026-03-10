@@ -2823,7 +2823,14 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 
 	pstree_switch_state(root_item, TASK_ALIVE);
 
-	/* TODO: Send dirty bitmap to replica */
+	/* Send dirty bitmap to replica so it can start Phase 3 restore */
+	if (opts.use_page_server) {
+		ret = send_cow_dirty_bitmap(dirty_ranges, nr_dirty_ranges);
+		if (ret) {
+			pr_err("Failed to send dirty bitmap to replica\n");
+			goto err;
+		}
+	}
 
 	/* === PHASE 5-6: Convergence === */
 	pr_info("=== PHASE 5-6: Convergence ===\n");

@@ -83,4 +83,7 @@ extern int send_dirty_bitmap_to_replica(int sk, u64 dst_id,
 					unsigned long *ranges,
 					unsigned int nr_ranges);
 
+/* COW phased migration: send dirty bitmap using current page server connection */
+extern int send_cow_dirty_bitmap(unsigned long *ranges, unsigned int nr_ranges);
+
 #endif /* __CR_PAGE_XFER__H__ */
