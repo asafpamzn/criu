@@ -1279,14 +1279,14 @@ static int cow_clear_written_bits(struct cow_dump_info *cdi)
 
 	struct pm_scan_arg args = {
 		.size = sizeof(struct pm_scan_arg),
-		.flags = PM_SCAN_WP_MATCHING,
+		.flags = PM_SCAN_WP_MATCHING | PM_SCAN_CHECK_WPASYNC,
 		.start = 0,
 		.end = 0,
 		.walk_end = 0,
 		.vec = 0,
 		.vec_len = 0,
 		.max_pages = 0,
-		.category_anyof_mask = PAGE_IS_WRITTEN,
+		.category_mask = PAGE_IS_WPALLOWED,
 		.return_mask = 0,
 	};
 
@@ -1478,13 +1478,13 @@ int cow_scan_dirty_pages(unsigned long **dirty_ranges,
 
 	struct pm_scan_arg args = {
 		.size = sizeof(struct pm_scan_arg),
-		.flags = 0,
+		.flags = PM_SCAN_WP_MATCHING | PM_SCAN_CHECK_WPASYNC,
 		.start = 0,
 		.end = 0,
 		.walk_end = 0,
 		.vec_len = 1000,
 		.max_pages = 0,
-		.category_anyof_mask = PAGE_IS_WRITTEN,
+		.category_mask = PAGE_IS_WRITTEN,
 		.return_mask = PAGE_IS_WRITTEN,
 	};
 
