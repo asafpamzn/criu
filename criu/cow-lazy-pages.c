@@ -21,11 +21,11 @@
 #include "cr_options.h"
 #include "criu-log.h"
 #include "page-xfer.h"
-#include "rst-malloc.h"
 #include "util.h"
 #include "xmalloc.h"
 #include "common/list.h"
 #include "servicefd.h"
+#include "uffd.h"
 #include "cow-lazy-pages.h"
 
 #undef LOG_PREFIX
@@ -39,113 +39,6 @@ struct cow_task {
 
 static LIST_HEAD(cow_tasks);
 static int nr_cow_tasks;
-
-/* Page buffer for storing received pages */
-struct cow_page_entry {
-	unsigned long vaddr;
-	int pid;
-	void *data;
-	struct hlist_node hash;
-};
-
-#define COW_PAGE_HASH_BITS	16
-#define COW_PAGE_HASH_SIZE	(1 << COW_PAGE_HASH_BITS)
-
-static struct hlist_head *cow_page_hash;
-static unsigned long cow_pages_buffered;
-static unsigned long cow_pages_total_bytes;
-
-static inline unsigned int cow_page_hash_fn(int pid, unsigned long vaddr)
-{
-	return (pid ^ (vaddr >> 12)) & (COW_PAGE_HASH_SIZE - 1);
-}
-
-static int cow_page_buffer_init(void)
-{
-	cow_page_hash = xzalloc(COW_PAGE_HASH_SIZE * sizeof(struct hlist_head));
-	if (!cow_page_hash)
-		return -1;
-
-	for (int i = 0; i < COW_PAGE_HASH_SIZE; i++)
-		INIT_HLIST_HEAD(&cow_page_hash[i]);
-
-	cow_pages_buffered = 0;
-	cow_pages_total_bytes = 0;
-	pr_info("Page buffer initialized (%d buckets)\n", COW_PAGE_HASH_SIZE);
-	return 0;
-}
-
-int cow_page_buffer_add(int pid, unsigned long vaddr, void *data, size_t len)
-{
-	struct cow_page_entry *entry;
-	unsigned int hash;
-
-	if (!cow_page_hash)
-		return -1;
-
-	entry = xmalloc(sizeof(*entry));
-	if (!entry)
-		return -1;
-
-	entry->data = xmalloc(len);
-	if (!entry->data) {
-		xfree(entry);
-		return -1;
-	}
-
-	memcpy(entry->data, data, len);
-	entry->vaddr = vaddr;
-	entry->pid = pid;
-
-	hash = cow_page_hash_fn(pid, vaddr);
-	hlist_add_head(&entry->hash, &cow_page_hash[hash]);
-
-	cow_pages_buffered++;
-	cow_pages_total_bytes += len;
-
-	return 0;
-}
-
-void *cow_page_buffer_lookup(int pid, unsigned long vaddr)
-{
-	struct cow_page_entry *entry;
-	unsigned int hash;
-
-	if (!cow_page_hash)
-		return NULL;
-
-	hash = cow_page_hash_fn(pid, vaddr);
-	hlist_for_each_entry(entry, &cow_page_hash[hash], hash) {
-		if (entry->pid == pid && entry->vaddr == vaddr)
-			return entry->data;
-	}
-
-	return NULL;
-}
-
-static void cow_page_buffer_destroy(void)
-{
-	struct cow_page_entry *entry;
-	struct hlist_node *tmp;
-	int i;
-
-	if (!cow_page_hash)
-		return;
-
-	for (i = 0; i < COW_PAGE_HASH_SIZE; i++) {
-		hlist_for_each_entry_safe(entry, tmp, &cow_page_hash[i], hash) {
-			hlist_del(&entry->hash);
-			xfree(entry->data);
-			xfree(entry);
-		}
-	}
-
-	xfree(cow_page_hash);
-	cow_page_hash = NULL;
-
-	pr_info("Page buffer destroyed (had %lu pages, %lu bytes)\n",
-		cow_pages_buffered, cow_pages_total_bytes);
-}
 
 /*
  * Discover tasks by scanning for pagemap-*.img files in images directory.
@@ -219,9 +112,11 @@ static void free_cow_tasks(void)
  * This is called instead of the normal cr_lazy_pages() when
  * --cow-dump --page-server are both specified. It:
  *   1. Discovers tasks from pagemap files (no pstree needed)
- *   2. Connects to the page server
- *   3. Requests all pages for each task
- *   4. Buffers received pages for later use in Phase 3
+ *   2. Initializes page buffer (using existing g_page_buffer in uffd.c)
+ *   3. Connects to the page server
+ *   4. Sets up async bulk reader for receiving pages
+ *   5. Requests all pages for each task
+ *   6. Runs event loop to receive and buffer pages
  */
 int cr_lazy_pages_cow_phase2(bool daemon)
 {
@@ -237,16 +132,18 @@ int cr_lazy_pages_cow_phase2(bool daemon)
 	if (discover_tasks_from_pagemaps())
 		return -1;
 
-	/* 2. Initialize page buffer */
-	if (cow_page_buffer_init())
+	/* 2. Initialize page buffer (uses g_page_buffer in uffd.c) */
+	if (page_buffer_init()) {
+		pr_err("Failed to initialize page buffer\n");
 		goto err_tasks;
+	}
 
 	/* 3. Daemonize if requested */
 	if (daemon) {
 		ret = cr_daemon(1, 0, -1);
 		if (ret == -1) {
 			pr_err("Can't run in the background\n");
-			goto err_buffer;
+			goto err_tasks;
 		}
 		if (ret > 0) {
 			/* Parent - daemon started successfully */
@@ -255,7 +152,7 @@ int cr_lazy_pages_cow_phase2(bool daemon)
 					pr_perror("Can't write pidfile");
 					kill(ret, SIGKILL);
 					waitpid(ret, NULL, 0);
-					goto err_buffer;
+					goto err_tasks;
 				}
 			}
 			return 0;
@@ -263,11 +160,11 @@ int cr_lazy_pages_cow_phase2(bool daemon)
 		/* Child continues */
 	}
 
-	/* 4. Set up epoll - just need page server socket */
-	nr_fds = 4;  /* page server + some margin */
+	/* 4. Set up epoll - page server + margin */
+	nr_fds = 4;
 	epollfd = epoll_prepare(nr_fds, &events);
 	if (epollfd < 0)
-		goto err_buffer;
+		goto err_tasks;
 
 	/* 5. Connect to page server */
 	if (connect_to_page_server_to_recv(epollfd)) {
@@ -275,7 +172,13 @@ int cr_lazy_pages_cow_phase2(bool daemon)
 		goto err_epoll;
 	}
 
-	/* 6. Request all pages for each discovered task */
+	/* 6. Set up async bulk reader (uses prebuffer_io_complete in uffd.c) */
+	if (setup_prebuffer_reader()) {
+		pr_err("Failed to setup prebuffer reader\n");
+		goto err_disconnect;
+	}
+
+	/* 7. Request all pages for each discovered task */
 	list_for_each_entry(ct, &cow_tasks, l) {
 		pr_info("Requesting all pages for pid=%d\n", ct->pid);
 		if (request_all_remote_pages(ct->pid) < 0) {
@@ -286,25 +189,22 @@ int cr_lazy_pages_cow_phase2(bool daemon)
 
 	pr_info("Waiting to receive pages from primary...\n");
 
-	/* 7. Event loop - receive and buffer pages */
+	/* 8. Event loop - receive and buffer pages */
 	ret = cow_phase2_handle_pages(epollfd, events, nr_fds);
 
-	pr_info("Phase 2 complete: buffered %lu pages (%lu bytes)\n",
-		cow_pages_buffered, cow_pages_total_bytes);
+	pr_info("Phase 2 complete\n");
 
 err_disconnect:
 	disconnect_from_page_server();
 err_epoll:
 	xfree(events);
-err_buffer:
-	cow_page_buffer_destroy();
 err_tasks:
 	free_cow_tasks();
 	return ret;
 }
 
 /*
- * Simple event loop for Phase 2 - just receive pages until done.
+ * Event loop for Phase 2 - receive pages until bulk transfer complete.
  */
 int cow_phase2_handle_pages(int epollfd, struct epoll_event *events, int nr_fds)
 {
@@ -325,14 +225,4 @@ int cow_phase2_handle_pages(int epollfd, struct epoll_event *events, int nr_fds)
 	}
 
 	return 0;
-}
-
-unsigned long cow_get_buffered_pages_count(void)
-{
-	return cow_pages_buffered;
-}
-
-unsigned long cow_get_buffered_pages_bytes(void)
-{
-	return cow_pages_total_bytes;
 }

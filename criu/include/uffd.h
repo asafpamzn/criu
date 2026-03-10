@@ -23,4 +23,10 @@ extern void store_pending_dirty_bitmap(unsigned long *ranges, unsigned int nr_ra
 /* Check if restore has connected (uffd available) */
 extern bool is_restore_connected(void);
 
+/* COW Phase 2: Initialize page buffer for pre-buffering */
+extern int page_buffer_init(void);
+
+/* COW Phase 2: Set up async bulk reader for pre-buffering pages */
+extern int setup_prebuffer_reader(void);
+
 #endif /* __CR_UFFD_H_ */

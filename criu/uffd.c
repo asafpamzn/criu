@@ -153,7 +153,7 @@ static inline unsigned int page_buffer_hash(unsigned long vaddr)
 	return (vaddr >> PAGE_SHIFT) & (PAGE_BUFFER_HASH_SIZE - 1);
 }
 
-static int page_buffer_init(void)
+int page_buffer_init(void)
 {
 	int i;
 
@@ -2467,7 +2467,7 @@ static int prebuffer_io_complete(unsigned long dst_id, unsigned long vaddr,
 	return 0;
 }
 
-static int setup_prebuffer_reader(void)
+int setup_prebuffer_reader(void)
 {
 	prebuffer_buf = xmalloc(PAGE_SIZE);
 	if (!prebuffer_buf)
