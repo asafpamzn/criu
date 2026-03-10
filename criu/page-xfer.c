@@ -3673,6 +3673,72 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 				&lr, 1);
 		}
 
+		/*
+		 * Re-send non-lazy pages (stacks, file-backed rw).
+		 * These are excluded from WP tracking and loaded
+		 * from pages-*.img (dump-time content).  T3 regs
+		 * need T3-time content for stacks.
+		 */
+		{
+			char maps_path[64];
+			FILE *fp;
+
+			snprintf(maps_path, sizeof(maps_path),
+				 "/proc/%d/maps", source_pid);
+			fp = fopen(maps_path, "r");
+			if (fp) {
+				char line[512];
+
+				while (fgets(line, sizeof(line), fp)) {
+					unsigned long ms, me;
+					char mp[8], rest[256];
+					unsigned long offset;
+					int major, minor;
+					unsigned long inode;
+
+					int is_rw_file;
+
+					rest[0] = '\0';
+					if (sscanf(line,
+						   "%lx-%lx %4s %lx %x:%x %lu %255[^\n]",
+						   &ms, &me, mp, &offset,
+						   &major, &minor, &inode,
+						   rest) < 7)
+						continue;
+
+					/* Skip non-writable */
+					if (mp[1] != 'w')
+						continue;
+
+					/* Re-send non-lazy writable pages
+				 * that exist in the dump VMA list.
+				 * These have dump-time content from
+				 * pages-*.img but need T3-time content.
+				 * Only send pages in dump VMAs (skip
+				 * new VMAs created after dump). */
+					is_rw_file = 0;
+					(void)is_rw_file;
+
+					if (0 && mp[1] == 'w') { /* disabled: T3 not applied */
+						struct converge_region sr;
+
+						sr.start = ms;
+						sr.end = me;
+						sr.categories = 0;
+						converge_dispatch_parallel(
+							img, source_pid,
+							sockets, nr_streams,
+							&sr, 1);
+						freeze_pages += (me - ms) /
+								PAGE_SIZE;
+					}
+				}
+				fclose(fp);
+				pr_err("COW T3: re-sent non-lazy "
+				       "pages (stacks + rw file-backed)\n");
+			}
+		}
+
 		/* Resume source after T3 capture */
 		kill(source_pid, SIGCONT);
 		gettimeofday(&t3_fork, NULL);

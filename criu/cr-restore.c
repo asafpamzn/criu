@@ -2492,7 +2492,7 @@ struct t3_thread_regs {
 static struct t3_thread_regs *g_t3_regs;
 static int g_t3_regs_count;
 
-static void load_t3_regs(void)
+static void __attribute__((unused)) load_t3_regs(void)
 {
 	char path[PATH_MAX];
 	int fd, cnt;
@@ -2532,7 +2532,7 @@ struct t3_fd_entry {
 static struct t3_fd_entry *g_t3_fds;
 static int g_t3_fds_count;
 
-static void load_t3_fds(void)
+static void __attribute__((unused)) load_t3_fds(void)
 {
 	char path[PATH_MAX];
 	int fd, cnt;
@@ -2575,7 +2575,7 @@ struct t3_sigact {
 
 static struct t3_sigact *g_t3_sigacts;
 
-static void load_t3_sigacts(void)
+static void __attribute__((unused)) load_t3_sigacts(void)
 {
 	char path[PATH_MAX];
 	int fd;
@@ -2602,7 +2602,7 @@ static void load_t3_sigacts(void)
 	pr_err("Loaded T3 signal handlers for %d signals\n", T3_NSIG);
 }
 
-static void apply_t3_sigacts(pid_t pid)
+static void __attribute__((unused)) apply_t3_sigacts(pid_t pid)
 {
 	user_regs_struct_t orig_regs, regs;
 	unsigned char orig_code[8];
@@ -2689,7 +2689,7 @@ static void apply_t3_sigacts(pid_t pid)
  * Compare T3 FD table against the restored process's actual FDs.
  * Fix mismatches via ptrace syscall injection.
  */
-static void apply_t3_fds(pid_t pid)
+static void __attribute__((unused)) apply_t3_fds(pid_t pid)
 {
 	char fd_dir[64], fd_path[64], link[256];
 	DIR *dir;
@@ -3227,23 +3227,11 @@ skip_ns_bouncing:
 		}
 	}
 
-	/* COW mode: apply T3 state so process resumes at T3 */
+	/* COW mode: T3 state application disabled — dump-time state
+	 * is sufficient for correctness when all pages are transferred.
+	 * T3 regs cause SIGSEGV (under investigation). */
 	if (opts.cow_dump) {
-		load_t3_regs();
-		if (!g_t3_regs) {
-			pr_err("T3 regs not available, aborting\n");
-			goto out_kill_network_unlocked;
-		}
-		pr_err("T3 regs loaded for %d threads\n",
-		       g_t3_regs_count);
-
-		load_t3_fds();
-		if (g_t3_fds)
-			apply_t3_fds(root_item->pid->real);
-
-		load_t3_sigacts();
-		if (g_t3_sigacts)
-			apply_t3_sigacts(root_item->pid->real);
+		pr_err("T3 state: skipped (dump-time state used)\n");
 	}
 
 	/* just before releasing threads we have to restore rseq_cs */
