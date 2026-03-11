@@ -2857,17 +2857,21 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 
 	pstree_switch_state(root_item, TASK_ALIVE);
 
-	/* Send dirty bitmap to replica so it can start Phase 3 restore */
-	if (opts.use_page_server) {
-		ret = send_cow_dirty_bitmap(dirty_ranges, nr_dirty_ranges);
-		if (ret) {
-			pr_err("Failed to send dirty bitmap to replica\n");
-			goto err;
-		}
-		pr_info("Dirty bitmap sent successfully\n");
-		/* Close the Phase 2 socket; convergence will open a new connection */
-		close_page_server_socket();
+	/*
+	 * Send dirty bitmap to replica so it can proceed with restore.
+	 * In COW phased migration, the socket was stored in page_server_sk
+	 * after receiving the bulk complete ACK.
+	 */
+	pr_info("Sending dirty bitmap to replica (%u ranges, %lu pages)\n",
+		nr_dirty_ranges, nr_dirty_pages);
+	ret = send_cow_dirty_bitmap(dirty_ranges, nr_dirty_ranges);
+	if (ret) {
+		pr_err("Failed to send dirty bitmap to replica\n");
+		goto err;
 	}
+	pr_info("Dirty bitmap sent successfully\n");
+	/* Close the Phase 2 socket; convergence will open a new connection */
+	close_page_server_socket();
 
 	/* === PHASE 5-6: Convergence === */
 	pr_info("=== PHASE 5-6: Convergence ===\n");

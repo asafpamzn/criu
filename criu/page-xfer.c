@@ -320,8 +320,12 @@ int send_cow_dirty_bitmap(unsigned long *ranges, unsigned int nr_ranges)
 {
 	struct pstree_item *item;
 
+	pr_info("send_cow_dirty_bitmap: page_server_sk=%d, nr_ranges=%u\n",
+		page_server_sk, nr_ranges);
+
 	if (page_server_sk < 0) {
-		pr_err("Page server not connected, cannot send dirty bitmap\n");
+		pr_err("Page server not connected (page_server_sk=%d), cannot send dirty bitmap\n",
+		       page_server_sk);
 		return -1;
 	}
 
@@ -2579,8 +2583,9 @@ static int page_server_serve(int sk)
 	 * Store the socket globally so send_cow_dirty_bitmap() can use it.
 	 */
 	if (bulk_ack_received) {
-		pr_info("Bulk ACK received, keeping socket open for dirty bitmap\n");
+		pr_info("Bulk ACK received, storing socket (sk=%d) for dirty bitmap\n", sk);
 		page_server_sk = sk;
+		pr_info("page_server_sk now set to %d\n", page_server_sk);
 		return 0;
 	}
 
