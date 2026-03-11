@@ -40,3 +40,8 @@ artifacts/
 # Compiled page-recv binary
 tools/page-recv
 FUTEX_DEADLOCK_RESEARCH.md
+
+# Generated eBPF files
+criu/bpf/dirty_track.skel.h
+criu/bpf/dirty_track.bpf.o
+criu/bpf/vmlinux.h
