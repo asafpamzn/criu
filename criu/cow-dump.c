@@ -1438,6 +1438,42 @@ int cow_dump_init_async(struct pstree_item *item,
 	if (cow_apply_writeprotect(cdi))
 		goto err;
 
+	/* DEBUG: Verify write protection was actually applied */
+	{
+		char path[64];
+		int pm_fd;
+		struct page_region check_reg;
+		struct pm_scan_arg check_args = {
+			.size = sizeof(struct pm_scan_arg),
+			.flags = 0,
+			.start = cdi->tracked_vmas[0].start,
+			.end = cdi->tracked_vmas[0].start + PAGE_SIZE,
+			.walk_end = cdi->tracked_vmas[0].start,
+			.vec = (u64)(unsigned long)&check_reg,
+			.vec_len = 1,
+			.max_pages = 1,
+			.category_anyof_mask = PAGE_IS_WPALLOWED | PAGE_IS_WRITTEN | PAGE_IS_PRESENT,
+			.return_mask = PAGE_IS_WPALLOWED | PAGE_IS_WRITTEN | PAGE_IS_PRESENT,
+		};
+		snprintf(path, sizeof(path), "/proc/%d/pagemap", cdi->source_pid);
+		pm_fd = open(path, O_RDONLY);
+		if (pm_fd >= 0) {
+			long n = ioctl(pm_fd, PAGEMAP_SCAN, &check_args);
+			if (n > 0) {
+				pr_info("DEBUG: First page 0x%lx categories=0x%llx "
+					"(WPALLOWED=%d WRITTEN=%d PRESENT=%d)\n",
+					(unsigned long)check_reg.start,
+					(unsigned long long)check_reg.categories,
+					!!(check_reg.categories & PAGE_IS_WPALLOWED),
+					!!(check_reg.categories & PAGE_IS_WRITTEN),
+					!!(check_reg.categories & PAGE_IS_PRESENT));
+			} else {
+				pr_info("DEBUG: No page regions found for first VMA\n");
+			}
+			close(pm_fd);
+		}
+	}
+
 	/*
 	 * Clear pre-existing PAGE_IS_WRITTEN bits so that the Phase 3
 	 * dirty scan only finds pages written during Phase 2 (while
@@ -1493,7 +1529,7 @@ int cow_scan_dirty_pages(unsigned long **dirty_ranges,
 		.vec_len = 1000,
 		.max_pages = 0,
 		.category_anyof_mask = PAGE_IS_WRITTEN,
-		.return_mask = PAGE_IS_WRITTEN,
+		.return_mask = PAGE_IS_WRITTEN | PAGE_IS_WPALLOWED,
 	};
 
 	if (!cdi) {
