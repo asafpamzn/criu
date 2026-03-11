@@ -1,12 +1,12 @@
 # CRIU COW Dump — Live Migration for Valkey
 
-Near-zero-downtime live migration using copy-on-write page tracking.
-23ms freeze, 1ms cutover, 200GB at 3.3 GB/s.
+Near-zero-downtime live migration using copy-on-write page tracking
+and eBPF dirty page detection. 44ms freeze, 200GB at 3.3 GB/s.
 
 ## Quick Start
 
 ```bash
-# Build on both machines
+# Build on both machines (requires clang, bpftool, libbpf-dev)
 make -j$(nproc)
 cd tools && gcc -O2 -o page-recv page-recv.c -llz4 -lpthread && cd ..
 sudo cp criu/criu /usr/local/sbin/criu
@@ -31,99 +31,106 @@ sudo env SKIP_FILL=1 KEEP_SOURCE_RUNNING=1 \
   Valkey running, serving clients
         │
   ┌─────▼──────────────────────┐
-  │  1. FREEZE (23ms)          │    ┌──────────────────────────┐
+  │  1. FREEZE (23-48ms)       │    ┌──────────────────────────┐
   │  - Seize process (ptrace)  │───▶│  Start restore.sh        │
   │  - Capture: VMAs, pagemap  │    │  CRIU restore + page-recv│
   │  - Setup WP tracking       │    └──────────────────────────┘
   │  - Resume (--leave-running)│
+  │  - eBPF attach (no gap)    │
   │  ◄ Valkey running again ►  │
   └─────┬──────────────────────┘
         │
   ┌─────▼──────────────────────┐    ┌──────────────────────────┐
   │  2. BULK TRANSFER (~60s)   │    │  RECEIVE                 │
-  │  - Fork COW snapshot       │───▶│  - 8 TCP streams         │
+  │  - Read from live source   │───▶│  - 8 TCP streams         │
   │  - 8 TCP streams, LZ4     │    │  - process_vm_writev     │
   │  - 3.3 GB/s throughput     │    │    into restored process │
   │  - Valkey still serving ►  │    │  - Restored Valkey is    │
-  │  (writes tracked by WP)    │    │    stopped (ptrace-trap) │
+  │  (writes tracked by eBPF)  │    │    stopped (ptrace-trap) │
   └─────┬──────────────────────┘    └──────────┬───────────────┘
         │                                      │
   ┌─────▼──────────────────────┐               │
-  │  3. CONVERGENCE (<2s)      │───────────────┘
-  │  - Fork snapshot (T1)      │    (sends dirty + T3 pages)
-  │  - SIGSTOP (T3)            │
-  │  - T3 register capture     │───▶  Saves t3_regs.dat
-  │  - libc rw- re-send        │───▶  Installs arena pages
+  │  3. T3 FREEZE (44ms)       │───────────────┘
+  │  - SIGSTOP source          │    (sends dirty + non-lazy pages)
+  │  - eBPF ring drain (~0ms)  │
+  │  - T3 state capture (10ms) │───▶  Saves t3_regs.dat, etc.
+  │  - Dirty pages dispatch    │───▶  Overwrites stale pages
+  │  - Non-lazy re-send (stacks│───▶  127 pages (stacks + .data)
+  │    + file-backed rw)       │
   │  - VMA diff (new mmaps)    │───▶  Injects mmap
   │  - SIGCONT source          │
   └─────┬──────────────────────┘
         │
   ┌─────▼──────────────────────┐    ┌──────────────────────────┐
-  │  4. CUTOVER (1ms)          │    │  CUTOVER                 │
-  │  - SIGSTOP source          │    │  - Apply T3 regs         │
-  │  - Send TCP "GO" ──────────│───▶│  - PTRACE_DETACH all     │
-  │  - SIGCONT source          │    │  - Valkey is live!       │
+  │  4. CUTOVER (0ms)          │    │  CUTOVER                 │
+  │  - Send TCP "GO" ──────────│───▶│  - Apply T3 registers    │
+  │  - No SIGSTOP needed       │    │  - PTRACE_DETACH all     │
+  │                            │    │  - Valkey is live!       │
   └────────────────────────────┘    └──────────────────────────┘
 ```
 
-### T3 Register Re-capture
+### eBPF Dirty Page Tracking
 
-The key innovation. Without it, registers are from dump time (T0) but
-memory is from T3 (60 seconds later) — every thread resumes at the wrong
-instruction. T3 re-capture fixes this:
+The key optimization. A BPF program hooks `fentry/do_wp_page` in the
+kernel, filtering by the target PID. Every write-protect fault pushes
+the faulting page address to a 64MB ring buffer.
 
-At the second freeze, `capture_and_send_t3_regs()` does PTRACE_SEIZE +
-PTRACE_GETREGSET on every thread, sends the registers to the replica.
-The replica applies them via PTRACE_SETREGSET before detach. Registers
-match T3 memory — deterministic 7/7.
+At T3, the page server drains the ring in microseconds — O(dirty_pages)
+instead of walking all 50M+ page table entries with PAGEMAP_SCAN
+(O(total_pages), ~150ms). This reduced T3 freeze from 170ms to 44ms.
 
-**Critical detail**: libc's rw- data segment is file-backed (not
-MAP_ANONYMOUS), so WP never tracks it. The explicit 2-page re-send from
-the frozen source is the only mechanism that delivers arena state.
+**Critical**: BPF attaches immediately after WP in `cr-dump.c` (zero
+gap). Any gap causes missed dirty pages → futex deadlock on replica.
+
+### Non-lazy Page Re-send
+
+Stacks and file-backed rw segments (.data/.bss of libc, ld.so, etc.)
+are not WP-tracked. They're re-sent from the frozen source at T3 for
+memory consistency. 127 pages (508KB) total.
 
 ### What Gets Transferred
 
 | Resource | How |
 |----------|-----|
-| Memory (heap, stack, mmap) | 8-stream bulk + convergence via page-recv |
-| CPU registers | T3 re-capture via PTRACE_SETREGSET |
+| Memory (heap, mmap) | 8-stream bulk + eBPF convergence via page-recv |
+| Stacks + lib .data | Non-lazy re-send from frozen source at T3 |
+| CPU registers | T3 capture + apply via PTRACE_SETREGSET |
 | File descriptors | CRIU image files |
 | TCP sockets | Closed (`--tcp-close`), clients reconnect |
-| Signal handlers, thread state | CRIU image files, restored via sigreturn |
-| New VMAs (jemalloc extents) | VMA diff protocol + ptrace mmap injection |
+| Signal handlers | T3 capture via parasite RPC |
+| New VMAs (jemalloc) | VMA diff protocol + ptrace mmap injection |
 
 ## Performance
 
 Tested on m7g.16xlarge (494GB RAM, 64 CPUs), same-AZ VPC.
 
-| Test | Size | Transfer | Throughput | Freeze | Cutover | Result |
-|------|------|----------|------------|--------|---------|--------|
-| Quiesced | 200GB | 62s | 3159 MB/s | 68ms | 1ms | **7/7** |
-| Live traffic | 200GB | 63s | 3279 MB/s | 68ms | 1ms | **7/7** |
-| Live + heavy bench | 100GB | 32s | 3054 MB/s | 68ms | 1ms | **7/7** |
+| Test | Size | Transfer | Throughput | Freeze | Result |
+|------|------|----------|------------|--------|--------|
+| Live traffic | 100GB | 30s | 3,233 MB/s | 44ms | **7/7** |
+| Live traffic | 200GB | 59s | 3,313 MB/s | 43ms | **6/7** (BGSAVE=disk) |
 
-**Source unavailability: 15ms dump + 52ms T3 + 1ms cutover = 68ms total.**
+**Source unavailability: 44ms** (T3 SIGSTOP→SIGCONT).
 
-### Stage Timing (60GB + live traffic)
+### Stage Timing (100GB + live traffic)
 
 | Stage | Duration | Notes |
 |-------|----------|-------|
-| Freeze (dump_one_task) | 15 ms | Seize + pagemap + parasite |
-| WP setup (post-resume) | 56 ms | 3120 ranges, WP_ASYNC |
-| Bulk transfer (8 streams) | ~20 s | LZ4, process_vm_readv |
-| T3 freeze (convergence) | **52 ms** | Sigacts 7ms + regs <1ms + FDs <1ms + dirty read |
-| Cutover | 1 ms | SIGSTOP → TCP "GO" |
-| **Total source frozen** | **68 ms** | 15ms dump + 52ms T3 + 1ms cutover |
+| Freeze (dump_one_task) | 23 ms | Seize + pagemap + parasite |
+| WP setup (post-resume) | 27 ms | WP_ASYNC, not frozen |
+| eBPF attach | 0 ms | Immediately after WP |
+| Bulk transfer (8 streams) | 30 s | LZ4, process_vm_readv |
+| T3 freeze | **44 ms** | eBPF drain + state capture + dispatch |
+| Cutover | 0 ms | TCP "GO", no SIGSTOP |
+| **Total source frozen** | **44 ms** | T3 only (dump is separate) |
 
 ### vs REPLICAOF
 
 | Metric | COW Migration | REPLICAOF |
 |--------|--------------|-----------|
-| 200GB transfer | **63s** | >20min (62GB incomplete) |
+| 200GB transfer | **59s** | >20min |
 | Throughput | **3.3 GB/s** | ~500 MB/s |
-| Source freeze | **23ms** | ~200ms (BGSAVE fork) |
-| Replica downtime | **24ms** | Entire sync duration |
-| Memory spike | None | 2× RSS (fork COW) |
+| Source freeze | **44ms** | ~1.7s (BGSAVE fork) |
+| Source memory spike | None | 2× RSS (fork COW) |
 
 ## Verification Tests (7/7)
 
@@ -135,58 +142,27 @@ Tested on m7g.16xlarge (494GB RAM, 64 CPUs), same-AZ VPC.
 6. **BGSAVE success** — heap consistent, no corruption
 7. **RANDOMKEY type check** — can read and identify key types
 
-## Running
-
-### CRIU Commands (inside migrate.sh / restore.sh)
-
-**Source:**
-```bash
-criu dump \
-  --tree $PID --images-dir /tmp/criu-images \
-  --cow-dump --lazy-pages \
-  --address $SOURCE_IP --port 9002 \
-  --serve-images 9005 \
-  --tcp-close --skip-in-flight --ext-unix-sk \
-  --leave-running --freeze-cgroup $CGROUP \
-  --display-stats
-```
-
-**Replica:**
-```bash
-criu restore \
-  --images-dir /tmp/criu-images \
-  --fetch-images $SOURCE_IP:9005 \
-  --lazy-pages --tcp-close --cow-dump \
-  --restore-detached --leave-stopped \
-  --skip-file-rwx-check --file-validation filesize
-```
-
-### Ports
-
-| Port | Purpose |
-|------|---------|
-| 9002 | Page server (8-stream bulk transfer) |
-| 9003 | Cutover "GO" signal |
-| 9004 | Staged signal (page-recv → source) |
-| 9005 | CRIU image file transfer |
-
 ## Key Files
 
 | File | Role |
 |------|------|
+| `criu/bpf/dirty_track.bpf.c` | eBPF program (fentry/do_wp_page) |
+| `criu/cow-bpf.c` | eBPF userspace: load, drain, stop |
+| `criu/page-xfer.c` | Page server, 8-stream bulk, T3 capture |
+| `criu/cow-dump.c` | WP_ASYNC tracking, userfaultfd injection |
+| `criu/cr-dump.c` | Dump orchestration, early resume, BPF start |
+| `criu/cr-restore.c` | Restore, T3 state loading |
+| `tools/page-recv.c` | Standalone receiver, process_vm_writev |
 | `scripts/migrate.sh` | Source orchestration |
 | `scripts/restore.sh` | Replica orchestration |
 | `scripts/verify-migration.sh` | 7-test verification suite |
-| `criu/page-xfer.c` | Page server, 8-stream bulk, convergence, T3 capture |
-| `criu/cow-dump.c` | WP_ASYNC tracking, userfaultfd injection |
-| `criu/cr-dump.c` | Dump orchestration, early resume |
-| `criu/cr-restore.c` | Restore, T3 reg application, VMA injection |
-| `tools/page-recv.c` | Standalone receiver, process_vm_writev |
 
 ## Requirements
 
-- Linux kernel 6.1+ (userfaultfd WP_ASYNC requires 6.7+)
+- Linux kernel 6.7+ (userfaultfd WP_ASYNC + PAGEMAP_SCAN)
 - `sysctl vm.unprivileged_userfaultfd=1`
+- `/sys/kernel/btf/vmlinux` (BTF for eBPF)
+- clang, bpftool, libbpf-dev (eBPF build toolchain)
 - aarch64 or x86_64
 - Both machines reachable over TCP
 
@@ -198,22 +174,25 @@ echo 1 | sudo tee /proc/sys/vm/unprivileged_userfaultfd
 ```
 
 ### Disk full on replica during BGSAVE
-The REPLICAOF command triggers a full sync RDB write. Disable saves:
-```bash
-valkey-cli config set save ""
-```
+BGSAVE forks the process — needs RSS + RDB file space. For large
+datasets, ensure replica disk > 2× dataset size.
 
-### Replica accepts writes
-The `wait_and_replicate.sh` script sets `REPLICAOF` which makes the
-replica read-only. If this didn't run, manually:
-```bash
-valkey-cli replicaof $SOURCE_IP 6379
-```
+### Replica io-threads config
+The replica's `/etc/valkey/valkey.conf` must match the source's
+`io-threads` setting. Mismatch can cause restore issues.
+
+### BPF fails to attach
+Requires `CAP_BPF` (or root) and BTF kernel support. Falls back to
+PAGEMAP_SCAN if BPF attach fails, but this may cause futex deadlock
+on the replica due to missed dirty pages.
 
 ## Limitations
 
-1. **Transfer speed**: ~3.3 GB/s, limited by `process_vm_readv` bandwidth.
+1. **Transfer speed**: ~3.3 GB/s, limited by `process_vm_readv`.
 2. **Replica RAM**: must fit the full dataset.
-3. **Client connections**: closed on dump (`--tcp-close`), clients reconnect.
-4. **x86_64**: tested on aarch64. x86_64 expected to work (T3 regs have
-   x86 paths) but not yet validated at scale.
+3. **Client connections**: closed on dump (`--tcp-close`).
+4. **x86_64**: tested on aarch64. x86_64 expected to work but not yet
+   validated at scale.
+5. **aarch64 only**: T3 register application uses a glibc-specific
+   fix (x0→x19 for interrupted syscalls). x86_64 will need an
+   equivalent for `orig_rax`.

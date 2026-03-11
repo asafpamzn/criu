@@ -14,9 +14,11 @@ Valkey (running)                                     page-recv (standalone, 8 st
   │                                                      │
 CRIU dump process                                        CRIU restore
   ├─ parasite RPC: create UFFD + register VMAs (WP)         ├─ fork process tree, map VMAs
-  ├─ apply UFFDIO_WRITEPROTECT (WP_ASYNC, post-resume)      ├─ apply T3 registers
-  ├─ page server: 8-stream bulk + convergence + T3 regs     └─ detach threads
-  └─ fork snapshot for consistent bulk read
+  ├─ apply UFFDIO_WRITEPROTECT (WP_ASYNC, post-resume)      ├─ apply T3 registers (PTRACE_SETREGSET)
+  ├─ eBPF attach (fentry/do_wp_page, zero gap after WP)     └─ detach threads
+  ├─ page server: 8-stream bulk (from live source)
+  ├─ T3: SIGSTOP → eBPF drain → state capture → SIGCONT
+  └─ VMA diff detection + send
 ```
 
 ## Dump-Side Flow (Source)
@@ -52,53 +54,72 @@ cr_dump_tasks()
        UFFDIO_WRITEPROTECT in 256MB chunks, worker threads
 ```
 
-### 2. Bulk Transfer (~60s for 200GB)
+### 2. eBPF Dirty Tracker (attached right after WP)
 
-**File**: `criu/page-xfer.c`, function `unified_page_server_thread()`
+**Files**: `criu/cr-dump.c` (attach), `criu/cow-bpf.c` (userspace),
+`criu/bpf/dirty_track.bpf.c` (kernel)
+
+```
+cr_dump_tasks()
+  └─ after WP applied + process resumed:
+       cow_bpf_start(pid)
+         ├─ dirty_track_bpf__open()
+         ├─ set rodata->target_pid
+         ├─ dirty_track_bpf__load() + __attach()
+         └─ fentry/do_wp_page hook active
+              Filters by PID, pushes page address to 64MB ring buffer
+              O(1) per fault, no userspace involvement until drain
+```
+
+### 3. Bulk Transfer (~60s for 200GB)
+
+**File**: `criu/page-xfer.c`, function `page_server_serve()`
 
 ```
 page_server_serve()
   └─ Multi-TCP section
-       ├─ fork_source_snapshot(source_pid)
-       │    PTRACE_SEIZE → inject clone() → fork child
-       │    Creates COW fork for consistent bulk read (T0)
-       │
        ├─ 8 stream worker threads  [stream_worker_func]
        │    Each reads assigned VMA ranges via process_vm_readv
+       │    Reads directly from live source (no fork)
        │    Compresses with LZ4, sends over TCP
-       │    VMAs > pages_per_worker are pre-split across workers
        │
        └─ Signal bulk_send_done
 ```
 
-### 3. Convergence
+No fork snapshot — WP_ASYNC ensures pages read before any write
+have dump-time content. Dirty pages are re-sent at T3.
+
+### 4. T3 Freeze + Convergence (~44ms)
 
 **File**: `criu/page-xfer.c`, function `cow_converge_dirty_pages_parallel()`
 
 ```
 cow_converge_dirty_pages_parallel()
   │
-  ├─ Fork T1 convergence snapshot
-  │    Source briefly SIGSTOP'd, fork, SIGCONT
-  │    Reads dirty pages from fork (T1 consistency)
+  ├─ kill(source_pid, SIGSTOP)
   │
-  ├─ Pre-freeze dirty scan (source running)
-  │    PAGEMAP_SCAN finds dirty pages (~20 pages at T3)
+  ├─ eBPF ring drain (cow_bpf_drain)         ~0ms
+  │    Sort + dedup + coalesce → region list
+  │    94-230 dirty pages typical
   │
-  ├─ T3 freeze (52ms total, no fork)
-  │    kill(source_pid, SIGSTOP)
-  │    ├─ Signal handlers via parasite re-inject (7ms)
-  │    ├─ Registers via PTRACE_GETREGSET (<1ms)
-  │    ├─ FD table from /proc/pid/fd (<1ms)
-  │    ├─ Dirty pages from frozen source (<1ms)
-  │    ├─ libc rw- re-send (<1ms)
-  │    └─ SIGCONT
+  ├─ T3 state capture
+  │    ├─ Signal handlers via parasite re-inject    ~10ms
+  │    ├─ Registers via PTRACE_GETREGSET            <1ms
+  │    └─ FD table from /proc/pid/fd                <1ms
   │
-  ├─ VMA diff detection (source running)
-  │    Scan /proc/pid/maps for new VMAs
-  │    Send PS_IOV_VMA_DIFF to replica
+  ├─ Dirty page dispatch (from frozen source)       ~10ms
+  │    process_vm_readv → LZ4 → TCP (8 streams)
   │
-  └─ SIGCONT source
+  ├─ Non-lazy re-send (stacks + lib .data/.bss)     ~5ms
+  │    127 pages (508KB) — file-backed rw + [stack]
+  │
+  ├─ libc rw- re-send                               <1ms
+  │
+  ├─ kill(source_pid, SIGCONT)
+  │
+  └─ VMA diff detection (source running)
+       Scan /proc/pid/maps for new VMAs
+       Send PS_IOV_VMA_DIFF to replica
 ```
 
 ### 4. T3 Register Re-capture

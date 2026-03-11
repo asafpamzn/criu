@@ -76,13 +76,8 @@ for _ in $(seq 1 6000); do timeout 1s valkey-cli ping &>/dev/null && break; slee
 timeout 1s valkey-cli ping &>/dev/null || { echo "ERROR: Valkey not responsive"; exit 1; }
 echo "Valkey is up"
 
-# --- 7. Configure as replica ---
+# --- 7. Post-restore config (no REPLICAOF — CRIU transferred all data) ---
 "$SCRIPT_DIR/wait_and_replicate.sh"
-
-# Verify READONLY
-for _ in $(seq 1 2000); do
-  valkey-cli -p "$VALKEY_PORT" set __probe__ 1 2>&1 | grep -qi "READONLY" && break; sleep 0.01
-done
 
 # Open to external clients
 sudo iptables -D INPUT -p tcp --dport "$VALKEY_PORT" ! -s 127.0.0.1 -j REJECT 2>/dev/null || true

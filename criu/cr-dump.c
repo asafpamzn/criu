@@ -66,6 +66,7 @@
 #include "mem.h"
 #include "page-pipe.h"
 #include "cow-dump.h"
+#include "cow-bpf.h"
 #include "posix-timer.h"
 #include "vdso.h"
 #include "vma.h"
@@ -2580,6 +2581,12 @@ int cr_dump_tasks(pid_t pid)
 				pr_err("Post-unfreeze WP failed\n");
 				goto err;
 			}
+
+			/* Start eBPF dirty tracker immediately
+			 * after WP — no gap for missed writes. */
+			if (cow_bpf_start(root_item->pid->real) == 0)
+				pr_err("BPF dirty tracker started "
+				       "(no gap after WP)\n");
 		}
 
 		/* Write deferred thread core images (off critical path) */

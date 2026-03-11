@@ -38,6 +38,7 @@
 #include "tls.h"
 #include "uffd.h"
 #include "cow-dump.h"
+#include "cow-bpf.h"
 #include "image-xfer.h"
 #include "criu-plugin.h"
 #include "plugin.h"
@@ -3539,6 +3540,99 @@ static long converge_dispatch_parallel(struct active_image *img,
  * Multi-stream convergence: distribute dirty page re-sends across
  * all TCP streams with vaddr hash affinity.
  */
+/*
+ * Cgroup-freeze: freezes at syscall boundaries (clean state).
+ * Returns path to cgroup.freeze file, or NULL on failure.
+ */
+static char g_cgroup_freeze_path[PATH_MAX];
+
+static bool __attribute__((unused)) cgroup_freeze(pid_t pid)
+{
+	char cgroup_buf[256];
+	char path[PATH_MAX];
+	char events[256];
+	FILE *fp;
+	int fd, i;
+
+	snprintf(path, sizeof(path), "/proc/%d/cgroup", pid);
+	fp = fopen(path, "r");
+	if (!fp)
+		return false;
+	if (!fgets(cgroup_buf, sizeof(cgroup_buf), fp)) {
+		fclose(fp);
+		return false;
+	}
+	fclose(fp);
+
+	/* Parse "0::/system.slice/valkey-server.service\n" */
+	{
+		char *p = strchr(cgroup_buf, ':');
+
+		if (!p)
+			return false;
+		p = strchr(p + 1, ':');
+		if (!p)
+			return false;
+		p++; /* skip second ':' */
+		/* Trim newline */
+		{
+			char *nl = strchr(p, '\n');
+
+			if (nl)
+				*nl = '\0';
+		}
+		snprintf(g_cgroup_freeze_path, sizeof(g_cgroup_freeze_path),
+			 "/sys/fs/cgroup%s/cgroup.freeze", p);
+	}
+
+	fd = open(g_cgroup_freeze_path, O_WRONLY);
+	if (fd < 0) {
+		pr_perror("cgroup_freeze: open %s", g_cgroup_freeze_path);
+		return false;
+	}
+	if (write(fd, "1", 1) != 1) {
+		pr_perror("cgroup_freeze: write");
+		close(fd);
+		return false;
+	}
+	close(fd);
+
+	/* Wait for frozen state (check cgroup.events) */
+	snprintf(path, sizeof(path), "%.*s/cgroup.events",
+		 (int)(strrchr(g_cgroup_freeze_path, '/') -
+			g_cgroup_freeze_path),
+		 g_cgroup_freeze_path);
+	for (i = 0; i < 1000; i++) {
+		fp = fopen(path, "r");
+		if (fp) {
+			while (fgets(events, sizeof(events), fp)) {
+				if (strstr(events, "frozen 1")) {
+					fclose(fp);
+					return true;
+				}
+			}
+			fclose(fp);
+		}
+		usleep(100);
+	}
+	pr_err("cgroup_freeze: timeout waiting for frozen state\n");
+	return false;
+}
+
+static void __attribute__((unused)) cgroup_unfreeze(void)
+{
+	int fd;
+
+	if (!g_cgroup_freeze_path[0])
+		return;
+	fd = open(g_cgroup_freeze_path, O_WRONLY);
+	if (fd < 0)
+		return;
+	if (write(fd, "0", 1) != 1)
+		pr_perror("cgroup_unfreeze: write");
+	close(fd);
+}
+
 static int cow_converge_dirty_pages_parallel(struct active_image *img,
 					     pid_t source_pid,
 					     int *sockets, int nr_streams)
@@ -3565,74 +3659,127 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 		struct timeval t3_start, t3_fork, t3_delta;
 
 		/*
-		 * T3 freeze: SIGSTOP → scan → capture → dispatch.
+		 * T3 freeze: SIGSTOP → dirty scan → capture → dispatch.
+		 * (cgroup-freeze blocks process_vm_readv, so SIGSTOP
+		 * is required for reading pages from the frozen source.)
 		 *
-		 * Dirty scan MUST be inside the SIGSTOP window:
-		 * cow_scan_dirty_pages uses PM_SCAN_WP_MATCHING
-		 * which clears the write-protect marker. A pre-scan
-		 * while live would lose writes between scan and
-		 * SIGSTOP (WP already cleared → not re-tracked).
+		 * Two paths for dirty scan:
+		 * (a) eBPF ring drain — O(dirty), microseconds
+		 * (b) PAGEMAP_SCAN fallback — O(total_pages), ~150ms
 		 */
 		kill(source_pid, SIGSTOP);
 		usleep(1000);
 		gettimeofday(&t3_start, NULL);
 
-		list_for_each_entry(lve, get_global_lazy_vmas(), list) {
-			unsigned long scan_pos;
+		if (cow_bpf_active()) {
+			/*
+			 * eBPF path: drain the ring buffer collected
+			 * since bulk transfer start. O(dirty_pages).
+			 *
+			 * The ring may contain duplicates (same page
+			 * faulted multiple times) — drain dedup's and
+			 * coalesces into contiguous regions.
+			 */
+			struct cow_bpf_region *bpf_regions;
+			int bpf_nr;
 
-			if (lve->dst_id != img->dst_id)
-				continue;
-
-			scan_pos = lve->start;
-			while (scan_pos < lve->end) {
-				unsigned long walk_end = 0;
-				int nr_regions, r;
-
-				nr_regions = cow_scan_dirty_pages(
-					source_pid, scan_pos, lve->end,
-					regions, CONVERGE_MAX_REGIONS,
-					&walk_end);
-				if (nr_regions <= 0)
-					break;
-
-				if (freeze_dirty_count + nr_regions > freeze_dirty_cap) {
-					int new_cap = (freeze_dirty_cap + nr_regions) * 2;
-					struct converge_region *tmp;
-					tmp = xrealloc(freeze_dirty,
-						       new_cap * sizeof(*tmp));
-					if (!tmp)
-						break;
-					freeze_dirty = tmp;
-					freeze_dirty_cap = new_cap;
+			bpf_regions = xmalloc(CONVERGE_MAX_REGIONS *
+					      sizeof(*bpf_regions));
+			if (bpf_regions) {
+				bpf_nr = cow_bpf_drain(bpf_regions,
+						       CONVERGE_MAX_REGIONS,
+						       &freeze_pages);
+				if (bpf_nr > 0) {
+					freeze_dirty = xmalloc(bpf_nr *
+						sizeof(*freeze_dirty));
+					if (freeze_dirty) {
+						int r;
+						for (r = 0; r < bpf_nr; r++) {
+							freeze_dirty[r].start =
+								bpf_regions[r].start;
+							freeze_dirty[r].end =
+								bpf_regions[r].end;
+							freeze_dirty[r].categories = 0;
+						}
+						freeze_dirty_count = bpf_nr;
+					}
 				}
-				for (r = 0; r < nr_regions; r++) {
-					freeze_dirty[freeze_dirty_count++] = regions[r];
-					freeze_pages += (regions[r].end - regions[r].start)
-							/ PAGE_SIZE;
-				}
-
-				scan_pos = walk_end;
-				if (walk_end >= lve->end)
-					break;
+				xfree(bpf_regions);
 			}
+
+			pr_err("COW T3 dirty scan (eBPF): %lu dirty pages "
+			       "(%d regions, %llu total events)\n",
+			       freeze_pages, freeze_dirty_count,
+			       (unsigned long long)cow_bpf_event_count());
+
+			cow_bpf_stop();
+		} else {
+			/*
+			 * PAGEMAP_SCAN fallback.
+			 * Dirty scan MUST be inside the SIGSTOP window:
+			 * cow_scan_dirty_pages uses PM_SCAN_WP_MATCHING
+			 * which clears the write-protect marker.
+			 */
+			list_for_each_entry(lve, get_global_lazy_vmas(), list) {
+				unsigned long scan_pos;
+
+				if (lve->dst_id != img->dst_id)
+					continue;
+
+				scan_pos = lve->start;
+				while (scan_pos < lve->end) {
+					unsigned long walk_end = 0;
+					int nr_regions, r;
+
+					nr_regions = cow_scan_dirty_pages(
+						source_pid, scan_pos, lve->end,
+						regions, CONVERGE_MAX_REGIONS,
+						&walk_end);
+					if (nr_regions <= 0)
+						break;
+
+					if (freeze_dirty_count + nr_regions >
+					    freeze_dirty_cap) {
+						int new_cap =
+							(freeze_dirty_cap +
+							 nr_regions) * 2;
+						struct converge_region *tmp;
+
+						tmp = xrealloc(freeze_dirty,
+							new_cap *
+							sizeof(*tmp));
+						if (!tmp)
+							break;
+						freeze_dirty = tmp;
+						freeze_dirty_cap = new_cap;
+					}
+					for (r = 0; r < nr_regions; r++) {
+						freeze_dirty[freeze_dirty_count++] =
+							regions[r];
+						freeze_pages +=
+							(regions[r].end -
+							 regions[r].start) /
+							PAGE_SIZE;
+					}
+
+					scan_pos = walk_end;
+					if (walk_end >= lve->end)
+						break;
+				}
+			}
+
+			pr_err("COW T3 dirty scan (PAGEMAP_SCAN): %lu dirty "
+			       "pages (%d regions)\n",
+			       freeze_pages, freeze_dirty_count);
 		}
 
-		pr_err("COW T3 dirty scan: %lu dirty pages "
-		       "(%d regions)\n", freeze_pages, freeze_dirty_count);
-
-		{
-
-		/* T3 full state capture */
+		/* T3 full state capture.
+		 * IMPORTANT: capture registers BEFORE sigacts,
+		 * because sigacts injects a parasite that modifies
+		 * thread registers. Regs must be the original
+		 * SIGSTOP-time values (at syscall boundaries). */
 		{
 			struct timeval ts, te, td;
-
-			gettimeofday(&ts, NULL);
-			capture_and_send_t3_sigacts(
-				source_pid, sockets[0], img->dst_id);
-			gettimeofday(&te, NULL);
-			timersub(&te, &ts, &td);
-			pr_err("COW T3 sigacts: %ldms\n",
-			       td.tv_sec * 1000 + td.tv_usec / 1000);
 
 			gettimeofday(&ts, NULL);
 			capture_and_send_t3_regs(
@@ -3648,6 +3795,14 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 			gettimeofday(&te, NULL);
 			timersub(&te, &ts, &td);
 			pr_err("COW T3 FDs: %ldms\n",
+			       td.tv_sec * 1000 + td.tv_usec / 1000);
+
+			gettimeofday(&ts, NULL);
+			capture_and_send_t3_sigacts(
+				source_pid, sockets[0], img->dst_id);
+			gettimeofday(&te, NULL);
+			timersub(&te, &ts, &td);
+			pr_err("COW T3 sigacts: %ldms\n",
 			       td.tv_sec * 1000 + td.tv_usec / 1000);
 		}
 
@@ -3674,14 +3829,21 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 		}
 
 		/*
-		 * Re-send non-lazy pages (stacks, file-backed rw).
-		 * These are excluded from WP tracking and loaded
-		 * from pages-*.img (dump-time content).  T3 regs
-		 * need T3-time content for stacks.
+		 * Re-send non-WP-tracked writable pages from
+		 * frozen source. These have dump-time content
+		 * from pages-*.img but need T3-time content
+		 * for state consistency (stacks, file-backed
+		 * rw like libc .data/.bss, ld.so .data, etc.).
+		 *
+		 * WP-tracked pages are handled by the eBPF
+		 * dirty scan above. Only re-send VMAs that
+		 * exist in the dump AND are not WP-tracked.
 		 */
 		{
 			char maps_path[64];
 			FILE *fp;
+			unsigned long nonlazy_pages = 0;
+			int nonlazy_vmas = 0;
 
 			snprintf(maps_path, sizeof(maps_path),
 				 "/proc/%d/maps", source_pid);
@@ -3691,52 +3853,69 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 
 				while (fgets(line, sizeof(line), fp)) {
 					unsigned long ms, me;
-					char mp[8], rest[256];
-					unsigned long offset;
-					int major, minor;
-					unsigned long inode;
+					char mp[8];
+					struct converge_region sr;
 
-					int is_rw_file;
-
-					rest[0] = '\0';
 					if (sscanf(line,
-						   "%lx-%lx %4s %lx %x:%x %lu %255[^\n]",
-						   &ms, &me, mp, &offset,
-						   &major, &minor, &inode,
-						   rest) < 7)
+						   "%lx-%lx %4s",
+						   &ms, &me, mp) < 3)
 						continue;
 
-					/* Skip non-writable */
 					if (mp[1] != 'w')
 						continue;
 
-					/* Re-send non-lazy writable pages
-				 * that exist in the dump VMA list.
-				 * These have dump-time content from
-				 * pages-*.img but need T3-time content.
-				 * Only send pages in dump VMAs (skip
-				 * new VMAs created after dump). */
-					is_rw_file = 0;
-					(void)is_rw_file;
+					/* Only re-send stacks and file-backed
+					 * rw VMAs (.data/.bss segments).
+					 * Skip anonymous heap VMAs — those
+					 * are WP-tracked, their dirty pages
+					 * handled by eBPF above. Anonymous
+					 * VMAs not in the WP list may be
+					 * post-dump allocations (jemalloc
+					 * retained arenas) that don't exist
+					 * on the replica → Bad address. */
+					{
+						unsigned long ino = 0;
+						char rest[256];
+						unsigned long d;
+						int d1, d2;
 
-					if (0 && mp[1] == 'w') { /* disabled: T3 not applied */
-						struct converge_region sr;
+						rest[0] = '\0';
+						if (sscanf(line,
+							   "%lx-%lx %4s %lx %x:%x %lu %255[^\n]",
+							   &ms, &me, mp,
+							   &d, &d1, &d2,
+							   &ino, rest) < 7)
+							continue;
 
-						sr.start = ms;
-						sr.end = me;
-						sr.categories = 0;
-						converge_dispatch_parallel(
-							img, source_pid,
-							sockets, nr_streams,
-							&sr, 1);
-						freeze_pages += (me - ms) /
-								PAGE_SIZE;
+						/* Only re-send file-backed
+						 * (inode > 0) or stacks.
+						 * Skip CRIU memfds. */
+						if (strstr(rest, "CRIUMFD") != NULL)
+							continue;
+						if (ino == 0 &&
+						    strstr(rest, "[stack") == NULL)
+							continue;
+						/* Skip shared mappings (s flag) */
+						if (mp[3] == 's')
+							continue;
 					}
+
+					sr.start = ms;
+					sr.end = me;
+					sr.categories = 0;
+					converge_dispatch_parallel(
+						img, source_pid,
+						sockets, nr_streams,
+						&sr, 1);
+					nonlazy_pages += (me - ms) /
+							 PAGE_SIZE;
+					nonlazy_vmas++;
 				}
 				fclose(fp);
-				pr_err("COW T3: re-sent non-lazy "
-				       "pages (stacks + rw file-backed)\n");
 			}
+			pr_err("COW T3: re-sent %lu non-lazy pages "
+			       "(%d VMAs: stacks + rw file-backed)\n",
+			       nonlazy_pages, nonlazy_vmas);
 		}
 
 		/* Resume source after T3 capture */
@@ -3908,8 +4087,6 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 		/* Source already SIGCONT'd after T3 capture */
 		xfree(freeze_dirty);
 	} /* end freeze block */
-
-	}
 
 	xfree(regions);
 	return 0;
@@ -4162,9 +4339,8 @@ static void *unified_page_server_thread(void *arg)
 
 				/*
 				 * No bulk fork in WP_ASYNC mode.
-				 * WP tracking + PAGEMAP_SCAN detects
-				 * all dirty pages — convergence re-sends
-				 * any pages modified during bulk transfer.
+				 * eBPF dirty tracker started in cr-dump.c
+				 * right after WP (no gap for missed writes).
 				 * Workers read directly from live source.
 				 */
 				{

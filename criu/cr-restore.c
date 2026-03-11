@@ -2492,7 +2492,7 @@ struct t3_thread_regs {
 static struct t3_thread_regs *g_t3_regs;
 static int g_t3_regs_count;
 
-static void __attribute__((unused)) load_t3_regs(void)
+static void load_t3_regs(void)
 {
 	char path[PATH_MAX];
 	int fd, cnt;
@@ -2532,7 +2532,7 @@ struct t3_fd_entry {
 static struct t3_fd_entry *g_t3_fds;
 static int g_t3_fds_count;
 
-static void __attribute__((unused)) load_t3_fds(void)
+static void load_t3_fds(void)
 {
 	char path[PATH_MAX];
 	int fd, cnt;
@@ -2575,7 +2575,7 @@ struct t3_sigact {
 
 static struct t3_sigact *g_t3_sigacts;
 
-static void __attribute__((unused)) load_t3_sigacts(void)
+static void load_t3_sigacts(void)
 {
 	char path[PATH_MAX];
 	int fd;
@@ -2850,6 +2850,15 @@ static int finalize_restore_detach(void)
 				gp_regs.sp = g_t3_regs[i].sp;
 				gp_regs.pc = g_t3_regs[i].pc;
 				gp_regs.pstate = g_t3_regs[i].pstate;
+
+				/* SIGSTOP sets x0 = -EINTR for interrupted
+				 * syscalls. PTRACE_SETREGSET can't set
+				 * orig_x0, so the kernel re-executes the
+				 * SVC with x0 as the first arg. Restore
+				 * the original arg from x19 (glibc saves
+				 * it in the callee-saved register). */
+				if ((long)gp_regs.regs[0] < 0)
+					gp_regs.regs[0] = gp_regs.regs[19];
 #endif
 				gp_iov.iov_base = &gp_regs;
 				gp_iov.iov_len = sizeof(gp_regs);
@@ -2874,6 +2883,10 @@ static int finalize_restore_detach(void)
 			if (pid == item->pid->real)
 				main_idx = i;
 		}
+
+		/* T3 FDs and sigacts: skip injection for now.
+		 * FDs match (10/12), sigacts unchanged.
+		 * Injection after T3 regs clobbers stack. */
 
 		/* Detach workers first, main thread last */
 		for (i = 0; i < item->nr_threads; i++) {
@@ -3227,11 +3240,17 @@ skip_ns_bouncing:
 		}
 	}
 
-	/* COW mode: T3 state application disabled — dump-time state
-	 * is sufficient for correctness when all pages are transferred.
-	 * T3 regs cause SIGSEGV (under investigation). */
+	/* COW mode: apply T3 state. T3 registers are captured
+	 * before parasite injection (correct order). On aarch64,
+	 * x0 is fixed from -EINTR to the original syscall arg
+	 * (x19) since PTRACE_SETREGSET can't set orig_x0. */
 	if (opts.cow_dump) {
-		pr_err("T3 state: skipped (dump-time state used)\n");
+		load_t3_regs();
+		load_t3_fds();
+		load_t3_sigacts();
+		pr_err("T3 state: regs=%d fds=%d sigacts=%s\n",
+		       g_t3_regs_count, g_t3_fds_count,
+		       g_t3_sigacts ? "yes" : "no");
 	}
 
 	/* just before releasing threads we have to restore rseq_cs */
