@@ -1809,7 +1809,7 @@ static int send_lazy_vma_page(int sk, unsigned long vaddr, u64 dst_id, pid_t sou
 	}
 
 	
-	if (cdi->phase == COW_PHASE_ASYNC_BULK) {
+	if (cdi->phase != COW_PHASE_ASYNC_BULK) {
 		/* Unprotect page — it's been sent, no need to track writes anymore */
 		uffd = cow_get_uffd_for_pid(source_pid);
 		if (uffd >= 0) {
