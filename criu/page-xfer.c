@@ -1807,6 +1807,8 @@ static int send_lazy_vma_page(int sk, unsigned long vaddr, u64 dst_id, pid_t sou
 		return -1;
 	}
 
+	/* DEBUG: Skip unprotect to test if it's causing PAGE_IS_WRITTEN */
+#if 0
 	/* Unprotect page — it's been sent, no need to track writes anymore */
 	uffd = cow_get_uffd_for_pid(source_pid);
 	if (uffd >= 0) {
@@ -1817,6 +1819,7 @@ static int send_lazy_vma_page(int sk, unsigned long vaddr, u64 dst_id, pid_t sou
 		if (ioctl(uffd, UFFDIO_WRITEPROTECT, &wp))
 			pr_perror("Failed to unprotect page at 0x%lx", vaddr);
 	}
+#endif
 	clock_gettime(CLOCK_MONOTONIC, &t_unprot);
 
 	/* Accumulate timing stats */
