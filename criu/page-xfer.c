@@ -3006,6 +3006,18 @@ static int page_server_read_bulk_stream(struct ps_async_read *ar, int flags)
 						pr_info("Sent bulk complete ACK to primary\n");
 				}
 
+				/*
+				 * COW mode: don't return BULK_STREAM_COMPLETE yet.
+				 * The dirty bitmap will arrive later (Phase 4).
+				 * Reset to read next header and continue.
+				 */
+				if (opts.cow_dump) {
+					pr_info("COW mode: waiting for dirty bitmap...\n");
+					ar->rb = 0;
+					ar->compress_state = COMPRESS_STATE_READING_HEADER;
+					return BULK_STREAM_PROGRESS;
+				}
+
 				return BULK_STREAM_COMPLETE;
 			}
 
@@ -3027,6 +3039,13 @@ static int page_server_read_bulk_stream(struct ps_async_read *ar, int flags)
 					ar->rb = 0;
 					ar->compress_state = COMPRESS_STATE_READING_HEADER;
 					pr_info("Dirty bitmap: 0 ranges, all pages clean\n");
+					/*
+					 * COW mode: dirty bitmap (even empty) marks end of bulk phase.
+					 */
+					if (opts.cow_dump) {
+						pr_info("COW mode: dirty bitmap complete, bulk phase done\n");
+						return BULK_STREAM_COMPLETE;
+					}
 					return BULK_STREAM_PROGRESS;
 				}
 
@@ -3240,6 +3259,15 @@ static int page_server_read_bulk_stream(struct ps_async_read *ar, int flags)
 			ar->dirty_ranges = NULL;
 			ar->rb = 0;
 			ar->compress_state = COMPRESS_STATE_READING_HEADER;
+
+			/*
+			 * COW mode: dirty bitmap marks end of bulk phase.
+			 * The primary will close the connection after this.
+			 */
+			if (opts.cow_dump) {
+				pr_info("COW mode: dirty bitmap complete, bulk phase done\n");
+				return BULK_STREAM_COMPLETE;
+			}
 		}
 		return BULK_STREAM_PROGRESS;
 	}
