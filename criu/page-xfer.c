@@ -1771,6 +1771,7 @@ static int send_lazy_vma_page(int sk, unsigned long vaddr, u64 dst_id, pid_t sou
 	int uffd;
 	struct iovec local_iov, remote_iov;
 	struct timespec t_start, t_readv, t_socket, t_unprot, t_end;
+	struct cow_dump_info *cdi = g_cow_info;
 
 	pr_debug("[SEND_PAGE] Sending non-COW page at vaddr=0x%lx pid=%d\n",
 		 vaddr, source_pid);
@@ -1807,19 +1808,20 @@ static int send_lazy_vma_page(int sk, unsigned long vaddr, u64 dst_id, pid_t sou
 		return -1;
 	}
 
-	/* DEBUG: Skip unprotect to test if it's causing PAGE_IS_WRITTEN */
-#if 0
-	/* Unprotect page — it's been sent, no need to track writes anymore */
-	uffd = cow_get_uffd_for_pid(source_pid);
-	if (uffd >= 0) {
-		struct uffdio_writeprotect wp;
-		wp.range.start = vaddr;
-		wp.range.len = PAGE_SIZE;
-		wp.mode = 0;
-		if (ioctl(uffd, UFFDIO_WRITEPROTECT, &wp))
-			pr_perror("Failed to unprotect page at 0x%lx", vaddr);
+	
+	if (cdi->phase == COW_PHASE_ASYNC_BULK) {
+		/* Unprotect page — it's been sent, no need to track writes anymore */
+		uffd = cow_get_uffd_for_pid(source_pid);
+		if (uffd >= 0) {
+			struct uffdio_writeprotect wp;
+			wp.range.start = vaddr;
+			wp.range.len = PAGE_SIZE;
+			wp.mode = 0;
+			if (ioctl(uffd, UFFDIO_WRITEPROTECT, &wp))
+				pr_perror("Failed to unprotect page at 0x%lx", vaddr);
+		}
 	}
-#endif
+
 	clock_gettime(CLOCK_MONOTONIC, &t_unprot);
 
 	/* Accumulate timing stats */
