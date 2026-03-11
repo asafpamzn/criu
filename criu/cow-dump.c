@@ -734,14 +734,25 @@ static int cow_handle_write_fault(struct cow_dump_info *cdi,
 		return -1;
 	}
 
-	/* Calculate pre-read range, clamped to VMA boundaries */
-	range_start = page_addr - (unsigned long)COW_PREREAD_BEFORE * PAGE_SIZE;
-	if (range_start < vma_start || range_start > page_addr) /* underflow */
-		range_start = vma_start;
+	/*
+	 * In WP_SYNC convergence mode, only dirty ranges are registered,
+	 * so we can't pre-read beyond the faulting page (other pages may
+	 * not be registered and UFFDIO_WRITEPROTECT would fail with ENOENT).
+	 * Just handle single pages in convergence mode.
+	 */
+	if (cdi->phase == COW_PHASE_SYNC_CONVERGE) {
+		range_start = page_addr;
+		range_end = page_addr + PAGE_SIZE;
+	} else {
+		/* Calculate pre-read range, clamped to VMA boundaries */
+		range_start = page_addr - (unsigned long)COW_PREREAD_BEFORE * PAGE_SIZE;
+		if (range_start < vma_start || range_start > page_addr) /* underflow */
+			range_start = vma_start;
 
-	range_end = page_addr + (unsigned long)(COW_PREREAD_AFTER + 1) * PAGE_SIZE;
-	if (range_end > vma_end)
-		range_end = vma_end;
+		range_end = page_addr + (unsigned long)(COW_PREREAD_AFTER + 1) * PAGE_SIZE;
+		if (range_end > vma_end)
+			range_end = vma_end;
+	}
 
 	nr_pages = (unsigned int)((range_end - range_start) / PAGE_SIZE);
 	if (nr_pages > COW_PREREAD_TOTAL)

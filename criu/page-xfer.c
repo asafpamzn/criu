@@ -2575,14 +2575,12 @@ static int page_server_serve(int sk)
 
 	/*
 	 * COW phased migration: after receiving bulk complete ACK,
-	 * close the socket immediately without waiting for EOF.
-	 * The replica keeps its end open for future use, so the
-	 * normal EOF wait would block forever.
+	 * keep the socket open for Phase 4 dirty bitmap transfer.
+	 * Store the socket globally so send_cow_dirty_bitmap() can use it.
 	 */
 	if (bulk_ack_received) {
-		pr_info("Bulk ACK received, closing session without EOF wait\n");
-		page_server_close();
-		close(sk);
+		pr_info("Bulk ACK received, keeping socket open for dirty bitmap\n");
+		page_server_sk = sk;
 		return 0;
 	}
 
@@ -2819,6 +2817,20 @@ out:
 int connect_to_page_server_to_send(void)
 {
 	return connect_to_page_server();
+}
+
+/*
+ * Close the page server socket (server-side).
+ * Used after sending dirty bitmap in COW phased migration.
+ * Unlike disconnect_from_page_server(), this doesn't send PS_IOV_CLOSE
+ * since we ARE the server, not the client.
+ */
+void close_page_server_socket(void)
+{
+	if (page_server_sk >= 0) {
+		pr_info("Closing page server socket (server-side)\n");
+		close_safe(&page_server_sk);
+	}
 }
 
 int disconnect_from_page_server(void)

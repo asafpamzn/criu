@@ -2840,6 +2840,12 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 	if (inventory_save_uptime(&he))
 		goto err;
 
+	/*
+	 * Signal to the replica that skeleton dump is complete.
+	 * restore.sh polls for this marker before starting criu restore.
+	 */
+	pr_info("PHASE 3 SKELETON DUMP COMPLETE\n");
+
 	/* === PHASE 4: WP_SYNC on dirty + unfreeze === */
 	pr_info("=== PHASE 4: WP_SYNC on dirty + unfreeze ===\n");
 
@@ -2858,6 +2864,9 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 			pr_err("Failed to send dirty bitmap to replica\n");
 			goto err;
 		}
+		pr_info("Dirty bitmap sent successfully\n");
+		/* Close the Phase 2 socket; convergence will open a new connection */
+		close_page_server_socket();
 	}
 
 	/* === PHASE 5-6: Convergence === */
