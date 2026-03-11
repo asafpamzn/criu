@@ -410,6 +410,8 @@ static int uffd_open_proc(pid_t pid)
 	memset(&api, 0, sizeof(api));
 	api.api = UFFD_API;
 	api.features = UFFD_FEATURE_PAGEFAULT_FLAG_WP;
+	if (kdat.has_pagemap_scan)
+		api.features |= UFFD_FEATURE_WP_ASYNC;
 
 	if (ioctl(fd, UFFDIO_API, &api)) {
 		pr_perror("UFFDIO_API on %s failed", path);
@@ -493,11 +495,16 @@ static int cow_register_vmas(struct cow_dump_info *cdi,
 		reg.mode = UFFDIO_REGISTER_MODE_WP;
 
 		ret = ioctl(cdi->uffd, UFFDIO_REGISTER, &reg);
-		if (ret) {
+		if (ret && cdi->phase != COW_PHASE_ASYNC_BULK) {
 			pr_warn("UFFDIO_REGISTER WP %lx-%lx failed: %s\n",
 				start, start + len, strerror(errno));
 			nr_failed++;
 			continue;
+		}
+		if (ret && cdi->phase == COW_PHASE_ASYNC_BULK) {
+			pr_info("UFFDIO_REGISTER WP %lx-%lx skipped in WP_ASYNC "
+				"(tracking via PAGEMAP_SCAN)\n",
+				start, start + len);
 		}
 
 		tvmas[i].start = start;
@@ -1279,14 +1286,14 @@ static int cow_clear_written_bits(struct cow_dump_info *cdi)
 
 	struct pm_scan_arg args = {
 		.size = sizeof(struct pm_scan_arg),
-		.flags = PM_SCAN_WP_MATCHING | PM_SCAN_CHECK_WPASYNC,
+		.flags = PM_SCAN_WP_MATCHING,
 		.start = 0,
 		.end = 0,
 		.walk_end = 0,
 		.vec = 0,
 		.vec_len = 0,
 		.max_pages = 0,
-		.category_mask = PAGE_IS_WPALLOWED,
+		.category_anyof_mask = PAGE_IS_WRITTEN,
 		.return_mask = 0,
 	};
 
@@ -1478,13 +1485,13 @@ int cow_scan_dirty_pages(unsigned long **dirty_ranges,
 
 	struct pm_scan_arg args = {
 		.size = sizeof(struct pm_scan_arg),
-		.flags = PM_SCAN_WP_MATCHING | PM_SCAN_CHECK_WPASYNC,
+		.flags = PM_SCAN_WP_MATCHING,
 		.start = 0,
 		.end = 0,
 		.walk_end = 0,
 		.vec_len = 1000,
 		.max_pages = 0,
-		.category_mask = PAGE_IS_WRITTEN,
+		.category_anyof_mask = PAGE_IS_WRITTEN,
 		.return_mask = PAGE_IS_WRITTEN,
 	};
 
