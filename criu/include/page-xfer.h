@@ -57,6 +57,7 @@ extern int connect_to_page_server_to_send(void);
 extern int connect_to_page_server_to_recv(int epfd);
 extern int disconnect_from_page_server(void);
 extern void close_page_server_socket(void);
+extern int get_page_server_sk(void);
 extern void wait_for_page_server_thread(void);
 extern bool page_server_bulk_stream_done(void);
 

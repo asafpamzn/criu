@@ -2870,19 +2870,22 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 		goto err;
 	}
 	pr_info("Dirty bitmap sent successfully\n");
-	/* Close the Phase 2 socket; convergence will open a new connection */
+
+	/* Close Phase 4 socket - replica received dirty bitmap */
 	close_page_server_socket();
 
 	/* === PHASE 5-6: Convergence === */
-	pr_info("=== PHASE 5-6: Convergence ===\n");
+	pr_info("=== PHASE 5-6: Convergence page server ===\n");
+	cow_set_phase(COW_PHASE_SYNC_CONVERGE);
 
 	/*
-	 * Start page server again for convergence phase.
-	 * WP_SYNC faults on dirty pages will be handled by the COW monitor.
+	 * Start a new page server for convergence.
+	 * The replica will reconnect to this server to request
+	 * dirty pages that weren't in its buffer.
 	 */
 	ret = cr_page_server(false, true, -1);
 	if (ret)
-		pr_err("Convergence phase failed\n");
+		pr_err("Convergence page server failed\n");
 
 	he.has_pre_dump_mode = false;
 	if (found_uprobes_vma()) {

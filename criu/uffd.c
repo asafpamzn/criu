@@ -1931,6 +1931,12 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 		 */
 		unsigned long long img_addr;
 
+		/* Check if server is available for convergence requests */
+		if (get_page_server_sk() < 0) {
+			lp_warn(lpi, "Page 0x%llx not in buffer, server unavailable - zeroing\n", address);
+			return uffd_zero(lpi, address, 1);
+		}
+
 		iov = find_iov(lpi, address);
 		if (!iov)
 			return uffd_zero(lpi, address, 1);

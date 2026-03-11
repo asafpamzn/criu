@@ -201,6 +201,23 @@ int cr_lazy_pages_cow_phase2(bool daemon)
 
 	/*
 	 * Phase 3: Dirty bitmap received, skeleton dump is ready.
+	 * Primary closed the socket after sending dirty bitmap.
+	 * Disconnect and reconnect for convergence phase.
+	 */
+	disconnect_from_page_server();
+
+	/* Small delay for primary to start new page server */
+	usleep(100000);  /* 100ms */
+
+	/* Reconnect to convergence page server */
+	if (connect_to_page_server_to_recv(epollfd)) {
+		pr_warn("Cannot reconnect to page server - will serve from buffer only\n");
+		/* Continue anyway - most pages should be in buffer */
+	} else {
+		pr_info("Reconnected to convergence page server\n");
+	}
+
+	/*
 	 * Now inventory.img and pstree.img exist on disk.
 	 */
 	if (prepare_dummy_pstree()) {

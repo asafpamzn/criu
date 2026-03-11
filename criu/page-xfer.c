@@ -46,10 +46,16 @@
 
 static int page_server_sk = -1;
 static bool bulk_stream_done = false;
+static bool dirty_bitmap_received = false;  /* COW mode: dirty bitmap fully received */
 
 bool page_server_bulk_stream_done(void)
 {
 	return bulk_stream_done;
+}
+
+int get_page_server_sk(void)
+{
+	return page_server_sk;
 }
 
 #define BULK_STREAM_WOULD_BLOCK 0
@@ -3048,7 +3054,8 @@ static int page_server_read_bulk_stream(struct ps_async_read *ar, int flags)
 					 * COW mode: dirty bitmap (even empty) marks end of bulk phase.
 					 */
 					if (opts.cow_dump) {
-						pr_info("COW mode: dirty bitmap complete, bulk phase done\n");
+						pr_info("COW mode: dirty bitmap complete (0 ranges), bulk phase done\n");
+						dirty_bitmap_received = true;
 						return BULK_STREAM_COMPLETE;
 					}
 					return BULK_STREAM_PROGRESS;
@@ -3236,6 +3243,13 @@ static int page_server_read_bulk_stream(struct ps_async_read *ar, int flags)
 			ar->dirty_ranges = NULL;
 			return -1;
 		}
+		if (ret == 0) {
+			pr_err("EOF while reading dirty bitmap (got %lu of %lu bytes)\n",
+			       ar->dirty_rb, ar->dirty_ranges_size);
+			xfree(ar->dirty_ranges);
+			ar->dirty_ranges = NULL;
+			return -1;
+		}
 		ar->dirty_rb += ret;
 
 		if (ar->dirty_rb == ar->dirty_ranges_size) {
@@ -3270,7 +3284,9 @@ static int page_server_read_bulk_stream(struct ps_async_read *ar, int flags)
 			 * The primary will close the connection after this.
 			 */
 			if (opts.cow_dump) {
-				pr_info("COW mode: dirty bitmap complete, bulk phase done\n");
+				pr_info("COW mode: dirty bitmap complete (%u ranges), bulk phase done\n",
+					ar->nr_dirty_ranges);
+				dirty_bitmap_received = true;
 				return BULK_STREAM_COMPLETE;
 			}
 		}
@@ -3446,8 +3462,17 @@ static int page_server_async_read(struct epoll_rfd *f)
 
 static int page_server_hangup_event(struct epoll_rfd *rfd)
 {
+	if (opts.cow_dump && dirty_bitmap_received) {
+		pr_info("Page server closed connection after dirty bitmap received\n");
+		return 0;
+	}
 	if (opts.cow_dump && bulk_stream_done) {
-		pr_info("Page server closed connection after bulk transfer\n");
+		/*
+		 * Bulk stream done but dirty bitmap not yet fully received.
+		 * The data might still be in the socket buffer - let the
+		 * read handler drain it before we give up.
+		 */
+		pr_info("Page server closed, continuing to drain dirty bitmap data\n");
 		return 0;
 	}
 	pr_err("Remote side closed connection\n");
@@ -3461,6 +3486,7 @@ int connect_to_page_server_to_recv(int epfd)
 	if (connect_to_page_server())
 		return -1;
 	bulk_stream_done = false;
+	dirty_bitmap_received = false;
 
 	ps_rfd.fd = page_server_sk;
 	/* Use bulk stream reader in bulk mode, regular reader in on-demand mode */
