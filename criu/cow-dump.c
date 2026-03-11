@@ -368,7 +368,7 @@ static void cow_monitor_drain_eventfd(void)
 }
 
 /* ------------------------------------------------------------------ */
-/*  Kernel support check + /proc uffd opener                           */
+/*  Kernel support check                                               */
 /* ------------------------------------------------------------------ */
 
 bool cow_check_kernel_support(void)
@@ -392,41 +392,6 @@ bool cow_check_kernel_support(void)
 	close(uffd);
 	pr_info("COW dump kernel support detected\n");
 	return true;
-}
-
-static int uffd_open_proc(pid_t pid)
-{
-	char path[64];
-	struct uffdio_api api;
-	int fd;
-
-	snprintf(path, sizeof(path), "/proc/%d/userfaultfd", pid);
-	fd = open(path, O_RDWR | O_CLOEXEC | O_NONBLOCK);
-	if (fd < 0) {
-		pr_perror("Cannot open %s", path);
-		return -1;
-	}
-
-	memset(&api, 0, sizeof(api));
-	api.api = UFFD_API;
-	api.features = UFFD_FEATURE_PAGEFAULT_FLAG_WP;
-	if (kdat.has_pagemap_scan)
-		api.features |= UFFD_FEATURE_WP_ASYNC;
-
-	if (ioctl(fd, UFFDIO_API, &api)) {
-		pr_perror("UFFDIO_API on %s failed", path);
-		close(fd);
-		return -1;
-	}
-	if (!(api.features & UFFD_FEATURE_PAGEFAULT_FLAG_WP)) {
-		pr_err("userfaultfd from %s lacks WP pagefault flag\n", path);
-		close(fd);
-		return -1;
-	}
-
-	pr_info("Opened %s: fd=%d features=0x%llx\n", path, fd,
-		(unsigned long long)api.features);
-	return fd;
 }
 
 /* ------------------------------------------------------------------ */
@@ -593,52 +558,55 @@ int cow_dump_init(struct pstree_item *item, struct vm_area_list *vma_area_list,
 		goto err;
 	}
 
-	if (kdat.has_uffd_proc) {
-		pr_info("Using /proc/%d/userfaultfd (direct path)\n",
-			item->pid->real);
-		cdi->uffd = uffd_open_proc(item->pid->real);
-		if (cdi->uffd < 0)
-			goto err;
-	} else {
-		args_size = sizeof(*args);
-		args = compel_parasite_args_s(ctl, args_size);
-		if (!args) {
-			pr_err("Failed to allocate parasite args\n");
-			goto err;
-		}
-
-		args->nr_vmas = 0;
-		args->total_pages = 0;
-		args->nr_failed_vmas = 0;
-		args->uffd_features = 0; /* Default: WP_SYNC (UFFD_FEATURE_PAGEFAULT_FLAG_WP) */
-		args->ret = -1;
-
-		ret = compel_rpc_call(PARASITE_CMD_COW_DUMP_INIT, ctl);
-		if (ret < 0) {
-			pr_err("Failed to initiate COW dump RPC\n");
-			goto err;
-		}
-
-		compel_util_recv_fd(ctl, &cdi->uffd);
-		if (cdi->uffd < 0) {
-			pr_err("Failed to receive uffd from parasite: %d\n",
-			       cdi->uffd);
-			goto err;
-		}
-
-		ret = compel_rpc_sync(PARASITE_CMD_COW_DUMP_INIT, ctl);
-		if (ret < 0 || args->ret != 0) {
-			pr_err("Parasite COW dump init failed: %d (ret=%d)\n",
-			       ret, args->ret);
-			goto err;
-		}
+	if (!ctl) {
+		pr_err("Parasite control required for WP_ASYNC uffd creation\n");
+		goto err;
 	}
+
+	args_size = sizeof(*args);
+	args = compel_parasite_args_s(ctl, args_size);
+	if (!args) {
+		pr_err("Failed to allocate parasite args\n");
+		goto err;
+	}
+
+	args->nr_vmas = 0;
+	args->total_pages = 0;
+	args->nr_failed_vmas = 0;
+	args->uffd_features = UFFD_FEATURE_WP_ASYNC;
+	args->ret = -1;
+
+	ret = compel_rpc_call(PARASITE_CMD_COW_DUMP_INIT, ctl);
+	if (ret < 0) {
+		pr_err("Failed to initiate COW dump RPC\n");
+		goto err;
+	}
+
+	compel_util_recv_fd(ctl, &cdi->uffd);
+	if (cdi->uffd < 0) {
+		pr_err("Failed to receive uffd from parasite: %d\n",
+		       cdi->uffd);
+		goto err;
+	}
+
+	ret = compel_rpc_sync(PARASITE_CMD_COW_DUMP_INIT, ctl);
+	if (ret < 0 || args->ret != 0) {
+		pr_err("Parasite COW dump init failed: %d (ret=%d)\n",
+		       ret, args->ret);
+		goto err;
+	}
+
+	cdi->uffd_async = cdi->uffd;
+	cdi->phase = COW_PHASE_ASYNC_BULK;
 
 	ret = cow_register_vmas(cdi, vma_area_list, &cdi->total_pages);
 	if (ret)
 		goto err;
 
 	if (cow_apply_writeprotect(cdi))
+		goto err;
+
+	if (cow_clear_written_bits(cdi))
 		goto err;
 
 	pr_info("COW dump initialized for pid %d: tracked=%u pages=%lu uffd=%d\n",
@@ -1588,9 +1556,8 @@ out:
  * cow_precreate_sync_uffd - Pre-create a WP_SYNC uffd via the parasite
  *
  * Must be called while the parasite is still alive (before compel_cure).
- * On kernels with /proc/<pid>/userfaultfd this is a no-op since Phase 4
- * can create the uffd directly.  On older kernels, the parasite creates
- * a userfaultfd(2) inside the target and passes it back via SCM_RIGHTS.
+ * The parasite creates a userfaultfd(2) inside the target and passes it
+ * back via SCM_RIGHTS so Phase 4 can use it for WP_SYNC convergence.
  */
 int cow_precreate_sync_uffd(struct parasite_ctl *ctl)
 {
@@ -1602,11 +1569,6 @@ int cow_precreate_sync_uffd(struct parasite_ctl *ctl)
 	if (!cdi) {
 		pr_err("COW dump not initialized\n");
 		return -1;
-	}
-
-	if (kdat.has_uffd_proc) {
-		pr_info("Kernel has /proc/<pid>/userfaultfd, skipping pre-create\n");
-		return 0;
 	}
 
 	if (!ctl) {
@@ -1679,18 +1641,13 @@ int cow_setup_sync_for_dirty(unsigned long *dirty_ranges,
 
 	pr_info("Setting up WP_SYNC for %u dirty ranges\n", nr_dirty_ranges);
 
-	if (kdat.has_uffd_proc) {
-		/* Create new uffd with WP_SYNC via /proc */
-		new_uffd = uffd_open_proc(cdi->source_pid);
-		if (new_uffd < 0)
-			return -1;
-	} else if (cdi->uffd_sync >= 0) {
+	if (cdi->uffd_sync >= 0) {
 		/* Use pre-created WP_SYNC uffd from parasite */
 		new_uffd = cdi->uffd_sync;
 		cdi->uffd_sync = -1; /* Ownership transferred */
 		pr_info("Using pre-created WP_SYNC uffd: fd=%d\n", new_uffd);
 	} else {
-		pr_err("No WP_SYNC uffd available (no /proc support and no pre-created fd)\n");
+		pr_err("No WP_SYNC uffd available (no pre-created fd)\n");
 		return -1;
 	}
 
