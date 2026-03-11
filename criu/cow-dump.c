@@ -1496,12 +1496,22 @@ int cow_scan_dirty_pages(unsigned long **dirty_ranges,
 
 		do {
 			args.start = args.walk_end;
+			pr_info("PAGEMAP_SCAN: scanning VMA 0x%lx-0x%lx "
+				"(start=0x%lx walk_end=0x%lx)\n",
+				vma_start, vma_end,
+				(unsigned long)args.start,
+				(unsigned long)args.walk_end);
 			regs_len = ioctl(pagemap_fd, PAGEMAP_SCAN, &args);
 			if (regs_len == -1) {
 				pr_perror("PAGEMAP_SCAN for VMA 0x%lx-0x%lx",
 					  vma_start, vma_end);
 				goto out;
 			}
+
+			pr_info("PAGEMAP_SCAN: returned %ld regions, "
+				"walk_end=0x%lx (vma_end=0x%lx)\n",
+				regs_len,
+				(unsigned long)args.walk_end, vma_end);
 
 			/* Safety: if no regions returned, avoid infinite loop */
 			if (regs_len == 0)
@@ -1511,6 +1521,11 @@ int cow_scan_dirty_pages(unsigned long **dirty_ranges,
 				unsigned long start = regs[j].start;
 				unsigned long len = regs[j].end - regs[j].start;
 				unsigned long pages = len / PAGE_SIZE;
+
+				pr_info("  dirty region[%u]: 0x%lx-0x%lx "
+					"(%lu pages, categories=0x%llx)\n",
+					j, start, start + len, pages,
+					(unsigned long long)regs[j].categories);
 
 				/* Grow ranges array if needed */
 				if (nr_ranges >= ranges_capacity) {
