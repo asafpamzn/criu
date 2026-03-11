@@ -3473,7 +3473,7 @@ static int page_server_hangup_event(struct epoll_rfd *rfd)
 		 * read handler drain it before we give up.
 		 */
 		pr_info("Page server closed, continuing to drain dirty bitmap data\n");
-		return 0;
+		return 1;
 	}
 	pr_err("Remote side closed connection\n");
 	return -1;
