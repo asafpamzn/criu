@@ -3073,7 +3073,9 @@ static int page_server_read_bulk_stream(struct ps_async_read *ar, int flags)
 				ar->compress_state = COMPRESS_STATE_READING_DIRTY_BITMAP;
 				pr_info("Dirty bitmap: expecting %u ranges (%lu bytes)\n",
 					ar->nr_dirty_ranges, ar->dirty_ranges_size);
-				return BULK_STREAM_PROGRESS;
+				/* Don't return - fall through to read data immediately.
+				 * After hangup, no more EPOLLIN events will trigger us. */
+				goto read_dirty_bitmap;
 			} else if (cmd == PS_IOV_ADD_F_COMPRESS) {
 				ar->compress_state = COMPRESS_STATE_READING_SIZE;
 				ar->compressed_size = 0;
@@ -3233,6 +3235,7 @@ static int page_server_read_bulk_stream(struct ps_async_read *ar, int flags)
 	}
 
 	/* Reading dirty bitmap data (COW phased migration) */
+read_dirty_bitmap:
 	if (ar->compress_state == COMPRESS_STATE_READING_DIRTY_BITMAP) {
 		need = ar->dirty_ranges_size - ar->dirty_rb;
 		buf = ((char *)ar->dirty_ranges) + ar->dirty_rb;
