@@ -2688,6 +2688,19 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 
 	pstree_switch_state(root_item, TASK_ALIVE);
 
+	/* DEBUG: Quick dirty scan immediately after resume, before bulk transfer */
+	{
+		unsigned long *dbg_ranges = NULL;
+		unsigned int dbg_nr = 0;
+		unsigned long dbg_total = 0;
+		usleep(100000); /* 100ms for process to "settle" */
+		if (cow_scan_dirty_pages(&dbg_ranges, &dbg_nr, &dbg_total) == 0) {
+			pr_info("DEBUG IMMEDIATE: %u dirty ranges, %lu pages BEFORE bulk transfer\n",
+				dbg_nr, dbg_total);
+			xfree(dbg_ranges);
+		}
+	}
+
 	/* === PHASE 2: Bulk page transfer === */
 	pr_info("=== PHASE 2: Bulk page transfer ===\n");
 
