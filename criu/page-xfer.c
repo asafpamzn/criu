@@ -1808,7 +1808,7 @@ static int send_lazy_vma_page(int sk, unsigned long vaddr, u64 dst_id, pid_t sou
 	}
 
 
-	if (cow_get_phase() != COW_PHASE_ASYNC_BULK) {
+	if (cow_get_phase() == COW_PHASE_SYNC_CONVERGE) {
 		pr_info("[SEND_PAGE unproterct] Sending non-COW page at vaddr=0x%lx pid=%d\n",
 				   vaddr, source_pid);
 		/* Unprotect page — it's been sent, no need to track writes anymore */
