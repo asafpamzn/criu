@@ -2964,6 +2964,9 @@ static int page_server_read_bulk_stream(struct ps_async_read *ar, int flags)
 	void *buf;
 	u32 cmd;
 
+	pr_info("bulk_stream: state=%d rb=%lu dirty_rb=%lu flags=%d\n",
+		ar->compress_state, ar->rb, ar->dirty_rb, flags);
+
 	/* Reading header */
 	if (ar->compress_state == COMPRESS_STATE_READING_HEADER) {
 		if (ar->rb < sizeof(ar->pi)) {
@@ -3234,10 +3237,18 @@ static int page_server_read_bulk_stream(struct ps_async_read *ar, int flags)
 		need = ar->dirty_ranges_size - ar->dirty_rb;
 		buf = ((char *)ar->dirty_ranges) + ar->dirty_rb;
 
+		pr_info("Dirty bitmap read: need=%d dirty_rb=%lu total=%lu flags=%d sk=%d\n",
+			need, ar->dirty_rb, ar->dirty_ranges_size, flags, page_server_sk);
+
 		ret = __recv(page_server_sk, buf, need, flags);
+
+		pr_info("Dirty bitmap recv: ret=%d errno=%d\n", ret, ret < 0 ? errno : 0);
+
 		if (ret < 0) {
-			if (flags == MSG_DONTWAIT && (errno == EAGAIN || errno == EINTR))
+			if (flags == MSG_DONTWAIT && (errno == EAGAIN || errno == EINTR)) {
+				pr_info("Dirty bitmap: WOULD_BLOCK (errno=%d)\n", errno);
 				return BULK_STREAM_WOULD_BLOCK;
+			}
 			pr_perror("Error reading dirty bitmap");
 			xfree(ar->dirty_ranges);
 			ar->dirty_ranges = NULL;
