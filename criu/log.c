@@ -26,6 +26,7 @@
 
 #include "../soccr/soccr.h"
 #include "compel/log.h"
+#include <time.h>
 
 #define DEFAULT_LOGFD STDERR_FILENO
 /* Enable timestamps if verbosity is increased from default */
