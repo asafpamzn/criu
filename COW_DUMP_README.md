@@ -1,7 +1,7 @@
 # CRIU COW Dump — Live Migration for Valkey
 
 Near-zero-downtime live migration using copy-on-write page tracking
-and eBPF dirty page detection. 44ms freeze, 200GB at 3.3 GB/s.
+and eBPF dirty page detection. 55ms total freeze, 200GB at 3.3 GB/s.
 
 ## Quick Start
 
@@ -31,7 +31,7 @@ sudo env SKIP_FILL=1 KEEP_SOURCE_RUNNING=1 \
   Valkey running, serving clients
         │
   ┌─────▼──────────────────────┐
-  │  1. FREEZE (23-48ms)       │    ┌──────────────────────────┐
+  │  1. DUMP FREEZE (26ms)     │    ┌──────────────────────────┐
   │  - Seize process (ptrace)  │───▶│  Start restore.sh        │
   │  - Capture: VMAs, pagemap  │    │  CRIU restore + page-recv│
   │  - Setup WP tracking       │    └──────────────────────────┘
@@ -41,7 +41,7 @@ sudo env SKIP_FILL=1 KEEP_SOURCE_RUNNING=1 \
   └─────┬──────────────────────┘
         │
   ┌─────▼──────────────────────┐    ┌──────────────────────────┐
-  │  2. BULK TRANSFER (~60s)   │    │  RECEIVE                 │
+  │  2. BULK TRANSFER (~30s)   │    │  RECEIVE                 │
   │  - Read from live source   │───▶│  - 8 TCP streams         │
   │  - 8 TCP streams, LZ4     │    │  - process_vm_writev     │
   │  - 3.3 GB/s throughput     │    │    into restored process │
@@ -50,21 +50,22 @@ sudo env SKIP_FILL=1 KEEP_SOURCE_RUNNING=1 \
   └─────┬──────────────────────┘    └──────────┬───────────────┘
         │                                      │
   ┌─────▼──────────────────────┐               │
-  │  3. T3 FREEZE (44ms)       │───────────────┘
-  │  - SIGSTOP source          │    (sends dirty + non-lazy pages)
+  │  3. T3 FREEZE (29ms)       │───────────────┘
+  │  - SIGSTOP (verified poll) │    (sends dirty + non-lazy pages)
   │  - eBPF ring drain (~0ms)  │
-  │  - T3 state capture (10ms) │───▶  Saves t3_regs.dat, etc.
+  │  - T3 regs + FDs (6ms)    │───▶  Saves t3_regs.dat, etc.
   │  - Dirty pages dispatch    │───▶  Overwrites stale pages
   │  - Non-lazy re-send (stacks│───▶  127 pages (stacks + .data)
   │    + file-backed rw)       │
-  │  - VMA diff (new mmaps)    │───▶  Injects mmap
+  │  - VMA diff (frozen scan)  │───▶  Injects mmap
   │  - SIGCONT source          │
   └─────┬──────────────────────┘
         │
   ┌─────▼──────────────────────┐    ┌──────────────────────────┐
   │  4. CUTOVER (0ms)          │    │  CUTOVER                 │
   │  - Send TCP "GO" ──────────│───▶│  - Apply T3 registers    │
-  │  - No SIGSTOP needed       │    │  - PTRACE_DETACH all     │
+  │  - No SIGSTOP needed       │    │  - Apply T3 sigacts      │
+  │                            │    │  - PTRACE_DETACH all     │
   │                            │    │  - Valkey is live!       │
   └────────────────────────────┘    └──────────────────────────┘
 ```
@@ -101,7 +102,7 @@ memory consistency. 127 pages (508KB) total.
 | CPU registers | T3 capture + apply via PTRACE_SETREGSET |
 | File descriptors | CRIU image files |
 | TCP sockets | Closed (`--tcp-close`), clients reconnect |
-| Signal handlers | T3 capture via parasite RPC |
+| Signal handlers | T3 capture (direct ptrace) + apply after detach |
 | New VMAs (jemalloc) | VMA diff protocol + ptrace mmap injection |
 
 ## Performance
@@ -197,6 +198,6 @@ on the replica due to missed dirty pages.
 3. **Client connections**: closed on dump (`--tcp-close`).
 4. **x86_64**: tested on aarch64. x86_64 expected to work but not yet
    validated at scale.
-5. **aarch64 only**: T3 register application uses a glibc-specific
-   fix (x0→x19 for interrupted syscalls). x86_64 will need an
-   equivalent for `orig_rax`.
+5. **aarch64 + x86_64**: T3 register application supports both.
+   aarch64 uses x0→x19 fix for interrupted syscalls. x86_64 sets
+   orig_rax via NT_PRSTATUS (no special handling needed).
