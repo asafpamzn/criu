@@ -326,18 +326,20 @@ int send_dirty_bitmap_to_replica(int sk, u64 dst_id,
  */
 static int wait_for_dirty_bitmap_ack(void)
 {
-	struct page_server_iov pi;
+	struct page_server_iov pi;	
 
-	pr_info("Waiting for dirty bitmap ACK from replica...\n");
+	while (true) {
+		pr_info("Waiting for dirty bitmap ACK from replica...\n");
+		if (__recv(page_server_sk, &pi, sizeof(pi), MSG_WAITALL) != sizeof(pi)) {
+			pr_perror("Failed to receive dirty bitmap ACK");
+			return -1;
+		}
 
-	if (__recv(page_server_sk, &pi, sizeof(pi), MSG_WAITALL) != sizeof(pi)) {
-		pr_perror("Failed to receive dirty bitmap ACK");
-		return -1;
-	}
-
-	if (decode_ps_cmd(pi.cmd) != PS_IOV_DIRTY_BITMAP_ACK) {
-		pr_err("Expected dirty bitmap ACK, got cmd=%u\n", decode_ps_cmd(pi.cmd));
-		return -1;
+		if (decode_ps_cmd(pi.cmd) != PS_IOV_DIRTY_BITMAP_ACK) {
+			pr_err("Expected dirty bitmap ACK, got cmd=%u\n", decode_ps_cmd(pi.cmd));
+			continue;
+		}
+		break;
 	}
 
 	pr_info("Received dirty bitmap ACK from replica\n");
@@ -3355,7 +3357,7 @@ read_dirty_bitmap:
 		ar->dirty_rb += ret;
 
 		if (ar->dirty_rb == ar->dirty_ranges_size) {
-			pr_info("Dirty bitmap received: %u ranges\n",
+			pr_info("Dirty bitmap received11: %u ranges\n",
 				ar->nr_dirty_ranges);
 
 			if (is_restore_connected()) {
