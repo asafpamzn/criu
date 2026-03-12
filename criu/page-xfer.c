@@ -3031,6 +3031,400 @@ static struct {
 	time_t last_print_time;
 } bulk_stats;
 
+/* Forward declaration for read_dirty_bitmap (called from read_bulk_header) */
+static int read_dirty_bitmap(struct ps_async_read *ar, int flags);
+
+/*
+ * Helper function for common recv pattern with stats tracking.
+ * Returns bytes received on success, -EAGAIN on would-block, -1 on error.
+ */
+static int bulk_recv(void *buf, int need, int flags)
+{
+	struct timespec t_recv_start, t_recv_end;
+	int ret;
+
+	clock_gettime(CLOCK_MONOTONIC, &t_recv_start);
+	bulk_stats.recv_calls++;
+	ret = __recv(page_server_sk, buf, need, flags);
+	clock_gettime(CLOCK_MONOTONIC, &t_recv_end);
+	bulk_stats.recv_wait_time_ns += (t_recv_end.tv_sec - t_recv_start.tv_sec) * 1000000000 +
+					(t_recv_end.tv_nsec - t_recv_start.tv_nsec);
+
+	if (ret < 0) {
+		if (flags == MSG_DONTWAIT && (errno == EAGAIN || errno == EINTR)) {
+			bulk_stats.recv_would_block++;
+			return -EAGAIN;
+		}
+		return -1;
+	}
+
+	bulk_stats.recv_bytes += ret;
+	return ret;
+}
+
+/*
+ * Handle end-of-transfer marker: send ACK and handle COW mode continuation.
+ */
+static int handle_end_of_transfer(struct ps_async_read *ar, u32 cmd)
+{
+	struct page_server_iov ack = {
+		.cmd = PS_IOV_BULK_COMPLETE_ACK,
+		.nr_pages = 0,
+		.vaddr = 0,
+		.dst_id = 0,
+	};
+
+	pr_info("Received end-of-transfer marker (cmd=%u dst_id=%lu)\n", cmd,
+		(unsigned long)ar->pi.dst_id);
+	bulk_stream_done = true;
+
+	/*
+	 * Send ACK back to primary so it can break out of
+	 * page_server_serve() and proceed to Phase 3 (skeleton dump).
+	 */
+	tcp_nodelay(page_server_sk, true);
+	if (__send(page_server_sk, &ack, sizeof(ack), 0) != sizeof(ack))
+		pr_perror("Failed to send bulk complete ACK");
+	else
+		pr_info("Sent bulk complete ACK to primary\n");
+
+	/*
+	 * COW mode: don't return BULK_STREAM_COMPLETE yet.
+	 * The dirty bitmap will arrive later (Phase 4).
+	 * Reset to read next header and continue.
+	 */
+	if (opts.cow_dump) {
+		pr_info("COW mode: waiting for dirty bitmap...\n");
+		ar->rb = 0;
+		ar->compress_state = COMPRESS_STATE_READING_HEADER;
+		return BULK_STREAM_PROGRESS;
+	}
+
+	return BULK_STREAM_COMPLETE;
+}
+
+/*
+ * Handle dirty bitmap header: process empty bitmap or allocate buffer for data.
+ * Returns BULK_STREAM_* on completion, 0 to continue to reading data.
+ */
+static int handle_dirty_bitmap_header(struct ps_async_read *ar)
+{
+	ar->nr_dirty_ranges = ar->pi.nr_pages;  /* overloaded */
+	ar->dirty_ranges_size = ar->nr_dirty_ranges * 2 * sizeof(unsigned long);
+
+	if (ar->dirty_ranges_size == 0) {
+		/* No dirty ranges — apply all buffered pages as clean */
+		if (is_restore_connected()) {
+			int uffd = get_first_lpi_uffd();
+
+			if (uffd >= 0)
+				apply_buffered_pages(uffd, NULL, 0);
+		} else {
+			/* Store for later — restore not connected yet */
+			store_pending_dirty_bitmap(NULL, 0);
+		}
+		ar->rb = 0;
+		ar->compress_state = COMPRESS_STATE_READING_HEADER;
+		pr_info("Dirty bitmap: 0 ranges, all pages clean\n");
+
+		/*
+		 * COW mode: dirty bitmap (even empty) marks end of bulk phase.
+		 * Send ACK to primary before marking complete.
+		 */
+		if (opts.cow_dump) {
+			pr_info("COW mode: dirty bitmap complete (0 ranges), bulk phase done\n");
+			if (send_dirty_bitmap_ack())
+				return -1;
+			dirty_bitmap_received = true;
+			return BULK_STREAM_COMPLETE;
+		}
+		return BULK_STREAM_PROGRESS;
+	}
+
+	ar->dirty_ranges = xmalloc(ar->dirty_ranges_size);
+	if (!ar->dirty_ranges) {
+		pr_err("Failed to allocate dirty ranges buffer\n");
+		return -1;
+	}
+	ar->dirty_rb = 0;
+	ar->compress_state = COMPRESS_STATE_READING_DIRTY_BITMAP;
+	pr_info("Dirty bitmap: expecting %u ranges (%lu bytes)\n",
+		ar->nr_dirty_ranges, ar->dirty_ranges_size);
+
+	return 0;  /* Continue to read dirty bitmap data */
+}
+
+/*
+ * Read bulk header and dispatch to next state.
+ */
+static int read_bulk_header(struct ps_async_read *ar, int flags)
+{
+	int ret;
+	u32 cmd;
+
+	if (ar->rb < sizeof(ar->pi)) {
+		void *buf = ((void *)&ar->pi) + ar->rb;
+		int need = sizeof(ar->pi) - ar->rb;
+
+		ret = bulk_recv(buf, need, flags);
+		if (ret == -EAGAIN)
+			return BULK_STREAM_WOULD_BLOCK;
+		if (ret < 0) {
+			pr_perror("Error reading header from page server");
+			return -1;
+		}
+		ar->rb += ret;
+	}
+
+	if (ar->rb < sizeof(ar->pi))
+		return BULK_STREAM_PROGRESS;
+
+	/* Header complete, dispatch based on command */
+	cmd = decode_ps_cmd(ar->pi.cmd);
+
+	if (ar->pi.nr_pages == 0 && cmd != PS_IOV_DIRTY_BITMAP)
+		return handle_end_of_transfer(ar, cmd);
+
+	if (cmd == PS_IOV_INVENTORY_READY) {
+		/* Primary signals inventory.img is ready */
+		set_inventory_ready_received();
+		ar->rb = 0;
+		ar->compress_state = COMPRESS_STATE_READING_HEADER;
+		return BULK_STREAM_PROGRESS;
+	}
+
+	if (cmd == PS_IOV_DIRTY_BITMAP) {
+		ret = handle_dirty_bitmap_header(ar);
+		if (ret != 0)
+			return ret;
+		/*
+		 * Continue to read dirty bitmap data immediately.
+		 * After hangup, no more EPOLLIN events will trigger us.
+		 */
+		return read_dirty_bitmap(ar, flags);
+	}
+
+	if (cmd == PS_IOV_ADD_F_COMPRESS) {
+		ar->compress_state = COMPRESS_STATE_READING_SIZE;
+		ar->compressed_size = 0;
+		ar->compressed_rb = 0;
+	} else {
+		ar->compress_state = COMPRESS_STATE_READING_UNCOMPRESSED;
+		ar->goal = sizeof(ar->pi) + ar->pi.nr_pages * PAGE_SIZE;
+	}
+
+	return BULK_STREAM_PROGRESS;
+}
+
+/*
+ * Read 4-byte compressed size and allocate buffer.
+ */
+static int read_compressed_size(struct ps_async_read *ar, int flags)
+{
+	int ret;
+	int need = sizeof(ar->compressed_size) - ar->compressed_rb;
+	void *buf = ((char *)&ar->compressed_size) + ar->compressed_rb;
+
+	ret = bulk_recv(buf, need, flags);
+	if (ret == -EAGAIN)
+		return BULK_STREAM_WOULD_BLOCK;
+	if (ret < 0) {
+		pr_perror("Error reading compressed size");
+		return -1;
+	}
+	ar->compressed_rb += ret;
+
+	if (ar->compressed_rb < sizeof(ar->compressed_size))
+		return BULK_STREAM_PROGRESS;
+
+	if (ar->compressed_size <= 0 || ar->compressed_size > LZ4_compressBound(PAGE_SIZE)) {
+		pr_err("Invalid compressed size: %d\n", ar->compressed_size);
+		return -1;
+	}
+
+	ar->compressed_buf = xmalloc(ar->compressed_size);
+	if (!ar->compressed_buf) {
+		pr_err("Failed to allocate compressed buffer\n");
+		return -1;
+	}
+
+	ar->compressed_rb = 0;
+	ar->compress_state = COMPRESS_STATE_READING_COMPRESSED;
+	return BULK_STREAM_PROGRESS;
+}
+
+/*
+ * Read compressed data, decompress, and invoke callback.
+ */
+static int read_compressed_data(struct ps_async_read *ar, int flags)
+{
+	int ret;
+	int need = ar->compressed_size - ar->compressed_rb;
+	void *buf = ar->compressed_buf + ar->compressed_rb;
+
+	ret = bulk_recv(buf, need, flags);
+	if (ret == -EAGAIN)
+		return BULK_STREAM_WOULD_BLOCK;
+	if (ret < 0) {
+		pr_perror("Error reading compressed data");
+		xfree(ar->compressed_buf);
+		ar->compressed_buf = NULL;
+		return -1;
+	}
+	ar->compressed_rb += ret;
+
+	if (ar->compressed_rb < ar->compressed_size)
+		return BULK_STREAM_PROGRESS;
+
+	/* Decompress and invoke callback */
+	{
+		int decomp_ret;
+		struct timespec t1, t2;
+
+		clock_gettime(CLOCK_MONOTONIC, &t1);
+		decomp_ret = LZ4_decompress_safe(ar->compressed_buf, ar->pages,
+						 ar->compressed_size, PAGE_SIZE);
+		clock_gettime(CLOCK_MONOTONIC, &t2);
+		bulk_stats.decompress_calls++;
+		bulk_stats.decompress_time_ns +=
+			(t2.tv_sec - t1.tv_sec) * 1000000000 + (t2.tv_nsec - t1.tv_nsec);
+		xfree(ar->compressed_buf);
+		ar->compressed_buf = NULL;
+
+		if (decomp_ret != PAGE_SIZE) {
+			pr_err("LZ4 decompression failed: expected %lu, got %d\n",
+			       PAGE_SIZE, decomp_ret);
+			return -1;
+		}
+	}
+
+	bulk_stats.callback_calls++;
+	bulk_stats.pages_completed++;
+	ret = ar->complete((int)ar->pi.dst_id, (unsigned long)ar->pi.vaddr,
+			   (int)ar->pi.nr_pages, ar->priv);
+	if (ret < 0)
+		return ret;
+
+	ar->rb = 0;
+	ar->goal = 0;
+	ar->compress_state = COMPRESS_STATE_READING_HEADER;
+	ar->compressed_size = 0;
+	ar->compressed_rb = 0;
+	return BULK_STREAM_PROGRESS;
+}
+
+/*
+ * Read uncompressed page data and invoke callback.
+ */
+static int read_uncompressed_data(struct ps_async_read *ar, int flags)
+{
+	int ret;
+	void *buf = ar->pages + (ar->rb - sizeof(ar->pi));
+	int need = ar->goal - ar->rb;
+
+	ret = bulk_recv(buf, need, flags);
+	if (ret == -EAGAIN)
+		return BULK_STREAM_WOULD_BLOCK;
+	if (ret < 0) {
+		pr_perror("Error reading uncompressed page data");
+		return -1;
+	}
+	ar->rb += ret;
+
+	if (ar->rb < ar->goal)
+		return BULK_STREAM_PROGRESS;
+
+	bulk_stats.callback_calls++;
+	bulk_stats.pages_completed++;
+	ret = ar->complete((int)ar->pi.dst_id, (unsigned long)ar->pi.vaddr,
+			   (int)ar->pi.nr_pages, ar->priv);
+	if (ret < 0)
+		return ret;
+
+	ar->rb = 0;
+	ar->goal = 0;
+	ar->compress_state = COMPRESS_STATE_READING_HEADER;
+	return BULK_STREAM_PROGRESS;
+}
+
+/*
+ * Read dirty bitmap data, apply or store for later.
+ */
+static int read_dirty_bitmap(struct ps_async_read *ar, int flags)
+{
+	int ret;
+	int need = ar->dirty_ranges_size - ar->dirty_rb;
+	void *buf = ((char *)ar->dirty_ranges) + ar->dirty_rb;
+
+	pr_info("Dirty bitmap read: need=%d dirty_rb=%lu total=%lu flags=%d sk=%d\n",
+		need, ar->dirty_rb, ar->dirty_ranges_size, flags, page_server_sk);
+
+	ret = __recv(page_server_sk, buf, need, flags);
+
+	pr_info("Dirty bitmap recv: ret=%d errno=%d\n", ret, ret < 0 ? errno : 0);
+
+	if (ret < 0) {
+		if (flags == MSG_DONTWAIT && (errno == EAGAIN || errno == EINTR)) {
+			pr_info("Dirty bitmap: WOULD_BLOCK (errno=%d)\n", errno);
+			return BULK_STREAM_WOULD_BLOCK;
+		}
+		pr_perror("Error reading dirty bitmap");
+		xfree(ar->dirty_ranges);
+		ar->dirty_ranges = NULL;
+		return -1;
+	}
+	if (ret == 0) {
+		pr_err("EOF while reading dirty bitmap (got %lu of %lu bytes)\n",
+		       ar->dirty_rb, ar->dirty_ranges_size);
+		xfree(ar->dirty_ranges);
+		ar->dirty_ranges = NULL;
+		return -1;
+	}
+	ar->dirty_rb += ret;
+
+	if (ar->dirty_rb < ar->dirty_ranges_size)
+		return BULK_STREAM_PROGRESS;
+
+	/* Dirty bitmap complete */
+	pr_info("Dirty bitmap received: %u ranges\n", ar->nr_dirty_ranges);
+
+	if (is_restore_connected()) {
+		int uffd = get_first_lpi_uffd();
+
+		pr_info("Restore connected, applying buffered pages\n");
+		if (uffd >= 0)
+			apply_buffered_pages(uffd, ar->dirty_ranges, ar->nr_dirty_ranges);
+		xfree(ar->dirty_ranges);
+	} else {
+		/*
+		 * Restore not connected yet — store bitmap for later.
+		 * handle_lazy_accept() will apply it when restore connects.
+		 */
+		pr_info("Restore not connected, storing dirty bitmap\n");
+		store_pending_dirty_bitmap(ar->dirty_ranges, ar->nr_dirty_ranges);
+		xfree(ar->dirty_ranges);
+	}
+
+	ar->dirty_ranges = NULL;
+	ar->rb = 0;
+	ar->compress_state = COMPRESS_STATE_READING_HEADER;
+
+	/*
+	 * COW mode: dirty bitmap marks end of bulk phase.
+	 * Send ACK to primary before marking complete.
+	 */
+	if (opts.cow_dump) {
+		pr_info("COW mode: dirty bitmap complete (%u ranges), bulk phase done\n",
+			ar->nr_dirty_ranges);
+		if (send_dirty_bitmap_ack())
+			return -1;
+		dirty_bitmap_received = true;
+		return BULK_STREAM_COMPLETE;
+	}
+
+	return BULK_STREAM_PROGRESS;
+}
+
 /*
  * Bulk mode continuous stream reader.
  * Processes headers and pages as they arrive without correlation to requests.
@@ -3039,367 +3433,29 @@ static struct {
  */
 static int page_server_read_bulk_stream(struct ps_async_read *ar, int flags)
 {
-	int ret, need;
-	void *buf;
-	u32 cmd;
-
 	pr_info("bulk_stream: state=%d rb=%lu dirty_rb=%lu flags=%d\n",
 		ar->compress_state, ar->rb, ar->dirty_rb, flags);
 
-	/* Reading header */
-	if (ar->compress_state == COMPRESS_STATE_READING_HEADER) {
-		if (ar->rb < sizeof(ar->pi)) {
-			struct timespec t_recv_start, t_recv_end;
+	switch (ar->compress_state) {
+	case COMPRESS_STATE_READING_HEADER:
+		return read_bulk_header(ar, flags);
 
-			buf = ((void *)&ar->pi) + ar->rb;
-			need = sizeof(ar->pi) - ar->rb;
+	case COMPRESS_STATE_READING_SIZE:
+		return read_compressed_size(ar, flags);
 
-			clock_gettime(CLOCK_MONOTONIC, &t_recv_start);
-			bulk_stats.recv_calls++;
-			ret = __recv(page_server_sk, buf, need, flags);
-			clock_gettime(CLOCK_MONOTONIC, &t_recv_end);
-			bulk_stats.recv_wait_time_ns += (t_recv_end.tv_sec - t_recv_start.tv_sec) * 1000000000 +
-						       (t_recv_end.tv_nsec - t_recv_start.tv_nsec);
-			if (ret < 0) {
-				if (flags == MSG_DONTWAIT && (errno == EAGAIN || errno == EINTR)) {
-					bulk_stats.recv_would_block++;
-					return BULK_STREAM_WOULD_BLOCK;
-				}
-				pr_perror("Error reading header from page server");
-				return -1;
-			}
-			bulk_stats.recv_bytes += ret;
-			ar->rb += ret;
-		}
+	case COMPRESS_STATE_READING_COMPRESSED:
+		return read_compressed_data(ar, flags);
 
-		if (ar->rb == sizeof(ar->pi)) {
-			cmd = decode_ps_cmd(ar->pi.cmd);
+	case COMPRESS_STATE_READING_UNCOMPRESSED:
+		return read_uncompressed_data(ar, flags);
 
-			if (ar->pi.nr_pages == 0 && cmd != PS_IOV_DIRTY_BITMAP) {
-				pr_info("Received end-of-transfer marker (cmd=%u dst_id=%lu)\n", cmd,
-					(unsigned long)ar->pi.dst_id);
-				bulk_stream_done = true;
+	case COMPRESS_STATE_READING_DIRTY_BITMAP:
+		return read_dirty_bitmap(ar, flags);
 
-				/*
-				 * Send ACK back to primary so it can
-				 * break out of page_server_serve() and
-				 * proceed to Phase 3 (skeleton dump).
-				 */
-				{
-					struct page_server_iov ack = {
-						.cmd = PS_IOV_BULK_COMPLETE_ACK,
-						.nr_pages = 0,
-						.vaddr = 0,
-						.dst_id = 0,
-					};
-					tcp_nodelay(page_server_sk, true);
-					if (__send(page_server_sk, &ack, sizeof(ack), 0) != sizeof(ack))
-						pr_perror("Failed to send bulk complete ACK");
-					else
-						pr_info("Sent bulk complete ACK to primary\n");
-				}
-
-				/*
-				 * COW mode: don't return BULK_STREAM_COMPLETE yet.
-				 * The dirty bitmap will arrive later (Phase 4).
-				 * Reset to read next header and continue.
-				 */
-				if (opts.cow_dump) {
-					pr_info("COW mode: waiting for dirty bitmap...\n");
-					ar->rb = 0;
-					ar->compress_state = COMPRESS_STATE_READING_HEADER;
-					return BULK_STREAM_PROGRESS;
-				}
-
-				return BULK_STREAM_COMPLETE;
-			}
-
-			if (cmd == PS_IOV_INVENTORY_READY) {
-				/* Primary signals inventory.img is ready */
-				set_inventory_ready_received();
-				ar->rb = 0;
-				ar->compress_state = COMPRESS_STATE_READING_HEADER;
-				return BULK_STREAM_PROGRESS;
-			}
-
-			if (cmd == PS_IOV_DIRTY_BITMAP) {
-				/* Dirty bitmap from primary (COW phased migration) */
-				ar->nr_dirty_ranges = ar->pi.nr_pages;  /* overloaded */
-				ar->dirty_ranges_size = ar->nr_dirty_ranges * 2 * sizeof(unsigned long);
-
-				if (ar->dirty_ranges_size == 0) {
-					/* No dirty ranges — apply all buffered pages as clean */
-					if (is_restore_connected()) {
-						int uffd = get_first_lpi_uffd();
-						if (uffd >= 0)
-							apply_buffered_pages(uffd, NULL, 0);
-					} else {
-						/* Store for later — restore not connected yet */
-						store_pending_dirty_bitmap(NULL, 0);
-					}
-					ar->rb = 0;
-					ar->compress_state = COMPRESS_STATE_READING_HEADER;
-					pr_info("Dirty bitmap: 0 ranges, all pages clean\n");
-					/*
-					 * COW mode: dirty bitmap (even empty) marks end of bulk phase.
-					 * Send ACK to primary before marking complete.
-					 */
-					if (opts.cow_dump) {
-						pr_info("COW mode: dirty bitmap complete (0 ranges), bulk phase done\n");
-						if (send_dirty_bitmap_ack())
-							return -1;
-						dirty_bitmap_received = true;
-						return BULK_STREAM_COMPLETE;
-					}
-					return BULK_STREAM_PROGRESS;
-				}
-
-				ar->dirty_ranges = xmalloc(ar->dirty_ranges_size);
-				if (!ar->dirty_ranges) {
-					pr_err("Failed to allocate dirty ranges buffer\n");
-					return -1;
-				}
-				ar->dirty_rb = 0;
-				ar->compress_state = COMPRESS_STATE_READING_DIRTY_BITMAP;
-				pr_info("Dirty bitmap: expecting %u ranges (%lu bytes)\n",
-					ar->nr_dirty_ranges, ar->dirty_ranges_size);
-				/* Don't return - fall through to read data immediately.
-				 * After hangup, no more EPOLLIN events will trigger us. */
-				goto read_dirty_bitmap;
-			} else if (cmd == PS_IOV_ADD_F_COMPRESS) {
-				ar->compress_state = COMPRESS_STATE_READING_SIZE;
-				ar->compressed_size = 0;
-				ar->compressed_rb = 0;
-			} else {
-				ar->compress_state = COMPRESS_STATE_READING_UNCOMPRESSED;
-				ar->goal = sizeof(ar->pi) + ar->pi.nr_pages * PAGE_SIZE;
-			}
-		}
-
-		return BULK_STREAM_PROGRESS;
+	default:
+		pr_err("Invalid bulk stream state: %d\n", ar->compress_state);
+		return -1;
 	}
-
-	/* Reading compressed size */
-	if (ar->compress_state == COMPRESS_STATE_READING_SIZE) {
-		struct timespec t_recv_start, t_recv_end;
-
-		need = sizeof(ar->compressed_size) - ar->compressed_rb;
-		buf = ((char *)&ar->compressed_size) + ar->compressed_rb;
-
-		clock_gettime(CLOCK_MONOTONIC, &t_recv_start);
-		bulk_stats.recv_calls++;
-		ret = __recv(page_server_sk, buf, need, flags);
-		clock_gettime(CLOCK_MONOTONIC, &t_recv_end);
-		bulk_stats.recv_wait_time_ns += (t_recv_end.tv_sec - t_recv_start.tv_sec) * 1000000000 +
-					       (t_recv_end.tv_nsec - t_recv_start.tv_nsec);
-		if (ret < 0) {
-			if (flags == MSG_DONTWAIT && (errno == EAGAIN || errno == EINTR)) {
-				bulk_stats.recv_would_block++;
-				return BULK_STREAM_WOULD_BLOCK;
-			}
-			pr_perror("Error reading compressed size");
-			return -1;
-		}
-		bulk_stats.recv_bytes += ret;
-		ar->compressed_rb += ret;
-
-		if (ar->compressed_rb == sizeof(ar->compressed_size)) {
-			if (ar->compressed_size <= 0 || ar->compressed_size > LZ4_compressBound(PAGE_SIZE)) {
-				pr_err("Invalid compressed size: %d\n", ar->compressed_size);
-				return -1;
-			}
-
-			ar->compressed_buf = xmalloc(ar->compressed_size);
-			if (!ar->compressed_buf) {
-				pr_err("Failed to allocate compressed buffer\n");
-				return -1;
-			}
-
-			ar->compressed_rb = 0;
-			ar->compress_state = COMPRESS_STATE_READING_COMPRESSED;
-		}
-
-		return BULK_STREAM_PROGRESS;
-	}
-
-	/* Reading compressed data */
-	if (ar->compress_state == COMPRESS_STATE_READING_COMPRESSED) {
-		struct timespec t_recv_start, t_recv_end;
-
-		need = ar->compressed_size - ar->compressed_rb;
-		buf = ar->compressed_buf + ar->compressed_rb;
-
-		clock_gettime(CLOCK_MONOTONIC, &t_recv_start);
-		bulk_stats.recv_calls++;
-		ret = __recv(page_server_sk, buf, need, flags);
-		clock_gettime(CLOCK_MONOTONIC, &t_recv_end);
-		bulk_stats.recv_wait_time_ns += (t_recv_end.tv_sec - t_recv_start.tv_sec) * 1000000000 +
-					       (t_recv_end.tv_nsec - t_recv_start.tv_nsec);
-		if (ret < 0) {
-			if (flags == MSG_DONTWAIT && (errno == EAGAIN || errno == EINTR)) {
-				bulk_stats.recv_would_block++;
-				return BULK_STREAM_WOULD_BLOCK;
-			}
-			pr_perror("Error reading compressed data");
-			xfree(ar->compressed_buf);
-			ar->compressed_buf = NULL;
-			return -1;
-		}
-		bulk_stats.recv_bytes += ret;
-		ar->compressed_rb += ret;
-
-		if (ar->compressed_rb == ar->compressed_size) {
-			int decomp_ret;
-			struct timespec t1, t2;
-
-			clock_gettime(CLOCK_MONOTONIC, &t1);
-			decomp_ret = LZ4_decompress_safe(ar->compressed_buf, ar->pages, ar->compressed_size,
-							 PAGE_SIZE);
-			clock_gettime(CLOCK_MONOTONIC, &t2);
-			bulk_stats.decompress_calls++;
-			bulk_stats.decompress_time_ns +=
-				(t2.tv_sec - t1.tv_sec) * 1000000000 + (t2.tv_nsec - t1.tv_nsec);
-			xfree(ar->compressed_buf);
-			ar->compressed_buf = NULL;
-
-			if (decomp_ret != PAGE_SIZE) {
-				pr_err("LZ4 decompression failed: expected %lu, got %d\n", PAGE_SIZE, decomp_ret);
-				return -1;
-			}
-
-			bulk_stats.callback_calls++;
-			bulk_stats.pages_completed++;
-			ret = ar->complete((int)ar->pi.dst_id, (unsigned long)ar->pi.vaddr, (int)ar->pi.nr_pages,
-					   ar->priv);
-			if (ret < 0)
-				return ret;
-
-			ar->rb = 0;
-			ar->goal = 0;
-			ar->compress_state = COMPRESS_STATE_READING_HEADER;
-			ar->compressed_size = 0;
-			ar->compressed_rb = 0;
-		}
-
-		return BULK_STREAM_PROGRESS;
-	}
-
-	/* Reading uncompressed page data */
-	if (ar->compress_state == COMPRESS_STATE_READING_UNCOMPRESSED) {
-		struct timespec t_recv_start, t_recv_end;
-
-		buf = ar->pages + (ar->rb - sizeof(ar->pi));
-		need = ar->goal - ar->rb;
-
-		clock_gettime(CLOCK_MONOTONIC, &t_recv_start);
-		bulk_stats.recv_calls++;
-		ret = __recv(page_server_sk, buf, need, flags);
-		clock_gettime(CLOCK_MONOTONIC, &t_recv_end);
-		bulk_stats.recv_wait_time_ns += (t_recv_end.tv_sec - t_recv_start.tv_sec) * 1000000000 +
-					       (t_recv_end.tv_nsec - t_recv_start.tv_nsec);
-		if (ret < 0) {
-			if (flags == MSG_DONTWAIT && (errno == EAGAIN || errno == EINTR)) {
-				bulk_stats.recv_would_block++;
-				return BULK_STREAM_WOULD_BLOCK;
-			}
-			pr_perror("Error reading uncompressed page data");
-			return -1;
-		}
-		bulk_stats.recv_bytes += ret;
-		ar->rb += ret;
-
-		if (ar->rb == ar->goal) {
-			bulk_stats.callback_calls++;
-			bulk_stats.pages_completed++;
-			ret = ar->complete((int)ar->pi.dst_id, (unsigned long)ar->pi.vaddr, (int)ar->pi.nr_pages,
-					   ar->priv);
-			if (ret < 0)
-				return ret;
-
-			ar->rb = 0;
-			ar->goal = 0;
-			ar->compress_state = COMPRESS_STATE_READING_HEADER;
-		}
-
-		return BULK_STREAM_PROGRESS;
-	}
-
-	/* Reading dirty bitmap data (COW phased migration) */
-read_dirty_bitmap:
-	if (ar->compress_state == COMPRESS_STATE_READING_DIRTY_BITMAP) {
-		need = ar->dirty_ranges_size - ar->dirty_rb;
-		buf = ((char *)ar->dirty_ranges) + ar->dirty_rb;
-
-		pr_info("Dirty bitmap read: need=%d dirty_rb=%lu total=%lu flags=%d sk=%d\n",
-			need, ar->dirty_rb, ar->dirty_ranges_size, flags, page_server_sk);
-
-		ret = __recv(page_server_sk, buf, need, flags);
-
-		pr_info("Dirty bitmap recv: ret=%d errno=%d\n", ret, ret < 0 ? errno : 0);
-
-		if (ret < 0) {
-			if (flags == MSG_DONTWAIT && (errno == EAGAIN || errno == EINTR)) {
-				pr_info("Dirty bitmap: WOULD_BLOCK (errno=%d)\n", errno);
-				return BULK_STREAM_WOULD_BLOCK;
-			}
-			pr_perror("Error reading dirty bitmap");
-			xfree(ar->dirty_ranges);
-			ar->dirty_ranges = NULL;
-			return -1;
-		}
-		if (ret == 0) {
-			pr_err("EOF while reading dirty bitmap (got %lu of %lu bytes)\n",
-			       ar->dirty_rb, ar->dirty_ranges_size);
-			xfree(ar->dirty_ranges);
-			ar->dirty_ranges = NULL;
-			return -1;
-		}
-		ar->dirty_rb += ret;
-
-		if (ar->dirty_rb == ar->dirty_ranges_size) {
-			pr_info("Dirty bitmap received11: %u ranges\n",
-				ar->nr_dirty_ranges);
-
-			if (is_restore_connected()) {
-				int uffd = get_first_lpi_uffd();
-
-				pr_info("Restore connected, applying buffered pages\n");
-				if (uffd >= 0)
-					apply_buffered_pages(uffd, ar->dirty_ranges,
-							     ar->nr_dirty_ranges);
-				xfree(ar->dirty_ranges);
-			} else {
-				/*
-				 * Restore not connected yet — store bitmap for later.
-				 * handle_lazy_accept() will apply it when restore connects.
-				 */
-				pr_info("Restore not connected, storing dirty bitmap\n");
-				store_pending_dirty_bitmap(ar->dirty_ranges,
-							   ar->nr_dirty_ranges);
-				xfree(ar->dirty_ranges);
-			}
-
-			ar->dirty_ranges = NULL;
-			ar->rb = 0;
-			ar->compress_state = COMPRESS_STATE_READING_HEADER;
-
-			/*
-			 * COW mode: dirty bitmap marks end of bulk phase.
-			 * Send ACK to primary before marking complete.
-			 */
-			if (opts.cow_dump) {
-				pr_info("COW mode: dirty bitmap complete (%u ranges), bulk phase done\n",
-					ar->nr_dirty_ranges);
-				if (send_dirty_bitmap_ack())
-					return -1;
-				dirty_bitmap_received = true;
-				return BULK_STREAM_COMPLETE;
-			}
-		}
-		return BULK_STREAM_PROGRESS;
-	}
-
-	return BULK_STREAM_PROGRESS;
 }
 
 /* Bulk stream statistics */
