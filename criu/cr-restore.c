@@ -2726,10 +2726,11 @@ sigact_done:
 		pr_err("apply_sigacts: restore code failed\n");
 	if (ptrace_poke_area(pid, orig_stack, (void *)(sp - 64), 64))
 		pr_err("apply_sigacts: restore stack failed\n");
-	vma_set_regs(pid, &orig_regs);
+	if (vma_set_regs(pid, &orig_regs))
+		pr_err("apply_sigacts: restore regs failed\n");
 detach_sigacts:
 	ptrace(PTRACE_DETACH, pid, NULL, NULL);
-	pr_err("T3 sigacts: applied %d signal handlers\n", applied);
+	pr_info("T3 sigacts: applied %d signal handlers\n", applied);
 }
 
 /*

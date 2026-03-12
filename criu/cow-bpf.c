@@ -16,7 +16,6 @@
 #include <errno.h>
 #include <unistd.h>
 #include <sys/time.h>
-#include <sys/time.h>
 #include <bpf/libbpf.h>
 
 #undef LOG_PREFIX
@@ -188,12 +187,15 @@ int cow_bpf_drain(struct cow_bpf_region *out_regions, int max_regions,
 	/* Coalesce contiguous pages into regions */
 	nr_regions = 0;
 	i = 0;
+	{
+	unsigned long page_size = sysconf(_SC_PAGESIZE);
+
 	while (i < dc.count && nr_regions < max_regions) {
 		unsigned long start = dc.addrs[i];
-		unsigned long end = start + 4096;
+		unsigned long end = start + page_size;
 
 		while (i + 1 < dc.count && dc.addrs[i + 1] == end) {
-			end += 4096;
+			end += page_size;
 			i++;
 		}
 		out_regions[nr_regions].start = start;
@@ -201,6 +203,7 @@ int cow_bpf_drain(struct cow_bpf_region *out_regions, int max_regions,
 		out_regions[nr_regions].categories = 0;
 		nr_regions++;
 		i++;
+	}
 	}
 
 	xfree(dc.addrs);
