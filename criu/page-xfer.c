@@ -3185,15 +3185,15 @@ static int read_bulk_header(struct ps_async_read *ar, int flags)
 	if (ar->pi.nr_pages == 0 && cmd != PS_IOV_DIRTY_BITMAP)
 		return handle_end_of_transfer(ar, cmd);
 
-	if (cmd == PS_IOV_INVENTORY_READY) {
+	switch (cmd) {
+	case PS_IOV_INVENTORY_READY:
 		/* Primary signals inventory.img is ready */
 		set_inventory_ready_received();
 		ar->rb = 0;
 		ar->compress_state = COMPRESS_STATE_READING_HEADER;
 		return BULK_STREAM_PROGRESS;
-	}
 
-	if (cmd == PS_IOV_DIRTY_BITMAP) {
+	case PS_IOV_DIRTY_BITMAP:
 		ret = handle_dirty_bitmap_header(ar);
 		if (ret != 0)
 			return ret;
@@ -3202,15 +3202,18 @@ static int read_bulk_header(struct ps_async_read *ar, int flags)
 		 * After hangup, no more EPOLLIN events will trigger us.
 		 */
 		return read_dirty_bitmap(ar, flags);
-	}
 
-	if (cmd == PS_IOV_ADD_F_COMPRESS) {
+	case PS_IOV_ADD_F_COMPRESS:
 		ar->compress_state = COMPRESS_STATE_READING_SIZE;
 		ar->compressed_size = 0;
 		ar->compressed_rb = 0;
-	} else {
+		break;
+
+	default:
+		/* Uncompressed page data */
 		ar->compress_state = COMPRESS_STATE_READING_UNCOMPRESSED;
 		ar->goal = sizeof(ar->pi) + ar->pi.nr_pages * PAGE_SIZE;
+		break;
 	}
 
 	return BULK_STREAM_PROGRESS;
