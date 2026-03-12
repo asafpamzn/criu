@@ -3182,7 +3182,7 @@ static int read_bulk_header(struct ps_async_read *ar, int flags)
 	/* Header complete, dispatch based on command */
 	cmd = decode_ps_cmd(ar->pi.cmd);
 
-	if (ar->pi.nr_pages == 0 && cmd != PS_IOV_DIRTY_BITMAP)
+	if (ar->pi.nr_pages == 0 && cmd != PS_IOV_DIRTY_BITMAP && cmd != PS_IOV_INVENTORY_READY)
 		return handle_end_of_transfer(ar, cmd);
 
 	switch (cmd) {
