@@ -53,7 +53,7 @@ static struct timeval start;
  * Manual buf len as sprintf will _always_ put '\0' at the end,
  * but we want a "constant" pid to be there on restore
  */
-#define TS_BUF_OFF 12
+#define TS_BUF_OFF 17
 
 static void timediff(struct timeval *from, struct timeval *to)
 {
@@ -69,12 +69,14 @@ static void timediff(struct timeval *from, struct timeval *to)
 static void print_ts(void)
 {
 	struct timeval t;
+	struct tm *tm;
 
 	gettimeofday(&t, NULL);
-	timediff(&start, &t);
-	snprintf(buffer, TS_BUF_OFF, "(%02u.%06u", (unsigned)t.tv_sec, (unsigned)t.tv_usec);
-	buffer[TS_BUF_OFF - 2] = ')'; /* this will overwrite the last digit if tv_sec>=100 */
-	buffer[TS_BUF_OFF - 1] = ' '; /* kill the '\0' produced by snprintf */
+	tm = localtime(&t.tv_sec);
+	snprintf(buffer, TS_BUF_OFF, "(%02d:%02d:%02d.%06u",
+		 tm->tm_hour, tm->tm_min, tm->tm_sec, (unsigned)t.tv_usec);
+	buffer[TS_BUF_OFF - 2] = ')';
+	buffer[TS_BUF_OFF - 1] = ' ';
 }
 
 int log_get_fd(void)
@@ -341,7 +343,7 @@ static void early_vprint(const char *format, unsigned int loglevel, va_list para
 		 * log levels with timestamps (>=LOG_TIMESTAMP).
 		 */
 		log_size = snprintf(early_log_buffer + early_log_buf_off, log_space,
-				    "(00.000000) ");
+				    "(00:00:00.000000) ");
 	}
 
 	if (log_size < log_space)
