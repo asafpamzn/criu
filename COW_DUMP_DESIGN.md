@@ -89,7 +89,32 @@ page_server_serve()
 No fork snapshot — WP_ASYNC ensures pages read before any write
 have dump-time content. Dirty pages are re-sent at T3.
 
-### 4. T3 Freeze + Convergence (~44ms)
+### 3b. Pre-T3 Sigacts Capture (~2ms, source live)
+
+**File**: `criu/page-xfer.c`, function `capture_and_send_t3_sigacts()`
+
+```
+capture_and_send_t3_sigacts(source_pid, ..., already_stopped=false)
+  │
+  ├─ PTRACE_SEIZE main thread only
+  ├─ PTRACE_INTERRUPT + waitpid
+  │
+  ├─ For each signal 1-64 (skip SIGKILL, SIGSTOP):
+  │    Write SVC+BRK at PC
+  │    Set regs: rt_sigaction(sig, NULL, &oldact, 8)
+  │    PTRACE_CONT → wait SIGTRAP
+  │    Read oldact from stack (handler, flags, mask)
+  │
+  ├─ Restore original code + stack + regs
+  ├─ PTRACE_DETACH — thread resumes immediately
+  │
+  └─ Send PS_IOV_T3_SIGACTS (2KB)
+
+No parasite, no collect_mappings, no compel_cure.
+Single thread paused ~2ms. Other threads unaffected.
+```
+
+### 4. T3 Freeze + Convergence (~29ms)
 
 **File**: `criu/page-xfer.c`, function `cow_converge_dirty_pages_parallel()`
 
@@ -97,29 +122,29 @@ have dump-time content. Dirty pages are re-sent at T3.
 cow_converge_dirty_pages_parallel()
   │
   ├─ kill(source_pid, SIGSTOP)
+  │    Poll /proc/pid/status for State:T (verified stop)
   │
   ├─ eBPF ring drain (cow_bpf_drain)         ~0ms
   │    Sort + dedup + coalesce → region list
+  │    If drops detected → fall back to PAGEMAP_SCAN
   │    94-230 dirty pages typical
   │
   ├─ T3 state capture
-  │    ├─ Signal handlers via parasite re-inject    ~10ms
-  │    ├─ Registers via PTRACE_GETREGSET            <1ms
-  │    └─ FD table from /proc/pid/fd                <1ms
+  │    ├─ Registers via PTRACE_GETREGSET            ~5ms
+  │    └─ FD table from /proc/pid/fd                ~1ms
+  │    (sigacts already captured pre-freeze)
   │
-  ├─ Dirty page dispatch (from frozen source)       ~10ms
+  ├─ Dirty page dispatch (from frozen source)       ~5ms
   │    process_vm_readv → LZ4 → TCP (8 streams)
   │
   ├─ Non-lazy re-send (stacks + lib .data/.bss)     ~5ms
   │    127 pages (508KB) — file-backed rw + [stack]
   │
-  ├─ libc rw- re-send                               <1ms
+  ├─ VMA diff detection (source still frozen)        ~5ms
+  │    Scan /proc/pid/maps for new VMAs
+  │    Send PS_IOV_VMA_DIFF + page data to replica
   │
-  ├─ kill(source_pid, SIGCONT)
-  │
-  └─ VMA diff detection (source running)
-       Scan /proc/pid/maps for new VMAs
-       Send PS_IOV_VMA_DIFF to replica
+  └─ kill(source_pid, SIGCONT)
 ```
 
 ### 4. T3 Register Re-capture

@@ -77,7 +77,11 @@ the faulting page address to a 64MB ring buffer.
 
 At T3, the page server drains the ring in microseconds — O(dirty_pages)
 instead of walking all 50M+ page table entries with PAGEMAP_SCAN
-(O(total_pages), ~150ms). This reduced T3 freeze from 170ms to 44ms.
+(O(total_pages), ~150ms). This reduced T3 freeze from 170ms to 29ms.
+
+**Safety**: Ring buffer drops are detected via a BPF counter. If the
+64MB ring fills up, the page server falls back to PAGEMAP_SCAN
+automatically — no silent data loss.
 
 **Critical**: BPF attaches immediately after WP in `cr-dump.c` (zero
 gap). Any gap causes missed dirty pages → futex deadlock on replica.
@@ -106,30 +110,30 @@ Tested on m7g.16xlarge (494GB RAM, 64 CPUs), same-AZ VPC.
 
 | Test | Size | Transfer | Throughput | Freeze | Result |
 |------|------|----------|------------|--------|--------|
-| Live traffic | 100GB | 30s | 3,233 MB/s | 44ms | **7/7** |
-| Live traffic | 200GB | 59s | 3,313 MB/s | 43ms | **6/7** (BGSAVE=disk) |
+| Live traffic | 100GB | 29s | 3,381 MB/s | 55ms | **7/7** |
+| Live traffic | 200GB | 59s | 3,313 MB/s | ~55ms | **7/7** |
 
-**Source unavailability: 44ms** (T3 SIGSTOP→SIGCONT).
+**Source unavailability: 55ms total** (26ms dump + 29ms T3, two separate windows).
 
 ### Stage Timing (100GB + live traffic)
 
 | Stage | Duration | Notes |
 |-------|----------|-------|
-| Freeze (dump_one_task) | 23 ms | Seize + pagemap + parasite |
-| WP setup (post-resume) | 27 ms | WP_ASYNC, not frozen |
+| Dump freeze | **26 ms** | Seize + maps + parasite + pagemap |
+| WP setup (post-resume) | 35 ms | WP_ASYNC, 63 threads, not frozen |
 | eBPF attach | 0 ms | Immediately after WP |
-| Bulk transfer (8 streams) | 30 s | LZ4, process_vm_readv |
-| T3 freeze | **44 ms** | eBPF drain + state capture + dispatch |
-| Cutover | 0 ms | TCP "GO", no SIGSTOP |
-| **Total source frozen** | **44 ms** | T3 only (dump is separate) |
+| Sigacts capture | 2 ms | Direct ptrace injection, pre-freeze |
+| Bulk transfer (8 streams) | 29 s | LZ4, process_vm_readv |
+| T3 freeze | **29 ms** | eBPF drain + regs + FDs + dirty + non-lazy + VMA diff |
+| **Total source frozen** | **55 ms** | 26ms dump + 29ms T3 |
 
 ### vs REPLICAOF
 
 | Metric | COW Migration | REPLICAOF |
 |--------|--------------|-----------|
 | 200GB transfer | **59s** | >20min |
-| Throughput | **3.3 GB/s** | ~500 MB/s |
-| Source freeze | **44ms** | ~1.7s (BGSAVE fork) |
+| Throughput | **3.4 GB/s** | ~500 MB/s |
+| Source freeze | **55ms** | ~1.7s (BGSAVE fork) |
 | Source memory spike | None | 2× RSS (fork COW) |
 
 ## Verification Tests (7/7)
