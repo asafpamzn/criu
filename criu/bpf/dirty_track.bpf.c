@@ -19,6 +19,8 @@
 
 /* Target PID — set by userspace before attaching */
 const volatile pid_t target_pid = 0;
+/* Page shift — set by userspace from sysconf(_SC_PAGESIZE) */
+const volatile unsigned int page_shift = 12;
 
 /* Ring buffer for dirty page addresses */
 struct {
@@ -34,6 +36,14 @@ struct {
 	__type(value, __u64);
 } event_count SEC(".maps");
 
+/* Counts ring buffer drops (ring full) */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u64);
+} drop_count SEC(".maps");
+
 SEC("fentry/do_wp_page")
 int BPF_PROG(track_wp_fault, struct vm_fault *vmf)
 {
@@ -47,11 +57,18 @@ int BPF_PROG(track_wp_fault, struct vm_fault *vmf)
 		return 0;
 
 	addr = BPF_CORE_READ(vmf, address);
-	/* Page-align */
-	addr &= ~((__u64)4095);
+	/* Page-align using configurable page shift */
+	addr &= ~(((__u64)1 << page_shift) - 1);
 
-	/* Push to ring buffer — drop if full (non-blocking) */
-	bpf_ringbuf_output(&dirty_ring, &addr, sizeof(addr), 0);
+	/* Push to ring buffer — track drops for correctness */
+	if (bpf_ringbuf_output(&dirty_ring, &addr, sizeof(addr), 0) != 0) {
+		__u64 *dropp;
+		__u32 dz = 0;
+
+		dropp = bpf_map_lookup_elem(&drop_count, &dz);
+		if (dropp)
+			__sync_fetch_and_add(dropp, 1);
+	}
 
 	/* Bump counter */
 	valp = bpf_map_lookup_elem(&event_count, &zero);

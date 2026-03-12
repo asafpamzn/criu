@@ -33,7 +33,8 @@ extern int cow_bpf_start(pid_t target_pid);
  * @max_regions: capacity of out_regions
  * @out_count: output: number of unique dirty pages
  *
- * Returns number of coalesced regions, or -1 on error.
+ * Returns number of coalesced regions, -1 on error, or -2 if
+ * ring buffer drops were detected (caller must use PAGEMAP_SCAN).
  */
 extern int cow_bpf_drain(struct cow_bpf_region *out_regions,
 			  int max_regions, unsigned long *out_count);
@@ -42,6 +43,12 @@ extern int cow_bpf_drain(struct cow_bpf_region *out_regions,
  * Get total event count from BPF (including duplicates).
  */
 extern u64 cow_bpf_event_count(void);
+
+/*
+ * Get count of dropped events (ring buffer full).
+ * Non-zero means dirty page list is incomplete.
+ */
+extern u64 cow_bpf_drop_count(void);
 
 /*
  * Stop BPF tracking — detach + free.

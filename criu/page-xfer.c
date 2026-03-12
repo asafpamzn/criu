@@ -2691,7 +2691,30 @@ static int cow_converge_dirty_pages(struct active_image *img,
 		unsigned long final_dirty = 0;
 
 		kill(source_pid, SIGSTOP);
-		usleep(1000);  /* let kernel finish in-flight faults */
+		/* Verify stopped — poll /proc status */
+		{
+			char spath[64];
+			char sbuf[256];
+			int sfd, tries;
+
+			snprintf(spath, sizeof(spath),
+				 "/proc/%d/status", source_pid);
+			for (tries = 0; tries < 200; tries++) {
+				sfd = open(spath, O_RDONLY);
+				if (sfd >= 0) {
+					int n = read(sfd, sbuf,
+						     sizeof(sbuf) - 1);
+					close(sfd);
+					if (n > 0) {
+						sbuf[n] = '\0';
+						if (strstr(sbuf,
+							   "\nState:\tT"))
+							break;
+					}
+				}
+				usleep(100);
+			}
+		}
 
 		list_for_each_entry(lve, get_global_lazy_vmas(), list) {
 			unsigned long scan_pos;
@@ -2909,149 +2932,196 @@ static bool addr_in_dump_vmas(u64 start, u64 end, u64 dst_id)
 #include <sys/syscall.h>
 
 /*
- * T3 signal handler + timer capture.
+ * Lightweight T3 signal handler capture via direct ptrace injection.
  *
- * Inject rt_sigaction() for each signal via ptrace to read the
- * current handler.  No parasite needed — direct syscall injection.
- * Also read itimers via /proc/pid/status signal masks.
+ * Injects rt_sigaction(sig, NULL, &oldact, 8) for each signal on a
+ * single thread. No parasite, no collect_mappings, no compel_cure.
+ * ~2ms instead of ~10ms. Works on both live and SIGSTOP'd processes.
  *
- * Layout per signal (aarch64): 32 bytes
- *   u64 sa_handler, sa_flags, sa_restorer, sa_mask
- */
-
-/*
- * T3 signal handler capture via parasite re-injection.
- *
- * At T3 the source is SIGSTOP'd.  We SEIZE all threads, consume
- * pending SIGSTOPs (PTRACE_CONT + wait4 cycle), then inject a
- * fresh parasite.  One RPC gets all 64 signal handlers.
+ * Kernel rt_sigaction oldact layout:
+ *   aarch64: handler(8) + flags(8) + mask(8) = 24 bytes (no restorer)
+ *   x86_64:  handler(8) + flags(8) + restorer(8) + mask(8) = 32 bytes
  */
 static int capture_and_send_t3_sigacts(pid_t source_pid, int socket,
-				       u32 dst_id)
+				       u32 dst_id, bool already_stopped)
 {
-	struct parasite_ctl *ctl;
-	struct parasite_dump_sa_args *args;
-	struct vm_area_list vmas;
-	struct page_server_iov hdr;
-	struct pstree_item *pi = root_item;
-	int sig, ret, t;
+	pid_t tid = source_pid;
+	user_regs_struct_t orig_regs, regs;
+	struct iovec iov;
+	unsigned long orig_code[2]; /* save 16 bytes at PC */
+	unsigned long orig_stack[8]; /* save 64 bytes at sp-64 */
+	unsigned long pc, sp;
+	unsigned long sa_buf[4];
+	int sig, status, captured = 0;
 	u64 sigdata[64 * 4];
+	struct page_server_iov hdr;
 	size_t total, sent = 0;
 
-	vm_area_list_init(&vmas);
-	ret = collect_mappings(source_pid, &vmas, NULL);
-	if (ret) {
-		pr_err("T3 sigacts: collect_mappings failed\n");
+	memset(sigdata, 0, sizeof(sigdata));
+
+	/* SEIZE + stop the main thread */
+	if (ptrace(PTRACE_SEIZE, tid, NULL, 0)) {
+		pr_perror("T3 sigacts: SEIZE %d", tid);
+		return -1;
+	}
+	if (ptrace(PTRACE_INTERRUPT, tid, NULL, NULL) ||
+	    waitpid(tid, &status, __WALL) != tid) {
+		ptrace(PTRACE_DETACH, tid, NULL, NULL);
 		return -1;
 	}
 
-	/*
-	 * SEIZE all LIVE threads from /proc/pid/task.
-	 * Do NOT use root_item->threads — it may include dead
-	 * child processes from the benchmark that were captured
-	 * at T_dump but exited since.
-	 */
-	{
-		char task_dir[64];
-		DIR *dir;
-		struct dirent *de;
-		pid_t tids[256];
-		int nr_tids = 0;
-
-		snprintf(task_dir, sizeof(task_dir),
-			 "/proc/%d/task", source_pid);
-		dir = opendir(task_dir);
-		if (!dir) {
-			pr_perror("T3 sigacts: opendir %s", task_dir);
+	if (already_stopped) {
+		if (ptrace(PTRACE_CONT, tid, 0, 0) ||
+		    waitpid(tid, &status, __WALL) != tid) {
+			ptrace(PTRACE_DETACH, tid, NULL, NULL);
 			return -1;
 		}
-		while ((de = readdir(dir)) != NULL && nr_tids < 256) {
-			if (de->d_name[0] == '.')
-				continue;
-			tids[nr_tids++] = atoi(de->d_name);
+	}
+
+	/* Save original registers */
+	iov.iov_base = &orig_regs;
+	iov.iov_len = sizeof(orig_regs);
+	if (ptrace(PTRACE_GETREGSET, tid,
+		   (void *)(unsigned long)NT_PRSTATUS, &iov)) {
+		ptrace(PTRACE_DETACH, tid, NULL, NULL);
+		return -1;
+	}
+
+#ifdef __aarch64__
+	pc = (unsigned long)orig_regs.pc;
+	sp = (unsigned long)orig_regs.sp;
+#elif defined(__x86_64__)
+	pc = (unsigned long)orig_regs.native.ip;
+	sp = (unsigned long)orig_regs.native.sp;
+#else
+	ptrace(PTRACE_DETACH, tid, NULL, NULL);
+	return -1;
+#endif
+
+	/* Save original code and stack */
+	errno = 0;
+	orig_code[0] = ptrace(PTRACE_PEEKDATA, tid, pc, NULL);
+	orig_code[1] = ptrace(PTRACE_PEEKDATA, tid, pc + 8, NULL);
+	if (errno)
+		goto detach;
+	{
+		int w;
+		for (w = 0; w < 8; w++) {
+			errno = 0;
+			orig_stack[w] = ptrace(PTRACE_PEEKDATA, tid,
+					       sp - 64 + w * 8, NULL);
+			if (errno)
+				goto detach;
 		}
-		closedir(dir);
-
-		for (t = 0; t < nr_tids; t++) {
-			int status;
-
-			if (ptrace(PTRACE_SEIZE, tids[t], NULL, 0)) {
-				pr_perror("T3 sigacts: SEIZE %d", tids[t]);
-				goto err_detach;
-			}
-			if (ptrace(PTRACE_INTERRUPT, tids[t], NULL, NULL)) {
-				ptrace(PTRACE_DETACH, tids[t], NULL, NULL);
-				goto err_detach;
-			}
-			if (waitpid(tids[t], &status, __WALL) != tids[t]) {
-				ptrace(PTRACE_DETACH, tids[t], NULL, NULL);
-				goto err_detach;
-			}
-			/* Consume pending SIGSTOP */
-			if (ptrace(PTRACE_CONT, tids[t], 0, 0)) {
-				ptrace(PTRACE_DETACH, tids[t], NULL, NULL);
-				goto err_detach;
-			}
-			if (waitpid(tids[t], &status, __WALL) != tids[t]) {
-				ptrace(PTRACE_DETACH, tids[t], NULL, NULL);
-				goto err_detach;
-			}
-		}
-		pr_err("T3 sigacts: seized %d threads\n", nr_tids);
 	}
 
-	ctl = parasite_infect_seized(source_pid, pi, &vmas);
-	if (!ctl) {
-		pr_err("T3 sigacts: parasite infect failed\n");
-		goto err_detach;
+	/* Write syscall+trap at PC */
+#ifdef __aarch64__
+	{
+		/* SVC #0 (0xD4000001) + BRK #0 (0xD4200000) = 8 bytes */
+		unsigned long svc_brk = 0xD4200000D4000001UL;
+		if (ptrace(PTRACE_POKEDATA, tid, pc, svc_brk))
+			goto restore;
 	}
-
-	ret = compel_rpc_call_sync(PARASITE_CMD_DUMP_SIGACTS, ctl);
-	if (ret) {
-		pr_err("T3 sigacts: RPC failed (%d)\n", ret);
-		if (compel_cure(ctl))
-			pr_err("T3 sigacts: cure failed\n");
-		goto err_detach;
+#elif defined(__x86_64__)
+	{
+		/* SYSCALL (0F 05) + INT3 (CC) in first 3 bytes */
+		unsigned long patched = (orig_code[0] & ~0xFFFFFFUL) |
+					0xCC050FUL;
+		if (ptrace(PTRACE_POKEDATA, tid, pc, patched))
+			goto restore;
 	}
+#endif
 
-	args = compel_parasite_args(ctl, struct parasite_dump_sa_args);
-
-	memset(sigdata, 0, sizeof(sigdata));
 	for (sig = 1; sig <= 64; sig++) {
 		int idx = sig - 1;
 
-		sigdata[idx * 4 + 0] = (u64)(unsigned long)
-			args->sas[idx].rt_sa_handler;
-		sigdata[idx * 4 + 1] = (u64)args->sas[idx].rt_sa_flags;
-		sigdata[idx * 4 + 2] = (u64)(unsigned long)
-			args->sas[idx].rt_sa_restorer;
-		sigdata[idx * 4 + 3] = args->sas[idx].rt_sa_mask.sig[0];
-	}
+		if (sig == SIGKILL || sig == SIGSTOP)
+			continue;
 
-	pr_err("T3 sigacts: captured 64 signal handlers\n");
+		regs = orig_regs;
+#ifdef __aarch64__
+		regs.regs[8] = __NR_rt_sigaction;
+		regs.regs[0] = sig;
+		regs.regs[1] = 0;	   /* act = NULL (read) */
+		regs.regs[2] = sp - 64;   /* oldact */
+		regs.regs[3] = 8;	   /* sigsetsize */
+		regs.pc = pc;
+#elif defined(__x86_64__)
+		regs.native.orig_ax = __NR_rt_sigaction;
+		regs.native.ax = __NR_rt_sigaction;
+		regs.native.di = sig;
+		regs.native.si = 0;
+		regs.native.dx = sp - 64;
+		regs.native.r10 = 8;
+		regs.native.ip = pc;
+#endif
+		iov.iov_base = &regs;
+		iov.iov_len = sizeof(regs);
+		if (ptrace(PTRACE_SETREGSET, tid,
+			   (void *)(unsigned long)NT_PRSTATUS, &iov))
+			break;
+		if (ptrace(PTRACE_CONT, tid, NULL, NULL))
+			break;
+		if (waitpid(tid, &status, __WALL) != tid)
+			break;
+		if (!WIFSTOPPED(status) || WSTOPSIG(status) != SIGTRAP)
+			break;
 
-	/* Cure + detach all live threads */
-	if (compel_stop_daemon_fast(ctl))
-		pr_err("T3 sigacts: stop daemon failed\n");
-	if (compel_cure_local(ctl))
-		pr_err("T3 sigacts: cure failed\n");
-	{
-		char td[64];
-		DIR *d;
-		struct dirent *e;
-
-		snprintf(td, sizeof(td), "/proc/%d/task", source_pid);
-		d = opendir(td);
-		if (d) {
-			while ((e = readdir(d)) != NULL) {
-				if (e->d_name[0] != '.')
-					ptrace(PTRACE_DETACH,
-					       atoi(e->d_name),
-					       NULL, NULL);
+		/* Read oldact from stack */
+		memset(sa_buf, 0, sizeof(sa_buf));
+		{
+			int w;
+#ifdef __aarch64__
+			/* aarch64: handler(8) + flags(8) + mask(8) = 24B */
+			for (w = 0; w < 3; w++) {
+				errno = 0;
+				sa_buf[w] = ptrace(PTRACE_PEEKDATA, tid,
+						   sp - 64 + w * 8, NULL);
+				if (errno)
+					goto restore;
 			}
-			closedir(d);
+			sigdata[idx * 4 + 0] = sa_buf[0]; /* handler */
+			sigdata[idx * 4 + 1] = sa_buf[1]; /* flags */
+			sigdata[idx * 4 + 2] = 0;	   /* no restorer */
+			sigdata[idx * 4 + 3] = sa_buf[2]; /* mask */
+#elif defined(__x86_64__)
+			/* x86_64: handler(8) + flags(8) + restorer(8) + mask(8) */
+			for (w = 0; w < 4; w++) {
+				errno = 0;
+				sa_buf[w] = ptrace(PTRACE_PEEKDATA, tid,
+						   sp - 64 + w * 8, NULL);
+				if (errno)
+					goto restore;
+			}
+			sigdata[idx * 4 + 0] = sa_buf[0];
+			sigdata[idx * 4 + 1] = sa_buf[1];
+			sigdata[idx * 4 + 2] = sa_buf[2];
+			sigdata[idx * 4 + 3] = sa_buf[3];
+#endif
 		}
+		captured++;
 	}
+
+restore:
+	/* Restore original code + stack + regs */
+	ptrace(PTRACE_POKEDATA, tid, pc, orig_code[0]);
+	ptrace(PTRACE_POKEDATA, tid, pc + 8, orig_code[1]);
+	{
+		int w;
+		for (w = 0; w < 8; w++)
+			ptrace(PTRACE_POKEDATA, tid,
+			       sp - 64 + w * 8, orig_stack[w]);
+	}
+	iov.iov_base = &orig_regs;
+	iov.iov_len = sizeof(orig_regs);
+	ptrace(PTRACE_SETREGSET, tid,
+	       (void *)(unsigned long)NT_PRSTATUS, &iov);
+detach:
+	ptrace(PTRACE_DETACH, tid, NULL, NULL);
+
+	pr_info("T3 sigacts: captured %d signals (direct injection)\n",
+		captured);
 
 	/* Send */
 	hdr.cmd = encode_ps_cmd(PS_IOV_T3_SIGACTS, 0);
@@ -3070,29 +3140,8 @@ static int capture_and_send_t3_sigacts(pid_t source_pid, int socket,
 		sent += w;
 	}
 
-	pr_err("T3 sigacts: sent %zu bytes\n", total);
+	pr_info("T3 sigacts: sent %zu bytes\n", total);
 	return 0;
-
-err_detach:
-	/* Detach any threads we might have seized */
-	{
-		char td[64];
-		DIR *d;
-		struct dirent *e;
-
-		snprintf(td, sizeof(td), "/proc/%d/task", source_pid);
-		d = opendir(td);
-		if (d) {
-			while ((e = readdir(d)) != NULL) {
-				if (e->d_name[0] != '.')
-					ptrace(PTRACE_DETACH,
-					       atoi(e->d_name),
-					       NULL, NULL);
-			}
-			closedir(d);
-		}
-	}
-	return -1;
 }
 
 /*
@@ -3181,7 +3230,7 @@ static int capture_and_send_t3_fds(pid_t source_pid, int socket,
 		return 0;
 	}
 
-	pr_err("T3 FDs: captured %d file descriptors\n", nr_fds);
+	pr_info("T3 FDs: captured %d file descriptors\n", nr_fds);
 
 	hdr.cmd = encode_ps_cmd(PS_IOV_T3_FDS, 0);
 	hdr.nr_pages = nr_fds;
@@ -3203,7 +3252,7 @@ static int capture_and_send_t3_fds(pid_t source_pid, int socket,
 		sent += w;
 	}
 
-	pr_err("T3 FDs: sent %d fds (%zu bytes)\n",
+	pr_info("T3 FDs: sent %d fds (%zu bytes)\n",
 	       nr_fds, total);
 	xfree(fds);
 	return 0;
@@ -3270,6 +3319,13 @@ static int capture_and_send_t3_regs(pid_t source_pid, int socket,
 			t3[i].sp = gp.sp;
 			t3[i].pc = gp.pc;
 			t3[i].pstate = gp.pstate;
+#elif defined(__x86_64__)
+			memcpy(t3[i].regs, &gp.native,
+			       sizeof(gp.native));
+			t3[i].sp = gp.native.sp;
+			t3[i].pc = gp.native.ip;
+			t3[i].pstate = gp.native.flags;
+			t3[i].tls = gp.native.fs_base;
 #else
 			t3[i].sp = gp.sp;
 			t3[i].pc = gp.ip;
@@ -3283,7 +3339,7 @@ static int capture_and_send_t3_regs(pid_t source_pid, int socket,
 		ptrace(PTRACE_DETACH, tid, NULL, NULL);
 	}
 
-	pr_err("T3 regs: captured %d threads\n", nr_threads);
+	pr_info("T3 regs: captured %d threads\n", nr_threads);
 
 	hdr.cmd = encode_ps_cmd(PS_IOV_T3_REGS, 0);
 	hdr.nr_pages = nr_threads;
@@ -3304,7 +3360,7 @@ static int capture_and_send_t3_regs(pid_t source_pid, int socket,
 		}
 		sent += w;
 	}
-	pr_err("T3 regs: sent %d threads (%zu bytes)\n",
+	pr_info("T3 regs: sent %d threads (%zu bytes)\n",
 	       nr_threads, (size_t)(nr_threads * sizeof(*t3)));
 	xfree(t3);
 	return 0;
@@ -3540,99 +3596,6 @@ static long converge_dispatch_parallel(struct active_image *img,
  * Multi-stream convergence: distribute dirty page re-sends across
  * all TCP streams with vaddr hash affinity.
  */
-/*
- * Cgroup-freeze: freezes at syscall boundaries (clean state).
- * Returns path to cgroup.freeze file, or NULL on failure.
- */
-static char g_cgroup_freeze_path[PATH_MAX];
-
-static bool __attribute__((unused)) cgroup_freeze(pid_t pid)
-{
-	char cgroup_buf[256];
-	char path[PATH_MAX];
-	char events[256];
-	FILE *fp;
-	int fd, i;
-
-	snprintf(path, sizeof(path), "/proc/%d/cgroup", pid);
-	fp = fopen(path, "r");
-	if (!fp)
-		return false;
-	if (!fgets(cgroup_buf, sizeof(cgroup_buf), fp)) {
-		fclose(fp);
-		return false;
-	}
-	fclose(fp);
-
-	/* Parse "0::/system.slice/valkey-server.service\n" */
-	{
-		char *p = strchr(cgroup_buf, ':');
-
-		if (!p)
-			return false;
-		p = strchr(p + 1, ':');
-		if (!p)
-			return false;
-		p++; /* skip second ':' */
-		/* Trim newline */
-		{
-			char *nl = strchr(p, '\n');
-
-			if (nl)
-				*nl = '\0';
-		}
-		snprintf(g_cgroup_freeze_path, sizeof(g_cgroup_freeze_path),
-			 "/sys/fs/cgroup%s/cgroup.freeze", p);
-	}
-
-	fd = open(g_cgroup_freeze_path, O_WRONLY);
-	if (fd < 0) {
-		pr_perror("cgroup_freeze: open %s", g_cgroup_freeze_path);
-		return false;
-	}
-	if (write(fd, "1", 1) != 1) {
-		pr_perror("cgroup_freeze: write");
-		close(fd);
-		return false;
-	}
-	close(fd);
-
-	/* Wait for frozen state (check cgroup.events) */
-	snprintf(path, sizeof(path), "%.*s/cgroup.events",
-		 (int)(strrchr(g_cgroup_freeze_path, '/') -
-			g_cgroup_freeze_path),
-		 g_cgroup_freeze_path);
-	for (i = 0; i < 1000; i++) {
-		fp = fopen(path, "r");
-		if (fp) {
-			while (fgets(events, sizeof(events), fp)) {
-				if (strstr(events, "frozen 1")) {
-					fclose(fp);
-					return true;
-				}
-			}
-			fclose(fp);
-		}
-		usleep(100);
-	}
-	pr_err("cgroup_freeze: timeout waiting for frozen state\n");
-	return false;
-}
-
-static void __attribute__((unused)) cgroup_unfreeze(void)
-{
-	int fd;
-
-	if (!g_cgroup_freeze_path[0])
-		return;
-	fd = open(g_cgroup_freeze_path, O_WRONLY);
-	if (fd < 0)
-		return;
-	if (write(fd, "0", 1) != 1)
-		pr_perror("cgroup_unfreeze: write");
-	close(fd);
-}
-
 static int cow_converge_dirty_pages_parallel(struct active_image *img,
 					     pid_t source_pid,
 					     int *sockets, int nr_streams)
@@ -3649,37 +3612,76 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 		return -1;
 
 	/*
-	 * T3 freeze: SIGSTOP → scan → capture → send → SIGCONT.
+	 * Pre-T3: capture signal handlers from the live process.
+	 * Uses direct ptrace injection (no parasite, ~2ms).
+	 */
+	{
+		struct timeval ts, te, td;
+
+		gettimeofday(&ts, NULL);
+		capture_and_send_t3_sigacts(
+			source_pid, sockets[0], img->dst_id, false);
+		gettimeofday(&te, NULL);
+		timersub(&te, &ts, &td);
+		pr_info("COW T3 sigacts (pre-freeze): %ldms\n",
+			td.tv_sec * 1000 + td.tv_usec / 1000);
+	}
+
+	/*
+	 * T3 freeze: SIGSTOP → scan → capture → dispatch →
+	 *            non-lazy → VMA diff → SIGCONT.
 	 */
 	{
 		struct lazy_vma_entry *lve;
 		struct converge_region *freeze_dirty = NULL;
 		int freeze_dirty_count = 0, freeze_dirty_cap = 0;
 		unsigned long freeze_pages = 0;
-		struct timeval t3_start, t3_fork, t3_delta;
+		struct timeval t3_start, t3_end, t3_delta;
+		bool bpf_was_active, need_pagemap_scan;
+
+		kill(source_pid, SIGSTOP);
+		/* Verify source is actually stopped before proceeding.
+		 * Can't waitpid (not the parent). Poll /proc status. */
+		{
+			char spath[64];
+			char sbuf[256];
+			int sfd, tries;
+
+			snprintf(spath, sizeof(spath),
+				 "/proc/%d/status", source_pid);
+			for (tries = 0; tries < 200; tries++) {
+				sfd = open(spath, O_RDONLY);
+				if (sfd >= 0) {
+					int n = read(sfd, sbuf,
+						     sizeof(sbuf) - 1);
+					close(sfd);
+					if (n > 0) {
+						sbuf[n] = '\0';
+						if (strstr(sbuf,
+							   "\nState:\tT"))
+							break;
+					}
+				}
+				usleep(100); /* 100μs per try, 20ms max */
+			}
+			if (tries >= 200)
+				pr_err("COW T3: source did not stop "
+				       "within 20ms\n");
+		}
+		gettimeofday(&t3_start, NULL);
 
 		/*
-		 * T3 freeze: SIGSTOP → dirty scan → capture → dispatch.
-		 * (cgroup-freeze blocks process_vm_readv, so SIGSTOP
-		 * is required for reading pages from the frozen source.)
-		 *
 		 * Two paths for dirty scan:
 		 * (a) eBPF ring drain — O(dirty), microseconds
 		 * (b) PAGEMAP_SCAN fallback — O(total_pages), ~150ms
+		 *
+		 * If eBPF ring dropped events (ring full), fall
+		 * back to PAGEMAP_SCAN for correctness.
 		 */
-		kill(source_pid, SIGSTOP);
-		usleep(1000);
-		gettimeofday(&t3_start, NULL);
+		bpf_was_active = cow_bpf_active();
+		need_pagemap_scan = !bpf_was_active;
 
-		if (cow_bpf_active()) {
-			/*
-			 * eBPF path: drain the ring buffer collected
-			 * since bulk transfer start. O(dirty_pages).
-			 *
-			 * The ring may contain duplicates (same page
-			 * faulted multiple times) — drain dedup's and
-			 * coalesces into contiguous regions.
-			 */
+		if (bpf_was_active) {
 			struct cow_bpf_region *bpf_regions;
 			int bpf_nr;
 
@@ -3689,37 +3691,53 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 				bpf_nr = cow_bpf_drain(bpf_regions,
 						       CONVERGE_MAX_REGIONS,
 						       &freeze_pages);
-				if (bpf_nr > 0) {
-					freeze_dirty = xmalloc(bpf_nr *
-						sizeof(*freeze_dirty));
-					if (freeze_dirty) {
+				if (bpf_nr >= 0) {
+					if (bpf_nr > 0) {
 						int r;
-						for (r = 0; r < bpf_nr; r++) {
-							freeze_dirty[r].start =
-								bpf_regions[r].start;
-							freeze_dirty[r].end =
-								bpf_regions[r].end;
-							freeze_dirty[r].categories = 0;
+
+						freeze_dirty = xmalloc(
+							bpf_nr *
+							sizeof(*freeze_dirty));
+						if (freeze_dirty) {
+							for (r = 0; r < bpf_nr; r++) {
+								freeze_dirty[r].start =
+									bpf_regions[r].start;
+								freeze_dirty[r].end =
+									bpf_regions[r].end;
+								freeze_dirty[r].categories = 0;
+							}
+							freeze_dirty_count = bpf_nr;
 						}
-						freeze_dirty_count = bpf_nr;
 					}
+					pr_info("COW T3 dirty scan (eBPF): "
+						"%lu dirty pages (%d regions, "
+						"%llu total events)\n",
+						freeze_pages,
+						freeze_dirty_count,
+						(unsigned long long)
+						cow_bpf_event_count());
+				} else {
+					/* -2 = ring drops, -1 = error */
+					need_pagemap_scan = true;
+					pr_err("COW T3: eBPF drain failed "
+					       "(%d), falling back to "
+					       "PAGEMAP_SCAN\n", bpf_nr);
 				}
 				xfree(bpf_regions);
+			} else {
+				need_pagemap_scan = true;
 			}
-
-			pr_err("COW T3 dirty scan (eBPF): %lu dirty pages "
-			       "(%d regions, %llu total events)\n",
-			       freeze_pages, freeze_dirty_count,
-			       (unsigned long long)cow_bpf_event_count());
-
 			cow_bpf_stop();
-		} else {
-			/*
-			 * PAGEMAP_SCAN fallback.
-			 * Dirty scan MUST be inside the SIGSTOP window:
-			 * cow_scan_dirty_pages uses PM_SCAN_WP_MATCHING
-			 * which clears the write-protect marker.
-			 */
+		}
+
+		if (need_pagemap_scan) {
+			/* Reset partial BPF state if any */
+			xfree(freeze_dirty);
+			freeze_dirty = NULL;
+			freeze_dirty_count = 0;
+			freeze_dirty_cap = 0;
+			freeze_pages = 0;
+
 			list_for_each_entry(lve, get_global_lazy_vmas(), list) {
 				unsigned long scan_pos;
 
@@ -3768,16 +3786,14 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 				}
 			}
 
-			pr_err("COW T3 dirty scan (PAGEMAP_SCAN): %lu dirty "
-			       "pages (%d regions)\n",
-			       freeze_pages, freeze_dirty_count);
+			pr_info("COW T3 dirty scan (PAGEMAP_SCAN%s): "
+				"%lu dirty pages (%d regions)\n",
+				bpf_was_active ? " after BPF drop" : "",
+				freeze_pages, freeze_dirty_count);
 		}
 
-		/* T3 full state capture.
-		 * IMPORTANT: capture registers BEFORE sigacts,
-		 * because sigacts injects a parasite that modifies
-		 * thread registers. Regs must be the original
-		 * SIGSTOP-time values (at syscall boundaries). */
+		/* T3 state capture: registers and FDs.
+		 * Sigacts captured pre-freeze (direct injection). */
 		{
 			struct timeval ts, te, td;
 
@@ -3786,24 +3802,16 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 				source_pid, sockets[0], img->dst_id);
 			gettimeofday(&te, NULL);
 			timersub(&te, &ts, &td);
-			pr_err("COW T3 regs: %ldms\n",
-			       td.tv_sec * 1000 + td.tv_usec / 1000);
+			pr_info("COW T3 regs: %ldms\n",
+				td.tv_sec * 1000 + td.tv_usec / 1000);
 
 			gettimeofday(&ts, NULL);
 			capture_and_send_t3_fds(
 				source_pid, sockets[0], img->dst_id);
 			gettimeofday(&te, NULL);
 			timersub(&te, &ts, &td);
-			pr_err("COW T3 FDs: %ldms\n",
-			       td.tv_sec * 1000 + td.tv_usec / 1000);
-
-			gettimeofday(&ts, NULL);
-			capture_and_send_t3_sigacts(
-				source_pid, sockets[0], img->dst_id);
-			gettimeofday(&te, NULL);
-			timersub(&te, &ts, &td);
-			pr_err("COW T3 sigacts: %ldms\n",
-			       td.tv_sec * 1000 + td.tv_usec / 1000);
+			pr_info("COW T3 FDs: %ldms\n",
+				td.tv_sec * 1000 + td.tv_usec / 1000);
 		}
 
 		/* Send dirty pages directly from frozen source */
@@ -3815,29 +3823,10 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 				freeze_pages = sent;
 		}
 
-		/* libc rw- re-send from frozen source */
-		if (g_libc_rw_start) {
-			struct converge_region lr;
-
-			lr.start = g_libc_rw_start;
-			lr.end = g_libc_rw_end;
-			lr.categories = 0;
-			converge_dispatch_parallel(
-				img, source_pid,
-				sockets, nr_streams,
-				&lr, 1);
-		}
-
 		/*
 		 * Re-send non-WP-tracked writable pages from
-		 * frozen source. These have dump-time content
-		 * from pages-*.img but need T3-time content
-		 * for state consistency (stacks, file-backed
-		 * rw like libc .data/.bss, ld.so .data, etc.).
-		 *
-		 * WP-tracked pages are handled by the eBPF
-		 * dirty scan above. Only re-send VMAs that
-		 * exist in the dump AND are not WP-tracked.
+		 * frozen source (stacks, file-backed rw like
+		 * libc .data/.bss, ld.so .data, etc.).
 		 */
 		{
 			char maps_path[64];
@@ -3864,15 +3853,6 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 					if (mp[1] != 'w')
 						continue;
 
-					/* Only re-send stacks and file-backed
-					 * rw VMAs (.data/.bss segments).
-					 * Skip anonymous heap VMAs — those
-					 * are WP-tracked, their dirty pages
-					 * handled by eBPF above. Anonymous
-					 * VMAs not in the WP list may be
-					 * post-dump allocations (jemalloc
-					 * retained arenas) that don't exist
-					 * on the replica → Bad address. */
 					{
 						unsigned long ino = 0;
 						char rest[256];
@@ -3887,15 +3867,11 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 							   &ino, rest) < 7)
 							continue;
 
-						/* Only re-send file-backed
-						 * (inode > 0) or stacks.
-						 * Skip CRIU memfds. */
 						if (strstr(rest, "CRIUMFD") != NULL)
 							continue;
 						if (ino == 0 &&
 						    strstr(rest, "[stack") == NULL)
 							continue;
-						/* Skip shared mappings (s flag) */
 						if (mp[3] == 's')
 							continue;
 					}
@@ -3913,36 +3889,15 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 				}
 				fclose(fp);
 			}
-			pr_err("COW T3: re-sent %lu non-lazy pages "
-			       "(%d VMAs: stacks + rw file-backed)\n",
-			       nonlazy_pages, nonlazy_vmas);
+			pr_info("COW T3: re-sent %lu non-lazy pages "
+				"(%d VMAs: stacks + rw file-backed)\n",
+				nonlazy_pages, nonlazy_vmas);
 		}
 
-		/* Resume source after T3 capture */
-		kill(source_pid, SIGCONT);
-		gettimeofday(&t3_fork, NULL);
-		timersub(&t3_fork, &t3_start, &t3_delta);
-		pr_err("COW T3 FREEZE: %ld.%03ldms SIGSTOP→SIGCONT "
-		       "(%lu dirty pages, no fork)\n",
-		       t3_delta.tv_sec * 1000 +
-		       t3_delta.tv_usec / 1000,
-		       t3_delta.tv_usec % 1000,
-		       freeze_pages);
-
-		pr_err("COW converge T3: %lu dirty pages "
-		       "across %d streams (%d regions)\n",
-		       freeze_pages, nr_streams, freeze_dirty_count);
-
-		/* No post-fork scan needed — source was frozen for
-		 * the entire dirty read, so no new dirty pages. */
-
-		/* No second freeze — dirty pages were read from the
-		 * frozen source in the single SIGSTOP window above.
-		 * No fork means no post-fork dirty delta. */
-
 		/*
-		 * Detect new VMAs (e.g. jemalloc mmap extents created
-		 * during transfer) and send VMA diff to replica.
+		 * VMA diff: detect new VMAs created during transfer
+		 * and send to replica. Done while source is frozen
+		 * for atomicity (no race with new mmap calls).
 		 */
 		{
 			struct timeval vd_start, vd_end, vd_delta;
@@ -3997,12 +3952,6 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 				fclose(mfp);
 			}
 
-			/*
-			 * Send VMA diff + page data for new VMAs
-			 * on stream 0.  The replica will pause when it
-			 * receives the diff, inject mmap(MAP_FIXED) via
-			 * ptrace, then resume to receive page data.
-			 */
 			if (new_vma_count > 0) {
 				struct page_server_iov vma_hdr = {
 					.cmd = encode_ps_cmd(PS_IOV_VMA_DIFF, 0),
@@ -4017,13 +3966,12 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 				struct iovec *lio;
 				int v;
 
-				pr_err("COW converge: %d new VMAs "
-				       "(%lu pages, %.1f MB)\n",
-				       new_vma_count, new_vma_pages,
-				       (double)(new_vma_pages * PAGE_SIZE) /
-				       (1024 * 1024));
+				pr_info("COW converge: %d new VMAs "
+					"(%lu pages, %.1f MB)\n",
+					new_vma_count, new_vma_pages,
+					(double)(new_vma_pages * PAGE_SIZE) /
+					(1024 * 1024));
 
-				/* Send VMA diff header + payload */
 				if (send_psi(sockets[0], &vma_hdr))
 					pr_err("COW: send VMA diff hdr failed\n");
 
@@ -4040,7 +3988,6 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 					sent_bytes += wr;
 				}
 
-				/* Send page data for new VMAs on stream 0 */
 				batch_buf = xmalloc(CONVERGE_BATCH_PAGES *
 						    PAGE_SIZE);
 				lio = xmalloc(CONVERGE_BATCH_PAGES *
@@ -4068,8 +4015,8 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 							pg += batch * PAGE_SIZE;
 						}
 					}
-					pr_err("COW converge: sent %lu "
-					       "new-VMA pages\n", total_sent);
+					pr_info("COW converge: sent %lu "
+						"new-VMA pages\n", total_sent);
 				}
 				xfree(batch_buf);
 				xfree(lio);
@@ -4078,15 +4025,25 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 			xfree(new_vmas);
 			gettimeofday(&vd_end, NULL);
 			timersub(&vd_end, &vd_start, &vd_delta);
-			pr_err("COW VMA diff: %ld.%03ldms\n",
-			       vd_delta.tv_sec * 1000 +
-			       vd_delta.tv_usec / 1000,
-			       vd_delta.tv_usec % 1000);
+			pr_info("COW VMA diff: %ld.%03ldms\n",
+				vd_delta.tv_sec * 1000 +
+				vd_delta.tv_usec / 1000,
+				vd_delta.tv_usec % 1000);
 		}
 
-		/* Source already SIGCONT'd after T3 capture */
+		/* Resume source after all T3 work complete */
+		kill(source_pid, SIGCONT);
+		gettimeofday(&t3_end, NULL);
+		timersub(&t3_end, &t3_start, &t3_delta);
+		pr_err("COW T3 FREEZE: %ld.%03ldms SIGSTOP→SIGCONT "
+		       "(%lu dirty pages)\n",
+		       t3_delta.tv_sec * 1000 +
+		       t3_delta.tv_usec / 1000,
+		       t3_delta.tv_usec % 1000,
+		       freeze_pages);
+
 		xfree(freeze_dirty);
-	} /* end freeze block */
+	} /* end T3 freeze block */
 
 	xfree(regions);
 	return 0;

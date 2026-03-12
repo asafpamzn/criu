@@ -16,6 +16,7 @@
 #include <errno.h>
 #include <unistd.h>
 #include <sys/time.h>
+#include <sys/time.h>
 #include <bpf/libbpf.h>
 
 #undef LOG_PREFIX
@@ -81,6 +82,7 @@ int cow_bpf_start(pid_t target_pid)
 	}
 
 	skel->rodata->target_pid = target_pid;
+	skel->rodata->page_shift = __builtin_ctz(sysconf(_SC_PAGESIZE));
 
 	err = dirty_track_bpf__load(skel);
 	if (err) {
@@ -99,7 +101,7 @@ int cow_bpf_start(pid_t target_pid)
 	g_ring_fd = bpf_map__fd(skel->maps.dirty_ring);
 	g_skel = skel;
 
-	pr_err("BPF dirty tracker: attached to do_wp_page "
+	pr_info("BPF dirty tracker: attached to do_wp_page "
 	       "for pid %d (ring_fd=%d)\n", target_pid, g_ring_fd);
 	return 0;
 }
@@ -146,6 +148,21 @@ int cow_bpf_drain(struct cow_bpf_region *out_regions, int max_regions,
 		pr_err("BPF drain: consume error %d\n", err);
 		xfree(dc.addrs);
 		return -1;
+	}
+
+	/* Check for ring buffer drops — if any events were lost,
+	 * the dirty page list is incomplete. Caller must fall
+	 * back to PAGEMAP_SCAN for correctness. */
+	{
+		u64 drops = cow_bpf_drop_count();
+
+		if (drops > 0) {
+			pr_err("BPF drain: %llu events dropped (ring full) "
+			       "— falling back to PAGEMAP_SCAN\n",
+			       (unsigned long long)drops);
+			xfree(dc.addrs);
+			return -2; /* special: drops detected */
+		}
 	}
 
 	if (dc.count == 0) {
@@ -204,13 +221,27 @@ u64 cow_bpf_event_count(void)
 	return count;
 }
 
+u64 cow_bpf_drop_count(void)
+{
+	u32 zero = 0;
+	u64 count = 0;
+
+	if (!g_skel)
+		return 0;
+
+	bpf_map__lookup_elem(g_skel->maps.drop_count,
+			     &zero, sizeof(zero),
+			     &count, sizeof(count), 0);
+	return count;
+}
+
 void cow_bpf_stop(void)
 {
 	if (g_skel) {
 		dirty_track_bpf__destroy(g_skel);
 		g_skel = NULL;
 		g_ring_fd = -1;
-		pr_err("BPF dirty tracker: detached\n");
+		pr_info("BPF dirty tracker: detached\n");
 	}
 }
 

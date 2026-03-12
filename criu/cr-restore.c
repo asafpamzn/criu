@@ -2520,7 +2520,7 @@ static void load_t3_regs(void)
 		return;
 	}
 	g_t3_regs_count = cnt;
-	pr_err("Loaded T3 registers for %d threads\n", cnt);
+	pr_info("Loaded T3 registers for %d threads\n", cnt);
 }
 
 struct t3_fd_entry {
@@ -2560,7 +2560,7 @@ static void load_t3_fds(void)
 		return;
 	}
 	g_t3_fds_count = cnt;
-	pr_err("Loaded T3 FD table: %d file descriptors\n", cnt);
+	pr_info("Loaded T3 FD table: %d file descriptors\n", cnt);
 }
 
 /* T3 signal handler table: 64 signals × {handler, flags, restorer, mask} */
@@ -2599,7 +2599,7 @@ static void load_t3_sigacts(void)
 		g_t3_sigacts = NULL;
 		return;
 	}
-	pr_err("Loaded T3 signal handlers for %d signals\n", T3_NSIG);
+	pr_info("Loaded T3 signal handlers for %d signals\n", T3_NSIG);
 }
 
 static void __attribute__((unused)) apply_t3_sigacts(pid_t pid)
@@ -2682,7 +2682,7 @@ static void __attribute__((unused)) apply_t3_sigacts(pid_t pid)
 	if (vma_set_regs(pid, &orig_regs))
 		pr_err("apply_sigacts: restore regs failed\n");
 
-	pr_err("T3 sigacts: applied %d signal handlers\n", applied);
+	pr_info("T3 sigacts: applied %d signal handlers\n", applied);
 }
 
 /*
@@ -2804,7 +2804,7 @@ static void __attribute__((unused)) apply_t3_fds(pid_t pid)
 		closedir(dir);
 	}
 
-	pr_err("T3 FDs: %d matched, %d opened, %d closed, "
+	pr_info("T3 FDs: %d matched, %d opened, %d closed, "
 	       "%d skipped, %d restored, %d T3\n",
 	       matched, opened, closed_cnt, skipped,
 	       restored_count, g_t3_fds_count);
@@ -2828,6 +2828,10 @@ static int finalize_restore_detach(void)
 			       item->nr_threads, g_t3_regs_count);
 			return -1;
 		}
+
+		/* T3 FD/sigact apply: disabled pending investigation.
+		 * Ptrace injection on threads in restorer sigreturn
+		 * trap needs careful handling of the trap state. */
 
 		/* Set regs + apply T3 regs, track main thread index */
 		for (i = 0; i < item->nr_threads; i++) {
@@ -2859,6 +2863,13 @@ static int finalize_restore_detach(void)
 				 * it in the callee-saved register). */
 				if ((long)gp_regs.regs[0] < 0)
 					gp_regs.regs[0] = gp_regs.regs[19];
+#elif defined(__x86_64__)
+				/* Copy full register set from T3 capture.
+				 * regs[] holds a memcpy'd user_regs_struct64.
+				 * orig_rax + fs_base included in SETREGSET. */
+				memcpy(&gp_regs.native, g_t3_regs[i].regs,
+				       sizeof(gp_regs.native));
+				gp_regs.__is_native = NATIVE_MAGIC;
 #endif
 				gp_iov.iov_base = &gp_regs;
 				gp_iov.iov_len = sizeof(gp_regs);
@@ -2868,6 +2879,7 @@ static int finalize_restore_detach(void)
 					pr_perror("T3 regs: GP set "
 						  "failed for %d", pid);
 
+#ifdef __aarch64__
 				tls_val = g_t3_regs[i].tls;
 				tls_iov.iov_base = &tls_val;
 				tls_iov.iov_len = sizeof(tls_val);
@@ -2875,18 +2887,16 @@ static int finalize_restore_detach(void)
 					   (void *)0x401UL, &tls_iov))
 					pr_perror("T3 regs: TLS set "
 						  "failed for %d", pid);
+#endif
+				/* x86_64: fs_base set via NT_PRSTATUS */
 
-				pr_err("T3 regs: thread %d pid %d "
+				pr_info("T3 regs: thread %d pid %d "
 				       "pc=%lx\n", i, pid,
 				       g_t3_regs[i].pc);
 			}
 			if (pid == item->pid->real)
 				main_idx = i;
 		}
-
-		/* T3 FDs and sigacts: skip injection for now.
-		 * FDs match (10/12), sigacts unchanged.
-		 * Injection after T3 regs clobbers stack. */
 
 		/* Detach workers first, main thread last */
 		for (i = 0; i < item->nr_threads; i++) {
