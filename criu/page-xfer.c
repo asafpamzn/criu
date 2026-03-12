@@ -94,6 +94,7 @@ static void psi2iovec(struct page_server_iov *ps, struct iovec *iov)
 #define PS_IOV_START_RESTORE  12   /* Signal replica to start process */
 #define PS_IOV_BULK_COMPLETE_ACK 13 /* Replica → Primary: all bulk pages received */
 #define PS_IOV_INVENTORY_READY  14  /* Primary → Replica: inventory.img written */
+#define PS_IOV_DIRTY_BITMAP_ACK 15  /* Replica → Primary: dirty bitmap received */
 
 #define PS_IOV_CLOSE	   0x1023
 
@@ -320,6 +321,30 @@ int send_dirty_bitmap_to_replica(int sk, u64 dst_id,
 }
 
 /*
+ * Wait for dirty bitmap ACK from replica.
+ * Called by primary after sending all dirty bitmaps.
+ */
+static int wait_for_dirty_bitmap_ack(void)
+{
+	struct page_server_iov pi;
+
+	pr_info("Waiting for dirty bitmap ACK from replica...\n");
+
+	if (__recv(page_server_sk, &pi, sizeof(pi), MSG_WAITALL) != sizeof(pi)) {
+		pr_perror("Failed to receive dirty bitmap ACK");
+		return -1;
+	}
+
+	if (decode_ps_cmd(pi.cmd) != PS_IOV_DIRTY_BITMAP_ACK) {
+		pr_err("Expected dirty bitmap ACK, got cmd=%u\n", decode_ps_cmd(pi.cmd));
+		return -1;
+	}
+
+	pr_info("Received dirty bitmap ACK from replica\n");
+	return 0;
+}
+
+/*
  * Send dirty bitmap to replica using the current page server connection.
  * Called from cr-dump.c after skeleton dump completes.
  */
@@ -355,6 +380,10 @@ int send_cow_dirty_bitmap(unsigned long *ranges, unsigned int nr_ranges)
 						 ranges, nr_ranges))
 			return -1;
 	}
+
+	/* Wait for ACK from replica to ensure it processed the dirty bitmap */
+	if (wait_for_dirty_bitmap_ack())
+		return -1;
 
 	return 0;
 }
@@ -2970,6 +2999,24 @@ static int page_server_start_async_read(void *buf, unsigned long nr_pages, ps_as
 	list_add_tail(&ar->l, &async_reads);
 	return 0;
 }
+
+/*
+ * Send dirty bitmap ACK to primary.
+ * Called by replica after fully receiving the dirty bitmap.
+ */
+static int send_dirty_bitmap_ack(void)
+{
+	struct page_server_iov pi = {
+		.cmd = encode_ps_cmd(PS_IOV_DIRTY_BITMAP_ACK, 0),
+		.nr_pages = 0,
+		.vaddr = 0,
+		.dst_id = 0,
+	};
+
+	pr_info("Sending dirty bitmap ACK to primary\n");
+	return send_psi(page_server_sk, &pi);
+}
+
 static struct {
 	unsigned long recv_calls;
 	unsigned long recv_would_block;
@@ -3093,9 +3140,12 @@ static int page_server_read_bulk_stream(struct ps_async_read *ar, int flags)
 					pr_info("Dirty bitmap: 0 ranges, all pages clean\n");
 					/*
 					 * COW mode: dirty bitmap (even empty) marks end of bulk phase.
+					 * Send ACK to primary before marking complete.
 					 */
 					if (opts.cow_dump) {
 						pr_info("COW mode: dirty bitmap complete (0 ranges), bulk phase done\n");
+						if (send_dirty_bitmap_ack())
+							return -1;
 						dirty_bitmap_received = true;
 						return BULK_STREAM_COMPLETE;
 					}
@@ -3333,11 +3383,13 @@ read_dirty_bitmap:
 
 			/*
 			 * COW mode: dirty bitmap marks end of bulk phase.
-			 * The primary will close the connection after this.
+			 * Send ACK to primary before marking complete.
 			 */
 			if (opts.cow_dump) {
 				pr_info("COW mode: dirty bitmap complete (%u ranges), bulk phase done\n",
 					ar->nr_dirty_ranges);
+				if (send_dirty_bitmap_ack())
+					return -1;
 				dirty_bitmap_received = true;
 				return BULK_STREAM_COMPLETE;
 			}
