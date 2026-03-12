@@ -54,7 +54,7 @@ static struct timeval start;
  * Manual buf len as sprintf will _always_ put '\0' at the end,
  * but we want a "constant" pid to be there on restore
  */
-#define TS_BUF_OFF 17
+#define TS_BUF_OFF 18
 #if 0
 static void timediff(struct timeval *from, struct timeval *to)
 {
