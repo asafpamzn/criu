@@ -29,6 +29,7 @@ else
 fi
 START_TOTAL=$(date +%s)
 LOG_FILE="$IMAGES_DIR/lazy-primary.log"
+LOG_FILE_SERVER="$IMAGES_DIR/lazy-server.log"
 CUTOVER_MARKER_FILE=${CUTOVER_MARKER_FILE:-}
 REPLICA_STAGED_FILE=${REPLICA_STAGED_FILE:-$IMAGES_DIR/replica_staged.log}
 RESTORE_VERIFY_DELAY_S=${RESTORE_VERIFY_DELAY_S:-0}
@@ -194,11 +195,11 @@ fi
 # skeleton images (everything except memory pages which are already being
 # streamed), then writes "PHASE 3 SKELETON DUMP COMPLETE" to the log.
 # We must wait for this before starting criu restore.
-SKELETON_READY_PATTERN="PHASE 3 SKELETON DUMP COMPLETE"
+SKELETON_READY_PATTERN="COW Phase 3: Waiting for restore to connect"
 echo "Step 5: Waiting for Phase 3 skeleton dump..."
 START_TIME=$(date +%s)
 while true; do
-	if [ -f "$LOG_FILE" ] && sudo grep -q "$SKELETON_READY_PATTERN" "$LOG_FILE" 2>/dev/null; then
+	if [ -f "$LOG_FILE_SERVER" ] && sudo grep -q "$SKELETON_READY_PATTERN" "$LOG_FILE_SERVER" 2>/dev/null; then
 		echo "Phase 3 skeleton dump ready"
 		mark_phase_event "REPLICA_SKELETON_DUMP_READY"
 		break
@@ -243,7 +244,7 @@ for attempt in $(seq 1 "$RESTORE_RETRY_ATTEMPTS"); do
 
 	# Run CRIU restore: recreates the process from dump images.
 	# In FAST_CUTOVER mode, the process is left in SIGSTOP state.
-	if sudo "$CRIU_BIN" restore "${RESTORE_ARGS[@]}" -v1 -o "$IMAGES_DIR/lazy-restore.log"; then
+	if sudo "$CRIU_BIN" restore "${RESTORE_ARGS[@]}" -v4 -o "$IMAGES_DIR/lazy-restore.log"; then
 		RESTORE_OK=1
 		mark_phase_event "REPLICA_CRIU_RESTORE_STARTED"
 		break
