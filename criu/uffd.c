@@ -2298,8 +2298,12 @@ static int handle_requests(int epollfd, struct epoll_event **events, int nr_fds)
 			lpi_put(lpi);
 		}
 
-		if (list_empty(&lpis))
+		if (list_empty(&lpis)) {
+			/* In COW mode, keep waiting until restore connects */
+			if (opts.cow_dump && !is_restore_connected())
+				continue;
 			break;
+		}
 	}
 
 out:
