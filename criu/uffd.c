@@ -2451,6 +2451,7 @@ static bool restore_connected = false;
 static unsigned long *pending_dirty_ranges = NULL;
 static unsigned int pending_nr_dirty_ranges = 0;
 static bool dirty_bitmap_received = false;
+static bool inventory_ready_received = false;
 
 /*
  * Pre-buffer callback: pages arrive before criu restore connects.
@@ -2609,6 +2610,19 @@ bool is_dirty_bitmap_received(void)
 bool is_restore_connected(void)
 {
 	return restore_connected;
+}
+
+/* Set inventory ready flag (called when PS_IOV_INVENTORY_READY received) */
+void set_inventory_ready_received(void)
+{
+	pr_info("Received inventory ready signal from primary\n");
+	inventory_ready_received = true;
+}
+
+/* Check if inventory.img is ready on disk */
+bool is_inventory_ready_received(void)
+{
+	return inventory_ready_received;
 }
 
 /*

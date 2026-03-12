@@ -93,6 +93,7 @@ static void psi2iovec(struct page_server_iov *ps, struct iovec *iov)
 #define PS_IOV_DIRTY_BITMAP   11   /* Primary sends dirty bitmap to replica */
 #define PS_IOV_START_RESTORE  12   /* Signal replica to start process */
 #define PS_IOV_BULK_COMPLETE_ACK 13 /* Replica → Primary: all bulk pages received */
+#define PS_IOV_INVENTORY_READY  14  /* Primary → Replica: inventory.img written */
 
 #define PS_IOV_CLOSE	   0x1023
 
@@ -353,6 +354,35 @@ int send_cow_dirty_bitmap(unsigned long *ranges, unsigned int nr_ranges)
 		if (send_dirty_bitmap_to_replica(page_server_sk, dst_id,
 						 ranges, nr_ranges))
 			return -1;
+	}
+
+	return 0;
+}
+
+/*
+ * Send inventory ready signal to replica (COW phased migration).
+ * Called by primary after writing inventory.img, so replica knows
+ * it's safe to load the pstree.
+ */
+int send_inventory_ready_signal(void)
+{
+	struct page_server_iov pi = {
+		.cmd = PS_IOV_INVENTORY_READY,
+		.nr_pages = 0,
+		.vaddr = 0,
+		.dst_id = 0,
+	};
+
+	pr_info("Sending inventory ready signal to replica\n");
+
+	if (page_server_sk < 0) {
+		pr_err("Page server not connected, cannot send inventory ready signal\n");
+		return -1;
+	}
+
+	if (send_psi(page_server_sk, &pi)) {
+		pr_err("Failed to send inventory ready signal\n");
+		return -1;
 	}
 
 	return 0;
@@ -3033,6 +3063,14 @@ static int page_server_read_bulk_stream(struct ps_async_read *ar, int flags)
 				}
 
 				return BULK_STREAM_COMPLETE;
+			}
+
+			if (cmd == PS_IOV_INVENTORY_READY) {
+				/* Primary signals inventory.img is ready */
+				set_inventory_ready_received();
+				ar->rb = 0;
+				ar->compress_state = COMPRESS_STATE_READING_HEADER;
+				return BULK_STREAM_PROGRESS;
 			}
 
 			if (cmd == PS_IOV_DIRTY_BITMAP) {

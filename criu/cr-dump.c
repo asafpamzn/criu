@@ -2846,6 +2846,25 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 	 */
 	pr_info("PHASE 3 SKELETON DUMP COMPLETE\n");
 
+	/*
+	 * Write inventory now so replica can load pstree.
+	 * This must happen BEFORE sending dirty bitmap.
+	 */
+	he.has_pre_dump_mode = false;
+	if (found_uprobes_vma()) {
+		he.has_allow_uprobes = true;
+		he.allow_uprobes = true;
+	}
+	if (write_img_inventory(&he))
+		goto err;
+
+	/* Signal replica that inventory.img is ready */
+	ret = send_inventory_ready_signal();
+	if (ret) {
+		pr_err("Failed to send inventory ready signal\n");
+		goto err;
+	}
+
 	/* === PHASE 4: WP_SYNC on dirty + unfreeze === */
 	pr_info("=== PHASE 4: WP_SYNC on dirty + unfreeze ===\n");
 
@@ -2887,13 +2906,7 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 	if (ret)
 		pr_err("Convergence page server failed\n");
 
-	he.has_pre_dump_mode = false;
-	if (found_uprobes_vma()) {
-		he.has_allow_uprobes = true;
-		he.allow_uprobes = true;
-	}
-
-	exit_code = write_img_inventory(&he);
+	/* Inventory was already written after skeleton dump - don't duplicate */
 	xfree(dirty_ranges);
 	goto finish;
 

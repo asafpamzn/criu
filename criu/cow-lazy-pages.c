@@ -219,9 +219,16 @@ int cr_lazy_pages_cow_phase2(bool daemon)
 
 	/*
 	 * Now inventory.img and pstree.img exist on disk.
+	 * The PS_IOV_INVENTORY_READY signal ensures we don't race
+	 * with the primary writing inventory.img.
 	 */
+	if (!is_inventory_ready_received()) {
+		pr_err("Inventory ready signal not received!\n");
+		goto err_disconnect;
+	}
+
 	if (prepare_dummy_pstree()) {
-		pr_err("Failed to prepare pstree (inventory.img missing?)\n");
+		pr_err("Failed to prepare pstree\n");
 		goto err_disconnect;
 	}
 
@@ -260,6 +267,7 @@ int cow_phase2_handle_pages(int epollfd, struct epoll_event *events, int nr_fds)
 {
 	int ret;
 	bool bulk_done = false;
+	bool inventory_ready = false;
 
 	while (1) {
 		ret = epoll_run_rfds(epollfd, events, nr_fds, -1);
@@ -272,6 +280,12 @@ int cow_phase2_handle_pages(int epollfd, struct epoll_event *events, int nr_fds)
 		if (!bulk_done && page_server_bulk_stream_done()) {
 			pr_info("Bulk page transfer complete, waiting for dirty bitmap...\n");
 			bulk_done = true;
+		}
+
+		/* Track inventory ready signal */
+		if (!inventory_ready && is_inventory_ready_received()) {
+			pr_info("Inventory ready signal received\n");
+			inventory_ready = true;
 		}
 
 		/* Dirty bitmap signals Phase 3 is ready */
