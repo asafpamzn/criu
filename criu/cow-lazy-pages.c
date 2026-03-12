@@ -204,7 +204,7 @@ int cr_lazy_pages_cow_phase2(bool daemon)
 	 * Primary closed the socket after sending dirty bitmap.
 	 * Disconnect and reconnect for convergence phase.
 	 */
-	disconnect_from_page_server();
+	close_page_server_socket();
 
 	/* Small delay for primary to start new page server */
 	usleep(100000);  /* 100ms */
