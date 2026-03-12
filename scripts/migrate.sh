@@ -59,14 +59,8 @@ $SSH ubuntu@$REPLICA "sudo env CUTOVER_PORT=$CUTOVER_PORT STAGED_PORT=$STAGED_PO
 REPLICA_PID=$!
 sleep 1
 
-# --- 6. Quiesce + dump ---
-log "Quiesce + dump..."
-sudo pkill -9 -f "[v]alkey-benchmark" 2>/dev/null || true
-sleep 0.1
-for _ in $(seq 1 50); do
-  N=$(valkey-cli -p "$VALKEY_PORT" CLIENT LIST 2>/dev/null | grep -c "^" || echo 99)
-  [ "$N" -le 1 ] && break; sleep 0.1
-done
+# --- 7. Dump (with live traffic running) ---
+log "Dump (live workload active=${RUN_WORKLOAD_DURING_MIGRATION})..."
 valkey-cli -p "$VALKEY_PORT" CONFIG SET lazyfree-lazy-expire no CONFIG SET save "" >/dev/null 2>&1 || true
 
 # No CLIENT PAUSE needed — T3 register re-capture makes thread
@@ -117,11 +111,10 @@ print(d.decode().strip())
 " > "$STAGED_FILE" 2>/dev/null) &
 STAGED_PID=$!
 
-# --- 7b. Live workload (optional) ---
+# --- 7b. Start live workload after dump (runs through bulk + T3) ---
 WORKLOAD_PID=""
 if [ "$RUN_WORKLOAD_DURING_MIGRATION" = "1" ]; then
-  for _ in $(seq 1 600); do [ -f "$IMAGES_DIR/bulk_send_done" ] && break; sleep 0.5; done
-  log "Starting live workload..."
+  log "Starting live workload (after dump, during bulk + T3)..."
   valkey-benchmark -p "$VALKEY_PORT" -t set,get -r 1000000 -c 16 -P 8 -d 512 --ratio 20:80 -n 1000000000 -q >/dev/null 2>&1 &
   WORKLOAD_PID=$!
 fi

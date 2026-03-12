@@ -2602,7 +2602,7 @@ static void load_t3_sigacts(void)
 	pr_info("Loaded T3 signal handlers for %d signals\n", T3_NSIG);
 }
 
-static void __attribute__((unused)) apply_t3_sigacts(pid_t pid)
+static void apply_t3_sigacts(pid_t pid)
 {
 	user_regs_struct_t orig_regs, regs;
 	unsigned char orig_code[8];
@@ -2613,8 +2613,19 @@ static void __attribute__((unused)) apply_t3_sigacts(pid_t pid)
 	if (!g_t3_sigacts)
 		return;
 
-	if (vma_get_regs(pid, &orig_regs))
+	/* SEIZE + stop the thread (may be running after detach) */
+	if (ptrace(PTRACE_SEIZE, pid, NULL, 0)) {
+		pr_perror("apply_sigacts: SEIZE %d", pid);
 		return;
+	}
+	if (ptrace(PTRACE_INTERRUPT, pid, NULL, NULL) ||
+	    waitpid(pid, &status, __WALL) != pid) {
+		ptrace(PTRACE_DETACH, pid, NULL, NULL);
+		return;
+	}
+
+	if (vma_get_regs(pid, &orig_regs))
+		goto detach_sigacts;
 
 #ifdef __aarch64__
 	pc = (unsigned long)orig_regs.pc;
@@ -2626,10 +2637,10 @@ static void __attribute__((unused)) apply_t3_sigacts(pid_t pid)
 
 	if (ptrace_peek_area(pid, orig_code, (void *)pc,
 			     sizeof(orig_code)))
-		return;
+		goto detach_sigacts;
 	if (ptrace_peek_area(pid, orig_stack,
 			     (void *)(sp - 64), 64))
-		return;
+		goto detach_sigacts;
 
 	for (sig = 1; sig <= T3_NSIG; sig++) {
 		struct t3_sigact *sa = &g_t3_sigacts[sig - 1];
@@ -2639,10 +2650,33 @@ static void __attribute__((unused)) apply_t3_sigacts(pid_t pid)
 		if (!sa->handler && !sa->flags)
 			continue;
 
-		/* Write sigact struct to stack */
-		if (ptrace_poke_area(pid, sa, (void *)(sp - 64),
-				     sizeof(*sa)))
-			continue;
+		/*
+		 * Write kernel_sigaction to stack. Layout differs:
+		 *   aarch64: handler(8) + flags(8) + mask(8) = 24B
+		 *   x86_64:  handler(8) + flags(8) + restorer(8) + mask(8) = 32B
+		 * Our t3_sigact has {handler, flags, restorer, mask}.
+		 * Must repack for the kernel's expected layout.
+		 */
+		{
+#ifdef __aarch64__
+			/* aarch64: no sa_restorer — skip it */
+			unsigned long ksa[3];
+
+			ksa[0] = sa->handler;
+			ksa[1] = sa->flags;
+			ksa[2] = sa->mask;
+			if (ptrace_poke_area(pid, ksa,
+					     (void *)(sp - 64),
+					     sizeof(ksa)))
+				continue;
+#else
+			/* x86_64: includes sa_restorer */
+			if (ptrace_poke_area(pid, sa,
+					     (void *)(sp - 64),
+					     sizeof(*sa)))
+				continue;
+#endif
+		}
 		if (ptrace_poke_area(pid, (void *)vma_syscall_insn,
 				     (void *)pc, sizeof(vma_syscall_insn)))
 			break;
@@ -2655,34 +2689,47 @@ static void __attribute__((unused)) apply_t3_sigacts(pid_t pid)
 		regs.regs[2] = 0;		/* oldact = NULL */
 		regs.regs[3] = 8;		/* sigsetsize */
 		regs.pc = pc;
-#else
-		regs.ax = __NR_rt_sigaction;
-		regs.di = sig;
-		regs.si = sp - 64;
-		regs.dx = 0;
-		regs.r10 = 8;
-		regs.ip = pc;
+#elif defined(__x86_64__)
+		regs.native.orig_ax = __NR_rt_sigaction;
+		regs.native.ax = __NR_rt_sigaction;
+		regs.native.di = sig;
+		regs.native.si = sp - 64;
+		regs.native.dx = 0;
+		regs.native.r10 = 8;
+		regs.native.ip = pc;
 #endif
 		if (vma_set_regs(pid, &regs))
 			break;
-		if (ptrace(PTRACE_CONT, pid, NULL, NULL))
-			break;
-		if (waitpid(pid, &status, __WALL) != pid)
-			break;
-		if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP)
-			applied++;
-	}
+		{
+			int retry;
 
-	/* Restore original code + stack + regs */
-	if (ptrace_poke_area(pid, orig_code, (void *)pc,
-			     sizeof(orig_code)))
+			for (retry = 0; retry < 5; retry++) {
+				if (ptrace(PTRACE_CONT, pid, NULL, NULL))
+					goto sigact_done;
+				if (waitpid(pid, &status, __WALL) != pid)
+					goto sigact_done;
+				if (WIFSTOPPED(status) &&
+				    WSTOPSIG(status) == SIGTRAP) {
+					applied++;
+					break;
+				}
+				/* Suppress pending signal and retry */
+				if (retry == 0)
+					vma_set_regs(pid, &regs);
+			}
+		}
+	}
+sigact_done:
+
+	/* Restore original code + stack + regs, then detach */
+	if (ptrace_poke_area(pid, orig_code, (void *)pc, sizeof(orig_code)))
 		pr_err("apply_sigacts: restore code failed\n");
 	if (ptrace_poke_area(pid, orig_stack, (void *)(sp - 64), 64))
 		pr_err("apply_sigacts: restore stack failed\n");
-	if (vma_set_regs(pid, &orig_regs))
-		pr_err("apply_sigacts: restore regs failed\n");
-
-	pr_info("T3 sigacts: applied %d signal handlers\n", applied);
+	vma_set_regs(pid, &orig_regs);
+detach_sigacts:
+	ptrace(PTRACE_DETACH, pid, NULL, NULL);
+	pr_err("T3 sigacts: applied %d signal handlers\n", applied);
 }
 
 /*
@@ -2829,9 +2876,7 @@ static int finalize_restore_detach(void)
 			return -1;
 		}
 
-		/* T3 FD/sigact apply: disabled pending investigation.
-		 * Ptrace injection on threads in restorer sigreturn
-		 * trap needs careful handling of the trap state. */
+		/* T3 sigacts applied after detach — see below */
 
 		/* Set regs + apply T3 regs, track main thread index */
 		for (i = 0; i < item->nr_threads; i++) {
@@ -3304,6 +3349,20 @@ skip_ns_bouncing:
 	/* Detaches from processes and they continue run through sigreturn. */
 	if (finalize_restore_detach())
 		goto out_kill_network_unlocked;
+
+	/*
+	 * Apply T3 sigacts AFTER detach. The process is running.
+	 * We SEIZE the main thread, inject rt_sigaction for each
+	 * signal, then DETACH. This avoids corrupting the kernel's
+	 * internal syscall state (orig_x0) which breaks syscall
+	 * restart on aarch64 if done before detach.
+	 */
+	if (opts.cow_dump && g_t3_sigacts) {
+		pid_t main_pid = root_item->pid->real;
+
+		usleep(1000); /* let process settle into event loop */
+		apply_t3_sigacts(main_pid);
+	}
 
 	pr_info("Restore finished successfully. Tasks resumed.\n");
 	write_stats(RESTORE_STATS);

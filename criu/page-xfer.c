@@ -3613,19 +3613,12 @@ static int cow_converge_dirty_pages_parallel(struct active_image *img,
 
 	/*
 	 * Pre-T3: capture signal handlers from the live process.
-	 * Uses direct ptrace injection (no parasite, ~2ms).
+	 * Uses direct ptrace injection on single thread (~2ms).
+	 * Needed for general correctness — sigacts can change
+	 * between dump and T3 for non-Valkey processes.
 	 */
-	{
-		struct timeval ts, te, td;
-
-		gettimeofday(&ts, NULL);
-		capture_and_send_t3_sigacts(
-			source_pid, sockets[0], img->dst_id, false);
-		gettimeofday(&te, NULL);
-		timersub(&te, &ts, &td);
-		pr_info("COW T3 sigacts (pre-freeze): %ldms\n",
-			td.tv_sec * 1000 + td.tv_usec / 1000);
-	}
+	capture_and_send_t3_sigacts(
+		source_pid, sockets[0], img->dst_id, false);
 
 	/*
 	 * T3 freeze: SIGSTOP → scan → capture → dispatch →
