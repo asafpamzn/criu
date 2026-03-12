@@ -339,6 +339,7 @@ int do_dump_gen_file(struct fd_parms *p, int lfd, const struct fdtype_ops *ops, 
 	e->flags = p->fd_flags;
 
 	ret = fd_id_generate(p->pid, e, p);
+	pr_err("DEBUG: do_dump_gen_file fd_id_generate returned %d for fd %d, type %d\n", ret, p->fd, ops->type);
 	if (ret == 1) /* new ID generated */
 		ret = ops->dump(lfd, e->id, p);
 	else
@@ -501,6 +502,8 @@ static int dump_one_file(struct pid *pid, int fd, int lfd, struct fd_opts *opts,
 	struct fd_parms p = FD_PARMS_INIT;
 	const struct fdtype_ops *ops;
 	struct fd_link link;
+
+	pr_err("DEBUG: dump_one_file called for pid %d, fd %d\n", pid->real, fd);
 
 	if (fill_fd_params(pid, fd, lfd, opts, &p) < 0) {
 		pr_err("Can't get stat on %d\n", fd);
@@ -1727,6 +1730,7 @@ static int collect_one_file(void *o, ProtobufCMessage *base, struct cr_img *i)
 	FileEntry *fe;
 
 	fe = pb_msg(base, FileEntry);
+	pr_err("DEBUG: collect_one_file called, type=%d\n", fe->type);
 	switch (fe->type) {
 	default:
 		pr_err("Unknown file type %d\n", fe->type);
@@ -1808,8 +1812,13 @@ struct collect_image_info files_cinfo = {
 
 int prepare_files(void)
 {
+	int ret;
+
+	pr_err("DEBUG: prepare_files called - starting file restore\n");
 	init_fdesc_hash();
 	init_sk_info_hash();
 	init_dead_pidfd_hash();
-	return collect_image(&files_cinfo);
+	ret = collect_image(&files_cinfo);
+	pr_err("DEBUG: prepare_files completed with ret=%d\n", ret);
+	return ret;
 }

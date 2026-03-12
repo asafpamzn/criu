@@ -59,6 +59,10 @@ int do_pb_read_one(struct cr_img *img, void **pobj, int type, bool eof)
 		return -1;
 	}
 
+	if (type == PB_FILE) {
+		pr_err("DEBUG: do_pb_read_one called for files.img (PB_FILE), eof=%d\n", eof);
+	}
+
 	*pobj = NULL;
 
 	if (unlikely(empty_image(img)))
@@ -152,6 +156,10 @@ int pb_write_one(struct cr_img *img, void *obj, int type)
 	iov[1].iov_base = buf;
 	iov[1].iov_len = size;
 
+	if (type == PB_FILE) {
+		pr_err("DEBUG: pb_write_one to files.img, size=%d\n", size);
+	}
+
 	ret = bwritev(&img->_x, iov, 2);
 	if (ret != size + sizeof(size)) {
 		pr_perror("Can't write %d bytes", (int)(size + sizeof(size)));
@@ -205,9 +213,17 @@ int collect_image(struct collect_image_info *cinfo)
 
 	pr_info("Collecting %d/%d (flags %x)\n", cinfo->fd_type, cinfo->pb_type, cinfo->flags);
 
+	if (cinfo->pb_type == PB_FILE) {
+		pr_err("DEBUG: collect_image opening files.img for restore\n");
+	}
+
 	img = open_image(cinfo->fd_type, O_RSTR);
 	if (!img)
 		return -1;
+
+	if (cinfo->pb_type == PB_FILE) {
+		pr_err("DEBUG: files.img opened successfully for restore\n");
+	}
 
 	if (cinfo->flags & COLLECT_SHARED) {
 		o_alloc = shmalloc;

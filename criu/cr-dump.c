@@ -1743,6 +1743,7 @@ static int dump_skeleton_one_task(struct pstree_item *item, InventoryEntry *pare
 			pr_err("Dump files (pid: %d) failed with %d\n", pid, ret);
 			goto err_cure;
 		}
+		pr_err("DEBUG: dump_task_files_seized completed for pid %d (skeleton dump)\n", pid);
 		ret = flush_eventpoll_dinfo_queue();
 		if (ret) {
 			pr_err("Dump eventpoll (pid: %d) failed with %d\n", pid, ret);
@@ -2032,6 +2033,7 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 			pr_err("Dump files (pid: %d) failed with %d\n", pid, ret);
 			goto err_cure;
 		}
+		pr_err("DEBUG: dump_task_files_seized completed for pid %d (standard dump)\n", pid);
 		ret = flush_eventpoll_dinfo_queue();
 		if (ret) {
 			pr_err("Dump eventpoll (pid: %d) failed with %d\n", pid, ret);
@@ -2455,6 +2457,7 @@ static int cr_dump_finish(int ret)
 	if (disconnect_from_page_server())
 		ret = -1;
 
+	pr_err("DEBUG: Closing glob_imgset\n");
 	close_cr_imgset(&glob_imgset);
 
 	if (bfd_flush_images())
@@ -2778,6 +2781,7 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 	glob_imgset = cr_glob_imgset_open(O_DUMP);
 	if (!glob_imgset)
 		goto err;
+	pr_err("DEBUG: glob_imgset opened for skeleton dump (COW path)\n");
 
 	if (seccomp_collect_dump_filters() < 0)
 		goto err;
@@ -3034,6 +3038,7 @@ int cr_dump_tasks(pid_t pid)
 	glob_imgset = cr_glob_imgset_open(O_DUMP);
 	if (!glob_imgset)
 		goto err;
+	pr_err("DEBUG: glob_imgset opened for dump (standard path)\n");
 
 	if (seccomp_collect_dump_filters() < 0)
 		goto err;
