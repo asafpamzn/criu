@@ -54,7 +54,7 @@ static struct timeval start;
  * but we want a "constant" pid to be there on restore
  */
 #define TS_BUF_OFF 17
-
+#if 0
 static void timediff(struct timeval *from, struct timeval *to)
 {
 	to->tv_sec -= from->tv_sec;
@@ -65,7 +65,7 @@ static void timediff(struct timeval *from, struct timeval *to)
 		to->tv_usec += USEC_PER_SEC - from->tv_usec;
 	}
 }
-
+#endif
 static void print_ts(void)
 {
 	struct timeval t;
