@@ -2531,8 +2531,8 @@ static int cr_dump_finish(int ret)
 		pstree_switch_state(root_item, TASK_ALIVE);
 		timing_stop(TIME_FROZEN);
 
-		pr_info("=== PHASE 7: Convergence page server ===\n");
-		cow_set_phase(COW_PHASE_SYNC_CONVERGE_POST_RESTORE);
+		pr_err("START RESTORE!!!\n");
+		
 		
 		/* Now start lazy page transfer with process running */
 		ret = cr_lazy_mem_dump();
