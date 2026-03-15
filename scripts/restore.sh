@@ -195,11 +195,11 @@ fi
 # skeleton images (everything except memory pages which are already being
 # streamed), then writes "PHASE 3 SKELETON DUMP COMPLETE" to the log.
 # We must wait for this before starting criu restore.
-SKELETON_READY_PATTERN="COW Phase 3: Waiting for restore to connect"
+SKELETON_READY_PATTERN="Waiting for page server thread to finish"
 echo "Step 5: Waiting for Phase 3 skeleton dump..."
 START_TIME=$(date +%s)
 while true; do
-	if [ -f "$LOG_FILE_SERVER" ] && sudo grep -q "$SKELETON_READY_PATTERN" "$LOG_FILE_SERVER" 2>/dev/null; then
+	if [ -f "$LOG_FILE" ] && sudo grep -q "$SKELETON_READY_PATTERN" "$LOG_FILE" 2>/dev/null; then
 		echo "Phase 3 skeleton dump ready"
 		mark_phase_event "REPLICA_SKELETON_DUMP_READY"
 		break
