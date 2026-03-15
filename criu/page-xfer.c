@@ -3150,8 +3150,8 @@ static int handle_end_of_transfer(struct ps_async_read *ar, u32 cmd)
 	 * The dirty bitmap will arrive later (Phase 4).
 	 * Reset to read next header and continue.
 	 */
-	if (opts.cow_dump) {
-		pr_info("COW mode: waiting for dirty bitmap...\n");
+	if (opts.cow_dump && !is_dirty_bitmap_received()) {
+		pr_info("COW mode Phase 2: waiting for dirty bitmap...\n");
 		ar->rb = 0;
 		ar->compress_state = COMPRESS_STATE_READING_HEADER;
 		return BULK_STREAM_PROGRESS;
