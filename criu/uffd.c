@@ -2666,6 +2666,13 @@ int cow_phase3_restore_loop(int ep_fd, struct epoll_event **events, int nr_fds)
 
 	pr_info("COW Phase 3: Waiting for restore to connect\n");
 
+	/* Re-initialize async bulk reader for Phase 3 convergence */
+	if (setup_prebuffer_reader()) {
+		pr_err("Failed to setup prebuffer reader for Phase 3\n");
+		close(lazy_sk);
+		return -1;
+	}
+
 	/* 5. Request all pages from primary for each task */
 	for_each_pstree_item(pi) {
 		if (task_alive(pi)) {
