@@ -2294,7 +2294,7 @@ static int process_vma_pages(struct active_image *img,
 					  source_pid, stats) < 0)
 			return -1;
 	}
-	print_thread_stats(stats);
+	
 
 	return 0;
 }
@@ -2364,7 +2364,7 @@ static void *unified_page_server_thread(void *arg)
 					break;
 				}
 			}
-
+			print_thread_stats(&stats);
 			/* Final drain of any remaining queued pages */
 			pthread_spin_lock(&active_images_lock);
 			if (final_queue_drain(img, source_pid, &stats) < 0) {
