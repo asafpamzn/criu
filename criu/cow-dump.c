@@ -1779,12 +1779,13 @@ int cow_setup_sync_for_dirty(unsigned long *dirty_ranges,
 	}
 
 	cdi->phase = COW_PHASE_SYNC_CONVERGE;
-
+#if 1 //TODO check restarted later on at cr_dump_finish
 	/* Start monitor thread for convergence */
 	if (cow_start_monitor_thread()) {
 		pr_err("Failed to start monitor thread for convergence\n");
 		return -1;
 	}
+#endif
 
 	pr_info("WP_SYNC convergence mode active\n");
 	return 0;

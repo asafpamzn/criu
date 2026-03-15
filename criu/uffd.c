@@ -2641,6 +2641,7 @@ int cow_phase3_restore_loop(int ep_fd, struct epoll_event **events, int nr_fds)
 	int lazy_sk;
 	int flags;
 	int ret;
+	struct pstree_item *pi;
 
 	/* Set global epollfd for use by handle_lazy_accept() */
 	epollfd = ep_fd;
@@ -2664,6 +2665,20 @@ int cow_phase3_restore_loop(int ep_fd, struct epoll_event **events, int nr_fds)
 	}
 
 	pr_info("COW Phase 3: Waiting for restore to connect\n");
+
+	/* 5. Request all pages from primary for each task */
+	for_each_pstree_item(pi) {
+		if (task_alive(pi)) {
+			pr_info("Requesting all remote pages for pid=%d\n",
+				vpid(pi));
+			if (request_all_remote_pages(vpid(pi)) < 0) {
+				pr_err("Failed to request pages for pid=%d\n",
+						vpid(pi));
+				xfree(events);
+				return -1;
+			}
+		}
+	}
 
 	/* Enter main event loop - handle page faults until restore finishes */
 	ret = handle_requests(epollfd, events, nr_fds);
