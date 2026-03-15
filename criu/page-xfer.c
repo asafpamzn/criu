@@ -3581,7 +3581,7 @@ int page_server_start_async_read_bulk(void *buf, unsigned long nr_pages,
 					      ps_async_read_complete complete, void *priv)
 {
 	struct ps_async_read *ar;
-
+	pr_info("page_server_start_async_read_bulk\n");
 	/* In bulk mode, only create reader once - it processes continuous stream */
 	if (!list_empty(&async_reads)) {
 		/* Already have a stream reader */
