@@ -2881,6 +2881,13 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 		goto err;
 	}
 
+	/*
+	 * Prepare lazy VMAs for convergence: clear sent_bitmap for dirty pages
+	 * so P3 will re-send them. Also sets convergence mode so add_active_image()
+	 * uses dirty page count instead of total page count.
+	 */
+	prepare_lazy_vmas_for_convergence(dirty_ranges, nr_dirty_ranges);
+
 	pstree_switch_state(root_item, TASK_ALIVE);
 
 	/*

@@ -1772,18 +1772,19 @@ static int add_active_image(u64 dst_id, int sk)
 {
 	struct active_image *img;
 	unsigned long total_pages;
-	
+	unsigned long remaining_pages;
+
 	pthread_spin_lock(&active_images_lock);
-	
+
 	/* Check if already active */
 	if (find_active_image(dst_id)) {
 		pthread_spin_unlock(&active_images_lock);
 		pr_info("Image dst_id=%lu already active\n", dst_id);
 		return 0;
 	}
-	
+
 	pthread_spin_unlock(&active_images_lock);
-	
+
 	/* Count total pages in lazy VMAs for this dst_id (uses global list) */
 	total_pages = count_lazy_vma_pages(dst_id);
 
@@ -1791,29 +1792,47 @@ static int add_active_image(u64 dst_id, int sk)
 		pr_err("Image dst_id=%lu matched ZERO lazy VMA pages\n", dst_id);
 		return 0;  /* Nothing to send */
 	}
-	
+
+	/*
+	 * In convergence mode (Phase 3), we only need to send dirty pages.
+	 * The sent_bitmap was cleared for dirty pages by
+	 * prepare_lazy_vmas_for_convergence(), so P3 scan will re-send them.
+	 * COW pages (from WP_SYNC faults) will be sent via P1 queue.
+	 */
+	if (is_convergence_mode()) {
+		remaining_pages = get_convergence_dirty_pages();
+		pr_info("Convergence mode: %lu dirty pages to send (total VMAs: %lu)\n",
+			remaining_pages, total_pages);
+		if (remaining_pages == 0) {
+			pr_info("No dirty pages in convergence mode, nothing to send\n");
+			return 0;
+		}
+	} else {
+		remaining_pages = total_pages;
+	}
+
 	/* Create active image entry */
 	img = xzalloc(sizeof(*img));
 	if (!img) {
 		pr_err("Failed to allocate active image\n");
 		return -1;
 	}
-	
+
 	img->dst_id = dst_id;
 	img->main_sk = sk;
 	img->total_pages = total_pages;
-	img->remaining_pages = total_pages;
+	img->remaining_pages = remaining_pages;
 	img->total_cow_pages = 0;
 	img->total_req_pages = 0;
-	
+
 	INIT_LIST_HEAD(&img->list);
-	
+
 	pthread_spin_lock(&active_images_lock);
 	list_add_tail(&img->list, &active_images_queue);
 	pthread_spin_unlock(&active_images_lock);
-	
-	pr_info("Added active image dst_id=%lu with %lu lazy VMA pages\n",
-		dst_id, total_pages);
+
+	pr_info("Added active image dst_id=%lu with %lu remaining pages (total: %lu)\n",
+		dst_id, remaining_pages, total_pages);
 	return 0;
 }
 /* Timing statistics for COW page flow (accumulated in nanoseconds, printed once/sec) */
@@ -1921,17 +1940,18 @@ static int send_cow_page_lazy(struct cow_page_queue_entry *entry, struct active_
 	unsigned long page_idx;
 	int ret;
 	struct timespec t1, t2;
-	
+	bool was_already_sent;
+
 	/* Time VMA lookup */
 	clock_gettime(CLOCK_MONOTONIC, &t1);
-	
+
 	/* Find which lazy VMA contains this page (uses global list) */
 	lve = find_lazy_vma_for_addr(entry->vaddr, img->dst_id);
-	
+
 	clock_gettime(CLOCK_MONOTONIC, &t2);
 	cow_timing.vma_lookup_total_ns += (t2.tv_sec - t1.tv_sec) * 1000000000 + (t2.tv_nsec - t1.tv_nsec);
 	cow_timing.vma_lookup_count++;
-	
+
 	if (!lve) {
 		pr_err("COW page 0x%lx not in any lazy VMA (dst_id=%lu)\n",
 		       entry->vaddr, img->dst_id);
@@ -1939,12 +1959,17 @@ static int send_cow_page_lazy(struct cow_page_queue_entry *entry, struct active_
 	}
 	/* Calculate page index within VMA */
 	page_idx = (entry->vaddr - lve->start) / PAGE_SIZE;
-	
-	/* Check if already sent */
-	if (bitmap_test_nonatomic(lve->sent_bitmap, page_idx)) {
-		pr_debug("COW page 0x%lx already sent\n", entry->vaddr);
-		return 0;
-	}
+
+	/*
+	 * COW pages from WP_SYNC faults have fresh data captured at fault time.
+	 * We must ALWAYS send them, even if the page was previously sent by P3,
+	 * because the process may have written to it again after P3 sent it.
+	 *
+	 * Track if it was already sent for remaining_pages accounting:
+	 * - If not sent yet: this counts against remaining_pages
+	 * - If already sent: don't double-count, but still send the new data
+	 */
+	was_already_sent = bitmap_test_nonatomic(lve->sent_bitmap, page_idx);
 
 	if (!entry->data) {
 		pr_err("COW queue entry 0x%lx has no data!\n", entry->vaddr);
@@ -1970,7 +1995,11 @@ static int send_cow_page_lazy(struct cow_page_queue_entry *entry, struct active_
 	/* Mark as sent */
 	bitmap_set_nonatomic(lve->sent_bitmap, page_idx);
 
-	return 1;  /* Successfully sent */
+	/*
+	 * Return 1 if this is the first send (count against remaining_pages).
+	 * Return 2 if page was already sent by P3 (don't double-count).
+	 */
+	return was_already_sent ? 2 : 1;
 }
 
 /* Helper to send a page request from lazy VMA */
@@ -2110,7 +2139,13 @@ static int drain_cow_pages(struct active_image *img, pid_t source_pid,
 {
 	int sent = 0;
 
-	while (max_pages > 0 && cow_has_pending_pages() && img->remaining_pages > 0) {
+	/*
+	 * In convergence mode, continue draining COW pages even if
+	 * remaining_pages is 0 - COW pages from "clean" pages written
+	 * after Phase 4 resume don't count against remaining_pages.
+	 */
+	while (max_pages > 0 && cow_has_pending_pages() &&
+	       (img->remaining_pages > 0 || is_convergence_mode())) {
 		struct cow_page_queue_entry *entry;
 		struct timespec tq1, tq2;
 		int ret;
@@ -2147,9 +2182,15 @@ static int drain_cow_pages(struct active_image *img, pid_t source_pid,
 
 		if (ret > 0) {
 			img->total_cow_pages++;
-			img->remaining_pages--;
 			stats->priority1_pages++;
 			sent++;
+			/*
+			 * ret == 1: first send of this page, decrement remaining_pages
+			 * ret == 2: page was already sent by P3, but COW has newer
+			 *           data - don't decrement to avoid going negative
+			 */
+			if (ret == 1)
+				img->remaining_pages--;
 		}
 		max_pages--;
 	}
@@ -2306,7 +2347,13 @@ static int process_vma_pages(struct active_image *img,
 static int final_queue_drain(struct active_image *img, pid_t source_pid,
 			     struct unified_thread_stats *stats)
 {
-	while (img->remaining_pages > 0) {
+	/*
+	 * In convergence mode, continue until both:
+	 *   - remaining_pages == 0 (all expected dirty pages sent)
+	 *   - COW queue empty (all WP_SYNC faults processed)
+	 */
+	while (img->remaining_pages > 0 ||
+	       (is_convergence_mode() && cow_has_pending_pages())) {
 		int cow_sent, req_sent;
 
 		/*
@@ -2370,7 +2417,13 @@ static void *unified_page_server_thread(void *arg)
 			if (final_queue_drain(img, source_pid, &stats) < 0) {
 				pr_err("Error in final queue drain\n");
 			}
-			if (img->remaining_pages == 0) {
+			/*
+			 * In convergence mode, completion requires both:
+			 *   - remaining_pages == 0 (all dirty pages sent)
+			 *   - COW queue empty (all WP_SYNC faults processed)
+			 */
+			if (img->remaining_pages == 0 &&
+			    (!is_convergence_mode() || !cow_has_pending_pages())) {
 				pthread_spin_unlock(&active_images_lock);
 				if (send_image_complete(img) < 0)
 					pr_err("Failed to complete image dst_id=%lu\n",

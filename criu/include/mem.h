@@ -78,4 +78,10 @@ extern unsigned long count_lazy_vma_pages(u64 dst_id);
 struct list_head *get_global_lazy_vmas(void);
 extern void free_global_lazy_vmas(void);
 
+/* COW convergence mode - Phase 3 dirty page handling */
+extern bool is_convergence_mode(void);
+extern unsigned long get_convergence_dirty_pages(void);
+extern unsigned long prepare_lazy_vmas_for_convergence(unsigned long *dirty_ranges,
+						       unsigned int nr_dirty_ranges);
+
 #endif /* __CR_MEM_H__ */

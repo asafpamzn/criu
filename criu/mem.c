@@ -120,8 +120,95 @@ unsigned long count_lazy_vma_pages(u64 dst_id)
 			total_pages += lve->total_pages;
 	}
 	pthread_spin_unlock(&lazy_vmas_lock);
-	
+
 	return total_pages;
+}
+
+/* Convergence mode state */
+static bool g_convergence_mode = false;
+static unsigned long g_convergence_dirty_pages = 0;
+
+bool is_convergence_mode(void)
+{
+	return g_convergence_mode;
+}
+
+unsigned long get_convergence_dirty_pages(void)
+{
+	return g_convergence_dirty_pages;
+}
+
+/*
+ * Prepare lazy VMAs for Phase 3 convergence.
+ * Clears sent_bitmap for pages in dirty_ranges so they can be re-sent.
+ * Returns total number of dirty pages.
+ *
+ * dirty_ranges format: [start0, len0, start1, len1, ...]
+ * Each range is (start_addr, length_in_bytes).
+ */
+unsigned long prepare_lazy_vmas_for_convergence(unsigned long *dirty_ranges,
+						unsigned int nr_dirty_ranges)
+{
+	struct lazy_vma_entry *lve;
+	unsigned long total_dirty_pages = 0;
+	unsigned int i;
+
+	if (!dirty_ranges || nr_dirty_ranges == 0) {
+		pr_info("No dirty ranges for convergence\n");
+		g_convergence_mode = true;
+		g_convergence_dirty_pages = 0;
+		return 0;
+	}
+
+	init_global_lazy_vmas();
+
+	pthread_spin_lock(&lazy_vmas_lock);
+
+	list_for_each_entry(lve, &global_lazy_vmas, list) {
+		unsigned long vma_start = lve->start;
+		unsigned long vma_end = lve->end;
+
+		/* Check each dirty range against this VMA */
+		for (i = 0; i < nr_dirty_ranges; i++) {
+			unsigned long range_start = dirty_ranges[i * 2];
+			unsigned long range_len = dirty_ranges[i * 2 + 1];
+			unsigned long range_end = range_start + range_len;
+			unsigned long overlap_start, overlap_end;
+			unsigned long page_idx, page_idx_end;
+
+			/* Calculate overlap between dirty range and this VMA */
+			if (range_end <= vma_start || range_start >= vma_end)
+				continue;  /* No overlap */
+
+			overlap_start = (range_start > vma_start) ? range_start : vma_start;
+			overlap_end = (range_end < vma_end) ? range_end : vma_end;
+
+			/* Clear sent_bitmap for pages in overlap region */
+			page_idx = (overlap_start - vma_start) / PAGE_SIZE;
+			page_idx_end = (overlap_end - vma_start + PAGE_SIZE - 1) / PAGE_SIZE;
+
+			if (page_idx_end > lve->total_pages)
+				page_idx_end = lve->total_pages;
+
+			for (; page_idx < page_idx_end; page_idx++) {
+				if (lve->sent_bitmap &&
+				    bitmap_test_nonatomic(lve->sent_bitmap, page_idx)) {
+					bitmap_clear_nonatomic(lve->sent_bitmap, page_idx);
+					total_dirty_pages++;
+				}
+			}
+		}
+	}
+
+	pthread_spin_unlock(&lazy_vmas_lock);
+
+	g_convergence_mode = true;
+	g_convergence_dirty_pages = total_dirty_pages;
+
+	pr_info("Prepared %lu dirty pages for convergence from %u ranges\n",
+		total_dirty_pages, nr_dirty_ranges);
+
+	return total_dirty_pages;
 }
 
 static int task_reset_dirty_track(int pid)

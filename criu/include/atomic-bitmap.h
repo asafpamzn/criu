@@ -79,4 +79,14 @@ static inline void bitmap_set_nonatomic(unsigned char *bitmap,
 	bitmap[page_idx / 8] |= (1 << (page_idx % 8));
 }
 
+/*
+ * Non-atomic clear - plain memory store without ordering guarantees.
+ * Safe for single-threaded contexts only (no concurrent writers).
+ */
+static inline void bitmap_clear_nonatomic(unsigned char *bitmap,
+					  unsigned long page_idx)
+{
+	bitmap[page_idx / 8] &= ~(1 << (page_idx % 8));
+}
+
 #endif /* __CR_ATOMIC_BITMAP_H__ */
