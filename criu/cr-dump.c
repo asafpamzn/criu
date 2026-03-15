@@ -2530,6 +2530,9 @@ static int cr_dump_finish(int ret)
 
 		pstree_switch_state(root_item, TASK_ALIVE);
 		timing_stop(TIME_FROZEN);
+
+		pr_info("=== PHASE 7: Convergence page server ===\n");
+		cow_set_phase(COW_PHASE_SYNC_CONVERGE_POST_RESTORE);
 		
 		/* Now start lazy page transfer with process running */
 		ret = cr_lazy_mem_dump();
@@ -2896,8 +2899,8 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 
 	/* Close Phase 4 socket - replica received dirty bitmap */
 	close_page_server_socket();
-	
-/* === PHASE 5-6: Convergence === */
+
+	/* === PHASE 5-6: Convergence === */
 	pr_info("=== PHASE 5-6: Convergence page server ===\n");
 	cow_set_phase(COW_PHASE_SYNC_CONVERGE);
 	/* Inventory was already written after skeleton dump - don't duplicate */

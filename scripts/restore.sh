@@ -195,7 +195,7 @@ fi
 # skeleton images (everything except memory pages which are already being
 # streamed), then writes "PHASE 3 SKELETON DUMP COMPLETE" to the log.
 # We must wait for this before starting criu restore.
-SKELETON_READY_PATTERN="Waiting for page server thread to finish"
+SKELETON_READY_PATTERN="START RESTORE!!!"
 echo "Step 5: Waiting for Phase 3 skeleton dump..."
 START_TIME=$(date +%s)
 while true; do

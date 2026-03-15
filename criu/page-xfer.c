@@ -1706,8 +1706,11 @@ static void cleanup_active_images_queue(void);
 
 void wait_for_page_server_thread(void)
 {
-	if (!g_unified_thread_running)
+	if (!g_unified_thread_running){
+		pr_err("ERROR wait_for_page_server_thread thread is not running.\n");
 		return;
+	}
+		
 	pr_info("Waiting for page server thread to finish...\n");
 	pthread_join(g_unified_thread, NULL);
 	g_unified_thread_running = false;
