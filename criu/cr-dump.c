@@ -2896,20 +2896,10 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 
 	/* Close Phase 4 socket - replica received dirty bitmap */
 	close_page_server_socket();
-
-	/* === PHASE 5-6: Convergence === */
+	
+/* === PHASE 5-6: Convergence === */
 	pr_info("=== PHASE 5-6: Convergence page server ===\n");
 	cow_set_phase(COW_PHASE_SYNC_CONVERGE);
-
-	/*
-	 * Start a new page server for convergence.
-	 * The replica will reconnect to this server to request
-	 * dirty pages that weren't in its buffer.
-	 */
-	ret = cr_page_server(false, true, -1);
-	if (ret)
-		pr_err("Convergence page server failed\n");
-
 	/* Inventory was already written after skeleton dump - don't duplicate */
 	xfree(dirty_ranges);
 	exit_code = 0;
