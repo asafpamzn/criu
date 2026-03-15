@@ -2912,6 +2912,7 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 
 	/* Inventory was already written after skeleton dump - don't duplicate */
 	xfree(dirty_ranges);
+	exit_code = 0;
 	goto finish;
 
 err_refreeze:
