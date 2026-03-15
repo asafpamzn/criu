@@ -2269,7 +2269,7 @@ static int process_vma_pages(struct active_image *img,
 	unsigned long vaddr;
 	unsigned long page_idx = 0;
 
-	pr_debug("Processing VMA: %lx-%lx len=%lu\n",
+	pr_info("Processing VMA: %lx-%lx len=%lu\n",
 		 lve->start, lve->end, lve->end - lve->start);
 
 	for (vaddr = lve->start; vaddr < lve->end; vaddr += PAGE_SIZE, page_idx++) {
@@ -2294,6 +2294,7 @@ static int process_vma_pages(struct active_image *img,
 					  source_pid, stats) < 0)
 			return -1;
 	}
+	print_thread_stats(stats);
 
 	return 0;
 }
