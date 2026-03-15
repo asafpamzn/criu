@@ -2380,7 +2380,7 @@ static int lazy_sk_read_event(struct epoll_rfd *rfd)
 		pr_err("Unexpected response: %x\n", fin);
 		return -1;
 	}
-
+	pr_perror("restore_finished = true\n");
 	restore_finished = true;
 
 	return 1;
