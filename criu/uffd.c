@@ -181,7 +181,7 @@ int page_buffer_init(void)
 /* Forward declaration — needed by page_buffer_add's dedup check */
 static struct page_buffer_entry *page_buffer_lookup(unsigned long vaddr);
 
-static int cow_page_buffer_add(unsigned long vaddr, void *data)
+int cow_page_buffer_add(unsigned long vaddr, void *data)
 {
 	struct page_buffer_entry *entry;
 	unsigned int hash;
@@ -234,7 +234,7 @@ static void page_buffer_remove(struct page_buffer_entry *entry)
 	xfree(entry);
 }
 
-static void cow_page_buffer_destroy(void)
+void cow_page_buffer_destroy(void)
 {
 	int i;
 	struct page_buffer_entry *entry;
