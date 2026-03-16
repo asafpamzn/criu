@@ -3689,7 +3689,6 @@ int connect_to_page_server_to_recv(int epfd)
 	if (connect_to_page_server())
 		return -1;
 	bulk_stream_done = false;
-	unset_dirty_bitmap_received();
 
 	ps_rfd.fd = page_server_sk;
 	/* Use bulk stream reader in bulk mode, regular reader in on-demand mode */

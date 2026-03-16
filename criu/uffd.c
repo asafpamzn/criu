@@ -2531,11 +2531,6 @@ void set_dirty_bitmap_received(void)
 	dirty_bitmap_received = true;
 }
 
-void unset_dirty_bitmap_received(void) 
-{
-	dirty_bitmap_received = false;
-}
-
 /* Set inventory ready flag (called when PS_IOV_INVENTORY_READY received) */
 void set_inventory_ready_received(void)
 {

@@ -28,8 +28,6 @@ extern bool is_restore_connected(void);
 extern bool is_dirty_bitmap_received(void);
 
 extern void set_dirty_bitmap_received(void);
-extern void unset_dirty_bitmap_received(void);
-
 
 /* Check if inventory.img is ready (PS_IOV_INVENTORY_READY received) */
 extern bool is_inventory_ready_received(void);
