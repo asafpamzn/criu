@@ -2661,7 +2661,7 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 		goto err;
 
 	/* === PHASE 1: Seize + Pre-dump + WP_ASYNC === */
-	pr_info("=== PHASE 1: Seize + Pre-dump + WP_ASYNC ===\n");
+	pr_err("=== PHASE 1: Seize + Pre-dump + WP_ASYNC ===\n");
 
 	if (collect_pstree())
 		goto err;
@@ -2708,7 +2708,7 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 	}
 
 	/* === PHASE 2: Bulk page transfer === */
-	pr_info("=== PHASE 2: Bulk page transfer ===\n");
+	pr_err("=== PHASE 2: Bulk page transfer ===\n");
 
 	/*
 	 * Start the page server to send all pages while the process runs.
@@ -2740,7 +2740,7 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 	}
 
 	/* === PHASE 3: Re-freeze + skeleton dump + dirty scan === */
-	pr_info("=== PHASE 3: Re-freeze + skeleton dump + dirty scan ===\n");
+	pr_err("=== PHASE 3: Re-freeze + skeleton dump + dirty scan ===\n");
 
 	/*
 	 * Re-seize all tasks. After Phase 1, tasks were released via
@@ -2873,7 +2873,7 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 	}
 
 	/* === PHASE 4: WP_SYNC on dirty + unfreeze === */
-	pr_info("=== PHASE 4: WP_SYNC on dirty + unfreeze ===\n");
+	pr_err("=== PHASE 4: WP_SYNC on dirty + unfreeze ===\n");
 
 	ret = cow_setup_sync_for_dirty(dirty_ranges, nr_dirty_ranges);
 	if (ret) {
@@ -2908,7 +2908,7 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 	close_page_server_socket();
 
 	/* === PHASE 5-6: Convergence === */
-	pr_info("=== PHASE 5-6: Convergence page server ===\n");
+	pr_err("=== PHASE 5-6: Convergence page server ===\n");
 	cow_set_phase(COW_PHASE_SYNC_CONVERGE);
 	/* Inventory was already written after skeleton dump - don't duplicate */
 	xfree(dirty_ranges);
