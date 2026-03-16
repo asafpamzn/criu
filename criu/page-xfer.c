@@ -3665,7 +3665,7 @@ static int page_server_async_read(struct epoll_rfd *f)
 
 static int page_server_hangup_event(struct epoll_rfd *rfd)
 {
-	if (opts.cow_dump && dirty_bitmap_received) {
+	if (opts.cow_dump && is_dirty_bitmap_received()) {
 		pr_info("Page server closed connection after dirty bitmap received\n");
 		return 0;
 	}
