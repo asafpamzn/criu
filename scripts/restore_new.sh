@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/.env"
+
+CRIU_BIN="${CRIU_BIN:-$SCRIPT_DIR/../criu/criu}"
+LOG_FILE="$IMAGES_DIR/lazy-primary.log"
+LOG_FILE_SERVER="$IMAGES_DIR/lazy-server.log"
+
+echo "=== CRIU Restore - Replica ==="
+
+# Step 1: Kill existing valkey
+echo "Step 1: Killing valkey-server..."
+sudo pkill -9 valkey-server 2>/dev/null || true
+sleep 1
+
+# Step 2: Start lazy-pages daemon
+echo "Step 2: Starting lazy-pages daemon..."
+sudo rm -f "$IMAGES_DIR/lazy-server.log"
+
+sudo "$CRIU_BIN" lazy-pages \
+  --images-dir "$IMAGES_DIR" \
+  --page-server \
+  --address "$PRIMARY_IP" \
+  --port "$CRIU_PORT" \
+  --cow-dump \
+  --tcp-close \
+  -v1 -o "$IMAGES_DIR/lazy-server.log" &
+LAZY_PAGES_PID=$!
+
+sleep 1
+if ! kill -0 "$LAZY_PAGES_PID" 2>/dev/null; then
+  echo "ERROR: lazy-pages exited early"
+  sudo tail -n 120 "$LOG_FILE_SERVER" 2>/dev/null || true
+  exit 1
+fi
+echo "Lazy-pages started (PID: $LAZY_PAGES_PID)"
+
+# Step 3: Wait for Phase 3 skeleton dump
+echo "Step 3: Waiting for skeleton dump..."
+SKELETON_READY_PATTERN="START RESTORE!!!"
+PHASE3_READY_PATTERN="COW Phase 3: Waiting for restore to connect"
+
+while true; do
+  if [ -f "$LOG_FILE" ] && sudo grep -q "$SKELETON_READY_PATTERN" "$LOG_FILE" 2>/dev/null; then
+    if [ -f "$LOG_FILE_SERVER" ] && sudo grep -q "$PHASE3_READY_PATTERN" "$LOG_FILE_SERVER" 2>/dev/null; then
+      echo "Skeleton dump ready"
+      break
+    fi
+  fi
+  if ! kill -0 "$LAZY_PAGES_PID" 2>/dev/null; then
+    echo "ERROR: lazy-pages died"
+    sudo tail -n 120 "$LOG_FILE_SERVER" 2>/dev/null || true
+    exit 1
+  fi
+  sleep 0.1
+done
+
+# Step 4: CRIU restore
+echo "Step 4: Starting CRIU restore..."
+if ! sudo "$CRIU_BIN" restore \
+  --images-dir "$IMAGES_DIR" \
+  --lazy-pages \
+  --tcp-close \
+  --cow-dump \
+  --restore-detached \
+  --skip-file-rwx-check \
+  --file-validation filesize \
+  -v4 -o "$IMAGES_DIR/lazy-restore.log"; then
+  echo "ERROR: restore failed"
+  sudo tail -n 120 "$IMAGES_DIR/lazy-restore.log" 2>/dev/null || true
+  exit 1
+fi
+
+# Step 5: Call wait_and_replicate
+echo "Step 5: Configuring replication..."
+"$SCRIPT_DIR/wait_and_replicate_new.sh"
+
+echo "=== Restore complete ==="
