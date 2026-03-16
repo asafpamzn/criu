@@ -128,7 +128,7 @@ int cr_lazy_pages_cow_phase2(bool daemon)
 	int ret = -1;
 	int nr_fds;
 
-	pr_info("=== COW Phase 2: Page buffering mode ===\n");
+	pr_err("=== COW Phase 2: Page buffering mode ===\n");
 
 	/* 1. Discover tasks from pagemap files */
 	if (discover_tasks_from_pagemaps())
@@ -189,7 +189,7 @@ int cr_lazy_pages_cow_phase2(bool daemon)
 		}
 	}
 
-	pr_info("Waiting to receive pages from primary...\n");
+	pr_err("Waiting to receive pages from primary...\n");
 
 	/* 8. Phase 2 event loop - buffer pages until dirty bitmap arrives */
 	ret = cow_phase2_handle_pages(epollfd, events, nr_fds);
@@ -198,7 +198,7 @@ int cr_lazy_pages_cow_phase2(bool daemon)
 		goto err_disconnect;
 	}
 
-	pr_info("=== COW Phase 3: Starting restore ===\n");
+	pr_err("=== COW Phase 3: Starting restore ===\n");
 
 	/*
 	 * Phase 3: Dirty bitmap received, skeleton dump is ready.

@@ -174,7 +174,7 @@ int page_buffer_init(void)
 	g_page_buffer.nr_discarded = 0;
 	g_page_buffer.active = true;
 
-	pr_info("Page buffer initialized for COW phased migration\n");
+	pr_err("Page buffer initialized for COW phased migration\n");
 	return 0;
 }
 
@@ -2579,7 +2579,7 @@ int cow_phase3_restore_loop(int ep_fd, struct epoll_event **events, int nr_fds)
 		return -1;
 	}
 
-	pr_info("COW Phase 3: Waiting for restore to connect\n");
+	pr_err("COW Phase 3: Waiting for restore to connect\n");
 
 	/* Re-initialize async bulk reader for Phase 3 convergence */
 	if (setup_prebuffer_reader()) {
