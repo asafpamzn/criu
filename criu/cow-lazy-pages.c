@@ -24,6 +24,7 @@
 #include "common/list.h"
 #include "servicefd.h"
 #include "uffd.h"
+#include "cow-uffd.h"
 #include "pstree.h"
 #include "rst_info.h"
 #include "cow-lazy-pages.h"
@@ -133,8 +134,8 @@ int cr_lazy_pages_cow_phase2(bool daemon)
 	if (discover_tasks_from_pagemaps())
 		return -1;
 
-	/* 2. Initialize page buffer (uses g_page_buffer in uffd.c) */
-	if (page_buffer_init()) {
+	/* 2. Initialize COW page buffer (thread-safe version in cow-uffd.c) */
+	if (cow_page_buffer_init()) {
 		pr_err("Failed to initialize page buffer\n");
 		goto err_tasks;
 	}

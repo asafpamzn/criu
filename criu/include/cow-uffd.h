@@ -1,0 +1,33 @@
+#ifndef __CR_COW_UFFD_H__
+#define __CR_COW_UFFD_H__
+
+#include <stdbool.h>
+
+/* Initialize COW page buffer with spinlock */
+int cow_page_buffer_init(void);
+
+/* Lookup page in buffer (thread-safe) - returns data pointer or NULL */
+void *cow_page_buffer_lookup_and_remove(unsigned long vaddr);
+
+/* Add page to buffer (thread-safe) */
+int cow_page_buffer_add(unsigned long vaddr, void *data);
+
+/* Get current page count */
+unsigned long cow_page_buffer_count(void);
+
+/* Destroy COW page buffer and free all resources */
+void cow_page_buffer_destroy(void);
+
+/* Discard dirty pages from buffer (called when dirty bitmap received) */
+void cow_page_buffer_discard_dirty(unsigned long *dirty_ranges, unsigned int nr_dirty_ranges);
+
+/* Start background drain thread */
+int cow_start_drain_thread(void);
+
+/* Stop background drain thread */
+void cow_stop_drain_thread(void);
+
+/* Check if drain thread is running */
+bool cow_drain_thread_running(void);
+
+#endif /* __CR_COW_UFFD_H__ */

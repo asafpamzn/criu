@@ -35,6 +35,7 @@
 #include "stats.h"
 #include "tls.h"
 #include "uffd.h"
+#include "cow-uffd.h"
 #include "cow-dump.h"
 #include "criu-plugin.h"
 #include "plugin.h"
@@ -3170,16 +3171,9 @@ static int handle_dirty_bitmap_header(struct ps_async_read *ar)
 	ar->dirty_ranges_size = ar->nr_dirty_ranges * 2 * sizeof(unsigned long);
 
 	if (ar->dirty_ranges_size == 0) {
-		/* No dirty ranges — apply all buffered pages as clean */
-		if (is_restore_connected()) {
-			int uffd = get_first_lpi_uffd();
-
-			if (uffd >= 0)
-				apply_buffered_pages(uffd, NULL, 0);
-		} else {
-			/* Store for later — restore not connected yet */
-			store_pending_dirty_bitmap(NULL, 0);
-		}
+		/* No dirty ranges — all buffered pages are clean */
+		/* Do NOT start drain thread here - wait for restore to connect */
+		/* Drain thread will start in handle_lazy_accept() when restore connects */
 		ar->rb = 0;
 		ar->compress_state = COMPRESS_STATE_READING_HEADER;
 		pr_info("Dirty bitmap: 0 ranges, all pages clean\n");
@@ -3187,6 +3181,7 @@ static int handle_dirty_bitmap_header(struct ps_async_read *ar)
 		/*
 		 * COW mode: dirty bitmap (even empty) marks end of bulk phase.
 		 * Send ACK to primary before marking complete.
+		 * Drain thread will start when restore connects 
 		 */
 		if (opts.cow_dump) {
 			pr_info("COW mode: dirty bitmap complete (0 ranges), bulk phase done\n");
@@ -3448,22 +3443,7 @@ static int read_dirty_bitmap(struct ps_async_read *ar, int flags)
 	/* Dirty bitmap complete */
 	pr_info("Dirty bitmap received: %u ranges\n", ar->nr_dirty_ranges);
 
-	if (is_restore_connected()) {
-		int uffd = get_first_lpi_uffd();
-
-		pr_info("Restore connected, applying buffered pages\n");
-		if (uffd >= 0)
-			apply_buffered_pages(uffd, ar->dirty_ranges, ar->nr_dirty_ranges);
-		xfree(ar->dirty_ranges);
-	} else {
-		/*
-		 * Restore not connected yet — store bitmap for later.
-		 * handle_lazy_accept() will apply it when restore connects.
-		 */
-		pr_info("Restore not connected, storing dirty bitmap\n");
-		store_pending_dirty_bitmap(ar->dirty_ranges, ar->nr_dirty_ranges);
-		xfree(ar->dirty_ranges);
-	}
+	xfree(ar->dirty_ranges);
 
 	ar->dirty_ranges = NULL;
 	ar->rb = 0;

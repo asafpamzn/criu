@@ -18,6 +18,9 @@ extern int apply_buffered_pages(int uffd, unsigned long *dirty_ranges,
 /* Return uffd of first active lazy_pages_info. Used by page-xfer.c. */
 extern int get_first_lpi_uffd(void);
 
+/* Return uffd for a given vaddr (for background drain thread). */
+extern int get_uffd_for_vaddr(unsigned long vaddr);
+
 /* Store dirty bitmap if it arrives before restore connects */
 extern void store_pending_dirty_bitmap(unsigned long *ranges, unsigned int nr_ranges);
 

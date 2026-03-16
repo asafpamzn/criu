@@ -45,6 +45,7 @@
 #include "pagemap.h"
 #include "pf-tracker.h"
 #include "cow-lazy-pages.h"
+#include "cow-uffd.h"
 #undef LOG_PREFIX
 #define LOG_PREFIX "uffd: "
 
@@ -1555,16 +1556,15 @@ found_iov:
 		return 0;
 
 	/*
-	 * In COW phased migration with buffering active, store pages
-	 * in buffer instead of UFFD_COPY. They will be applied later
-	 * after receiving the dirty bitmap.
+	 * In COW phased migration, store pages in buffer.
+	 * Page faults check buffer first, background thread drains.
 	 */
-	if (opts.cow_dump && g_page_buffer.active) {
+	if (opts.cow_dump) {
 		unsigned long i;
 
 		for (i = 0; i < pages; i++) {
-			ret = page_buffer_add(vaddr + i * PAGE_SIZE,
-					      (char *)lpi->buf + i * PAGE_SIZE);
+			ret = cow_page_buffer_add(vaddr + i * PAGE_SIZE,
+						  (char *)lpi->buf + i * PAGE_SIZE);
 			if (ret < 0) {
 				lp_err(lpi, "Failed to buffer page at 0x%lx\n",
 				       vaddr + i * PAGE_SIZE);
@@ -1891,31 +1891,25 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 	 * In COW phased migration, check if the page is already
 	 * buffered. If so, UFFD_COPY directly from buffer.
 	 */
-	if (opts.cow_dump && g_page_buffer.hash_table) {
-		struct page_buffer_entry *entry;
+	if (opts.cow_dump) {
+		void *data = cow_page_buffer_lookup_and_remove(address);
 
-		entry = page_buffer_lookup(address);
-		if (entry) {
-			struct uffdio_copy uffd_copy;
+		if (data) {
+			struct uffdio_copy uffd_copy = {
+				.dst = address,
+				.src = (unsigned long)data,
+				.len = PAGE_SIZE,
+				.mode = 0,
+				.copy = 0,
+			};
 
-			lp_debug(lpi, "Page at 0x%llx found in buffer\n", address);
-
-			uffd_copy.dst = address;
-			uffd_copy.src = (unsigned long)entry->data;
-			uffd_copy.len = PAGE_SIZE;
-			uffd_copy.mode = 0;
-			uffd_copy.copy = 0;
+			lp_debug(lpi, "Page 0x%llx served from COW buffer\n", address);
 
 			if (ioctl(lpi->lpfd.fd, UFFDIO_COPY, &uffd_copy) < 0) {
-				if (errno != EEXIST) {
+				if (errno != EEXIST)
 					lp_perror(lpi, "UFFDIO_COPY from buffer failed");
-					return -1;
-				}
-				/* EEXIST: page already present, that's fine */
 			}
-
-			page_buffer_remove(entry);
-			g_page_buffer.nr_applied++;
+			xfree(data);
 			lpi->copied_pages++;
 			return 0;
 		}
@@ -2468,8 +2462,8 @@ static int prebuffer_io_complete(unsigned long dst_id, unsigned long vaddr,
 	int i;
 
 	for (i = 0; i < nr_pages; i++) {
-		if (page_buffer_add(vaddr + i * PAGE_SIZE,
-				    (char *)buf + i * PAGE_SIZE) < 0) {
+		if (cow_page_buffer_add(vaddr + i * PAGE_SIZE,
+					(char *)buf + i * PAGE_SIZE) < 0) {
 			pr_err("Failed to buffer page at 0x%lx\n",
 			       vaddr + i * PAGE_SIZE);
 			return -1;
@@ -2535,32 +2529,25 @@ static int handle_lazy_accept(struct epoll_rfd *rfd)
 
 	/*
 	 * Keep buffering ON — handle_page_fault() will serve from buffer.
-	 * The dirty bitmap will trigger apply_buffered_pages() to
-	 * bulk-apply remaining clean pages.
+	 * Start background drain thread to proactively apply buffered pages.
 	 */
 	restore_connected = true;
 
 	pr_info("criu restore setup complete, %lu pages buffered\n",
-		g_page_buffer.nr_pages);
+		cow_page_buffer_count());
 
 	/*
-	 * Apply any pending dirty bitmap that arrived before restore connected.
-	 * This handles the timing edge case where skeleton dump finishes quickly.
+	 * Start drain thread only if dirty bitmap already received.
+	 * Drain thread requires uffd (only available after restore connects).
+	 * If bitmap hasn't arrived yet, we'll start drain thread when it does.
 	 */
-	if (pending_dirty_ranges || pending_nr_dirty_ranges == 0) {
-		int uffd = get_first_lpi_uffd();
-
-		if (uffd >= 0) {
-			pr_info("Applying pending dirty bitmap: %u ranges\n",
-				pending_nr_dirty_ranges);
-			apply_buffered_pages(uffd, pending_dirty_ranges,
-					     pending_nr_dirty_ranges);
+	if (opts.cow_dump && is_dirty_bitmap_received()) {
+		pr_info("Dirty bitmap already received, starting drain thread\n");
+		if (dirty_bitmap_received == false) {
+			pr_info("Dirty bitmap already was not received exiting\n");
+			exit(0);
 		}
-		if (pending_dirty_ranges) {
-			xfree(pending_dirty_ranges);
-			pending_dirty_ranges = NULL;
-		}
-		pending_nr_dirty_ranges = 0;
+		cow_start_drain_thread();
 	}
 
 	return 0;
@@ -2577,6 +2564,20 @@ int get_first_lpi_uffd(void)
 
 	list_for_each_entry(lpi, &lpis, l) {
 		if (!lpi->exited && lpi->lpfd.fd > 0)
+			return lpi->lpfd.fd;
+	}
+	return -1;
+}
+
+/* Return uffd for a given vaddr (for background drain thread). */
+int get_uffd_for_vaddr(unsigned long vaddr)
+{
+	struct lazy_pages_info *lpi;
+
+	list_for_each_entry(lpi, &lpis, l) {
+		if (lpi->exited || lpi->lpfd.fd < 0)
+			continue;
+		if (find_iov(lpi, vaddr))
 			return lpi->lpfd.fd;
 	}
 	return -1;
@@ -2759,7 +2760,7 @@ int cr_lazy_pages(bool daemon)
 		struct pstree_item *pi;
 
 		/* 1. Initialize page buffer hash table */
-		if (page_buffer_init() < 0) {
+		if (cow_page_buffer_init() < 0) {
 			pr_err("Failed to initialize page buffer\n");
 			xfree(events);
 			return -1;
@@ -2826,7 +2827,7 @@ int cr_lazy_pages(bool daemon)
 			/* Request all pages for bulk mode */
 			if (opts.cow_dump) {
 				/* Initialize page buffer for COW migration */
-				if (page_buffer_init() < 0) {
+				if (cow_page_buffer_init() < 0) {
 					pr_err("Failed to initialize page buffer\n");
 					xfree(events);
 					return -1;
@@ -2852,7 +2853,7 @@ int cr_lazy_pages(bool daemon)
 
 	/* Clean up page buffer if it was initialized */
 	if (opts.cow_dump)
-		page_buffer_destroy();
+		cow_page_buffer_destroy();
 
 	/* Clean up prebuffer */
 	if (prebuffer_buf) {
