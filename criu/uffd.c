@@ -234,7 +234,7 @@ static void page_buffer_remove(struct page_buffer_entry *entry)
 	xfree(entry);
 }
 
-static void page_buffer_destroy(void)
+static void cow_page_buffer_destroy(void)
 {
 	int i;
 	struct page_buffer_entry *entry;
