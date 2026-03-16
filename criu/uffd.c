@@ -181,39 +181,6 @@ int page_buffer_init(void)
 /* Forward declaration — needed by page_buffer_add's dedup check */
 static struct page_buffer_entry *page_buffer_lookup(unsigned long vaddr);
 
-int cow_page_buffer_add(unsigned long vaddr, void *data)
-{
-	struct page_buffer_entry *entry;
-	unsigned int hash;
-
-	/* Check for duplicate — avoid memory leak if same page arrives twice */
-	entry = page_buffer_lookup(vaddr);
-	if (entry) {
-		/* Update existing entry with newer data */
-		memcpy(entry->data, data, PAGE_SIZE);
-		return 0;
-	}
-
-	entry = xmalloc(sizeof(*entry));
-	if (!entry)
-		return -1;
-
-	entry->data = xmalloc(PAGE_SIZE);
-	if (!entry->data) {
-		xfree(entry);
-		return -1;
-	}
-
-	memcpy(entry->data, data, PAGE_SIZE);
-	entry->vaddr = vaddr;
-	INIT_HLIST_NODE(&entry->hash);
-
-	hash = page_buffer_hash(vaddr);
-	hlist_add_head(&entry->hash, &g_page_buffer.hash_table[hash]);
-	g_page_buffer.nr_pages++;
-
-	return 0;
-}
 
 static struct page_buffer_entry *page_buffer_lookup(unsigned long vaddr)
 {
