@@ -185,29 +185,6 @@ static void page_buffer_remove(struct page_buffer_entry *entry)
 	xfree(entry);
 }
 
-void cow_page_buffer_destroy(void)
-{
-	int i;
-	struct page_buffer_entry *entry;
-	struct hlist_node *tmp;
-
-	if (!g_page_buffer.hash_table)
-		return;
-
-	for (i = 0; i < PAGE_BUFFER_HASH_SIZE; i++) {
-		hlist_for_each_entry_safe(entry, tmp,
-					  &g_page_buffer.hash_table[i], hash) {
-			page_buffer_remove(entry);
-		}
-	}
-
-	xfree(g_page_buffer.hash_table);
-	g_page_buffer.hash_table = NULL;
-	g_page_buffer.active = false;
-
-	pr_info("Page buffer destroyed: applied=%lu discarded=%lu\n",
-		g_page_buffer.nr_applied, g_page_buffer.nr_discarded);
-}
 
 /* Check if address falls within any dirty range */
 static bool is_in_dirty_range(unsigned long vaddr,
