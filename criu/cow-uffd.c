@@ -147,27 +147,10 @@ unsigned long cow_page_buffer_count(void)
 	return cow_buffer.nr_pages;
 }
 
-/* Check if address falls within any dirty range */
-static bool is_in_dirty_range(unsigned long vaddr,
-			      unsigned long *dirty_ranges,
-			      unsigned int nr_dirty_ranges)
-{
-	unsigned int i;
-	for (i = 0; i < nr_dirty_ranges; i++) {
-		unsigned long start = dirty_ranges[i * 2];
-		unsigned long len = dirty_ranges[i * 2 + 1];
-		if (vaddr >= start && vaddr < start + len)
-			return true;
-	}
-	return false;
-}
-
 void cow_page_buffer_discard_dirty(unsigned long *dirty_ranges,
 				   unsigned int nr_dirty_ranges)
 {
-	struct page_buffer_entry *entry;
-	struct hlist_node *tmp;
-	int i;
+	unsigned int i;
 	unsigned long discarded = 0;
 
 	if (!cow_buffer.initialized || !dirty_ranges || nr_dirty_ranges == 0)
@@ -175,16 +158,29 @@ void cow_page_buffer_discard_dirty(unsigned long *dirty_ranges,
 
 	pthread_spin_lock(&cow_buffer.lock);
 
-	for (i = 0; i < PAGE_BUFFER_HASH_SIZE; i++) {
-		hlist_for_each_entry_safe(entry, tmp,
-					  &cow_buffer.hash_table[i], hash) {
-			if (is_in_dirty_range(entry->vaddr, dirty_ranges, nr_dirty_ranges)) {
-				hlist_del(&entry->hash);
-				xfree(entry->data);
-				xfree(entry);
-				cow_buffer.nr_pages--;
-				cow_buffer.nr_discarded++;
-				discarded++;
+	/* Iterate dirty ranges and do O(1) hash lookups */
+	for (i = 0; i < nr_dirty_ranges; i++) {
+		unsigned long start = dirty_ranges[i * 2];
+		unsigned long len = dirty_ranges[i * 2 + 1];
+		unsigned long vaddr;
+
+		/* Iterate each page in this dirty range */
+		for (vaddr = start; vaddr < start + len; vaddr += PAGE_SIZE) {
+			unsigned int hash = page_buffer_hash(vaddr);
+			struct page_buffer_entry *entry;
+			struct hlist_node *tmp;
+
+			hlist_for_each_entry_safe(entry, tmp,
+						  &cow_buffer.hash_table[hash], hash) {
+				if (entry->vaddr == vaddr) {
+					hlist_del(&entry->hash);
+					xfree(entry->data);
+					xfree(entry);
+					cow_buffer.nr_pages--;
+					cow_buffer.nr_discarded++;
+					discarded++;
+					break;  /* Found and removed, move to next page */
+				}
 			}
 		}
 	}
