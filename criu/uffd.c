@@ -2471,7 +2471,7 @@ static int handle_lazy_accept(struct epoll_rfd *rfd)
 	 */
 	if (opts.cow_dump && is_dirty_bitmap_received()) {
 		pr_info("Dirty bitmap already received, starting drain thread\n");
-		if (dirty_bitmap_received == false) {
+		if (!is_dirty_bitmap_received()) {
 			pr_info("Dirty bitmap already was not received exiting\n");
 			exit(0);
 		}
@@ -2511,27 +2511,6 @@ int get_uffd_for_vaddr(unsigned long vaddr)
 	return -1;
 }
 
-/*
- * Store dirty bitmap for later application.
- * Called from page-xfer.c when bitmap arrives before restore connects.
- */
-void store_pending_dirty_bitmap(unsigned long *ranges, unsigned int nr_ranges)
-{
-	if (pending_dirty_ranges) {
-		xfree(pending_dirty_ranges);
-		pending_dirty_ranges = NULL;
-	}
-
-	pending_nr_dirty_ranges = nr_ranges;
-	if (nr_ranges > 0 && ranges) {
-		size_t size = nr_ranges * 2 * sizeof(unsigned long);
-		pending_dirty_ranges = xmalloc(size);
-		if (pending_dirty_ranges)
-			memcpy(pending_dirty_ranges, ranges, size);
-	}
-	pr_info("Stored pending dirty bitmap: %u ranges\n", nr_ranges);
-	dirty_bitmap_received = true;
-}
 
 /* Check if dirty bitmap has been received from primary */
 bool is_dirty_bitmap_received(void)
@@ -2543,6 +2522,18 @@ bool is_dirty_bitmap_received(void)
 bool is_restore_connected(void)
 {
 	return restore_connected;
+}
+
+/* Set inventory ready flag (called when PS_IOV_INVENTORY_READY received) */
+void set_dirty_bitmap_received(void)
+{
+	pr_info("Received inventory ready signal from primary\n");
+	dirty_bitmap_received = true;
+}
+
+void unset_dirty_bitmap_received(void) 
+{
+	dirty_bitmap_received = false;
 }
 
 /* Set inventory ready flag (called when PS_IOV_INVENTORY_READY received) */

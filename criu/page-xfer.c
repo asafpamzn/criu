@@ -47,7 +47,6 @@
 
 static int page_server_sk = -1;
 static bool bulk_stream_done = false;
-static bool dirty_bitmap_received = false;  /* COW mode: dirty bitmap fully received */
 
 bool page_server_bulk_stream_done(void)
 {
@@ -3187,7 +3186,7 @@ static int handle_dirty_bitmap_header(struct ps_async_read *ar)
 			pr_info("COW mode: dirty bitmap complete (0 ranges), bulk phase done\n");
 			if (send_dirty_bitmap_ack())
 				return -1;
-			dirty_bitmap_received = true;
+			set_dirty_bitmap_received();
 			return BULK_STREAM_COMPLETE;
 		}
 		return BULK_STREAM_PROGRESS;
@@ -3456,9 +3455,11 @@ static int read_dirty_bitmap(struct ps_async_read *ar, int flags)
 	if (opts.cow_dump) {
 		pr_info("COW mode: dirty bitmap complete (%u ranges), bulk phase done\n",
 			ar->nr_dirty_ranges);
-		if (send_dirty_bitmap_ack())
+		if (send_dirty_bitmap_ack()){
+			pr_err("COW mode: send_dirty_bitmap_ack FAILED!!!!\n");			
 			return -1;
-		dirty_bitmap_received = true;
+		}
+		set_dirty_bitmap_received();
 		return BULK_STREAM_COMPLETE;
 	}
 
@@ -3688,7 +3689,7 @@ int connect_to_page_server_to_recv(int epfd)
 	if (connect_to_page_server())
 		return -1;
 	bulk_stream_done = false;
-	dirty_bitmap_received = false;
+	unset_dirty_bitmap_received();
 
 	ps_rfd.fd = page_server_sk;
 	/* Use bulk stream reader in bulk mode, regular reader in on-demand mode */

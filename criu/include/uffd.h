@@ -21,20 +21,22 @@ extern int get_first_lpi_uffd(void);
 /* Return uffd for a given vaddr (for background drain thread). */
 extern int get_uffd_for_vaddr(unsigned long vaddr);
 
-/* Store dirty bitmap if it arrives before restore connects */
-extern void store_pending_dirty_bitmap(unsigned long *ranges, unsigned int nr_ranges);
-
 /* Check if restore has connected (uffd available) */
 extern bool is_restore_connected(void);
 
 /* Check if dirty bitmap has been received from primary (Phase 3 signal) */
 extern bool is_dirty_bitmap_received(void);
 
+extern void set_dirty_bitmap_received(void);
+extern void unset_dirty_bitmap_received(void);
+
+
 /* Check if inventory.img is ready (PS_IOV_INVENTORY_READY received) */
 extern bool is_inventory_ready_received(void);
 
 /* Set inventory ready flag (called by page-xfer when signal received) */
 extern void set_inventory_ready_received(void);
+
 
 /* COW Phase 2: Initialize page buffer for pre-buffering */
 extern int page_buffer_init(void);
