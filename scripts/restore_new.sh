@@ -19,8 +19,18 @@ sleep 1
 echo "Step 2: Creating ready signal..."
 echo "READY" | sudo tee "$IMAGES_DIR/ready.log" >/dev/null
 
-# Step 3: Start lazy-pages daemon
-echo "Step 3: Starting lazy-pages daemon..."
+# Step 3: Wait for source page-server
+echo "Step 3: Waiting for source page-server..."
+while true; do
+  if [ -f "$LOG_FILE" ] && sudo grep -q "PAGE SERVER READY TO SERVE" "$LOG_FILE" 2>/dev/null; then
+    echo "Source page-server ready"
+    break
+  fi
+  sleep 0.1
+done
+
+# Step 4: Start lazy-pages daemon
+echo "Step 4: Starting lazy-pages daemon..."
 sudo rm -f "$IMAGES_DIR/lazy-server.log"
 
 sudo "$CRIU_BIN" lazy-pages \
@@ -41,8 +51,8 @@ if ! kill -0 "$LAZY_PAGES_PID" 2>/dev/null; then
 fi
 echo "Lazy-pages started (PID: $LAZY_PAGES_PID)"
 
-# Step 4: Wait for Phase 3 skeleton dump
-echo "Step 4: Waiting for skeleton dump..."
+# Step 5: Wait for Phase 3 skeleton dump
+echo "Step 5: Waiting for skeleton dump..."
 SKELETON_READY_PATTERN="START RESTORE!!!"
 PHASE3_READY_PATTERN="COW Phase 3: Waiting for restore to connect"
 
@@ -61,8 +71,8 @@ while true; do
   sleep 0.1
 done
 
-# Step 5: CRIU restore
-echo "Step 5: Starting CRIU restore..."
+# Step 6: CRIU restore
+echo "Step 6: Starting CRIU restore..."
 if ! sudo "$CRIU_BIN" restore \
   --images-dir "$IMAGES_DIR" \
   --lazy-pages \
@@ -77,8 +87,8 @@ if ! sudo "$CRIU_BIN" restore \
   exit 1
 fi
 
-# Step 6: Call wait_and_replicate
-echo "Step 6: Configuring replication..."
+# Step 7: Call wait_and_replicate
+echo "Step 7: Configuring replication..."
 "$SCRIPT_DIR/wait_and_replicate_new.sh"
 
 echo "=== Restore complete ==="
