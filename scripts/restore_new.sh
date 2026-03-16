@@ -15,8 +15,12 @@ echo "Step 1: Killing valkey-server..."
 sudo pkill -9 valkey-server 2>/dev/null || true
 sleep 1
 
-# Step 2: Start lazy-pages daemon
-echo "Step 2: Starting lazy-pages daemon..."
+# Step 2: Signal readiness to PRIMARY
+echo "Step 2: Creating ready signal..."
+echo "READY" | sudo tee "$IMAGES_DIR/ready.log" >/dev/null
+
+# Step 3: Start lazy-pages daemon
+echo "Step 3: Starting lazy-pages daemon..."
 sudo rm -f "$IMAGES_DIR/lazy-server.log"
 
 sudo "$CRIU_BIN" lazy-pages \
@@ -37,8 +41,8 @@ if ! kill -0 "$LAZY_PAGES_PID" 2>/dev/null; then
 fi
 echo "Lazy-pages started (PID: $LAZY_PAGES_PID)"
 
-# Step 3: Wait for Phase 3 skeleton dump
-echo "Step 3: Waiting for skeleton dump..."
+# Step 4: Wait for Phase 3 skeleton dump
+echo "Step 4: Waiting for skeleton dump..."
 SKELETON_READY_PATTERN="START RESTORE!!!"
 PHASE3_READY_PATTERN="COW Phase 3: Waiting for restore to connect"
 
@@ -57,8 +61,8 @@ while true; do
   sleep 0.1
 done
 
-# Step 4: CRIU restore
-echo "Step 4: Starting CRIU restore..."
+# Step 5: CRIU restore
+echo "Step 5: Starting CRIU restore..."
 if ! sudo "$CRIU_BIN" restore \
   --images-dir "$IMAGES_DIR" \
   --lazy-pages \
@@ -73,8 +77,8 @@ if ! sudo "$CRIU_BIN" restore \
   exit 1
 fi
 
-# Step 5: Call wait_and_replicate
-echo "Step 5: Configuring replication..."
+# Step 6: Call wait_and_replicate
+echo "Step 6: Configuring replication..."
 "$SCRIPT_DIR/wait_and_replicate_new.sh"
 
 echo "=== Restore complete ==="
