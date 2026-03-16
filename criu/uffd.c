@@ -178,22 +178,6 @@ int page_buffer_init(void)
 	return 0;
 }
 
-/* Forward declaration — needed by page_buffer_add's dedup check */
-static struct page_buffer_entry *page_buffer_lookup(unsigned long vaddr);
-
-
-static struct page_buffer_entry *page_buffer_lookup(unsigned long vaddr)
-{
-	struct page_buffer_entry *entry;
-	unsigned int hash = page_buffer_hash(vaddr);
-
-	hlist_for_each_entry(entry, &g_page_buffer.hash_table[hash], hash) {
-		if (entry->vaddr == vaddr)
-			return entry;
-	}
-	return NULL;
-}
-
 static void page_buffer_remove(struct page_buffer_entry *entry)
 {
 	hlist_del(&entry->hash);
