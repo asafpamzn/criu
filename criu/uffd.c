@@ -351,7 +351,7 @@ void check_and_print_uffd_stats(void)
 	time_t now = time(NULL);
 	int i;	
 
-	if (now - uffd_stats.last_print_time >= 1) {
+	if (now - uffd_stats.last_print_time >= 30) {
 		
 		{
 			struct timespec ts;

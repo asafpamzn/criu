@@ -2124,7 +2124,7 @@ static void maybe_print_stats(struct unified_thread_stats *stats)
 {
 	time_t now = time(NULL);
 
-	if (now - stats->last_print_time >= 1) {
+	if (now - stats->last_print_time >= 30) {
 		print_thread_stats(stats);
 		stats->last_print_time = now;
 	}
