@@ -2364,15 +2364,23 @@ static int final_queue_drain(struct active_image *img, pid_t source_pid,
 		 */
 		cow_sent = drain_cow_pages(img, source_pid, 100, stats);
 		if (cow_sent < 0)
+		{
+			pr_err("cow_sent < 0)\n");
 			return -1;
+		}
 
 		req_sent = drain_page_requests(img, source_pid, stats);
-		if (req_sent < 0)
+		if (req_sent < 0){
+			pr_err("req_sent < 0)\n");
 			return -1;
+		}
 
 		/* No more pending work */
 		if (cow_sent == 0 && req_sent == 0 && !is_convergence_mode())
+		{
+			pr_err("!is_convergence_mode() break;\n");
 			break;
+		}
 	}
 
 	return 0;
