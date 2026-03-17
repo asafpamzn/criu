@@ -1445,14 +1445,14 @@ static struct {
 	unsigned long serve_unknown;
 	
 	time_t last_print_time;
-} ps_stats;
+} ps_stats = {0};
 
 static void check_and_print_stats(void)
 {
 	time_t now = time(NULL);
 
 	if (now - ps_stats.last_print_time >= 1) {
-		pr_debug("[PAGE_SERVER_STATS] get_pages: reqs=%lu with_cow=%lu no_cow=%lu pages=%lu cow=%lu errs=%lu | serve: open2=%lu parent=%lu add_f=%lu get=%lu close=%lu\n",
+		pr_err("[PAGE_SERVER_STATS] get_pages: reqs=%lu with_cow=%lu no_cow=%lu pages=%lu cow=%lu errs=%lu | serve: open2=%lu parent=%lu add_f=%lu get=%lu close=%lu\n",
 			ps_stats.get_total_requests,
 			ps_stats.get_with_cow,
 			ps_stats.get_no_cow,
@@ -1477,7 +1477,7 @@ static int page_server_add(int sk, struct page_server_iov *pi, u32 flags, bool c
 	struct page_xfer *lxfer = &cxfer.loc_xfer;
 	struct iovec iov;
 
-	pr_debug("Adding %" PRIx64 " - %" PRIx64 " (compressed=%d)\n",
+	pr_err("Adding %" PRIx64 " - %" PRIx64 " (compressed=%d)\n",
 		 pi->vaddr, pi->vaddr + pi->nr_pages * PAGE_SIZE, compressed);
 
 	if (prep_loc_xfer(pi))
@@ -2026,7 +2026,7 @@ static int send_request_page_lazy(struct page_request_entry *req, struct active_
 		
 		/* Check if already sent */
 		if (bitmap_test_nonatomic(lve->sent_bitmap, page_idx)) {
-			pr_debug("Request page 0x%lx already sent, skipping\n", page_vaddr);
+			pr_err("Request page 0x%lx already sent, skipping\n", page_vaddr);
 			continue;
 		}
 
@@ -2043,7 +2043,7 @@ static int send_request_page_lazy(struct page_request_entry *req, struct active_
 		 */
 		if (lve->cow_bitmap &&
 		    atomic_bitmap_test(lve->cow_bitmap, page_idx)) {
-			pr_debug("P2: page 0x%lx is COW, skipping for P1\n",
+			pr_err("P2: page 0x%lx is COW, skipping for P1\n",
 				 page_vaddr);
 			continue;
 		}
@@ -2616,7 +2616,7 @@ static int page_server_serve(int sk)
 			 * An answer must be sent back to inform another side,
 			 * that all data were received
 			 */
-			pr_info("Got close; sending completion status\n");
+			pr_err("Got close; sending completion status\n");
 			if (__send(sk, &status, sizeof(status), 0) != sizeof(status)) {
 				pr_perror("Can't send the final package");
 				ret = -1;
