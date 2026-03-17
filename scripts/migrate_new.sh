@@ -15,6 +15,11 @@ if [ -z "$PID" ]; then
   exit 1
 fi
 
+# Step 0: Kill leftover ssh/restore processes
+echo "Step 0: Killing leftover ssh restore processes..."
+sudo pkill -9 -f "ssh.*restore_new.sh" 2>/dev/null || true
+sleep 0.1
+
 # Step 1: Clean images dir
 echo "Step 1: Cleaning $IMAGES_DIR..."
 sudo rm -rf "$IMAGES_DIR"/*
