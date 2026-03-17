@@ -2368,12 +2368,14 @@ static int final_queue_drain(struct active_image *img, pid_t source_pid,
 			return -1;
 
 		req_sent = drain_page_requests(img, source_pid, stats);
+		#if 0
 		if (req_sent < 0)
 			return -1;
+		#endif
 
 		/* No more pending work */
 		if (cow_sent == 0 && req_sent == 0)
-			break;
+			continue;
 	}
 
 	return 0;
