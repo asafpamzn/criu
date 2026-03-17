@@ -1734,7 +1734,7 @@ int cow_setup_sync_for_dirty(unsigned long *dirty_ranges,
 		return 0;
 	}
 
-	pr_info("Setting up WP_SYNC for %u dirty ranges\n", nr_dirty_ranges);
+	pr_err("Setting up WP_SYNC for %u dirty ranges\n", nr_dirty_ranges);
 
 	if (cdi->uffd_sync >= 0) {
 		/* Use pre-created WP_SYNC uffd from parasite */
