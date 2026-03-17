@@ -3667,7 +3667,7 @@ static int page_server_hangup_event(struct epoll_rfd *rfd)
 {
 	if (opts.cow_dump && is_dirty_bitmap_received()) {
 		pr_err("Page server closed connection after dirty bitmap received\n");
-		return 0;
+		return 1;
 	}
 	if (opts.cow_dump && bulk_stream_done) {
 		/*
