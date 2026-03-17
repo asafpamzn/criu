@@ -2352,7 +2352,7 @@ static int final_queue_drain(struct active_image *img, pid_t source_pid,
 	 *   - remaining_pages == 0 (all expected dirty pages sent)
 	 *   - COW queue empty (all WP_SYNC faults processed)
 	 */
-	pr_err("final_queue_drain img->remaining_pages=%d is_convergence_mode()=%d cow_has_pending_pages()=%d\n",
+	pr_err("final_queue_drain img->remaining_pages=%lu is_convergence_mode()=%d cow_has_pending_pages()=%d\n",
 		   img->remaining_pages, is_convergence_mode(), cow_has_pending_pages());
 	while (true)//mg->remaining_pages > 0 ||
 	       //(is_convergence_mode() && cow_has_pending_pages())) 
