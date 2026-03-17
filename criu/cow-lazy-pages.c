@@ -279,19 +279,19 @@ int cow_phase2_handle_pages(int epollfd, struct epoll_event *events, int nr_fds)
 
 		/* Track bulk transfer completion */
 		if (!bulk_done && page_server_bulk_stream_done()) {
-			pr_info("Bulk page transfer complete, waiting for dirty bitmap...\n");
+			pr_err("Bulk page transfer complete, waiting for dirty bitmap...\n");
 			bulk_done = true;
 		}
 
 		/* Track inventory ready signal */
 		if (!inventory_ready && is_inventory_ready_received()) {
-			pr_info("Inventory ready signal received\n");
+			pr_err("Inventory ready signal received\n");
 			inventory_ready = true;
 		}
 
 		/* Dirty bitmap signals Phase 3 is ready */
 		if (is_dirty_bitmap_received()) {
-			pr_info("Dirty bitmap received - Phase 3 ready\n");
+			pr_err("Dirty bitmap received - Phase 3 ready\n");
 			return 0;
 		}
 	}
