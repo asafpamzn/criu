@@ -3541,13 +3541,10 @@ static int page_server_async_read_bulk(struct epoll_rfd *f)
 {
 	struct ps_async_read *ar;
 	int ret;
-	pr_debug("page_server_async_read_bulk\n");
-	
+
 	check_and_print_bulk_stats();
 
 	if (list_empty(&async_reads)) {
-		if (opts.cow_dump && bulk_stream_done)
-			return 0;
 		pr_err("Bulk async read with empty queue\n");
 		return -1;
 	}
@@ -3556,7 +3553,7 @@ static int page_server_async_read_bulk(struct epoll_rfd *f)
 	ret = page_server_read_bulk_stream(ar, MSG_DONTWAIT);
 
 	if (ret == BULK_STREAM_COMPLETE) {
-		/* End marker - cleanup stream reader */
+		/* Cleanup stream reader - will be recreated on reconnection */
 		list_del(&ar->l);
 		xfree(ar);
 		return 0;

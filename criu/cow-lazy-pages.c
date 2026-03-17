@@ -216,6 +216,10 @@ int cr_lazy_pages_cow_phase2(bool daemon)
 		/* Continue anyway - most pages should be in buffer */
 	} else {
 		pr_info("Reconnected to convergence page server\n");
+		/* Recreate the bulk reader for on-demand page fault responses */
+		if (reinit_prebuffer_reader()) {
+			pr_warn("Failed to reinit prebuffer reader\n");
+		}
 	}
 
 	/*

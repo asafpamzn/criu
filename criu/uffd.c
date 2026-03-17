@@ -2412,6 +2412,23 @@ int setup_prebuffer_reader(void)
 }
 
 /*
+ * Reinitialize the prebuffer reader after reconnection.
+ * Used in COW convergence mode when we reconnect to the page server
+ * after the bulk transfer completes. The previous reader was deleted
+ * when BULK_STREAM_COMPLETE was received, so we need a new one.
+ */
+int reinit_prebuffer_reader(void)
+{
+	if (!prebuffer_buf) {
+		pr_err("reinit_prebuffer_reader: prebuffer_buf not initialized\n");
+		return -1;
+	}
+	pr_debug("Reinitializing prebuffer reader for convergence phase\n");
+	return page_server_start_async_read_bulk(
+		prebuffer_buf, 1, prebuffer_io_complete, prebuffer_buf);
+}
+
+/*
  * Non-blocking accept handler for when criu restore connects.
  * Called from epoll loop when restore connects on the Unix socket.
  */
