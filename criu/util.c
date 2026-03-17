@@ -1443,7 +1443,7 @@ static void check_and_print_epoll_stats(void)
 			struct tm *tm;
 			clock_gettime(CLOCK_REALTIME, &ts);
 			tm = localtime(&ts.tv_sec);
-			pr_warn("[EPOLL_STATS] [%02d:%02d:%02d.%03ld] read_calls=%lu read_success=%lu epoll_wait_calls=%lu epoll_wait_ns=%lu\n",
+			pr_info("[EPOLL_STATS] [%02d:%02d:%02d.%03ld] read_calls=%lu read_success=%lu epoll_wait_calls=%lu epoll_wait_ns=%lu\n",
 				tm->tm_hour, tm->tm_min, tm->tm_sec, ts.tv_nsec / 1000000,
 				epoll_stats.total_read_calls,
 				epoll_stats.total_read_success,
@@ -1493,7 +1493,7 @@ int epoll_run_rfds(int epollfd, struct epoll_event *evs, int nr_fds, int timeout
 				break;
 			}
 			/* Timeout (ret=0): continue polling, don't break */
-			pr_perror("Epoll timed out");
+			pr_perror("Epoll timed out123\n");
 			continue;
 		}
 

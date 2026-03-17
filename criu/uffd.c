@@ -358,7 +358,7 @@ void check_and_print_uffd_stats(void)
 			struct tm *tm;
 			clock_gettime(CLOCK_REALTIME, &ts);
 			tm = localtime(&ts.tv_sec);
-			pr_err("[UFFD_STATS] [%02d:%02d:%02d.%03ld] reqs=%lu(pf:%lu,bg:%lu) pages=%lu\n",
+			pr_info("[UFFD_STATS] [%02d:%02d:%02d.%03ld] reqs=%lu(pf:%lu,bg:%lu) pages=%lu\n",
 				tm->tm_hour, tm->tm_min, tm->tm_sec, ts.tv_nsec / 1000000,
 				uffd_stats.total_pf_reqs + uffd_stats.total_bg_reqs,
 				uffd_stats.total_pf_reqs,
@@ -398,7 +398,7 @@ void check_and_print_uffd_stats(void)
 
 		/* Print EAGAIN stats */
 		if (uffd_stats.eagain_processed > 0 || uffd_stats.eagain_skipped > 0 || uffd_stats.eagain_calls > 0) {
-			pr_err("  EAGAIN: processed=%lu succeeded=%lu blocked=%lu errors=%lu skipped=%lu | time=%lu ns (%lu calls)\n",
+			pr_info("  EAGAIN: processed=%lu succeeded=%lu blocked=%lu errors=%lu skipped=%lu | time=%lu ns (%lu calls)\n",
 				uffd_stats.eagain_processed,
 				uffd_stats.eagain_succeeded,
 				uffd_stats.eagain_blocked,
