@@ -2541,9 +2541,9 @@ static int page_server_serve(int sk)
 	while (1) {
 		struct page_server_iov pi;
 		u32 cmd;
-
+		pr_perror("__recv\n");
 		ret = __recv(sk, &pi, sizeof(pi), MSG_WAITALL);
-
+		pr_perror("post __recv ret = %d\n", ret);
 		if (!ret)
 			break;
 
