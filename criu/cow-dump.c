@@ -714,7 +714,7 @@ static int cow_handle_write_fault(struct cow_dump_info *cdi,
 	ssize_t ret;
 	bool found_vma = false;
 
-	pr_debug("Write fault at 0x%lx\n", page_addr);
+	pr_err("Write fault at 0x%lx\n", page_addr);
 	COW_STAT_INC(write_faults);
 
 	/* Find the VMA containing this fault */
@@ -931,7 +931,7 @@ static int cow_process_events(struct cow_dump_info *cdi, bool blocking,
 			break;
 		case UFFD_EVENT_REMAP:
 			COW_STAT_INC(remap_events);
-			pr_info("Memory remap event\n");
+			pr_err("Memory remap event\n");
 			break;
 		default:
 			COW_STAT_INC(unknown_events);
@@ -1294,7 +1294,7 @@ static int cow_clear_written_bits(struct cow_dump_info *cdi)
 		args.end = vma_end;
 		args.walk_end = vma_start;
 
-		pr_info("clear_written_bits: VMA 0x%lx-0x%lx (%lu pages)\n",
+		pr_err("clear_written_bits: VMA 0x%lx-0x%lx (%lu pages)\n",
 			vma_start, vma_end,
 			(vma_end - vma_start) / PAGE_SIZE);
 
@@ -1317,7 +1317,7 @@ static int cow_clear_written_bits(struct cow_dump_info *cdi)
 						       debug_regs[j].start) /
 						      PAGE_SIZE;
 				vma_cleared += pages;
-				pr_info("  cleared region[%u]: 0x%lx-0x%lx "
+				pr_err("  cleared region[%u]: 0x%lx-0x%lx "
 					"(%lu pages, cat=0x%llx)\n",
 					j, (unsigned long)debug_regs[j].start,
 					(unsigned long)debug_regs[j].end,
@@ -1326,13 +1326,13 @@ static int cow_clear_written_bits(struct cow_dump_info *cdi)
 			}
 
 			if (nregs == 0) {
-				pr_info("  no regions found (walk_end=0x%lx vma_end=0x%lx)\n",
+				pr_err("  no regions found (walk_end=0x%lx vma_end=0x%lx)\n",
 					(unsigned long)args.walk_end, vma_end);
 				break;
 			}
 		} while (args.walk_end != vma_end);
 
-		pr_info("clear_written_bits: VMA 0x%lx cleared %lu pages\n",
+		pr_err("clear_written_bits: VMA 0x%lx cleared %lu pages\n",
 			vma_start, vma_cleared);
 		total_cleared += vma_cleared;
 
@@ -1342,7 +1342,7 @@ static int cow_clear_written_bits(struct cow_dump_info *cdi)
 
 	close(pagemap_fd);
 
-	pr_info("Cleared written bits on %u VMAs: %lu total pages cleared\n",
+	pr_err("Cleared written bits on %u VMAs: %lu total pages cleared\n",
 		cdi->nr_tracked_vmas, total_cleared);
 	return ret;
 }
