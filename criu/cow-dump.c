@@ -1753,6 +1753,7 @@ int cow_setup_sync_for_dirty(unsigned long *dirty_ranges,
 	cdi->uffd_async = -1;
 
 	/* Register and write-protect each dirty range */
+	unsigned int registered_ok = 0, register_skip = 0;
 	for (i = 0; i < nr_dirty_ranges; i++) {
 		unsigned long start = dirty_ranges[i * 2];
 		unsigned long len = dirty_ranges[i * 2 + 1];
@@ -1760,9 +1761,21 @@ int cow_setup_sync_for_dirty(unsigned long *dirty_ranges,
 		reg.range.start = start;
 		reg.range.len = len;
 		reg.mode = UFFDIO_REGISTER_MODE_WP;
-		pr_info("UFFDIO_REGISTER WP_SYNC 0x%lx-%lx len=%ld\n",start, start +len, len);
+		pr_debug("UFFDIO_REGISTER WP_SYNC 0x%lx-0x%lx len=%ld\n",
+			 start, start + len, len);
 		if (ioctl(cdi->uffd, UFFDIO_REGISTER, &reg)) {
-			pr_perror("UFFDIO_REGISTER WP_SYNC 0x%lx-%lx failed",
+			/*
+			 * ENOMEM/EINVAL are expected if VMA was unmapped or
+			 * modified during traffic. Skip silently.
+			 */
+			if (errno == ENOMEM || errno == EINVAL) {
+				pr_debug("UFFDIO_REGISTER WP_SYNC 0x%lx-0x%lx skipped "
+					 "(VMA changed): %s\n",
+					 start, start + len, strerror(errno));
+				register_skip++;
+				continue;
+			}
+			pr_perror("UFFDIO_REGISTER WP_SYNC 0x%lx-0x%lx failed",
 				  start, start + len);
 			continue; /* Best effort */
 		}
@@ -1772,11 +1785,14 @@ int cow_setup_sync_for_dirty(unsigned long *dirty_ranges,
 		wp.mode = UFFDIO_WRITEPROTECT_MODE_WP;
 
 		if (ioctl(cdi->uffd, UFFDIO_WRITEPROTECT, &wp)) {
-			pr_perror("UFFDIO_WRITEPROTECT 0x%lx-%lx failed",
+			pr_perror("UFFDIO_WRITEPROTECT 0x%lx-0x%lx failed",
 				  start, start + len);
 			continue; /* Best effort */
 		}
+		registered_ok++;
 	}
+	pr_warn("WP_SYNC registration: %u ok, %u skipped (VMA changed), %u total\n",
+		registered_ok, register_skip, nr_dirty_ranges);
 
 	cdi->phase = COW_PHASE_SYNC_CONVERGE;
 #if 1 //TODO check restarted later on at cr_dump_finish
