@@ -1493,7 +1493,7 @@ int epoll_run_rfds(int epollfd, struct epoll_event *evs, int nr_fds, int timeout
 				break;
 			}
 			/* Timeout (ret=0): continue polling, don't break */
-			pr_perror("Epoll timed out123\n");
+			pr_err("Epoll timed out, errno=%d (%s)\n", errno, strerror(errno));
 			continue;
 		}
 
