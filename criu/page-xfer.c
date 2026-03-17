@@ -2499,7 +2499,7 @@ static int page_server_get_pages(int sk, struct page_server_iov *pi)
 		add_page_request(pi->vaddr + (i * PAGE_SIZE), 1, sk, pi->dst_id);
 	}
 	
-	pr_debug("Split and enqueued %lu page requests starting at vaddr=%lx\n", 
+	pr_err("Split and enqueued %lu page requests starting at vaddr=%lx\n", 
 		 (unsigned long)pi->nr_pages, (unsigned long)pi->vaddr);
 	
 	/* Return immediately - background thread will send the response */
