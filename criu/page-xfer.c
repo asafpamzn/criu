@@ -2354,8 +2354,7 @@ static int final_queue_drain(struct active_image *img, pid_t source_pid,
 	 */
 	pr_err("final_queue_drain img->remaining_pages=%lu is_convergence_mode()=%d cow_has_pending_pages()=%d\n",
 		   img->remaining_pages, is_convergence_mode(), cow_has_pending_pages());
-	while (img->remaining_pages > 0 ||
-	       (is_convergence_mode() && cow_has_pending_pages())) 
+	while (img->remaining_pages > 0 || is_convergence_mode()) 
 	{
 		int cow_sent, req_sent;
 
@@ -2372,7 +2371,7 @@ static int final_queue_drain(struct active_image *img, pid_t source_pid,
 			return -1;
 
 		/* No more pending work */
-		if (cow_sent == 0 && req_sent == 0)
+		if (cow_sent == 0 && req_sent == 0 && !is_convergence_mode())
 			break;
 	}
 
