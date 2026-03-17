@@ -1721,6 +1721,8 @@ int cow_setup_sync_for_dirty(unsigned long *dirty_ranges,
 	struct uffdio_writeprotect wp;
 	int new_uffd;
 	unsigned int i;
+	unsigned int registered_ok = 0, register_skip = 0;
+	
 
 	if (!cdi) {
 		pr_err("COW dump not initialized\n");
@@ -1753,7 +1755,6 @@ int cow_setup_sync_for_dirty(unsigned long *dirty_ranges,
 	cdi->uffd_async = -1;
 
 	/* Register and write-protect each dirty range */
-	unsigned int registered_ok = 0, register_skip = 0;
 	for (i = 0; i < nr_dirty_ranges; i++) {
 		unsigned long start = dirty_ranges[i * 2];
 		unsigned long len = dirty_ranges[i * 2 + 1];
