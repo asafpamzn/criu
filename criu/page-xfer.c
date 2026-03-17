@@ -3131,7 +3131,7 @@ static int handle_end_of_transfer(struct ps_async_read *ar, u32 cmd)
 		.dst_id = 0,
 	};
 
-	pr_info("Received end-of-transfer marker (cmd=%u dst_id=%lu)\n", cmd,
+	pr_err("Received end-of-transfer marker (cmd=%u dst_id=%lu)\n", cmd,
 		(unsigned long)ar->pi.dst_id);
 	bulk_stream_done = true;
 
@@ -3143,7 +3143,7 @@ static int handle_end_of_transfer(struct ps_async_read *ar, u32 cmd)
 	if (__send(page_server_sk, &ack, sizeof(ack), 0) != sizeof(ack))
 		pr_perror("Failed to send bulk complete ACK");
 	else
-		pr_info("Sent bulk complete ACK to primary\n");
+		pr_err("Sent bulk complete ACK to primary\n");
 
 	/*
 	 * COW mode: don't return BULK_STREAM_COMPLETE yet.
@@ -3151,7 +3151,7 @@ static int handle_end_of_transfer(struct ps_async_read *ar, u32 cmd)
 	 * Reset to read next header and continue.
 	 */
 	if (opts.cow_dump && !is_dirty_bitmap_received()) {
-		pr_info("COW mode Phase 2: waiting for dirty bitmap...\n");
+		pr_err("COW mode Phase 2: waiting for dirty bitmap...\n");
 		ar->rb = 0;
 		ar->compress_state = COMPRESS_STATE_READING_HEADER;
 		return BULK_STREAM_PROGRESS;
@@ -3666,7 +3666,7 @@ static int page_server_async_read(struct epoll_rfd *f)
 static int page_server_hangup_event(struct epoll_rfd *rfd)
 {
 	if (opts.cow_dump && is_dirty_bitmap_received()) {
-		pr_info("Page server closed connection after dirty bitmap received\n");
+		pr_err("Page server closed connection after dirty bitmap received\n");
 		return 0;
 	}
 	if (opts.cow_dump && bulk_stream_done) {
@@ -3675,7 +3675,7 @@ static int page_server_hangup_event(struct epoll_rfd *rfd)
 		 * The data might still be in the socket buffer - let the
 		 * read handler drain it before we give up.
 		 */
-		pr_info("Page server closed, continuing to drain dirty bitmap data\n");
+		pr_err("Page server closed, continuing to drain dirty bitmap data\n");
 		return 1;
 	}
 	pr_err("Remote side closed connection\n");
