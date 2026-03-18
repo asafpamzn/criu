@@ -1437,7 +1437,7 @@ static void check_and_print_epoll_stats(void)
 {
 	time_t now = time(NULL);
 	
-	if (now - epoll_stats.last_print_time >= 1) {
+	if (now - epoll_stats.last_print_time >= 60) {
 		if (epoll_stats.total_read_calls > 0 || epoll_stats.total_read_success > 0 || epoll_stats.epoll_wait_calls > 0) {
 			struct timespec ts;
 			struct tm *tm;
