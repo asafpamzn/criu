@@ -499,7 +499,6 @@ static int cow_register_vmas(struct cow_dump_info *cdi,
 /* ------------------------------------------------------------------ */
 /*  Init / Fini                                                        */
 /* ------------------------------------------------------------------ */
-static int cow_clear_written_bits(struct cow_dump_info *cdi);
 static void free_cow_page_entry(struct cow_page_queue_entry *entry)
 {
 	if (entry->data)
