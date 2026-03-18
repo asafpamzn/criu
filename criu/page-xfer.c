@@ -3484,7 +3484,7 @@ static int read_dirty_bitmap(struct ps_async_read *ar, int flags)
  */
 static int page_server_read_bulk_stream(struct ps_async_read *ar, int flags)
 {
-	pr_info("bulk_stream: state=%d rb=%lu dirty_rb=%lu flags=%d\n",
+	pr_debug("bulk_stream: state=%d rb=%lu dirty_rb=%lu flags=%d\n",
 		ar->compress_state, ar->rb, ar->dirty_rb, flags);
 
 	switch (ar->compress_state) {
