@@ -605,10 +605,6 @@ int cow_dump_init(struct pstree_item *item, struct vm_area_list *vma_area_list,
 
 	if (cow_apply_writeprotect(cdi))
 		goto err;
-#if 1
-	if (cow_clear_written_bits(cdi))
-		goto err;
-#endif
 
 	pr_info("COW dump initialized for pid %d: tracked=%u pages=%lu uffd=%d\n",
 		item->pid->real, cdi->nr_tracked_vmas,
@@ -1245,111 +1241,6 @@ void cow_set_phase(enum cow_dump_phase phase)
 }
 
 /* ------------------------------------------------------------------ */
-/*  Baseline written-bit clearing                                      */
-/* ------------------------------------------------------------------ */
-
-/*
- * cow_clear_written_bits - Clear PAGE_IS_WRITTEN on all tracked VMAs
- *
- * After setting up WP_ASYNC write-protect, pages that were already
- * dirty still have their "written" bit set.  We use PAGEMAP_SCAN with
- * PM_SCAN_WP_MATCHING to re-apply write-protect on those pages and
- * clear their written bits.  After this, only pages actually written
- * during Phase 2 (while the process runs) will show PAGE_IS_WRITTEN
- * in the Phase 3 dirty scan.
- */
-static int cow_clear_written_bits(struct cow_dump_info *cdi)
-{
-	char path[64];
-	int pagemap_fd;
-	unsigned int i;
-	int ret = 0;
-	unsigned long total_cleared = 0;
-	struct page_region debug_regs[256];
-
-	struct pm_scan_arg args = {
-		.size = sizeof(struct pm_scan_arg),
-		.flags = PM_SCAN_WP_MATCHING,
-		.start = 0,
-		.end = 0,
-		.walk_end = 0,
-		.vec = (u64)(unsigned long)debug_regs,
-		.vec_len = 256,
-		.max_pages = 0,
-		.category_anyof_mask = PAGE_IS_WRITTEN,
-		.return_mask = PAGE_IS_WRITTEN,
-	};
-
-	snprintf(path, sizeof(path), "/proc/%d/pagemap", cdi->source_pid);
-	pagemap_fd = open(path, O_RDWR);
-	if (pagemap_fd < 0) {
-		pr_perror("Cannot open %s for clearing written bits", path);
-		return -1;
-	}
-
-	for (i = 0; i < cdi->nr_tracked_vmas; i++) {
-		unsigned long vma_start = cdi->tracked_vmas[i].start;
-		unsigned long vma_end = cdi->tracked_vmas[i].end;
-		unsigned long vma_cleared = 0;
-
-		args.start = vma_start;
-		args.end = vma_end;
-		args.walk_end = vma_start;
-
-		pr_err("clear_written_bits: VMA 0x%lx-0x%lx (%lu pages)\n",
-			vma_start, vma_end,
-			(vma_end - vma_start) / PAGE_SIZE);
-
-		do {
-			long nregs;
-			unsigned int j;
-
-			args.start = args.walk_end;
-			nregs = ioctl(pagemap_fd, PAGEMAP_SCAN, &args);
-			if (nregs < 0) {
-				pr_perror("PAGEMAP_SCAN WP_MATCHING clear for "
-					  "VMA 0x%lx-0x%lx failed (errno=%d)",
-					  vma_start, vma_end, errno);
-				ret = -1;
-				break;
-			}
-
-			for (j = 0; j < (unsigned int)nregs; j++) {
-				unsigned long pages = (debug_regs[j].end -
-						       debug_regs[j].start) /
-						      PAGE_SIZE;
-				vma_cleared += pages;
-				pr_err("  cleared region[%u]: 0x%lx-0x%lx "
-					"(%lu pages, cat=0x%llx)\n",
-					j, (unsigned long)debug_regs[j].start,
-					(unsigned long)debug_regs[j].end,
-					pages,
-					(unsigned long long)debug_regs[j].categories);
-			}
-
-			if (nregs == 0) {
-				pr_err("  no regions found (walk_end=0x%lx vma_end=0x%lx)\n",
-					(unsigned long)args.walk_end, vma_end);
-				break;
-			}
-		} while (args.walk_end != vma_end);
-
-		pr_err("clear_written_bits: VMA 0x%lx cleared %lu pages\n",
-			vma_start, vma_cleared);
-		total_cleared += vma_cleared;
-
-		if (ret)
-			break;
-	}
-
-	close(pagemap_fd);
-
-	pr_err("Cleared written bits on %u VMAs: %lu total pages cleared\n",
-		cdi->nr_tracked_vmas, total_cleared);
-	return ret;
-}
-
-/* ------------------------------------------------------------------ */
 /*  WP_ASYNC phased migration support                                  */
 /* ------------------------------------------------------------------ */
 
@@ -1449,15 +1340,6 @@ int cow_dump_init_async(struct pstree_item *item,
 
 	/* Apply write-protect — reuse cow_apply_writeprotect() */
 	if (cow_apply_writeprotect(cdi))
-		goto err;
-
-
-	/*
-	 * Clear pre-existing PAGE_IS_WRITTEN bits so that the Phase 3
-	 * dirty scan only finds pages written during Phase 2 (while
-	 * the process runs with WP_ASYNC active).
-	 */
-	if (cow_clear_written_bits(cdi))
 		goto err;
 
 	/* DO NOT start monitor thread — WP_ASYNC doesn't generate faults */

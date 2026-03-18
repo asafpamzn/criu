@@ -423,7 +423,7 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 		cow_tracked;
 
 	if (opts.cow_dump && !lazy_capable) {
-		pr_err("LAZY_DEBUG: VMA 0x%llx-0x%llx NOT lazy_capable: "
+		pr_debug("LAZY_DEBUG: VMA 0x%llx-0x%llx NOT lazy_capable: "
 		       "can_be_lazy=%d guard=%d prot=0x%x private=%d droppable=%d "
 		       "stack=%d cow_tracked=%d\n",
 		       (unsigned long long)vma->e->start,
