@@ -144,6 +144,7 @@ struct page_buffer {
 	unsigned long nr_pages;
 	unsigned long nr_applied;
 	unsigned long nr_discarded;
+	unsigned long nr_eagain;
 	bool active;
 };
 
@@ -172,6 +173,7 @@ int page_buffer_init(void)
 	g_page_buffer.nr_pages = 0;
 	g_page_buffer.nr_applied = 0;
 	g_page_buffer.nr_discarded = 0;
+	g_page_buffer.nr_eagain = 0;
 	g_page_buffer.active = true;
 
 	pr_err("Page buffer initialized for COW phased migration\n");
@@ -246,24 +248,35 @@ int apply_buffered_pages(int uffd, unsigned long *dirty_ranges,
 				if (errno == EEXIST) {
 					/* Page already present, skip */
 					g_page_buffer.nr_discarded++;
+					page_state_set(entry->vaddr, PAGE_STATE_DISCARDED);
+					page_buffer_remove(entry);
+				} else if (errno == EAGAIN) {
+					/* Keep in buffer, retry in next pass */
+					g_page_buffer.nr_eagain++;
+					page_state_set(entry->vaddr, PAGE_STATE_EAGAIN_QUEUED);
+					/* Don't remove - will retry */
+					continue;
 				} else {
 					pr_perror("UFFDIO_COPY failed for 0x%lx",
 						  entry->vaddr);
+					page_state_set(entry->vaddr, PAGE_STATE_DISCARDED);
+					page_buffer_remove(entry);
 					ret = -1;
 				}
 			} else {
 				g_page_buffer.nr_applied++;
+				page_state_set(entry->vaddr, PAGE_STATE_COPIED);
+				page_buffer_remove(entry);
 			}
-
-			page_buffer_remove(entry);
 		}
 	}
 
 	/* Switch to direct mode - no more buffering */
 	g_page_buffer.active = false;
 
-	pr_info("Buffered pages applied: %lu success, %lu discarded\n",
-		g_page_buffer.nr_applied, g_page_buffer.nr_discarded);
+	pr_info("Buffered pages applied: %lu success, %lu discarded, %lu eagain\n",
+		g_page_buffer.nr_applied, g_page_buffer.nr_discarded,
+		g_page_buffer.nr_eagain);
 
 	return ret;
 }
@@ -1307,16 +1320,19 @@ static int uffd_copy(struct lazy_pages_info *lpi, __u64 address, unsigned long *
 		/* In COW dump mode, queue EAGAIN requests instead of blocking */
 		if (errno == EAGAIN && opts.cow_dump) {
 			pf_tracker_set_state(address, PF_STATE_PENDING_EAGAIN);
+			page_state_set(address, PAGE_STATE_EAGAIN_QUEUED);
 			return queue_eagain_request(lpi, address, *nr_pages, lpi->buf, "copy");
 		}
-		
+
 		/* Non-COW mode or non-EAGAIN: check for other errors */
 		if (uffd_check_op_error(lpi, "copy", nr_pages, uffdio_copy.copy)) {
 			lp_err(lpi, "UFFDIO_COPY got error\n");
+			page_state_set(address, PAGE_STATE_DISCARDED);
 			return -1;
 		}
 
 		/* If uffd_check_op_error handled it (e.g., ENOSPC/ESRCH), return success */
+		page_state_set(address, PAGE_STATE_DISCARDED);
 		return 0;
 	}
 
@@ -1327,13 +1343,16 @@ static int uffd_copy(struct lazy_pages_info *lpi, __u64 address, unsigned long *
 		/* In COW dump mode, queue EAGAIN requests */
 		if (errno == EAGAIN && opts.cow_dump) {
 			pf_tracker_set_state(address, PF_STATE_PENDING_EAGAIN);
+			page_state_set(address, PAGE_STATE_EAGAIN_QUEUED);
 			return queue_eagain_request(lpi, address, *nr_pages, lpi->buf, "copy");
 		}
 
 		if (uffd_check_op_error(lpi, "copy", nr_pages, uffdio_copy.copy)) {
 			lp_err(lpi, "UFFDIO_COPY err \n");
+			page_state_set(address, PAGE_STATE_DISCARDED);
 			return -1;
 		}
+		page_state_set(address, PAGE_STATE_DISCARDED);
 		return 0;
 	}
 
@@ -1347,6 +1366,7 @@ static int uffd_copy(struct lazy_pages_info *lpi, __u64 address, unsigned long *
 
 	/* Mark as completed in the tracker */
 	pf_tracker_set_state(address, PF_STATE_COMPLETED);
+	page_state_set(address, PAGE_STATE_COPIED);
 
 	return 0;
 }
@@ -1388,6 +1408,24 @@ static int uffd_io_complete(struct page_read *pr, unsigned long img_addr, unsign
 	 */
 	req_pages = (req->end - req->start) / PAGE_SIZE;
 	nr = min(nr, req_pages);
+
+	/*
+	 * In COW mode, the same page may be in the buffer from bulk transfer.
+	 * Remove it to avoid EEXIST when drain thread tries to copy it later.
+	 */
+	if (opts.cow_dump) {
+		unsigned long i;
+		for (i = 0; i < nr; i++) {
+			unsigned long page_addr = addr + i * PAGE_SIZE;
+			void *buffered = cow_page_buffer_lookup_and_remove(page_addr);
+			if (buffered) {
+				page_state_set(page_addr, PAGE_STATE_URGENT_PENDING);
+				xfree(buffered);
+			} else {
+				page_state_set(page_addr, PAGE_STATE_URGENT_PENDING);
+			}
+		}
+	}
 
 	ret = uffd_copy(lpi, addr, &nr);
 	if (ret < 0)
@@ -1834,13 +1872,21 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 				.copy = 0,
 			};
 
+			/* Track: found in buffer, about to copy */
+			page_state_set(address, PAGE_STATE_PF_PENDING);
+
 			lp_debug(lpi, "Page 0x%llx served from COW buffer\n", address);
 
 			if (ioctl(lpi->lpfd.fd, UFFDIO_COPY, &uffd_copy) < 0) {
-				if (errno == EEXIST)
+				if (errno == EEXIST) {
 					pr_err("COW_TRACE PF_COPY: 0x%llx FAILED errno=EEXIST\n", address);
-				else
+					page_state_set(address, PAGE_STATE_DISCARDED);
+				} else {
 					pr_err("COW_TRACE PF_COPY: 0x%llx FAILED errno=%d\n", address, errno);
+					page_state_set(address, PAGE_STATE_DISCARDED);
+				}
+			} else {
+				page_state_set(address, PAGE_STATE_COPIED);
 			}
 			xfree(data);
 			lpi->copied_pages++;
@@ -2697,6 +2743,10 @@ int cr_lazy_pages(bool daemon)
 			xfree(events);
 			return -1;
 		}
+
+		/* Initialize page state tracker for debugging */
+		if (page_state_init())
+			pr_warn("Failed to initialize page state tracker (non-fatal)\n");
 
 		/* 2. Connect to page server and add socket to epoll */
 		if (connect_to_page_server_to_recv(epollfd)) {

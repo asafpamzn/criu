@@ -13,6 +13,7 @@
 #include "criu-log.h"
 #include "xmalloc.h"
 #include "common/list.h"
+#include "pf-tracker.h"
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "cow-uffd: "
@@ -31,6 +32,7 @@ static struct {
 	unsigned long nr_pages;
 	unsigned long nr_applied;
 	unsigned long nr_discarded;
+	unsigned long nr_eagain;
 	pthread_spinlock_t lock;
 	bool initialized;
 } cow_buffer = { .initialized = false };
@@ -63,6 +65,7 @@ int cow_page_buffer_init(void)
 	cow_buffer.nr_pages = 0;
 	cow_buffer.nr_applied = 0;
 	cow_buffer.nr_discarded = 0;
+	cow_buffer.nr_eagain = 0;
 	cow_buffer.initialized = true;
 
 	pr_info("COW page buffer initialized\n");
@@ -112,6 +115,9 @@ int cow_page_buffer_add(unsigned long vaddr, void *data)
 	hlist_add_head(&entry->hash, &cow_buffer.hash_table[hash]);
 	cow_buffer.nr_pages++;
 	pthread_spin_unlock(&cow_buffer.lock);
+
+	/* Track page state: now in buffer */
+	page_state_set(vaddr, PAGE_STATE_IN_BUFFER);
 
 	pr_debug("COW_TRACE ADD: 0x%lx (total=%lu)\n", vaddr, cow_buffer.nr_pages);
 
@@ -181,6 +187,7 @@ void cow_page_buffer_discard_dirty(unsigned long *dirty_ranges,
 					cow_buffer.nr_pages--;
 					cow_buffer.nr_discarded++;
 					discarded++;
+					page_state_set(vaddr, PAGE_STATE_DISCARDED);
 					break;  /* Found and removed, move to next page */
 				}
 			}
@@ -228,6 +235,37 @@ void cow_page_buffer_destroy(void)
 }
 
 /*
+ * Re-add a page to the buffer for EAGAIN retry.
+ * Called when UFFDIO_COPY fails with EAGAIN.
+ */
+static void cow_page_buffer_readd(unsigned long vaddr, void *data)
+{
+	struct page_buffer_entry *entry;
+	unsigned int hash;
+
+	entry = xmalloc(sizeof(*entry));
+	if (!entry) {
+		pr_err("Failed to re-add page 0x%lx on EAGAIN\n", vaddr);
+		xfree(data);
+		return;
+	}
+
+	entry->data = data;
+	entry->vaddr = vaddr;
+	INIT_HLIST_NODE(&entry->hash);
+
+	hash = page_buffer_hash(vaddr);
+
+	pthread_spin_lock(&cow_buffer.lock);
+	hlist_add_head(&entry->hash, &cow_buffer.hash_table[hash]);
+	cow_buffer.nr_pages++;
+	pthread_spin_unlock(&cow_buffer.lock);
+
+	page_state_set(vaddr, PAGE_STATE_EAGAIN_QUEUED);
+	pr_debug("COW_TRACE DRAIN_READD: 0x%lx re-buffered for EAGAIN retry\n", vaddr);
+}
+
+/*
  * Background drain thread - proactively UFFDIO_COPY pages
  * from buffer to reduce future page faults and free memory.
  */
@@ -250,11 +288,15 @@ static void *background_drain_thread(void *arg)
 				unsigned long vaddr = entry->vaddr;
 				void *data = entry->data;
 				int uffd;
+				bool free_data = true;
 
 				/* Remove from hash while holding lock */
 				hlist_del(&entry->hash);
 				cow_buffer.nr_pages--;
 				xfree(entry);
+
+				/* Track: removed from buffer, about to copy */
+				page_state_set(vaddr, PAGE_STATE_DRAIN_PENDING);
 
 				pr_err("COW_TRACE DRAIN_REMOVE: 0x%lx (remaining=%lu)\n", vaddr, cow_buffer.nr_pages);
 
@@ -279,23 +321,38 @@ static void *background_drain_thread(void *arg)
 							 * before we removed it. Safe to discard our copy.
 							 */
 							cow_buffer.nr_discarded++;
+							page_state_set(vaddr, PAGE_STATE_DISCARDED);
 							pr_err("COW_TRACE DRAIN_COPY: 0x%lx FAILED errno=EEXIST\n", vaddr);
 						} else if (errno == ENOENT) {
 							/* ENOENT: VMA was unmapped (app freed memory) */
 							cow_buffer.nr_discarded++;
+							page_state_set(vaddr, PAGE_STATE_DISCARDED);
 							pr_err("COW_TRACE DRAIN_COPY: 0x%lx FAILED errno=ENOENT (VMA unmapped)\n", vaddr);
+						} else if (errno == EAGAIN) {
+							/*
+							 * EAGAIN: page table locked. Re-add to buffer
+							 * for retry on next pass.
+							 */
+							cow_buffer.nr_eagain++;
+							cow_page_buffer_readd(vaddr, data);
+							free_data = false;  /* Data transferred to buffer */
+							pr_debug("COW_TRACE DRAIN_COPY: 0x%lx EAGAIN, re-buffered\n", vaddr);
 						} else {
+							page_state_set(vaddr, PAGE_STATE_DISCARDED);
 							pr_err("COW_TRACE DRAIN_COPY: 0x%lx FAILED errno=%d\n", vaddr, errno);
 						}
 					} else {
 						cow_buffer.nr_applied++;
+						page_state_set(vaddr, PAGE_STATE_COPIED);
 						drained++;
 					}
 				} else {
 					cow_buffer.nr_discarded++;
+					page_state_set(vaddr, PAGE_STATE_DISCARDED);
 				}
 
-				xfree(data);
+				if (free_data)
+					xfree(data);
 				pthread_spin_lock(&cow_buffer.lock);
 			}
 		}
@@ -306,8 +363,9 @@ static void *background_drain_thread(void *arg)
 		usleep(100);
 	}
 
-	pr_info("Drain thread done: %lu drained, %lu applied, %lu discarded\n",
-		drained, cow_buffer.nr_applied, cow_buffer.nr_discarded);
+	pr_info("Drain thread done: %lu drained, %lu applied, %lu discarded, %lu eagain\n",
+		drained, cow_buffer.nr_applied, cow_buffer.nr_discarded,
+		cow_buffer.nr_eagain);
 
 	drain_thread_active = false;
 	return NULL;

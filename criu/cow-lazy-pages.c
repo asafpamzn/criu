@@ -26,6 +26,7 @@
 #include "uffd.h"
 #include "cow-uffd.h"
 #include "pstree.h"
+#include "pf-tracker.h"
 #include "rst_info.h"
 #include "cow-lazy-pages.h"
 
@@ -140,6 +141,11 @@ int cr_lazy_pages_cow_phase2(bool daemon)
 		goto err_tasks;
 	}
 
+	/* Initialize page state tracker for debugging */
+	if (page_state_init()) {
+		pr_warn("Failed to initialize page state tracker (non-fatal)\n");
+	}
+
 	/* 3. Daemonize if requested */
 	if (daemon) {
 		ret = cr_daemon(1, 0, -1);
@@ -252,6 +258,8 @@ int cr_lazy_pages_cow_phase2(bool daemon)
 		pr_err("Phase 3 restore loop failed\n");
 
 err_disconnect:
+	/* Print page state statistics and cleanup */
+	page_state_destroy();
 	disconnect_from_page_server();
 err_epoll:
 	xfree(events);
