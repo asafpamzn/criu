@@ -113,7 +113,7 @@ int cow_page_buffer_add(unsigned long vaddr, void *data)
 	cow_buffer.nr_pages++;
 	pthread_spin_unlock(&cow_buffer.lock);
 
-	pr_err("COW_TRACE ADD: 0x%lx (total=%lu)\n", vaddr, cow_buffer.nr_pages);
+	pr_debug("COW_TRACE ADD: 0x%lx (total=%lu)\n", vaddr, cow_buffer.nr_pages);
 
 	return 0;
 }
