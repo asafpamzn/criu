@@ -298,7 +298,7 @@ static void *background_drain_thread(void *arg)
 				/* Track: removed from buffer, about to copy */
 				page_state_set(vaddr, PAGE_STATE_DRAIN_PENDING);
 
-				pr_err("COW_TRACE DRAIN_REMOVE: 0x%lx (remaining=%lu)\n", vaddr, cow_buffer.nr_pages);
+				pr_debug("COW_TRACE DRAIN_REMOVE: 0x%lx (remaining=%lu)\n", vaddr, cow_buffer.nr_pages);
 
 				pthread_spin_unlock(&cow_buffer.lock);
 
