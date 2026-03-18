@@ -10,6 +10,8 @@ LOG_FILE_SERVER="$IMAGES_DIR/lazy-server.log"
 
 echo "=== CRIU Restore - Replica ==="
 
+sudo rm /var/log/valkey/*
+
 # Step 0: Kill leftover criu processes
 echo "Step 0: Killing leftover criu processes..."
 sudo pkill -9 -f "criu lazy-pages" 2>/dev/null || true
