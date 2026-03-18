@@ -1496,6 +1496,232 @@ out:
 }
 
 /*
+ * cow_is_vma_trackable - Check if a VMA should be COW-tracked
+ *
+ * Uses the same criteria as cow_register_vmas() to determine if a VMA
+ * is eligible for COW tracking.
+ */
+static bool cow_is_vma_trackable(struct vma_area *vma)
+{
+	if (!vma_entry_can_be_lazy(vma->e))
+		return false;
+	if (vma_area_is(vma, VMA_AREA_GUARD))
+		return false;
+	if (!(vma->e->prot & PROT_WRITE))
+		return false;
+	if (!vma_area_is_private(vma, kdat.task_size) &&
+	    !vma_area_is(vma, VMA_ANON_SHARED))
+		return false;
+	if (vma_entry_is(vma->e, VMA_AREA_VVAR))
+		return false;
+	if (vma->e->flags & MAP_DROPPABLE)
+		return false;
+	return true;
+}
+
+/*
+ * cow_region_subtract - Subtract tracked region from [start, end)
+ *
+ * Returns the portion(s) of [start, end) not covered by the tracked VMAs.
+ * Appends results to ranges array at *nr_ranges position.
+ */
+static int cow_region_subtract(unsigned long start, unsigned long end,
+			       unsigned long **ranges, unsigned int *nr_ranges,
+			       unsigned int *capacity)
+{
+	struct cow_dump_info *cdi = g_cow_info;
+	unsigned int i;
+	unsigned long cur_start = start;
+
+	if (!cdi || !cdi->nr_tracked_vmas) {
+		/* No tracked VMAs, entire region is new */
+		goto add_region;
+	}
+
+	/*
+	 * Walk through tracked VMAs and find gaps.
+	 * tracked_vmas are sorted by start address from cow_register_vmas.
+	 */
+	for (i = 0; i < cdi->nr_tracked_vmas && cur_start < end; i++) {
+		unsigned long t_start = cdi->tracked_vmas[i].start;
+		unsigned long t_end = cdi->tracked_vmas[i].end;
+
+		/* Skip tracked VMAs that end before our current position */
+		if (t_end <= cur_start)
+			continue;
+
+		/* Skip tracked VMAs that start after our region ends */
+		if (t_start >= end)
+			break;
+
+		/* Found overlap - add the gap before this tracked VMA */
+		if (t_start > cur_start) {
+			unsigned long gap_end = (t_start < end) ? t_start : end;
+			unsigned long gap_len = gap_end - cur_start;
+
+			if (*nr_ranges >= *capacity) {
+				unsigned int new_cap = *capacity ? *capacity * 2 : 64;
+				unsigned long *new_ranges;
+
+				new_ranges = xrealloc(*ranges,
+						      new_cap * 2 * sizeof(unsigned long));
+				if (!new_ranges)
+					return -1;
+				*ranges = new_ranges;
+				*capacity = new_cap;
+			}
+
+			(*ranges)[(*nr_ranges) * 2] = cur_start;
+			(*ranges)[(*nr_ranges) * 2 + 1] = gap_len;
+			(*nr_ranges)++;
+
+			pr_info("  new region: 0x%lx-0x%lx (%lu pages)\n",
+				cur_start, gap_end, gap_len / PAGE_SIZE);
+		}
+
+		/* Move past this tracked VMA */
+		cur_start = t_end;
+	}
+
+add_region:
+	/* Add any remaining portion after all tracked VMAs */
+	if (cur_start < end) {
+		unsigned long len = end - cur_start;
+
+		if (*nr_ranges >= *capacity) {
+			unsigned int new_cap = *capacity ? *capacity * 2 : 64;
+			unsigned long *new_ranges;
+
+			new_ranges = xrealloc(*ranges,
+					      new_cap * 2 * sizeof(unsigned long));
+			if (!new_ranges)
+				return -1;
+			*ranges = new_ranges;
+			*capacity = new_cap;
+		}
+
+		(*ranges)[(*nr_ranges) * 2] = cur_start;
+		(*ranges)[(*nr_ranges) * 2 + 1] = len;
+		(*nr_ranges)++;
+
+		pr_info("  new region: 0x%lx-0x%lx (%lu pages)\n",
+			cur_start, end, len / PAGE_SIZE);
+	}
+
+	return 0;
+}
+
+/*
+ * cow_detect_new_vmas - Detect VMAs that appeared after Phase 1
+ *
+ * Compares the current VMA list with the tracked VMAs from Phase 1.
+ * Returns ranges for any new or extended VMA regions that weren't
+ * tracked. These regions need to be marked dirty for WP_SYNC since
+ * we have no record of their pages from Phase 2.
+ *
+ * @vmas: Current VMA list (from collect_mappings in Phase 3)
+ * @new_ranges: Output array of [start, len, ...] pairs
+ * @nr_new_ranges: Output count of new ranges
+ *
+ * Caller must xfree() the new_ranges array.
+ * Returns: 0 on success, -1 on error
+ */
+int cow_detect_new_vmas(struct vm_area_list *vmas,
+			unsigned long **new_ranges,
+			unsigned int *nr_new_ranges)
+{
+	struct vma_area *vma;
+	unsigned long *ranges = NULL;
+	unsigned int nr_ranges = 0;
+	unsigned int capacity = 0;
+
+	if (!g_cow_info) {
+		pr_err("COW dump not initialized\n");
+		return -1;
+	}
+
+	*new_ranges = NULL;
+	*nr_new_ranges = 0;
+
+	pr_info("Detecting new VMAs (comparing against %u tracked VMAs)\n",
+		g_cow_info->nr_tracked_vmas);
+
+	list_for_each_entry(vma, &vmas->h, list) {
+		unsigned long start = vma->e->start;
+		unsigned long end = vma->e->end;
+
+		/* Use same filtering as cow_register_vmas */
+		if (!cow_is_vma_trackable(vma))
+			continue;
+
+		pr_info("Checking VMA 0x%lx-0x%lx\n", start, end);
+
+		if (cow_region_subtract(start, end, &ranges, &nr_ranges, &capacity)) {
+			xfree(ranges);
+			return -1;
+		}
+	}
+
+	*new_ranges = ranges;
+	*nr_new_ranges = nr_ranges;
+
+	pr_info("Detected %u new VMA regions\n", nr_ranges);
+	return 0;
+}
+
+/*
+ * cow_merge_dirty_ranges - Merge two range arrays into one
+ *
+ * @dirty_ranges: First array (dirty pages from PAGEMAP_SCAN)
+ * @nr_dirty: Count of dirty ranges
+ * @new_ranges: Second array (new VMAs)
+ * @nr_new: Count of new ranges
+ * @merged_ranges: Output merged array
+ * @nr_merged: Output merged count
+ *
+ * Caller must xfree() the merged_ranges array.
+ * The input arrays are NOT freed by this function.
+ * Returns: 0 on success, -1 on error
+ */
+int cow_merge_dirty_ranges(unsigned long *dirty_ranges, unsigned int nr_dirty,
+			   unsigned long *new_ranges, unsigned int nr_new,
+			   unsigned long **merged_ranges, unsigned int *nr_merged)
+{
+	unsigned long *merged;
+	unsigned int total = nr_dirty + nr_new;
+	unsigned int i;
+
+	*merged_ranges = NULL;
+	*nr_merged = 0;
+
+	if (total == 0)
+		return 0;
+
+	merged = xmalloc(total * 2 * sizeof(unsigned long));
+	if (!merged)
+		return -1;
+
+	/* Copy dirty ranges */
+	for (i = 0; i < nr_dirty; i++) {
+		merged[i * 2] = dirty_ranges[i * 2];
+		merged[i * 2 + 1] = dirty_ranges[i * 2 + 1];
+	}
+
+	/* Append new VMA ranges */
+	for (i = 0; i < nr_new; i++) {
+		merged[(nr_dirty + i) * 2] = new_ranges[i * 2];
+		merged[(nr_dirty + i) * 2 + 1] = new_ranges[i * 2 + 1];
+	}
+
+	*merged_ranges = merged;
+	*nr_merged = total;
+
+	pr_info("Merged %u dirty + %u new = %u total ranges\n",
+		nr_dirty, nr_new, total);
+	return 0;
+}
+
+/*
  * cow_precreate_sync_uffd - Pre-create a WP_SYNC uffd via the parasite
  *
  * Must be called while the parasite is still alive (before compel_cure).

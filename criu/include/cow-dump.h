@@ -200,4 +200,38 @@ extern enum cow_dump_phase cow_get_phase(void);
  */
 extern void cow_set_phase(enum cow_dump_phase phase);
 
+/**
+ * cow_detect_new_vmas - Detect VMAs that appeared after Phase 1
+ * @vmas: Current VMA list (from collect_mappings in Phase 3)
+ * @new_ranges: Output array of [start, len, ...] pairs
+ * @nr_new_ranges: Output count of new ranges
+ *
+ * Compares current VMAs with Phase 1 tracked VMAs to find new or
+ * extended regions. These need to be marked dirty for WP_SYNC.
+ * Caller must xfree() the new_ranges array.
+ *
+ * Returns: 0 on success, -1 on error
+ */
+extern int cow_detect_new_vmas(struct vm_area_list *vmas,
+			       unsigned long **new_ranges,
+			       unsigned int *nr_new_ranges);
+
+/**
+ * cow_merge_dirty_ranges - Merge dirty and new VMA range arrays
+ * @dirty_ranges: Dirty pages from PAGEMAP_SCAN
+ * @nr_dirty: Count of dirty ranges
+ * @new_ranges: New VMA ranges from cow_detect_new_vmas()
+ * @nr_new: Count of new ranges
+ * @merged_ranges: Output merged array
+ * @nr_merged: Output merged count
+ *
+ * Caller must xfree() the merged_ranges array.
+ * Input arrays are NOT freed.
+ *
+ * Returns: 0 on success, -1 on error
+ */
+extern int cow_merge_dirty_ranges(unsigned long *dirty_ranges, unsigned int nr_dirty,
+				  unsigned long *new_ranges, unsigned int nr_new,
+				  unsigned long **merged_ranges, unsigned int *nr_merged);
+
 #endif /* __CR_COW_DUMP_H_ */

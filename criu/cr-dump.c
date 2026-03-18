@@ -2750,6 +2750,62 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 		nr_dirty_ranges, total_dirty_pages);
 
 	/*
+	 * Detect VMAs that were created between Phase 1 and Phase 3.
+	 * New VMAs weren't tracked during Phase 2, so their pages weren't
+	 * sent. We mark them as dirty to ensure they get transferred
+	 * and protected with WP_SYNC for convergence.
+	 */
+	{
+		struct vm_area_list phase3_vmas;
+		unsigned long *new_vma_ranges = NULL;
+		unsigned int nr_new_vma_ranges = 0;
+
+		vm_area_list_init(&phase3_vmas);
+
+		ret = collect_mappings(root_item->pid->real, &phase3_vmas, NULL);
+		if (ret) {
+			pr_err("Failed to collect Phase 3 VMAs\n");
+			goto err;
+		}
+
+		ret = cow_detect_new_vmas(&phase3_vmas, &new_vma_ranges, &nr_new_vma_ranges);
+		free_mappings(&phase3_vmas);
+
+		if (ret) {
+			pr_err("Failed to detect new VMAs\n");
+			goto err;
+		}
+
+		if (nr_new_vma_ranges > 0) {
+			unsigned long *merged_ranges = NULL;
+			unsigned int nr_merged = 0;
+
+			pr_info("Found %u new VMA regions since Phase 1\n",
+				nr_new_vma_ranges);
+
+			ret = cow_merge_dirty_ranges(dirty_ranges, nr_dirty_ranges,
+						     new_vma_ranges, nr_new_vma_ranges,
+						     &merged_ranges, &nr_merged);
+			xfree(new_vma_ranges);
+
+			if (ret) {
+				pr_err("Failed to merge dirty ranges\n");
+				goto err;
+			}
+
+			/* Replace dirty_ranges with merged result */
+			xfree(dirty_ranges);
+			dirty_ranges = merged_ranges;
+			nr_dirty_ranges = nr_merged;
+
+			pr_info("After merge: %u total ranges for WP_SYNC\n",
+				nr_dirty_ranges);
+		} else {
+			xfree(new_vma_ranges);
+		}
+	}
+
+	/*
 	 * Now perform full dump setup. Phase 1 used predump variants,
 	 * but skeleton dump needs full collection.
 	 */
