@@ -710,7 +710,7 @@ static int cow_handle_write_fault(struct cow_dump_info *cdi,
 	ssize_t ret;
 	bool found_vma = false;
 
-	pr_err("Write fault at 0x%lx\n", page_addr);
+	pr_debug("Write fault at 0x%lx\n", page_addr);
 	COW_STAT_INC(write_faults);
 
 	/* Find the VMA containing this fault */
@@ -1450,7 +1450,7 @@ int cow_scan_dirty_pages(unsigned long **dirty_ranges,
 				unsigned long len = regs[j].end - regs[j].start;
 				unsigned long pages = len / PAGE_SIZE;
 
-				pr_info("  dirty region[%u]: 0x%lx-0x%lx "
+				pr_debug"  dirty region[%u]: 0x%lx-0x%lx "
 					"(%lu pages, categories=0x%llx)\n",
 					j, start, start + len, pages,
 					(unsigned long long)regs[j].categories);
