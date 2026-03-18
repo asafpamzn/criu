@@ -113,6 +113,8 @@ int cow_page_buffer_add(unsigned long vaddr, void *data)
 	cow_buffer.nr_pages++;
 	pthread_spin_unlock(&cow_buffer.lock);
 
+	pr_err("COW_TRACE ADD: 0x%lx (total=%lu)\n", vaddr, cow_buffer.nr_pages);
+
 	return 0;
 }
 
@@ -254,6 +256,8 @@ static void *background_drain_thread(void *arg)
 				cow_buffer.nr_pages--;
 				xfree(entry);
 
+				pr_err("COW_TRACE DRAIN_REMOVE: 0x%lx (remaining=%lu)\n", vaddr, cow_buffer.nr_pages);
+
 				pthread_spin_unlock(&cow_buffer.lock);
 
 				/* Find uffd for this address and UFFDIO_COPY */
@@ -269,15 +273,19 @@ static void *background_drain_thread(void *arg)
 
 					if (ioctl(uffd, UFFDIO_COPY, &uffd_copy) < 0) {
 						if (errno == EEXIST) {
-							/* EEXIST: page already filled - BUT WITH WHAT? */
+							/*
+							 * EEXIST: page already present. This is expected
+							 * when page fault handler served it from buffer
+							 * before we removed it. Safe to discard our copy.
+							 */
 							cow_buffer.nr_discarded++;
-							pr_err("DEBUG DRAIN EEXIST: Page 0x%lx already exists - DISCARDING CORRECT DATA!\n", vaddr);
+							pr_err("COW_TRACE DRAIN_COPY: 0x%lx FAILED errno=EEXIST\n", vaddr);
 						} else if (errno == ENOENT) {
 							/* ENOENT: VMA was unmapped (app freed memory) */
 							cow_buffer.nr_discarded++;
-							pr_warn("Drain UFFDIO_COPY ENOENT 0x%lx - VMA unmapped\n", vaddr);
+							pr_err("COW_TRACE DRAIN_COPY: 0x%lx FAILED errno=ENOENT (VMA unmapped)\n", vaddr);
 						} else {
-							pr_perror("Drain UFFDIO_COPY failed 0x%lx", vaddr);
+							pr_err("COW_TRACE DRAIN_COPY: 0x%lx FAILED errno=%d\n", vaddr, errno);
 						}
 					} else {
 						cow_buffer.nr_applied++;

@@ -221,8 +221,8 @@ int apply_buffered_pages(int uffd, unsigned long *dirty_ranges,
 		return 0;
 	}
 
-	pr_info("Applying buffered pages: %lu total, %u dirty ranges\n",
-		g_page_buffer.nr_pages, nr_dirty_ranges);
+	pr_err("COW_TRACE G_BUFFER_DRAIN: nr_pages=%lu active=%d dirty_ranges=%u\n",
+		g_page_buffer.nr_pages, g_page_buffer.active, nr_dirty_ranges);
 
 	for (i = 0; i < PAGE_BUFFER_HASH_SIZE; i++) {
 		hlist_for_each_entry_safe(entry, tmp,
@@ -1688,8 +1688,9 @@ static int handle_remove(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 	unreg.start = msg->arg.remove.start;
 	unreg.len = msg->arg.remove.end - msg->arg.remove.start;
 
-	lp_err(lpi, "%s: %llx(%llx)\n", msg->event == UFFD_EVENT_REMOVE ? "REMOVE" : "UNMAP",
-		 unreg.start, unreg.len);
+	lp_err(lpi, "COW_TRACE UNMAP: %llx-%llx (%s)\n",
+		 unreg.start, unreg.start + unreg.len,
+		 msg->event == UFFD_EVENT_REMOVE ? "REMOVE" : "UNMAP");
 
 	/*
 	 * The REMOVE event does not change the VMA, so we need to
@@ -1822,6 +1823,8 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 	if (opts.cow_dump) {
 		void *data = cow_page_buffer_lookup_and_remove(address);
 
+		pr_err("COW_TRACE PF_LOOKUP: 0x%llx found=%s\n", address, data ? "YES" : "NO");
+
 		if (data) {
 			struct uffdio_copy uffd_copy = {
 				.dst = address,
@@ -1835,9 +1838,9 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 
 			if (ioctl(lpi->lpfd.fd, UFFDIO_COPY, &uffd_copy) < 0) {
 				if (errno == EEXIST)
-					lp_err(lpi, "DEBUG PF HANDLER EEXIST: Page 0x%llx from buffer got EEXIST!\n", address);
+					pr_err("COW_TRACE PF_COPY: 0x%llx FAILED errno=EEXIST\n", address);
 				else
-					lp_perror(lpi, "UFFDIO_COPY from buffer failed");
+					pr_err("COW_TRACE PF_COPY: 0x%llx FAILED errno=%d\n", address, errno);
 			}
 			xfree(data);
 			lpi->copied_pages++;
@@ -1859,14 +1862,23 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 
 		/* Check if server is available for convergence requests */
 		if (get_page_server_sk() < 0) {
-			lp_err(lpi, "DEBUG COW ZERO-FILL PATH 1: Page 0x%llx server unavailable - ZEROING!\n", address);
-			return uffd_zero(lpi, address, 1);
+			/*
+			 * In COW mode, don't zero-fill - the correct data should
+			 * arrive via the drain thread. Return 0 to let the process
+			 * retry the fault when drain thread fills the page.
+			 */
+			lp_warn(lpi, "Page 0x%llx server unavailable in COW mode - waiting for drain\n", address);
+			return 0;
 		}
 
 		iov = find_iov(lpi, address);
 		if (!iov) {
-			lp_err(lpi, "DEBUG COW ZERO-FILL PATH 2: Page 0x%llx IOV not found - ZEROING!\n", address);
-			return uffd_zero(lpi, address, 1);
+			/*
+			 * IOV not found - this page may not need lazy restore,
+			 * or drain thread will fill it. Don't corrupt with zeros.
+			 */
+			lp_warn(lpi, "Page 0x%llx IOV not found in COW mode - waiting for drain\n", address);
+			return 0;
 		}
 
 		img_addr = iov->img_start + (address - iov->start);
