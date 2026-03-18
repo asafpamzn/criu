@@ -605,9 +605,10 @@ int cow_dump_init(struct pstree_item *item, struct vm_area_list *vma_area_list,
 
 	if (cow_apply_writeprotect(cdi))
 		goto err;
-
+#if 1
 	if (cow_clear_written_bits(cdi))
 		goto err;
+#endif
 
 	pr_info("COW dump initialized for pid %d: tracked=%u pages=%lu uffd=%d\n",
 		item->pid->real, cdi->nr_tracked_vmas,
@@ -1180,13 +1181,7 @@ bool cow_dump_is_vma_tracked(pid_t source_pid, unsigned long start,
 		    g_cow_info->tracked_vmas[i].end == end)
 			return true;
 	}
-	/* No match found - log first few tracked VMAs for comparison */
-	pr_err("cow_dump_is_vma_tracked: VMA 0x%lx-0x%lx not found. "
-	       "First tracked: 0x%lx-0x%lx (nr_tracked=%u)\n",
-	       start, end,
-	       g_cow_info->nr_tracked_vmas > 0 ? g_cow_info->tracked_vmas[0].start : 0,
-	       g_cow_info->nr_tracked_vmas > 0 ? g_cow_info->tracked_vmas[0].end : 0,
-	       g_cow_info->nr_tracked_vmas);
+
 	return false;
 }
 
@@ -1456,41 +1451,6 @@ int cow_dump_init_async(struct pstree_item *item,
 	if (cow_apply_writeprotect(cdi))
 		goto err;
 
-	/* DEBUG: Verify write protection was actually applied */
-	{
-		char path[64];
-		int pm_fd;
-		struct page_region check_reg;
-		struct pm_scan_arg check_args = {
-			.size = sizeof(struct pm_scan_arg),
-			.flags = 0,
-			.start = cdi->tracked_vmas[0].start,
-			.end = cdi->tracked_vmas[0].start + PAGE_SIZE,
-			.walk_end = cdi->tracked_vmas[0].start,
-			.vec = (u64)(unsigned long)&check_reg,
-			.vec_len = 1,
-			.max_pages = 1,
-			.category_anyof_mask = PAGE_IS_WPALLOWED | PAGE_IS_WRITTEN | PAGE_IS_PRESENT,
-			.return_mask = PAGE_IS_WPALLOWED | PAGE_IS_WRITTEN | PAGE_IS_PRESENT,
-		};
-		snprintf(path, sizeof(path), "/proc/%d/pagemap", cdi->source_pid);
-		pm_fd = open(path, O_RDONLY);
-		if (pm_fd >= 0) {
-			long n = ioctl(pm_fd, PAGEMAP_SCAN, &check_args);
-			if (n > 0) {
-				pr_info("DEBUG: First page 0x%lx categories=0x%llx "
-					"(WPALLOWED=%d WRITTEN=%d PRESENT=%d)\n",
-					(unsigned long)check_reg.start,
-					(unsigned long long)check_reg.categories,
-					!!(check_reg.categories & PAGE_IS_WPALLOWED),
-					!!(check_reg.categories & PAGE_IS_WRITTEN),
-					!!(check_reg.categories & PAGE_IS_PRESENT));
-			} else {
-				pr_info("DEBUG: No page regions found for first VMA\n");
-			}
-			close(pm_fd);
-		}
-	}
 
 	/*
 	 * Clear pre-existing PAGE_IS_WRITTEN bits so that the Phase 3
