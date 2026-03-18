@@ -1834,12 +1834,16 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 			lp_debug(lpi, "Page 0x%llx served from COW buffer\n", address);
 
 			if (ioctl(lpi->lpfd.fd, UFFDIO_COPY, &uffd_copy) < 0) {
-				if (errno != EEXIST)
+				if (errno == EEXIST)
+					lp_err(lpi, "DEBUG PF HANDLER EEXIST: Page 0x%llx from buffer got EEXIST!\n", address);
+				else
 					lp_perror(lpi, "UFFDIO_COPY from buffer failed");
 			}
 			xfree(data);
 			lpi->copied_pages++;
 			return 0;
+		} else {
+			lp_debug(lpi, "DEBUG PF: Page 0x%llx NOT in buffer, will request from server\n", address);
 		}
 	}
 
@@ -1855,13 +1859,15 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 
 		/* Check if server is available for convergence requests */
 		if (get_page_server_sk() < 0) {
-			lp_warn(lpi, "Page 0x%llx not in buffer, server unavailable - zeroing\n", address);
+			lp_err(lpi, "DEBUG COW ZERO-FILL PATH 1: Page 0x%llx server unavailable - ZEROING!\n", address);
 			return uffd_zero(lpi, address, 1);
 		}
 
 		iov = find_iov(lpi, address);
-		if (!iov)
+		if (!iov) {
+			lp_err(lpi, "DEBUG COW ZERO-FILL PATH 2: Page 0x%llx IOV not found - ZEROING!\n", address);
 			return uffd_zero(lpi, address, 1);
+		}
 
 		img_addr = iov->img_start + (address - iov->start);
 

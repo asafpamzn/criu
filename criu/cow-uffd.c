@@ -268,12 +268,14 @@ static void *background_drain_thread(void *arg)
 					};
 
 					if (ioctl(uffd, UFFDIO_COPY, &uffd_copy) < 0) {
-						if (errno == EEXIST || errno == ENOENT) {
-							/* EEXIST: page already filled
-							 * ENOENT: VMA was unmapped (app freed memory)
-							 */
+						if (errno == EEXIST) {
+							/* EEXIST: page already filled - BUT WITH WHAT? */
 							cow_buffer.nr_discarded++;
-							pr_perror("Drain UFFDIO_COPY nr_discarded 0x%lx", vaddr);
+							pr_err("DEBUG DRAIN EEXIST: Page 0x%lx already exists - DISCARDING CORRECT DATA!\n", vaddr);
+						} else if (errno == ENOENT) {
+							/* ENOENT: VMA was unmapped (app freed memory) */
+							cow_buffer.nr_discarded++;
+							pr_warn("Drain UFFDIO_COPY ENOENT 0x%lx - VMA unmapped\n", vaddr);
 						} else {
 							pr_perror("Drain UFFDIO_COPY failed 0x%lx", vaddr);
 						}
