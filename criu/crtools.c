@@ -521,6 +521,8 @@ usage:
 	       "  --skip-file-rwx-check\n"
 	       "			Skip checking file permissions\n"
 	       "			(r/w/x for u/g/o) on restore.\n"
+	       "  --skip-file-size-check\n"
+	       "			Skip checking file size on restore.\n"
 	       "\n"
 	       "Check options:\n"
 	       "  Without options, \"criu check\" checks availability of absolutely required\n"

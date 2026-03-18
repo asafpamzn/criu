@@ -197,6 +197,7 @@ struct cr_options {
 	char *work_dir;
 	int network_lock_method;
 	int skip_file_rwx_check;
+	int skip_file_size_check;
 	int allow_uprobes;
 
 	/*

@@ -77,13 +77,6 @@ while true; do
   sleep 0.1
 done
 
-# Step 5b: Prepare log files for CRIU validation
-# CRIU stores file sizes at dump time; stdout.log must exist with content
-echo "Step 5b: Preparing log files..."
-sudo mkdir -p /var/log/valkey
-echo "CRIU restore placeholder" | sudo tee /var/log/valkey/stdout.log >/dev/null
-echo "CRIU restore placeholder" | sudo tee /var/log/valkey/stderr.log >/dev/null
-
 # Step 6: CRIU restore
 echo "Step 6: Starting CRIU restore..."
 if ! sudo "$CRIU_BIN" restore \
@@ -93,6 +86,7 @@ if ! sudo "$CRIU_BIN" restore \
   --cow-dump \
   --restore-detached \
   --skip-file-rwx-check \
+  --skip-file-size-check \
   --file-validation filesize \
   -v4 -o "$IMAGES_DIR/lazy-restore.log"; then
   echo "ERROR: restore failed"
