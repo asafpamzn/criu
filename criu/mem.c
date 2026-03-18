@@ -422,6 +422,20 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 		!is_stack(item, vma_start) &&
 		cow_tracked;
 
+	if (opts.cow_dump && !lazy_capable) {
+		pr_err("LAZY_DEBUG: VMA 0x%llx-0x%llx NOT lazy_capable: "
+		       "can_be_lazy=%d guard=%d prot=0x%x private=%d droppable=%d "
+		       "stack=%d cow_tracked=%d\n",
+		       (unsigned long long)vma->e->start,
+		       (unsigned long long)vma->e->end,
+		       vma_entry_can_be_lazy(vma->e),
+		       vma_area_is(vma, VMA_AREA_GUARD),
+		       vma->e->prot,
+		       vma_area_is_private(vma, kdat.task_size),
+		       !!(vma->e->flags & MAP_DROPPABLE),
+		       is_stack(item, vma_start),
+		       cow_tracked);
+	}
 
 	dump_all_pages = should_dump_entire_vma(vma->e);
 

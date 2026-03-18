@@ -1180,6 +1180,13 @@ bool cow_dump_is_vma_tracked(pid_t source_pid, unsigned long start,
 		    g_cow_info->tracked_vmas[i].end == end)
 			return true;
 	}
+	/* No match found - log first few tracked VMAs for comparison */
+	pr_err("cow_dump_is_vma_tracked: VMA 0x%lx-0x%lx not found. "
+	       "First tracked: 0x%lx-0x%lx (nr_tracked=%u)\n",
+	       start, end,
+	       g_cow_info->nr_tracked_vmas > 0 ? g_cow_info->tracked_vmas[0].start : 0,
+	       g_cow_info->nr_tracked_vmas > 0 ? g_cow_info->tracked_vmas[0].end : 0,
+	       g_cow_info->nr_tracked_vmas);
 	return false;
 }
 
