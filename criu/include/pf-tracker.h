@@ -28,6 +28,7 @@ enum page_state {
 	PAGE_STATE_COPIED,            /* UFFDIO_COPY succeeded */
 	PAGE_STATE_DIRTY,             /* Discarded due to dirty bitmap, will be re-sent */
 	PAGE_STATE_DISCARDED,         /* Discarded due to error (EEXIST, ENOENT, etc.) */
+	PAGE_STATE_UNMAPPED,          /* Region was unmapped, page no longer valid */
 };
 
 extern int page_state_init(void);
@@ -39,5 +40,8 @@ extern const char *page_state_name(enum page_state state);
 
 /* Print full history of state changes for a page - call on error for debugging */
 extern void page_state_print_history(unsigned long vaddr);
+
+/* Mark all pages in a range as unmapped (for REMOVE/UNMAP events) */
+extern void page_state_mark_range_unmapped(unsigned long start, unsigned long len);
 
 #endif /* __CR_PF_TRACKER_H__ */

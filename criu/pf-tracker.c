@@ -21,7 +21,7 @@
 
 #define PAGE_STATE_HASH_BITS 18
 #define PAGE_STATE_HASH_SIZE (1 << PAGE_STATE_HASH_BITS)
-#define PAGE_STATE_MAX       9
+#define PAGE_STATE_MAX       10
 #define PAGE_STATE_HISTORY_SIZE 16  /* Max history entries per page */
 
 struct page_state_history {
@@ -58,6 +58,7 @@ static const char *state_names[] = {
 	[PAGE_STATE_COPIED]         = "COPIED",
 	[PAGE_STATE_DIRTY]          = "DIRTY",
 	[PAGE_STATE_DISCARDED]      = "DISCARDED",
+	[PAGE_STATE_UNMAPPED]       = "UNMAPPED",
 };
 
 const char *page_state_name(enum page_state state)
@@ -93,24 +94,30 @@ static bool is_valid_transition(enum page_state from, enum page_state to)
 		return to == PAGE_STATE_PF_PENDING ||
 		       to == PAGE_STATE_DRAIN_PENDING ||
 		       to == PAGE_STATE_DIRTY ||
-		       to == PAGE_STATE_DISCARDED;
+		       to == PAGE_STATE_DISCARDED ||
+		       to == PAGE_STATE_UNMAPPED;
 	case PAGE_STATE_PF_PENDING:
 		return to == PAGE_STATE_COPIED ||
 		       to == PAGE_STATE_DISCARDED ||
-		       to == PAGE_STATE_EAGAIN_QUEUED;
+		       to == PAGE_STATE_EAGAIN_QUEUED ||
+		       to == PAGE_STATE_UNMAPPED;
 	case PAGE_STATE_DRAIN_PENDING:
 		return to == PAGE_STATE_COPIED ||
 		       to == PAGE_STATE_DISCARDED ||
-		       to == PAGE_STATE_EAGAIN_QUEUED;
+		       to == PAGE_STATE_EAGAIN_QUEUED ||
+		       to == PAGE_STATE_UNMAPPED;
 	case PAGE_STATE_URGENT_PENDING:
 		return to == PAGE_STATE_COPIED ||
 		       to == PAGE_STATE_EAGAIN_QUEUED ||
-		       to == PAGE_STATE_DISCARDED;
+		       to == PAGE_STATE_DISCARDED ||
+		       to == PAGE_STATE_UNMAPPED;
 	case PAGE_STATE_EAGAIN_QUEUED:
 		return to == PAGE_STATE_COPIED ||
-		       to == PAGE_STATE_DISCARDED;
+		       to == PAGE_STATE_DISCARDED ||
+		       to == PAGE_STATE_UNMAPPED;
 	case PAGE_STATE_COPIED:
 	case PAGE_STATE_DISCARDED:
+	case PAGE_STATE_UNMAPPED:
 		/* Terminal states - no further transitions allowed */
 		return false;
 	case PAGE_STATE_DIRTY:
@@ -324,6 +331,26 @@ enum page_state page_state_get(unsigned long vaddr)
 	pthread_spin_unlock(&g_page_state.lock);
 
 	return state;
+}
+
+void page_state_mark_range_unmapped(unsigned long start, unsigned long len)
+{
+	unsigned long vaddr;
+	enum page_state state;
+
+	if (!g_page_state.initialized)
+		return;
+
+	for (vaddr = start; vaddr < start + len; vaddr += PAGE_SIZE) {
+		state = page_state_get(vaddr);
+		/* Only transition non-terminal states to UNMAPPED */
+		if (state != PAGE_STATE_UNKNOWN &&
+		    state != PAGE_STATE_COPIED &&
+		    state != PAGE_STATE_DISCARDED &&
+		    state != PAGE_STATE_UNMAPPED) {
+			page_state_set(vaddr, PAGE_STATE_UNMAPPED);
+		}
+	}
 }
 
 void page_state_print_stats(void)

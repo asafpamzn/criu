@@ -1738,13 +1738,16 @@ static int handle_remove(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 		 unreg.start, unreg.start + unreg.len,
 		 msg->event == UFFD_EVENT_REMOVE ? "REMOVE" : "UNMAP");
 
+	/* Mark all pages in range as unmapped for state tracking */
+	page_state_mark_range_unmapped(unreg.start, unreg.len);
+
 	/*
 	 * The REMOVE event does not change the VMA, so we need to
 	 * make sure that we won't handle #PFs in the removed
 	 * range. With UNMAP, there's no VMA to worry about
 	 */
 
-	 if (msg->event == UFFD_EVENT_REMOVE && ioctl(lpi->lpfd.fd, UFFDIO_UNREGISTER, &unreg)) {
+	if (msg->event == UFFD_EVENT_REMOVE && ioctl(lpi->lpfd.fd, UFFDIO_UNREGISTER, &unreg)) {
 		/*
 		 * The kernel returns -ENOMEM when unregister is
 		 * called after the process has gone
