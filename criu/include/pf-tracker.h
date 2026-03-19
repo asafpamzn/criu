@@ -36,4 +36,7 @@ extern enum page_state page_state_get(unsigned long vaddr);
 extern void page_state_print_stats(void);
 extern const char *page_state_name(enum page_state state);
 
+/* Print full history of state changes for a page - call on error for debugging */
+extern void page_state_print_history(unsigned long vaddr);
+
 #endif /* __CR_PF_TRACKER_H__ */

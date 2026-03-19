@@ -321,13 +321,15 @@ static void *background_drain_thread(void *arg)
 							 * before we removed it. Safe to discard our copy.
 							 */
 							cow_buffer.nr_discarded++;
-							page_state_set(vaddr, PAGE_STATE_DISCARDED);
 							pr_err("COW_TRACE DRAIN_COPY: 0x%lx FAILED errno=EEXIST\n", vaddr);
+							page_state_print_history(vaddr);
+							page_state_set(vaddr, PAGE_STATE_DISCARDED);
 						} else if (errno == ENOENT) {
 							/* ENOENT: VMA was unmapped (app freed memory) */
 							cow_buffer.nr_discarded++;
-							page_state_set(vaddr, PAGE_STATE_DISCARDED);
 							pr_err("COW_TRACE DRAIN_COPY: 0x%lx FAILED errno=ENOENT (VMA unmapped)\n", vaddr);
+							page_state_print_history(vaddr);
+							page_state_set(vaddr, PAGE_STATE_DISCARDED);
 						} else if (errno == EAGAIN) {
 							/*
 							 * EAGAIN: page table locked. Re-add to buffer
@@ -338,8 +340,9 @@ static void *background_drain_thread(void *arg)
 							free_data = false;  /* Data transferred to buffer */
 							pr_debug("COW_TRACE DRAIN_COPY: 0x%lx EAGAIN, re-buffered\n", vaddr);
 						} else {
-							page_state_set(vaddr, PAGE_STATE_DISCARDED);
 							pr_err("COW_TRACE DRAIN_COPY: 0x%lx FAILED errno=%d\n", vaddr, errno);
+							page_state_print_history(vaddr);
+							page_state_set(vaddr, PAGE_STATE_DISCARDED);
 						}
 					} else {
 						cow_buffer.nr_applied++;
@@ -348,6 +351,8 @@ static void *background_drain_thread(void *arg)
 					}
 				} else {
 					cow_buffer.nr_discarded++;
+					pr_err("COW_TRACE DRAIN_COPY: 0x%lx no uffd found\n", vaddr);
+					page_state_print_history(vaddr);
 					page_state_set(vaddr, PAGE_STATE_DISCARDED);
 				}
 

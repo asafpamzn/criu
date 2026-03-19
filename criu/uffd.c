@@ -248,6 +248,8 @@ int apply_buffered_pages(int uffd, unsigned long *dirty_ranges,
 				if (errno == EEXIST) {
 					/* Page already present, skip */
 					g_page_buffer.nr_discarded++;
+					pr_debug("apply_buffered: 0x%lx EEXIST\n", entry->vaddr);
+					page_state_print_history(entry->vaddr);
 					page_state_set(entry->vaddr, PAGE_STATE_DISCARDED);
 					page_buffer_remove(entry);
 				} else if (errno == EAGAIN) {
@@ -259,6 +261,7 @@ int apply_buffered_pages(int uffd, unsigned long *dirty_ranges,
 				} else {
 					pr_perror("UFFDIO_COPY failed for 0x%lx",
 						  entry->vaddr);
+					page_state_print_history(entry->vaddr);
 					page_state_set(entry->vaddr, PAGE_STATE_DISCARDED);
 					page_buffer_remove(entry);
 					ret = -1;
@@ -1327,11 +1330,13 @@ static int uffd_copy(struct lazy_pages_info *lpi, __u64 address, unsigned long *
 		/* Non-COW mode or non-EAGAIN: check for other errors */
 		if (uffd_check_op_error(lpi, "copy", nr_pages, uffdio_copy.copy)) {
 			lp_err(lpi, "UFFDIO_COPY got error\n");
+			page_state_print_history(address);
 			page_state_set(address, PAGE_STATE_DISCARDED);
 			return -1;
 		}
 
 		/* If uffd_check_op_error handled it (e.g., ENOSPC/ESRCH), return success */
+		page_state_print_history(address);
 		page_state_set(address, PAGE_STATE_DISCARDED);
 		return 0;
 	}
@@ -1349,9 +1354,11 @@ static int uffd_copy(struct lazy_pages_info *lpi, __u64 address, unsigned long *
 
 		if (uffd_check_op_error(lpi, "copy", nr_pages, uffdio_copy.copy)) {
 			lp_err(lpi, "UFFDIO_COPY err \n");
+			page_state_print_history(address);
 			page_state_set(address, PAGE_STATE_DISCARDED);
 			return -1;
 		}
+		page_state_print_history(address);
 		page_state_set(address, PAGE_STATE_DISCARDED);
 		return 0;
 	}
@@ -1880,9 +1887,11 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 			if (ioctl(lpi->lpfd.fd, UFFDIO_COPY, &uffd_copy) < 0) {
 				if (errno == EEXIST) {
 					pr_err("COW_TRACE PF_COPY: 0x%llx FAILED errno=EEXIST\n", address);
+					page_state_print_history(address);
 					page_state_set(address, PAGE_STATE_DISCARDED);
 				} else {
 					pr_err("COW_TRACE PF_COPY: 0x%llx FAILED errno=%d\n", address, errno);
+					page_state_print_history(address);
 					page_state_set(address, PAGE_STATE_DISCARDED);
 				}
 			} else {

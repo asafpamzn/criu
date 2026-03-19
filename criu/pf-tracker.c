@@ -15,17 +15,27 @@
 /*
  * Comprehensive page state tracking implementation.
  * Uses hash table for O(1) lookup with millions of pages.
+ * Stores full history of state changes with timestamps for debugging.
  */
 
 #define PAGE_STATE_HASH_BITS 18
 #define PAGE_STATE_HASH_SIZE (1 << PAGE_STATE_HASH_BITS)
 #define PAGE_STATE_MAX       8
+#define PAGE_STATE_HISTORY_SIZE 16  /* Max history entries per page */
+
+struct page_state_history {
+	enum page_state state;
+	struct timespec timestamp;
+};
 
 struct page_state_entry {
 	unsigned long vaddr;
 	enum page_state state;
 	struct timespec last_change;
 	struct hlist_node hash;
+	/* History of state changes */
+	struct page_state_history history[PAGE_STATE_HISTORY_SIZE];
+	int history_count;
 };
 
 static struct {
@@ -143,14 +153,95 @@ static struct page_state_entry *page_state_find_locked(unsigned long vaddr)
 	return NULL;
 }
 
+/* Add a state change to the entry's history */
+static void page_state_add_history(struct page_state_entry *entry,
+				   enum page_state state,
+				   struct timespec *ts)
+{
+	int idx;
+
+	if (entry->history_count < PAGE_STATE_HISTORY_SIZE) {
+		idx = entry->history_count++;
+	} else {
+		/* History full - shift left and add at end */
+		memmove(&entry->history[0], &entry->history[1],
+			(PAGE_STATE_HISTORY_SIZE - 1) * sizeof(entry->history[0]));
+		idx = PAGE_STATE_HISTORY_SIZE - 1;
+	}
+
+	entry->history[idx].state = state;
+	entry->history[idx].timestamp = *ts;
+}
+
+/* Format timestamp as HH:MM:SS.mmm relative to first entry */
+static void format_timestamp(struct timespec *ts, struct timespec *base, char *buf, size_t len)
+{
+	long delta_sec = ts->tv_sec - base->tv_sec;
+	long delta_nsec = ts->tv_nsec - base->tv_nsec;
+	long ms;
+
+	if (delta_nsec < 0) {
+		delta_sec--;
+		delta_nsec += 1000000000;
+	}
+
+	ms = delta_nsec / 1000000;
+
+	snprintf(buf, len, "+%ld.%03ld", delta_sec, ms);
+}
+
+/*
+ * Print the full history of state changes for a page.
+ * Call this when an error occurs to understand what happened.
+ */
+void page_state_print_history(unsigned long vaddr)
+{
+	struct page_state_entry *entry;
+	int i;
+	char ts_buf[32];
+
+	if (!g_page_state.initialized) {
+		pr_err("PAGE_HISTORY 0x%lx: tracker not initialized\n", vaddr);
+		return;
+	}
+
+	pthread_spin_lock(&g_page_state.lock);
+
+	entry = page_state_find_locked(vaddr);
+	if (!entry) {
+		pthread_spin_unlock(&g_page_state.lock);
+		pr_err("PAGE_HISTORY 0x%lx: no history (page not tracked)\n", vaddr);
+		return;
+	}
+
+	pr_err("PAGE_HISTORY 0x%lx: %d transitions, current=%s\n",
+	       vaddr, entry->history_count, page_state_name(entry->state));
+
+	if (entry->history_count > 0) {
+		struct timespec *base = &entry->history[0].timestamp;
+
+		for (i = 0; i < entry->history_count; i++) {
+			format_timestamp(&entry->history[i].timestamp, base,
+					 ts_buf, sizeof(ts_buf));
+			pr_err("  [%d] %s sec: %s\n", i, ts_buf,
+			       page_state_name(entry->history[i].state));
+		}
+	}
+
+	pthread_spin_unlock(&g_page_state.lock);
+}
+
 int page_state_set(unsigned long vaddr, enum page_state new_state)
 {
 	struct page_state_entry *entry;
 	enum page_state old_state;
 	unsigned int hash;
+	struct timespec now;
 
 	if (!g_page_state.initialized)
 		return -1;
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
 
 	pthread_spin_lock(&g_page_state.lock);
 
@@ -164,11 +255,24 @@ int page_state_set(unsigned long vaddr, enum page_state new_state)
 			pr_err("PAGE_STATE ILLEGAL_TRANSITION: 0x%lx %s -> %s\n",
 			       vaddr, page_state_name(old_state),
 			       page_state_name(new_state));
+			/* Print history on illegal transition */
+			pthread_spin_unlock(&g_page_state.lock);
+			page_state_print_history(vaddr);
+			pthread_spin_lock(&g_page_state.lock);
+			/* Re-find entry after releasing lock */
+			entry = page_state_find_locked(vaddr);
+			if (!entry) {
+				pthread_spin_unlock(&g_page_state.lock);
+				return -1;
+			}
 		}
 
 		g_page_state.transitions[old_state][new_state]++;
 		entry->state = new_state;
-		clock_gettime(CLOCK_MONOTONIC, &entry->last_change);
+		entry->last_change = now;
+
+		/* Record in history */
+		page_state_add_history(entry, new_state, &now);
 	} else {
 		/* New entry */
 		entry = xmalloc(sizeof(*entry));
@@ -179,8 +283,12 @@ int page_state_set(unsigned long vaddr, enum page_state new_state)
 
 		entry->vaddr = vaddr;
 		entry->state = new_state;
-		clock_gettime(CLOCK_MONOTONIC, &entry->last_change);
+		entry->last_change = now;
+		entry->history_count = 0;
 		INIT_HLIST_NODE(&entry->hash);
+
+		/* Add initial state to history */
+		page_state_add_history(entry, new_state, &now);
 
 		hash = page_state_hash(vaddr);
 		hlist_add_head(&entry->hash, &g_page_state.hash_table[hash]);
