@@ -1,6 +1,7 @@
 #include <string.h>
 #include <time.h>
 #include <pthread.h>
+#include <stdio.h>
 
 #include "int.h"
 #include "page.h"
