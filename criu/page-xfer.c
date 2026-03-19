@@ -1648,7 +1648,7 @@ static void add_page_request(unsigned long vaddr, unsigned long nr_pages, int sk
 	entry->sk = sk;
 	entry->dst_id = dst_id;
 
-	pr_debug("Requesting page at %lx (nr_pages=%lu, dst_id=%lu)\n", vaddr, nr_pages, dst_id);
+	pr_err("Requesting page at %lx (nr_pages=%lu, dst_id=%lu)\n", vaddr, nr_pages, dst_id);
 
 	/* Location will be looked up on first access */
 	entry->ppb = NULL;
@@ -1982,6 +1982,8 @@ static int send_cow_page_lazy(struct cow_page_queue_entry *entry, struct active_
 
 	ret = send_page_compressed(img->main_sk, entry->data, img->dst_id,
 				   entry->vaddr);
+	pr_err("COW page 0x%lx not sent VMA (dst_id=%lu)\n",
+		       entry->vaddr, img->dst_id);
 
 	clock_gettime(CLOCK_MONOTONIC, &t2);
 	cow_timing.send_page_total_ns += (t2.tv_sec - t1.tv_sec) * 1000000000 + (t2.tv_nsec - t1.tv_nsec);
@@ -2045,7 +2047,8 @@ static int send_request_page_lazy(struct page_request_entry *req, struct active_
 				 page_vaddr);
 			continue;
 		}
-
+		pr_err("[SEND_PAGE] Sending #PF req page at vaddr=0x%lx pid=%d\n",
+		 		  vaddr, source_pid);
 		/* Page is not modified — send live data */
 		ret = send_lazy_vma_page(req->sk, page_vaddr, req->dst_id, source_pid);
 		if (ret < 0)
