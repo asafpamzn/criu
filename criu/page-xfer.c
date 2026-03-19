@@ -2050,7 +2050,7 @@ static int send_request_page_lazy(struct page_request_entry *req, struct active_
 		pr_err("[SEND_PAGE] Sending #PF req page at vaddr=0x%lx pid=%d\n",
 		 		  page_vaddr, source_pid);
 		/* Page is not modified — send live data */
-		ret = send_lazy_vma_page(req->sk, page_vaddr, req->dst_id, source_pid);
+		ret = send_lazy_vma_page(img->main_sk, page_vaddr, req->dst_id, source_pid);
 		if (ret < 0)
 			return -1;
 
