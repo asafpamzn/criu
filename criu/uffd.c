@@ -1429,6 +1429,8 @@ found_iov:
 	 * Page faults check buffer first, background thread drains.
 	 */
 	if (opts.cow_dump) {
+		/* Pre-convergence: buffer for later drain */
+		unsigned long i;
 		/*
 		 * In convergence phase, UFFD is ready - copy directly to avoid
 		 * page faults waiting for drain thread to process buffered pages.
@@ -1441,8 +1443,7 @@ found_iov:
 			return ret;
 		}
 
-		/* Pre-convergence: buffer for later drain */
-		unsigned long i;
+
 
 		for (i = 0; i < pages; i++) {
 			ret = cow_page_buffer_add(vaddr + i * PAGE_SIZE,
