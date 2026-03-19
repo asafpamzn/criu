@@ -233,6 +233,7 @@ int apply_buffered_pages(int uffd, unsigned long *dirty_ranges,
 					      nr_dirty_ranges)) {
 				/* Dirty page - discard, will be re-sent */
 				g_page_buffer.nr_discarded++;
+				page_state_set(entry->vaddr, PAGE_STATE_DIRTY);
 				page_buffer_remove(entry);
 				continue;
 			}

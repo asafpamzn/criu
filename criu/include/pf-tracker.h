@@ -26,7 +26,8 @@ enum page_state {
 	PAGE_STATE_URGENT_PENDING,    /* Urgent request received, about to copy */
 	PAGE_STATE_EAGAIN_QUEUED,     /* UFFDIO_COPY got EAGAIN, queued for retry */
 	PAGE_STATE_COPIED,            /* UFFDIO_COPY succeeded */
-	PAGE_STATE_DISCARDED,         /* Discarded (EEXIST, ENOENT, dirty, etc.) */
+	PAGE_STATE_DIRTY,             /* Discarded due to dirty bitmap, will be re-sent */
+	PAGE_STATE_DISCARDED,         /* Discarded due to error (EEXIST, ENOENT, etc.) */
 };
 
 extern int page_state_init(void);

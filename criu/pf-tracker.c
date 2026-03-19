@@ -21,7 +21,7 @@
 
 #define PAGE_STATE_HASH_BITS 18
 #define PAGE_STATE_HASH_SIZE (1 << PAGE_STATE_HASH_BITS)
-#define PAGE_STATE_MAX       8
+#define PAGE_STATE_MAX       9
 #define PAGE_STATE_HISTORY_SIZE 16  /* Max history entries per page */
 
 struct page_state_history {
@@ -56,6 +56,7 @@ static const char *state_names[] = {
 	[PAGE_STATE_URGENT_PENDING] = "URGENT_PENDING",
 	[PAGE_STATE_EAGAIN_QUEUED]  = "EAGAIN_QUEUED",
 	[PAGE_STATE_COPIED]         = "COPIED",
+	[PAGE_STATE_DIRTY]          = "DIRTY",
 	[PAGE_STATE_DISCARDED]      = "DISCARDED",
 };
 
@@ -91,6 +92,7 @@ static bool is_valid_transition(enum page_state from, enum page_state to)
 	case PAGE_STATE_IN_BUFFER:
 		return to == PAGE_STATE_PF_PENDING ||
 		       to == PAGE_STATE_DRAIN_PENDING ||
+		       to == PAGE_STATE_DIRTY ||
 		       to == PAGE_STATE_DISCARDED;
 	case PAGE_STATE_PF_PENDING:
 		return to == PAGE_STATE_COPIED ||
@@ -111,6 +113,9 @@ static bool is_valid_transition(enum page_state from, enum page_state to)
 	case PAGE_STATE_DISCARDED:
 		/* Terminal states - no further transitions allowed */
 		return false;
+	case PAGE_STATE_DIRTY:
+		/* Dirty pages CAN be re-sent with newer data */
+		return to == PAGE_STATE_IN_BUFFER;
 	default:
 		return false;
 	}

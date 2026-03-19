@@ -13,6 +13,7 @@
 #include "criu-log.h"
 #include "xmalloc.h"
 #include "common/list.h"
+#include "common/bug.h"
 #include "pf-tracker.h"
 
 #undef LOG_PREFIX
@@ -76,9 +77,25 @@ int cow_page_buffer_add(unsigned long vaddr, void *data)
 {
 	struct page_buffer_entry *entry;
 	unsigned int hash;
+	enum page_state state;
 
 	if (!cow_buffer.initialized)
 		return -1;
+
+	/*
+	 * Server rule: each page is sent only once, unless dirty (re-sent with
+	 * newer data). DIRTY -> IN_BUFFER is valid (dirty page re-sent).
+	 * COPIED/DISCARDED -> IN_BUFFER is a bug - server sent duplicate
+	 * non-dirty page.
+	 */
+	state = page_state_get(vaddr);
+	if (state == PAGE_STATE_COPIED || state == PAGE_STATE_DISCARDED) {
+		pr_err("COW_TRACE ADD_ERROR: 0x%lx already %s - server sent duplicate!\n",
+		       vaddr, page_state_name(state));
+		page_state_print_history(vaddr);
+		BUG();  /* Protocol violation - stop immediately */
+	}
+	/* PAGE_STATE_DIRTY is OK - page being re-sent with newer data */
 
 	hash = page_buffer_hash(vaddr);
 
@@ -187,7 +204,7 @@ void cow_page_buffer_discard_dirty(unsigned long *dirty_ranges,
 					cow_buffer.nr_pages--;
 					cow_buffer.nr_discarded++;
 					discarded++;
-					page_state_set(vaddr, PAGE_STATE_DISCARDED);
+					page_state_set(vaddr, PAGE_STATE_DIRTY);
 					break;  /* Found and removed, move to next page */
 				}
 			}
