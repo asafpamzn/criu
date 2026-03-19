@@ -205,85 +205,6 @@ static bool is_in_dirty_range(unsigned long vaddr,
 	return false;
 }
 
-/*
- * Apply buffered pages to address space after receiving dirty bitmap.
- * Clean pages are UFFD_COPY'd, dirty pages are discarded (will be re-sent).
- */
-int apply_buffered_pages(int uffd, unsigned long *dirty_ranges,
-			 unsigned int nr_dirty_ranges)
-{
-	int i;
-	struct page_buffer_entry *entry;
-	struct hlist_node *tmp;
-	struct uffdio_copy uffd_copy;
-	int ret = 0;
-
-	if (!g_page_buffer.hash_table) {
-		pr_warn("apply_buffered_pages: buffer not initialized\n");
-		return 0;
-	}
-
-	pr_err("COW_TRACE G_BUFFER_DRAIN: nr_pages=%lu active=%d dirty_ranges=%u\n",
-		g_page_buffer.nr_pages, g_page_buffer.active, nr_dirty_ranges);
-
-	for (i = 0; i < PAGE_BUFFER_HASH_SIZE; i++) {
-		hlist_for_each_entry_safe(entry, tmp,
-					  &g_page_buffer.hash_table[i], hash) {
-			if (is_in_dirty_range(entry->vaddr, dirty_ranges,
-					      nr_dirty_ranges)) {
-				/* Dirty page - discard, will be re-sent */
-				g_page_buffer.nr_discarded++;
-				page_state_set(entry->vaddr, PAGE_STATE_DIRTY);
-				page_buffer_remove(entry);
-				continue;
-			}
-
-			/* Clean page - UFFD_COPY to address space */
-			uffd_copy.dst = entry->vaddr;
-			uffd_copy.src = (unsigned long)entry->data;
-			uffd_copy.len = PAGE_SIZE;
-			uffd_copy.mode = 0;
-			uffd_copy.copy = 0;
-
-			if (ioctl(uffd, UFFDIO_COPY, &uffd_copy) < 0) {
-				if (errno == EEXIST) {
-					/* Page already present, skip */
-					g_page_buffer.nr_discarded++;
-					pr_debug("apply_buffered: 0x%lx EEXIST\n", entry->vaddr);
-					page_state_print_history(entry->vaddr);
-					page_state_set(entry->vaddr, PAGE_STATE_DISCARDED);
-					page_buffer_remove(entry);
-				} else if (errno == EAGAIN) {
-					/* Keep in buffer, retry in next pass */
-					g_page_buffer.nr_eagain++;
-					page_state_set(entry->vaddr, PAGE_STATE_EAGAIN_QUEUED);
-					/* Don't remove - will retry */
-					continue;
-				} else {
-					pr_perror("UFFDIO_COPY failed for 0x%lx",
-						  entry->vaddr);
-					page_state_print_history(entry->vaddr);
-					page_state_set(entry->vaddr, PAGE_STATE_DISCARDED);
-					page_buffer_remove(entry);
-					ret = -1;
-				}
-			} else {
-				g_page_buffer.nr_applied++;
-				page_state_set(entry->vaddr, PAGE_STATE_COPIED);
-				page_buffer_remove(entry);
-			}
-		}
-	}
-
-	/* Switch to direct mode - no more buffering */
-	g_page_buffer.active = false;
-
-	pr_info("Buffered pages applied: %lu success, %lu discarded, %lu eagain\n",
-		g_page_buffer.nr_applied, g_page_buffer.nr_discarded,
-		g_page_buffer.nr_eagain);
-
-	return ret;
-}
 
 /* Histogram statistics structure */
 static struct {
@@ -1868,6 +1789,8 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 	/*
 	 * In COW phased migration, check if the page is already
 	 * buffered. If so, UFFD_COPY directly from buffer.
+	 * IMPORTANT: Only serve from buffer AFTER dirty bitmap received,
+	 * otherwise we may copy a page that will be re-sent as dirty.
 	 */
 	if (opts.cow_dump) {
 		void *data = cow_page_buffer_lookup_and_remove(address);
@@ -2562,17 +2485,6 @@ err:
 	return -1;
 }
 
-/* Return uffd of first active lpi. Used by page-xfer.c for apply_buffered_pages(). */
-int get_first_lpi_uffd(void)
-{
-	struct lazy_pages_info *lpi;
-
-	list_for_each_entry(lpi, &lpis, l) {
-		if (!lpi->exited && lpi->lpfd.fd > 0)
-			return lpi->lpfd.fd;
-	}
-	return -1;
-}
 
 /* Return uffd for a given vaddr (for background drain thread). */
 int get_uffd_for_vaddr(unsigned long vaddr)

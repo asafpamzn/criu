@@ -44,4 +44,7 @@ extern void page_state_print_history(unsigned long vaddr);
 /* Mark all pages in a range as unmapped (for REMOVE/UNMAP events) */
 extern void page_state_mark_range_unmapped(unsigned long start, unsigned long len);
 
+/* Mark COPIED/DISCARDED pages in dirty ranges as DIRTY for re-receive */
+extern void page_state_mark_dirty_ranges(unsigned long *ranges, unsigned int nr_ranges);
+
 #endif /* __CR_PF_TRACKER_H__ */

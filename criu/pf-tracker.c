@@ -116,9 +116,13 @@ static bool is_valid_transition(enum page_state from, enum page_state to)
 		       to == PAGE_STATE_DISCARDED ||
 		       to == PAGE_STATE_UNMAPPED;
 	case PAGE_STATE_COPIED:
+		/* COPIED pages can become DIRTY if source re-sends with newer data */
+		return to == PAGE_STATE_DIRTY;
 	case PAGE_STATE_DISCARDED:
+		/* DISCARDED pages can become DIRTY if source re-sends with newer data */
+		return to == PAGE_STATE_DIRTY;
 	case PAGE_STATE_UNMAPPED:
-		/* Terminal states - no further transitions allowed */
+		/* Truly terminal - region no longer exists */
 		return false;
 	case PAGE_STATE_DIRTY:
 		/* Dirty pages CAN be re-sent with newer data */
@@ -351,6 +355,36 @@ void page_state_mark_range_unmapped(unsigned long start, unsigned long len)
 			page_state_set(vaddr, PAGE_STATE_UNMAPPED);
 		}
 	}
+}
+
+void page_state_mark_dirty_ranges(unsigned long *ranges, unsigned int nr_ranges)
+{
+	unsigned int i;
+	unsigned long marked = 0;
+
+	if (!g_page_state.initialized || !ranges || nr_ranges == 0)
+		return;
+
+	for (i = 0; i < nr_ranges; i++) {
+		unsigned long start = ranges[i * 2];
+		unsigned long len = ranges[i * 2 + 1];
+		unsigned long vaddr;
+
+		for (vaddr = start; vaddr < start + len; vaddr += PAGE_SIZE) {
+			enum page_state state = page_state_get(vaddr);
+			/*
+			 * Mark COPIED/DISCARDED pages as expecting re-send.
+			 * These pages were already delivered to the application,
+			 * but the source has newer data that will arrive.
+			 */
+			if (state == PAGE_STATE_COPIED ||
+			    state == PAGE_STATE_DISCARDED) {
+				page_state_set(vaddr, PAGE_STATE_DIRTY);
+				marked++;
+			}
+		}
+	}
+	pr_info("Marked %lu COPIED/DISCARDED pages as DIRTY for re-receive\n", marked);
 }
 
 void page_state_print_stats(void)

@@ -250,7 +250,6 @@ int cr_lazy_pages_cow_phase2(bool daemon)
 	/*
 	 * Phase 3 continues in the normal lazy-pages flow.
 	 * The buffered pages in g_page_buffer will be:
-	 *   - Applied via UFFD_COPY when restore connects (apply_buffered_pages)
 	 *   - Served to page faults (handle_page_fault checks buffer first)
 	 */
 	ret = cow_phase3_restore_loop(epollfd, &events, nr_fds);

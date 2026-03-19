@@ -2181,18 +2181,14 @@ static int drain_cow_pages(struct active_image *img, pid_t source_pid,
 			return -1;
 		}
 
-		if (ret > 0) {
+		if (ret == 1) {
+			/* Page was sent for first time - count it */
 			img->total_cow_pages++;
 			stats->priority1_pages++;
 			sent++;
-			/*
-			 * ret == 1: first send of this page, decrement remaining_pages
-			 * ret == 2: page was already sent by P3, but COW has newer
-			 *           data - don't decrement to avoid going negative
-			 */
-			if (ret == 1)
-				img->remaining_pages--;
+			img->remaining_pages--;
 		}
+		/* ret == 2 means skipped (already sent, not dirty) - don't count */
 		max_pages--;
 	}
 
@@ -2663,12 +2659,13 @@ static int page_server_serve(int sk)
 			}
 
 			/*
-			 * TODO: Apply buffered pages using the dirty bitmap.
-			 * For now, just store the ranges for later use.
-			 * The actual application happens via apply_buffered_pages()
-			 * called from the lazy pages daemon.
+			 * Discard dirty pages from buffer (IN_BUFFER -> DIRTY).			 
+			 * to UFFDIO_COPY later.
 			 */
-			pr_info("Dirty bitmap received: %u ranges\n", nr_ranges);
+			if (nr_ranges > 0)
+				cow_page_buffer_discard_dirty(ranges, nr_ranges);
+
+			pr_info("Dirty bitmap applied: %u ranges\n", nr_ranges);
 
 			if (ranges)
 				xfree(ranges);
