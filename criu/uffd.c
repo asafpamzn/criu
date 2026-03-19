@@ -180,14 +180,6 @@ int page_buffer_init(void)
 	return 0;
 }
 
-static void page_buffer_remove(struct page_buffer_entry *entry)
-{
-	hlist_del(&entry->hash);
-	xfree(entry->data);
-	xfree(entry);
-}
-
-
 /* Histogram statistics structure */
 static struct {
 	/* Histogram buckets by page count: 1, 16, 32, 64, 128, 256, 512, 1024, >1024 */
