@@ -188,24 +188,6 @@ static void page_buffer_remove(struct page_buffer_entry *entry)
 }
 
 
-/* Check if address falls within any dirty range */
-static bool is_in_dirty_range(unsigned long vaddr,
-			      unsigned long *dirty_ranges,
-			      unsigned int nr_dirty_ranges)
-{
-	unsigned int i;
-
-	for (i = 0; i < nr_dirty_ranges; i++) {
-		unsigned long start = dirty_ranges[i * 2];
-		unsigned long len = dirty_ranges[i * 2 + 1];
-
-		if (vaddr >= start && vaddr < start + len)
-			return true;
-	}
-	return false;
-}
-
-
 /* Histogram statistics structure */
 static struct {
 	/* Histogram buckets by page count: 1, 16, 32, 64, 128, 256, 512, 1024, >1024 */
