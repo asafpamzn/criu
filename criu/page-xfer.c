@@ -1961,15 +1961,16 @@ static int send_cow_page_lazy(struct cow_page_queue_entry *entry, struct active_
 	page_idx = (entry->vaddr - lve->start) / PAGE_SIZE;
 
 	/*
-	 * COW pages from WP_SYNC faults have fresh data captured at fault time.
-	 * We must ALWAYS send them, even if the page was previously sent by P3,
-	 * because the process may have written to it again after P3 sent it.
-	 *
-	 * Track if it was already sent for remaining_pages accounting:
-	 * - If not sent yet: this counts against remaining_pages
-	 * - If already sent: don't double-count, but still send the new data
+	 * Track if it was already sent for remaining_pages accounting.
+	 * If already sent, skip - the page wasn't dirtied since last send.
+	 * Dirty pages have their sent_bitmap cleared by prepare_lazy_vmas_for_convergence().
 	 */
 	was_already_sent = bitmap_test_nonatomic(lve->sent_bitmap, page_idx);
+
+	if (was_already_sent) {
+		/* Page already sent and not dirtied - skip duplicate send */
+		return 2;  /* Return 2 = already sent, don't count against remaining */
+	}
 
 	if (!entry->data) {
 		pr_err("COW queue entry 0x%lx has no data!\n", entry->vaddr);
@@ -1995,11 +1996,8 @@ static int send_cow_page_lazy(struct cow_page_queue_entry *entry, struct active_
 	/* Mark as sent */
 	bitmap_set_nonatomic(lve->sent_bitmap, page_idx);
 
-	/*
-	 * Return 1 if this is the first send (count against remaining_pages).
-	 * Return 2 if page was already sent by P3 (don't double-count).
-	 */
-	return was_already_sent ? 2 : 1;
+	/* Return 1: first send, counts against remaining_pages */
+	return 1;
 }
 
 /* Helper to send a page request from lazy VMA */
