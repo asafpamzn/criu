@@ -1425,38 +1425,10 @@ found_iov:
 		return 0;
 
 	/*
-	 * In COW phased migration, store pages in buffer.
-	 * Page faults check buffer first, background thread drains.
+	 * NOTE: In COW mode, this callback is NOT called - pages flow through
+	 * convergence_io_complete() or prebuffer_io_complete() instead.
+	 * This code path is only for non-COW lazy pages.
 	 */
-	if (opts.cow_dump) {
-		/* Pre-convergence: buffer for later drain */
-		unsigned long i;
-		/*
-		 * In convergence phase, UFFD is ready - copy directly to avoid
-		 * page faults waiting for drain thread to process buffered pages.
-		 */
-		if (is_dirty_bitmap_received()) {
-			ret = uffd_copy(lpi, vaddr, &pages);
-			if (ret < 0)
-				return ret;
-			lp_debug(lpi, "Direct copy %lu pages at 0x%lx (convergence)\n", pages, vaddr);
-			return ret;
-		}
-
-
-
-		for (i = 0; i < pages; i++) {
-			ret = cow_page_buffer_add(vaddr + i * PAGE_SIZE,
-						  (char *)lpi->buf + i * PAGE_SIZE);
-			if (ret < 0) {
-				lp_err(lpi, "Failed to buffer page at 0x%lx\n",
-				       vaddr + i * PAGE_SIZE);
-				return ret;
-			}
-		}
-		lp_debug(lpi, "Buffered %lu pages at 0x%lx\n", pages, vaddr);
-		return 0;
-	}
 
 	/* Copy pages to userspace */
 	ret = uffd_copy(lpi, vaddr, &pages);
@@ -2400,6 +2372,60 @@ int setup_prebuffer_reader(void)
 }
 
 /*
+ * Convergence callback: pages arrive after restore connected AND dirty bitmap received.
+ * Can do direct UFFDIO_COPY since we have uffd available.
+ */
+static int convergence_io_complete(unsigned long dst_id, unsigned long vaddr,
+				   unsigned long nr_pages, void *priv)
+{
+	void *buf = priv;
+	struct lazy_pages_info *lpi;
+	int ret;
+
+	/* Find lpi for this vaddr */
+	list_for_each_entry(lpi, &lpis, l) {
+		unsigned long pages;
+
+		if (lpi->exited || lpi->lpfd.fd < 0)
+			continue;
+		if (!find_iov(lpi, vaddr))
+			continue;
+
+		/* Copy buffer to lpi->buf and call uffd_copy */
+		memcpy(lpi->buf, buf, nr_pages * PAGE_SIZE);
+		pages = nr_pages;
+		ret = uffd_copy(lpi, vaddr, &pages);
+		if (ret < 0) {
+			lp_err(lpi, "Direct convergence copy failed at 0x%lx\n", vaddr);
+			return ret;
+		}
+		lp_debug(lpi, "Direct copy %lu pages at 0x%lx (convergence)\n", pages, vaddr);
+		return 0;
+	}
+
+	/* No matching lpi - shouldn't happen in convergence, log warning */
+	pr_warn("Convergence: no lpi for vaddr 0x%lx, buffering\n", vaddr);
+	return cow_page_buffer_add(vaddr, buf);
+}
+
+/*
+ * Switch async reader to convergence mode.
+ * Called when BOTH restore is connected AND dirty bitmap is received.
+ */
+static void switch_to_convergence_callback(void)
+{
+	if (!prebuffer_buf) {
+		pr_warn("Cannot switch to convergence: no prebuffer_buf\n");
+		return;
+	}
+
+	if (page_server_update_async_callback(convergence_io_complete, prebuffer_buf) == 0)
+		pr_info("Switched to convergence callback - direct copy enabled\n");
+	else
+		pr_warn("Failed to switch to convergence callback\n");
+}
+
+/*
  * Non-blocking accept handler for when criu restore connects.
  * Called from epoll loop when restore connects on the Unix socket.
  */
@@ -2453,16 +2479,13 @@ static int handle_lazy_accept(struct epoll_rfd *rfd)
 		cow_page_buffer_count());
 
 	/*
-	 * Start drain thread only if dirty bitmap already received.
-	 * Drain thread requires uffd (only available after restore connects).
-	 * If bitmap hasn't arrived yet, we'll start drain thread when it does.
+	 * Start drain thread and switch to convergence callback only if
+	 * dirty bitmap already received. Both require uffd available.
+	 * If bitmap hasn't arrived yet, we'll do this when it does.
 	 */
 	if (opts.cow_dump && is_dirty_bitmap_received()) {
-		pr_info("Dirty bitmap already received, starting drain thread\n");
-		if (!is_dirty_bitmap_received()) {
-			pr_info("Dirty bitmap already was not received exiting\n");
-			exit(0);
-		}
+		pr_info("Dirty bitmap already received, entering convergence\n");
+		switch_to_convergence_callback();
 		cow_start_drain_thread();
 	}
 
@@ -2501,16 +2524,27 @@ bool is_restore_connected(void)
 	return restore_connected;
 }
 
-/* Set inventory ready flag (called when PS_IOV_INVENTORY_READY received) */
+/* Set dirty bitmap received flag (called when dirty bitmap fully received) */
 void set_dirty_bitmap_received(void)
 {
-	pr_info("Received inventory ready signal from primary\n");
+	pr_info("Dirty bitmap received from primary\n");
 	dirty_bitmap_received = true;
 
 	/* Enable debug logging for convergence phase debugging */
 	opts.log_level = LOG_DEBUG;
 	log_set_loglevel(opts.log_level);
 	pr_info("Debug logging enabled for convergence phase\n");
+
+	/*
+	 * If restore is already connected, switch to convergence callback
+	 * and start drain thread now. Otherwise handle_lazy_accept() will
+	 * do this when restore connects.
+	 */
+	if (is_restore_connected()) {
+		pr_info("Restore already connected, entering convergence\n");
+		switch_to_convergence_callback();
+		cow_start_drain_thread();
+	}
 }
 
 /* Set inventory ready flag (called when PS_IOV_INVENTORY_READY received) */

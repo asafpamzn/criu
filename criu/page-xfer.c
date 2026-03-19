@@ -3566,6 +3566,24 @@ int page_server_start_async_read_bulk(void *buf, unsigned long nr_pages,
 }
 
 /*
+ * Update the async bulk reader callback (for COW convergence phase).
+ * Called when restore connects AND dirty bitmap is received.
+ */
+int page_server_update_async_callback(ps_async_read_complete complete, void *priv)
+{
+	struct ps_async_read *ar;
+
+	if (list_empty(&async_reads))
+		return -1;
+
+	ar = list_first_entry(&async_reads, struct ps_async_read, l);
+	ar->complete = complete;
+	ar->priv = priv;
+	pr_info("Updated async bulk reader callback for convergence\n");
+	return 0;
+}
+
+/*
  * There are two possible event types we need to handle:
  * - page info is available as a reply to request_remote_page
  * - page data is available, and it follows page info we've just received
