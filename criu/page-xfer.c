@@ -2630,48 +2630,6 @@ static int page_server_serve(int sk)
 			ps_stats.serve_get++;
 			ret = page_server_get_all_pages(sk, &pi);
 			break;
-		case PS_IOV_DIRTY_BITMAP: {
-			/*
-			 * Receive dirty bitmap from primary for COW phased migration.
-			 * nr_pages is overloaded to contain the number of dirty ranges.
-			 * Each range is a (start, len) pair of unsigned longs.
-			 */
-			unsigned int nr_ranges = pi.nr_pages;
-			unsigned long *ranges = NULL;
-			size_t ranges_size = nr_ranges * 2 * sizeof(unsigned long);
-
-			pr_info("Receiving dirty bitmap: %u ranges\n", nr_ranges);
-
-			if (nr_ranges > 0) {
-				ranges = xmalloc(ranges_size);
-				if (!ranges) {
-					pr_err("Failed to allocate dirty ranges\n");
-					ret = -1;
-					break;
-				}
-
-				if (__recv(sk, ranges, ranges_size, MSG_WAITALL) != ranges_size) {
-					pr_perror("Failed to receive dirty ranges");
-					xfree(ranges);
-					ret = -1;
-					break;
-				}
-			}
-
-			/*
-			 * Discard dirty pages from buffer (IN_BUFFER -> DIRTY).			 
-			 * to UFFDIO_COPY later.
-			 */
-			if (nr_ranges > 0)
-				cow_page_buffer_discard_dirty(ranges, nr_ranges);
-
-			pr_info("Dirty bitmap applied: %u ranges\n", nr_ranges);
-
-			if (ranges)
-				xfree(ranges);
-			ret = 0;
-			break;
-		}
 		case PS_IOV_START_RESTORE:
 			/* Signal to start the restore process */
 			pr_info("Received start restore signal\n");
@@ -3447,8 +3405,11 @@ static int read_dirty_bitmap(struct ps_async_read *ar, int flags)
 	if (ar->dirty_rb < ar->dirty_ranges_size)
 		return BULK_STREAM_PROGRESS;
 
-	/* Dirty bitmap complete */
+	/* Dirty bitmap complete - discard dirty pages from buffer */
 	pr_info("Dirty bitmap received: %u ranges\n", ar->nr_dirty_ranges);
+
+	if (ar->nr_dirty_ranges > 0 && ar->dirty_ranges)
+		cow_page_buffer_discard_dirty(ar->dirty_ranges, ar->nr_dirty_ranges);
 
 	xfree(ar->dirty_ranges);
 
