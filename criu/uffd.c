@@ -1429,6 +1429,19 @@ found_iov:
 	 * Page faults check buffer first, background thread drains.
 	 */
 	if (opts.cow_dump) {
+		/*
+		 * In convergence phase, UFFD is ready - copy directly to avoid
+		 * page faults waiting for drain thread to process buffered pages.
+		 */
+		if (is_dirty_bitmap_received()) {
+			ret = uffd_copy(lpi, vaddr, &pages);
+			if (ret < 0)
+				return ret;
+			lp_debug(lpi, "Direct copy %lu pages at 0x%lx (convergence)\n", pages, vaddr);
+			return ret;
+		}
+
+		/* Pre-convergence: buffer for later drain */
 		unsigned long i;
 
 		for (i = 0; i < pages; i++) {

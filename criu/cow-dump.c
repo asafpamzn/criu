@@ -1450,7 +1450,7 @@ int cow_scan_dirty_pages(unsigned long **dirty_ranges,
 				unsigned long len = regs[j].end - regs[j].start;
 				unsigned long pages = len / PAGE_SIZE;
 
-				pr_err("  dirty region[%u]: 0x%lx-0x%lx "
+				pr_info("  dirty region[%u]: 0x%lx-0x%lx "
 					"(%lu pages, categories=0x%llx)\n",
 					j, start, start + len, pages,
 					(unsigned long long)regs[j].categories);
