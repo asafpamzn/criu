@@ -125,8 +125,11 @@ static bool is_valid_transition(enum page_state from, enum page_state to)
 		/* Truly terminal - region no longer exists */
 		return false;
 	case PAGE_STATE_DIRTY:
-		/* Dirty pages CAN be re-sent with newer data */
-		return to == PAGE_STATE_IN_BUFFER;
+		/* Dirty pages can be:
+		 * - Re-buffered (IN_BUFFER) if arriving pre-convergence
+		 * - Directly copied (COPIED) during convergence phase
+		 */
+		return to == PAGE_STATE_IN_BUFFER || to == PAGE_STATE_COPIED;
 	default:
 		return false;
 	}
