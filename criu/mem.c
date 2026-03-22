@@ -105,6 +105,66 @@ struct lazy_vma_entry *find_lazy_vma_by_addr(unsigned long vaddr)
 	return NULL;
 }
 
+/*
+ * add_lazy_vma_for_new_region - Add a new VMA to global_lazy_vmas
+ *
+ * Called from Phase 3 when new VMAs are detected that weren't present
+ * in Phase 1. These need to be added to global_lazy_vmas so the page
+ * server can iterate through them during page transfer.
+ *
+ * @start: VMA start address
+ * @len: VMA length in bytes
+ * @dst_id: Process identifier for page transfer
+ * @source_pid: PID for process_vm_readv
+ *
+ * Returns: 0 on success, -1 on error
+ */
+int add_lazy_vma_for_new_region(unsigned long start, unsigned long len,
+				u64 dst_id, pid_t source_pid)
+{
+	struct lazy_vma_entry *lve;
+	unsigned long nr_pages, bitmap_size;
+
+	lve = xmalloc(sizeof(*lve));
+	if (!lve)
+		return -1;
+
+	init_global_lazy_vmas();
+
+	nr_pages = len / PAGE_SIZE;
+	lve->start = start;
+	lve->end = start + len;
+	lve->total_pages = nr_pages;
+	lve->dst_id = dst_id;
+	lve->source_pid = source_pid;
+	lve->vma = NULL;  /* No vma_area for Phase 3 discovered regions */
+
+	/* Allocate bitmaps (all zeros - no pages sent yet) */
+	bitmap_size = BITMAP_ALLOC_SIZE(nr_pages);
+	lve->sent_bitmap = xzalloc(bitmap_size);
+	if (!lve->sent_bitmap) {
+		xfree(lve);
+		return -1;
+	}
+	lve->cow_bitmap = xzalloc(bitmap_size);
+	if (!lve->cow_bitmap) {
+		xfree(lve->sent_bitmap);
+		xfree(lve);
+		return -1;
+	}
+
+	pthread_spin_lock(&lazy_vmas_lock);
+	list_add_tail(&lve->list, &global_lazy_vmas);
+	pthread_spin_unlock(&lazy_vmas_lock);
+
+	pr_info("Added lazy VMA for new region 0x%lx-0x%lx "
+		"(%lu pages, dst_id=%lu, pid=%d)\n",
+		start, start + len, nr_pages,
+		(unsigned long)dst_id, source_pid);
+
+	return 0;
+}
+
 /* Count total pages in lazy VMAs for a given dst_id (exported for page-xfer.c) */
 unsigned long count_lazy_vma_pages(u64 dst_id)
 {

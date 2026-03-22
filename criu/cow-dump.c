@@ -54,6 +54,7 @@ struct cow_page_queue {
 /* COW dump state for one dump session — single tracked process */
 struct cow_dump_info {
 	pid_t source_pid;
+	u64 dst_id;            /* Process identifier for page transfer */
 	int uffd;
 	int uffd_async;        /* WP_ASYNC uffd fd (kept for cleanup) */
 	int uffd_sync;         /* Pre-created WP_SYNC uffd (via parasite) */
@@ -533,6 +534,7 @@ int cow_dump_init(struct pstree_item *item, struct vm_area_list *vma_area_list,
 		return -1;
 
 	cdi->source_pid = item->pid->real;
+	cdi->dst_id = vpid(item);
 	cdi->uffd = -1;
 	cdi->uffd_async = -1;
 	cdi->uffd_sync = -1;
@@ -1264,6 +1266,7 @@ int cow_dump_init_async(struct pstree_item *item,
 		return -1;
 
 	cdi->source_pid = item->pid->real;
+	cdi->dst_id = vpid(item);
 	cdi->uffd = -1;
 	cdi->uffd_async = -1;
 	cdi->uffd_sync = -1;
@@ -1618,6 +1621,9 @@ add_region:
  * in Phase 3. This ensures the fault handler can find these regions during
  * WP_SYNC convergence.
  *
+ * Also adds these regions to global_lazy_vmas so the page server can
+ * iterate through them during page transfer.
+ *
  * @ranges: Array of [start, len, ...] pairs
  * @nr_ranges: Number of ranges
  *
@@ -1651,6 +1657,15 @@ static int cow_extend_tracked_vmas(unsigned long *ranges, unsigned int nr_ranges
 		new_tracked[cdi->nr_tracked_vmas + i].end = start + len;
 		pr_info("Added new tracked VMA: 0x%lx-0x%lx\n",
 			start, start + len);
+
+		/* Also add to global_lazy_vmas for page transfer */
+		if (add_lazy_vma_for_new_region(start, len,
+						cdi->dst_id, cdi->source_pid)) {
+			pr_err("Failed to add lazy VMA for 0x%lx-0x%lx\n",
+			       start, start + len);
+			xfree(new_tracked);
+			return -1;
+		}
 	}
 
 	cdi->tracked_vmas = new_tracked;

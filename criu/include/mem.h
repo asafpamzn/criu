@@ -77,6 +77,8 @@ extern struct lazy_vma_entry *find_lazy_vma_by_addr(unsigned long vaddr);
 extern unsigned long count_lazy_vma_pages(u64 dst_id);
 struct list_head *get_global_lazy_vmas(void);
 extern void free_global_lazy_vmas(void);
+extern int add_lazy_vma_for_new_region(unsigned long start, unsigned long len,
+				       u64 dst_id, pid_t source_pid);
 
 /* COW convergence mode - Phase 3 dirty page handling */
 extern bool is_convergence_mode(void);
