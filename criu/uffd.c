@@ -78,6 +78,7 @@ struct lazy_iov {
 	unsigned long start;	 /* run-time start address, tracks remaps */
 	unsigned long end;	 /* run-time end address, tracks remaps */
 	unsigned long img_start; /* start address at the dump time */
+	bool is_new_vma;	 /* true if this IOV is for a Phase 3 new VMA */
 };
 
 struct lazy_pages_info {
@@ -1823,6 +1824,22 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 			return 0;
 		}
 
+		/*
+		 * New VMAs created after Phase 1 don't have pagemap entries.
+		 * Request the page directly from the page server.
+		 */
+		if (iov->is_new_vma) {
+			lp_debug(lpi, "Page 0x%llx in new VMA - requesting from server\n", address);
+			uffd_stats.total_pf_reqs++;
+			pf_tracker_add(address, 1, lpi->pid, true);
+
+			if (request_remote_pages(lpi->pr.img_id, address, 1) < 0) {
+				lp_err(lpi, "Error requesting new VMA page 0x%llx\n", address);
+				return -1;
+			}
+			return 0;  /* Page will arrive via bulk stream */
+		}
+
 		img_addr = iov->img_start + (address - iov->start);
 
 		uffd_stats.total_pf_reqs++;
@@ -2604,9 +2621,10 @@ static int create_iovs_for_new_ranges(unsigned long *dirty_ranges,
 				iov->start = start;
 				iov->end = end;
 				iov->img_start = start;
+				iov->is_new_vma = true;
 				list_add_tail(&iov->l, &lpi->iovs);
 
-				pr_info("Created IOV for new VMA range: 0x%lx-0x%lx (%lu pages)\n",
+				pr_info("Created IOV for new VMA range: 0x%lx-0x%lx (%lu pages, is_new_vma=true)\n",
 					start, end, len / PAGE_SIZE);
 				created++;
 				break;
