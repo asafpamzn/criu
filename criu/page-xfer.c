@@ -3376,12 +3376,12 @@ static int read_dirty_bitmap(struct ps_async_read *ar, int flags)
 	int need = ar->dirty_ranges_size - ar->dirty_rb;
 	void *buf = ((char *)ar->dirty_ranges) + ar->dirty_rb;
 
-	pr_info("Dirty bitmap read: need=%d dirty_rb=%lu total=%lu flags=%d sk=%d\n",
+	pr_debug("Dirty bitmap read: need=%d dirty_rb=%lu total=%lu flags=%d sk=%d\n",
 		need, ar->dirty_rb, ar->dirty_ranges_size, flags, page_server_sk);
 
 	ret = __recv(page_server_sk, buf, need, flags);
 
-	pr_info("Dirty bitmap recv: ret=%d errno=%d\n", ret, ret < 0 ? errno : 0);
+	pr_debug("Dirty bitmap recv: ret=%d errno=%d\n", ret, ret < 0 ? errno : 0);
 
 	if (ret < 0) {
 		if (flags == MSG_DONTWAIT && (errno == EAGAIN || errno == EINTR)) {

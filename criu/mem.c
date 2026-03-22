@@ -204,11 +204,12 @@ unsigned long prepare_lazy_vmas_for_convergence(unsigned long *dirty_ranges,
 
 	g_convergence_mode = true;
 	g_convergence_dirty_pages = total_dirty_pages;
-
+#if 0
 	/* Enable debug logging for convergence phase debugging */
 	opts.log_level = LOG_DEBUG;
 	log_set_loglevel(opts.log_level);
 	pr_info("Debug logging enabled for convergence phase\n");
+#endif
 
 	pr_info("Prepared %lu dirty pages for convergence from %u ranges\n",
 		total_dirty_pages, nr_dirty_ranges);

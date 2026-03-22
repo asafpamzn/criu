@@ -2529,11 +2529,12 @@ void set_dirty_bitmap_received(void)
 {
 	pr_info("Dirty bitmap received from primary\n");
 	dirty_bitmap_received = true;
-
+#if 0
 	/* Enable debug logging for convergence phase debugging */
 	opts.log_level = LOG_DEBUG;
 	log_set_loglevel(opts.log_level);
 	pr_info("Debug logging enabled for convergence phase\n");
+#endif
 
 	/*
 	 * If restore is already connected, switch to convergence callback
