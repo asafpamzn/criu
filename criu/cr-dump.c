@@ -2812,6 +2812,12 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 	if (collect_pstree_ids())
 		goto err;
 
+	/*
+	 * Update COW dst_id now that collect_pstree_ids() has populated vpid.
+	 * Phase 1 init set dst_id = vpid(item) before IDs were collected.
+	 */
+	cow_set_dst_id(vpid(root_item));
+
 	if (network_lock())
 		goto err;
 

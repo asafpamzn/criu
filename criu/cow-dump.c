@@ -258,6 +258,21 @@ out:
 /* ------------------------------------------------------------------ */
 
 static struct cow_dump_info *g_cow_info = NULL;
+
+/*
+ * cow_set_dst_id - Update the dst_id after collect_pstree_ids() populates vpid
+ *
+ * In COW phased dump, g_cow_info is initialized in Phase 1 before
+ * collect_pstree_ids() runs, so vpid(item) returns -1 at that time.
+ * This function allows cr-dump.c to update dst_id in Phase 3 after
+ * the IDs are properly collected.
+ */
+void cow_set_dst_id(u64 dst_id)
+{
+	if (g_cow_info)
+		g_cow_info->dst_id = dst_id;
+}
+
 static _Atomic bool g_stop_monitoring = false;
 static pthread_mutex_t g_monitor_state_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_monitor_eventfd = -1;

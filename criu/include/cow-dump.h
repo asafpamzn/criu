@@ -53,6 +53,15 @@ extern int cow_dump_init(struct pstree_item *item, struct vm_area_list *vma_area
 extern void cow_dump_fini(void);
 
 /**
+ * cow_set_dst_id - Update the dst_id for page transfer
+ * @dst_id: Process identifier (vpid)
+ *
+ * In COW phased dump, the initial dst_id is set before collect_pstree_ids()
+ * populates vpid. Call this after collect_pstree_ids() to fix it.
+ */
+extern void cow_set_dst_id(u64 dst_id);
+
+/**
  * cow_check_kernel_support - Check if kernel supports COW dump
  *
  * Verifies that the kernel has necessary userfaultfd write-protect
