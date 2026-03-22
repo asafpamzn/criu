@@ -27,7 +27,8 @@ extern bool is_restore_connected(void);
 /* Check if dirty bitmap has been received from primary (Phase 3 signal) */
 extern bool is_dirty_bitmap_received(void);
 
-extern void set_dirty_bitmap_received(void);
+extern void set_dirty_bitmap_received(unsigned long *dirty_ranges,
+				      unsigned int nr_dirty_ranges);
 
 /* Check if inventory.img is ready (PS_IOV_INVENTORY_READY received) */
 extern bool is_inventory_ready_received(void);

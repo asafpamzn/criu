@@ -3146,13 +3146,13 @@ static int handle_dirty_bitmap_header(struct ps_async_read *ar)
 		/*
 		 * COW mode: dirty bitmap (even empty) marks end of bulk phase.
 		 * Send ACK to primary before marking complete.
-		 * Drain thread will start when restore connects 
+		 * Drain thread will start when restore connects
 		 */
 		if (opts.cow_dump) {
 			pr_info("COW mode: dirty bitmap complete (0 ranges), bulk phase done\n");
 			if (send_dirty_bitmap_ack())
 				return -1;
-			set_dirty_bitmap_received();
+			set_dirty_bitmap_received(NULL, 0);
 			return BULK_STREAM_COMPLETE;
 		}
 		return BULK_STREAM_PROGRESS;
@@ -3411,27 +3411,31 @@ static int read_dirty_bitmap(struct ps_async_read *ar, int flags)
 	if (ar->nr_dirty_ranges > 0 && ar->dirty_ranges)
 		cow_page_buffer_discard_dirty(ar->dirty_ranges, ar->nr_dirty_ranges);
 
-	xfree(ar->dirty_ranges);
-
-	ar->dirty_ranges = NULL;
 	ar->rb = 0;
 	ar->compress_state = COMPRESS_STATE_READING_HEADER;
 
 	/*
 	 * COW mode: dirty bitmap marks end of bulk phase.
 	 * Send ACK to primary before marking complete.
+	 * Ownership of dirty_ranges is transferred to set_dirty_bitmap_received().
 	 */
 	if (opts.cow_dump) {
 		pr_info("COW mode: dirty bitmap complete (%u ranges), bulk phase done\n",
 			ar->nr_dirty_ranges);
-		if (send_dirty_bitmap_ack()){
-			pr_err("COW mode: send_dirty_bitmap_ack FAILED!!!!\n");			
+		if (send_dirty_bitmap_ack()) {
+			pr_err("COW mode: send_dirty_bitmap_ack FAILED!!!!\n");
+			xfree(ar->dirty_ranges);
+			ar->dirty_ranges = NULL;
 			return -1;
 		}
-		set_dirty_bitmap_received();
+		/* Pass ownership of dirty_ranges to uffd.c for IOV creation */
+		set_dirty_bitmap_received(ar->dirty_ranges, ar->nr_dirty_ranges);
+		ar->dirty_ranges = NULL;
 		return BULK_STREAM_COMPLETE;
 	}
 
+	xfree(ar->dirty_ranges);
+	ar->dirty_ranges = NULL;
 	return BULK_STREAM_PROGRESS;
 }
 

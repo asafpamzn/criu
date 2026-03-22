@@ -2484,6 +2484,21 @@ static int handle_lazy_accept(struct epoll_rfd *rfd)
 	 * If bitmap hasn't arrived yet, we'll do this when it does.
 	 */
 	if (opts.cow_dump && is_dirty_bitmap_received()) {
+		/*
+		 * If dirty ranges were received before restore connected,
+		 * create IOVs for new VMAs now that LPIs are set up.
+		 */
+		if (pending_dirty_ranges) {
+			pr_info("Creating IOVs for %u pending dirty ranges\n",
+				pending_nr_dirty_ranges);
+			if (create_iovs_for_new_ranges(pending_dirty_ranges,
+						       pending_nr_dirty_ranges) < 0)
+				pr_warn("Failed to create IOVs for some new ranges\n");
+			xfree(pending_dirty_ranges);
+			pending_dirty_ranges = NULL;
+			pending_nr_dirty_ranges = 0;
+		}
+
 		pr_info("Dirty bitmap already received, entering convergence\n");
 		switch_to_convergence_callback();
 		cow_start_drain_thread();
@@ -2524,27 +2539,109 @@ bool is_restore_connected(void)
 	return restore_connected;
 }
 
-/* Set dirty bitmap received flag (called when dirty bitmap fully received) */
-void set_dirty_bitmap_received(void)
+/*
+ * Create IOVs for dirty ranges that don't have existing IOVs.
+ * This handles new VMAs created between Phase 1 and Phase 3.
+ */
+static int create_iovs_for_new_ranges(unsigned long *dirty_ranges,
+				      unsigned int nr_dirty_ranges)
 {
-	pr_info("Dirty bitmap received from primary\n");
+	struct lazy_pages_info *lpi;
+	unsigned int i;
+	int created = 0;
+
+	if (!dirty_ranges || nr_dirty_ranges == 0)
+		return 0;
+
+	/* Process each dirty range */
+	for (i = 0; i < nr_dirty_ranges; i++) {
+		unsigned long start = dirty_ranges[i * 2];
+		unsigned long len = dirty_ranges[i * 2 + 1];
+		unsigned long end = start + len;
+		bool found = false;
+
+		/* Check if any lpi has IOVs covering this range */
+		list_for_each_entry(lpi, &lpis, l) {
+			if (lpi->exited)
+				continue;
+			if (find_iov(lpi, start)) {
+				found = true;
+				break;
+			}
+		}
+
+		if (!found) {
+			/*
+			 * No existing IOV for this range - it's a new VMA.
+			 * Add IOV to the first active lpi (in COW mode
+			 * there's typically one process being migrated).
+			 */
+			list_for_each_entry(lpi, &lpis, l) {
+				struct lazy_iov *iov;
+
+				if (lpi->exited)
+					continue;
+
+				iov = xzalloc(sizeof(*iov));
+				if (!iov) {
+					pr_err("Failed to allocate IOV for new range\n");
+					return -1;
+				}
+
+				iov->start = start;
+				iov->end = end;
+				iov->img_start = start;
+				list_add_tail(&iov->l, &lpi->iovs);
+
+				pr_info("Created IOV for new VMA range: 0x%lx-0x%lx (%lu pages)\n",
+					start, end, len / PAGE_SIZE);
+				created++;
+				break;
+			}
+		}
+	}
+
+	if (created > 0)
+		pr_info("Created %d IOVs for new VMA ranges from dirty bitmap\n", created);
+
+	return 0;
+}
+
+/* Set dirty bitmap received flag (called when dirty bitmap fully received) */
+void set_dirty_bitmap_received(unsigned long *dirty_ranges,
+			       unsigned int nr_dirty_ranges)
+{
+	pr_info("Dirty bitmap received from primary (%u ranges)\n", nr_dirty_ranges);
+
 	dirty_bitmap_received = true;
-#if 0
-	/* Enable debug logging for convergence phase debugging */
-	opts.log_level = LOG_DEBUG;
-	log_set_loglevel(opts.log_level);
-	pr_info("Debug logging enabled for convergence phase\n");
-#endif
 
 	/*
-	 * If restore is already connected, switch to convergence callback
-	 * and start drain thread now. Otherwise handle_lazy_accept() will
-	 * do this when restore connects.
+	 * If restore is already connected, create IOVs for new VMAs now.
+	 * Otherwise store dirty_ranges for later processing in handle_lazy_accept().
 	 */
 	if (is_restore_connected()) {
+		/*
+		 * Create IOVs for new VMA ranges that don't have existing IOVs.
+		 * These are VMAs created between Phase 1 and Phase 3.
+		 */
+		if (create_iovs_for_new_ranges(dirty_ranges, nr_dirty_ranges) < 0)
+			pr_warn("Failed to create IOVs for some new ranges\n");
+
+		/* Free the dirty ranges - we've processed them */
+		xfree(dirty_ranges);
+
 		pr_info("Restore already connected, entering convergence\n");
 		switch_to_convergence_callback();
 		cow_start_drain_thread();
+	} else {
+		/*
+		 * Restore not connected yet - store dirty ranges for later.
+		 * handle_lazy_accept() will create IOVs when restore connects.
+		 */
+		pr_info("Storing dirty ranges for later IOV creation (%u ranges)\n",
+			nr_dirty_ranges);
+		pending_dirty_ranges = dirty_ranges;
+		pending_nr_dirty_ranges = nr_dirty_ranges;
 	}
 }
 
