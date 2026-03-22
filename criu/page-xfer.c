@@ -1982,7 +1982,7 @@ static int send_cow_page_lazy(struct cow_page_queue_entry *entry, struct active_
 
 	ret = send_page_compressed(img->main_sk, entry->data, img->dst_id,
 				   entry->vaddr);
-	pr_err("COW page 0x%lx sent VMA (dst_id=%lu)\n",
+	pr_debug("COW page 0x%lx sent VMA (dst_id=%lu)\n",
 		       entry->vaddr, img->dst_id);
 
 	clock_gettime(CLOCK_MONOTONIC, &t2);
