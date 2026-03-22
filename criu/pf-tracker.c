@@ -521,7 +521,7 @@ void pf_tracker_set_state(unsigned long long address, enum pf_state state)
 	entry = pf_tracker_find(address);
 	if (!entry) {
 		if (state == PF_STATE_COMPLETED)
-			pr_warn("PF_TRACKER: UFFDIO_COPY succeeded for untracked address 0x%llx\n",
+			pr_debug("PF_TRACKER: UFFDIO_COPY succeeded for untracked address 0x%llx\n",
 				(unsigned long long)address);
 		return;
 	}
