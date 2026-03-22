@@ -2750,6 +2750,16 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 		nr_dirty_ranges, total_dirty_pages);
 
 	/*
+	 * Collect pstree IDs now so vpid(item) is valid for the VMA detection.
+	 * This must happen before cow_detect_new_vmas() which uses dst_id.
+	 */
+	if (collect_pstree_ids())
+		goto err;
+
+	/* Update COW dst_id now that collect_pstree_ids() has populated vpid */
+	cow_set_dst_id(vpid(root_item));
+
+	/*
 	 * Detect VMAs that were created between Phase 1 and Phase 3.
 	 * New VMAs weren't tracked during Phase 2, so their pages weren't
 	 * sent. We mark them as dirty to ensure they get transferred
@@ -2804,19 +2814,6 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 			xfree(new_vma_ranges);
 		}
 	}
-
-	/*
-	 * Now perform full dump setup. Phase 1 used predump variants,
-	 * but skeleton dump needs full collection.
-	 */
-	if (collect_pstree_ids())
-		goto err;
-
-	/*
-	 * Update COW dst_id now that collect_pstree_ids() has populated vpid.
-	 * Phase 1 init set dst_id = vpid(item) before IDs were collected.
-	 */
-	cow_set_dst_id(vpid(root_item));
 
 	if (network_lock())
 		goto err;
