@@ -333,20 +333,22 @@ static void *background_drain_thread(void *arg)
 					if (ioctl(uffd, UFFDIO_COPY, &uffd_copy) < 0) {
 						if (errno == EEXIST) {
 							/*
-							 * EEXIST: page already present. This is expected
-							 * when page fault handler served it from buffer
-							 * before we removed it. Safe to discard our copy.
+							 * EEXIST: page already present. BUG - duplicate copy!
 							 */
 							cow_buffer.nr_discarded++;
-							pr_err("COW_TRACE DRAIN_COPY: 0x%lx FAILED errno=EEXIST\n", vaddr);
+							pr_err("BUG: DRAIN_COPY EEXIST at 0x%lx - duplicate copy!\n", vaddr);
 							page_state_print_history(vaddr);
-							page_state_set(vaddr, PAGE_STATE_DISCARDED);
+							/* Don't set DISCARDED if DIRTY - illegal transition */
+							if (page_state_get(vaddr) != PAGE_STATE_DIRTY)
+								page_state_set(vaddr, PAGE_STATE_DISCARDED);
 						} else if (errno == ENOENT) {
 							/* ENOENT: VMA was unmapped (app freed memory) */
 							cow_buffer.nr_discarded++;
 							pr_err("COW_TRACE DRAIN_COPY: 0x%lx FAILED errno=ENOENT (VMA unmapped)\n", vaddr);
 							page_state_print_history(vaddr);
-							page_state_set(vaddr, PAGE_STATE_DISCARDED);
+							/* Don't set DISCARDED if DIRTY - illegal transition */
+							if (page_state_get(vaddr) != PAGE_STATE_DIRTY)
+								page_state_set(vaddr, PAGE_STATE_DISCARDED);
 						} else if (errno == EAGAIN) {
 							/*
 							 * EAGAIN: page table locked. Re-add to buffer
@@ -359,7 +361,9 @@ static void *background_drain_thread(void *arg)
 						} else {
 							pr_err("COW_TRACE DRAIN_COPY: 0x%lx FAILED errno=%d\n", vaddr, errno);
 							page_state_print_history(vaddr);
-							page_state_set(vaddr, PAGE_STATE_DISCARDED);
+							/* Don't set DISCARDED if DIRTY - illegal transition */
+							if (page_state_get(vaddr) != PAGE_STATE_DIRTY)
+								page_state_set(vaddr, PAGE_STATE_DISCARDED);
 						}
 					} else {
 						cow_buffer.nr_applied++;
@@ -370,7 +374,9 @@ static void *background_drain_thread(void *arg)
 					cow_buffer.nr_discarded++;
 					pr_err("COW_TRACE DRAIN_COPY: 0x%lx no uffd found\n", vaddr);
 					page_state_print_history(vaddr);
-					page_state_set(vaddr, PAGE_STATE_DISCARDED);
+					/* Don't set DISCARDED if DIRTY - illegal transition */
+					if (page_state_get(vaddr) != PAGE_STATE_DIRTY)
+						page_state_set(vaddr, PAGE_STATE_DISCARDED);
 				}
 
 				if (free_data)

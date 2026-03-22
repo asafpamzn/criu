@@ -1228,7 +1228,12 @@ static int uffd_copy(struct lazy_pages_info *lpi, __u64 address, unsigned long *
 		if (uffd_check_op_error(lpi, "copy", nr_pages, uffdio_copy.copy)) {
 			lp_err(lpi, "UFFDIO_COPY got error\n");
 			page_state_print_history(address);
-			page_state_set(address, PAGE_STATE_DISCARDED);
+			/*
+			 * Don't set DISCARDED if page is DIRTY - it will be re-sent.
+			 * DIRTY -> DISCARDED is an illegal transition.
+			 */
+			if (page_state_get(address) != PAGE_STATE_DIRTY)
+				page_state_set(address, PAGE_STATE_DISCARDED);
 			return -1;
 		}
 
@@ -1241,7 +1246,9 @@ static int uffd_copy(struct lazy_pages_info *lpi, __u64 address, unsigned long *
 			page_state_print_history(address);
 			return -1;
 		}
-		page_state_set(address, PAGE_STATE_DISCARDED);
+		/* Don't set DISCARDED if page is DIRTY - illegal transition */
+		if (page_state_get(address) != PAGE_STATE_DIRTY)
+			page_state_set(address, PAGE_STATE_DISCARDED);
 		return 0;
 	}
 
@@ -1259,7 +1266,9 @@ static int uffd_copy(struct lazy_pages_info *lpi, __u64 address, unsigned long *
 		if (uffd_check_op_error(lpi, "copy", nr_pages, uffdio_copy.copy)) {
 			lp_err(lpi, "UFFDIO_COPY err \n");
 			page_state_print_history(address);
-			page_state_set(address, PAGE_STATE_DISCARDED);
+			/* Don't set DISCARDED if page is DIRTY - illegal transition */
+			if (page_state_get(address) != PAGE_STATE_DIRTY)
+				page_state_set(address, PAGE_STATE_DISCARDED);
 			return -1;
 		}
 		/*
@@ -1270,7 +1279,9 @@ static int uffd_copy(struct lazy_pages_info *lpi, __u64 address, unsigned long *
 			page_state_print_history(address);
 			return -1;
 		}
-		page_state_set(address, PAGE_STATE_DISCARDED);
+		/* Don't set DISCARDED if page is DIRTY - illegal transition */
+		if (page_state_get(address) != PAGE_STATE_DIRTY)
+			page_state_set(address, PAGE_STATE_DISCARDED);
 		return 0;
 	}
 

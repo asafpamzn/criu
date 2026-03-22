@@ -37,6 +37,14 @@ echo "=== A4. COW uffd registrations ==="
 grep -E "uffd.*register|WP.*protect" "$PRIMARY_LOG" 2>/dev/null | head -20 || echo "No uffd registration logs"
 echo ""
 
+echo "=== A5. New VMA WP_SYNC registration ==="
+grep -E "Registering new VMA.*WP_SYNC" "$PRIMARY_LOG" 2>/dev/null | head -10 || echo "No new VMA WP_SYNC registrations"
+echo ""
+
+echo "=== A6. All tracked VMAs ==="
+grep -E "tracked VMA|nr_tracked_vmas" "$PRIMARY_LOG" 2>/dev/null | tail -20 || echo "No tracked VMA info"
+echo ""
+
 # ============================================
 # SECTION B: PAGE STATE TRACKER ISSUES (Replica)
 # ============================================
@@ -109,21 +117,128 @@ echo "=== D3. Pages discarded from buffer ==="
 grep -E "discard.*dirty|buffer.*discard" "$SERVER_LOG" 2>/dev/null | head -10 || echo "No discard logs"
 echo ""
 
+echo "=== D4. COW phase transitions ==="
+grep -E "COW_PHASE|phase.*SYNC|phase.*ASYNC|phase.*CONVERGE" "$PRIMARY_LOG" 2>/dev/null | tail -10 || echo "No phase info"
+echo ""
+
+echo "=== D5. WP_SYNC setup ==="
+grep -E "WP_SYNC|setup_sync_for_dirty" "$PRIMARY_LOG" 2>/dev/null | tail -10 || echo "No WP_SYNC setup info"
+echo ""
+
 # ============================================
-# SECTION E: SPECIFIC ADDRESS ANALYSIS
+# SECTION E: AUTOMATIC ADDRESS ANALYSIS
 # ============================================
+echo "========================================================"
+echo "=== E. AUTOMATIC FAILING ADDRESS ANALYSIS ==="
+echo "========================================================"
+echo ""
+
+# Extract new VMA ranges from primary log
+echo "=== E1. New VMA ranges detected ==="
+NEW_VMAS=$(grep -oE "Added lazy VMA for new region 0x[0-9a-f]+-0x[0-9a-f]+" "$PRIMARY_LOG" 2>/dev/null | \
+           sed 's/Added lazy VMA for new region //')
+if [ -n "$NEW_VMAS" ]; then
+    echo "$NEW_VMAS"
+else
+    echo "No new VMAs found"
+fi
+echo ""
+
+# Function to check if address is in a VMA range
+check_in_vma() {
+    local addr=$1
+    local addr_dec=$((16#${addr#0x}))
+    while IFS='-' read -r start end; do
+        local start_dec=$((16#${start#0x}))
+        local end_dec=$((16#${end#0x}))
+        if [ "$addr_dec" -ge "$start_dec" ] && [ "$addr_dec" -lt "$end_dec" ]; then
+            echo "YES (in $start-$end)"
+            return 0
+        fi
+    done <<< "$NEW_VMAS"
+    echo "NO"
+    return 1
+}
+
+# Extract and analyze "Failed to unprotect" addresses
+echo "=== E2. Failed to unprotect addresses ==="
+UNPROTECT_ADDRS=$(grep -oE "Failed to unprotect page at 0x[0-9a-f]+" "$PRIMARY_LOG" 2>/dev/null | \
+                  grep -oE "0x[0-9a-f]+" | sort -u)
+if [ -n "$UNPROTECT_ADDRS" ]; then
+    while read -r addr; do
+        in_new=$(check_in_vma "$addr")
+        echo "  $addr - In new VMA: $in_new"
+        # Show context from primary log
+        echo "    Context from primary:"
+        grep -B2 -A2 "$addr" "$PRIMARY_LOG" 2>/dev/null | head -10 | sed 's/^/      /'
+        echo ""
+    done <<< "$UNPROTECT_ADDRS"
+else
+    echo "  No unprotect failures found"
+fi
+echo ""
+
+# Extract and analyze ILLEGAL_TRANSITION addresses
+echo "=== E3. ILLEGAL_TRANSITION addresses ==="
+ILLEGAL_ADDRS=$(grep -oE "ILLEGAL_TRANSITION: 0x[0-9a-f]+" "$SERVER_LOG" 2>/dev/null | \
+                grep -oE "0x[0-9a-f]+" | sort -u)
+if [ -n "$ILLEGAL_ADDRS" ]; then
+    while read -r addr; do
+        in_new=$(check_in_vma "$addr")
+        echo "  $addr - In new VMA: $in_new"
+        # Show page history
+        echo "    Page history:"
+        grep -A10 "PAGE_HISTORY $addr" "$SERVER_LOG" 2>/dev/null | head -12 | sed 's/^/      /'
+        echo ""
+    done <<< "$ILLEGAL_ADDRS"
+else
+    echo "  No illegal transitions found"
+fi
+echo ""
+
+# Extract and analyze UFFDIO_COPY error addresses
+echo "=== E4. UFFDIO_COPY error addresses ==="
+COPY_ERR_ADDRS=$(grep -B5 "UFFDIO_COPY got error\|UFFDIO_COPY err" "$SERVER_LOG" 2>/dev/null | \
+                 grep -oE "0x[0-9a-f]{10,}" | sort -u | head -10)
+if [ -n "$COPY_ERR_ADDRS" ]; then
+    while read -r addr; do
+        in_new=$(check_in_vma "$addr")
+        echo "  $addr - In new VMA: $in_new"
+        # Show context
+        echo "    Context:"
+        grep -B3 -A3 "$addr" "$SERVER_LOG" 2>/dev/null | grep -E "COPY|HISTORY|transition" | head -8 | sed 's/^/      /'
+        echo ""
+    done <<< "$COPY_ERR_ADDRS"
+else
+    echo "  No UFFDIO_COPY errors found"
+fi
+echo ""
+
+# Extract and analyze "no uffd found" addresses
+echo "=== E5. 'no uffd found' addresses (drain thread) ==="
+NO_UFFD_ADDRS=$(grep -oE "DRAIN_COPY: 0x[0-9a-f]+ no uffd" "$SERVER_LOG" 2>/dev/null | \
+                grep -oE "0x[0-9a-f]+" | sort -u | head -10)
+if [ -n "$NO_UFFD_ADDRS" ]; then
+    while read -r addr; do
+        in_new=$(check_in_vma "$addr")
+        echo "  $addr - In new VMA: $in_new"
+    done <<< "$NO_UFFD_ADDRS"
+else
+    echo "  No 'no uffd found' errors"
+fi
+echo ""
+
+# Manual address analysis if provided
 if [ -n "$FAIL_ADDR" ]; then
-    echo "========================================================"
-    echo "=== E. SPECIFIC ADDRESS ANALYSIS: $FAIL_ADDR ==="
-    echo "========================================================"
+    echo "=== E6. Manual address analysis: $FAIL_ADDR ==="
+    in_new=$(check_in_vma "$FAIL_ADDR")
+    echo "  In new VMA: $in_new"
     echo ""
-
-    echo "=== E1. Address in primary log ==="
-    grep -i "$FAIL_ADDR" "$PRIMARY_LOG" 2>/dev/null | head -20 || echo "Not found in primary"
+    echo "  In primary log:"
+    grep -i "$FAIL_ADDR" "$PRIMARY_LOG" 2>/dev/null | head -10 | sed 's/^/    /'
     echo ""
-
-    echo "=== E2. Address in server log ==="
-    grep -i "$FAIL_ADDR" "$SERVER_LOG" 2>/dev/null | head -20 || echo "Not found in server"
+    echo "  In server log:"
+    grep -i "$FAIL_ADDR" "$SERVER_LOG" 2>/dev/null | head -10 | sed 's/^/    /'
     echo ""
 fi
 
