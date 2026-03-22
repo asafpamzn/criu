@@ -2373,9 +2373,9 @@ static int final_queue_drain(struct active_image *img, pid_t source_pid,
 		}
 
 		/* No more pending work */
-		if (cow_sent == 0 && req_sent == 0 && !is_convergence_mode())
+		if (cow_sent == 0 && req_sent == 0)
 		{
-			pr_err("!is_convergence_mode() break;\n");
+			pr_err("break from final_queue_drain;\n");
 			break;
 		}
 	}
@@ -2537,10 +2537,8 @@ static int page_server_serve(int sk)
 
 	while (1) {
 		struct page_server_iov pi;
-		u32 cmd;
-		pr_perror("__recv\n");
-		ret = __recv(sk, &pi, sizeof(pi), MSG_WAITALL);
-		pr_perror("post __recv ret = %d\n", ret);
+		u32 cmd;		
+		ret = __recv(sk, &pi, sizeof(pi), MSG_WAITALL);		
 		if (!ret)
 			break;
 
