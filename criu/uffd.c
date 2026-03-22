@@ -1817,9 +1817,14 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 		iov = find_iov(lpi, address);
 		if (!iov) {
 			/*
-			 * IOV not found - this page may not need lazy restore,
-			 * or drain thread will fill it. Don't corrupt with zeros.
+			 * IOV not found. If dirty bitmap received, all pages should
+			 * have been transferred - zero-fill this page. Otherwise
+			 * wait for drain thread to fill it.
 			 */
+			if (is_dirty_bitmap_received()) {
+				lp_warn(lpi, "Page 0x%llx IOV not found after convergence - zero fill\n", address);
+				return uffd_zero(lpi, address, 1);
+			}
 			lp_warn(lpi, "Page 0x%llx IOV not found in COW mode - waiting for drain\n", address);
 			return 0;
 		}
