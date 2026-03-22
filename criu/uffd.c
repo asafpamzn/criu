@@ -2424,7 +2424,8 @@ static void switch_to_convergence_callback(void)
 	else
 		pr_warn("Failed to switch to convergence callback\n");
 }
-
+static int create_iovs_for_new_ranges(unsigned long *dirty_ranges,
+				      unsigned int nr_dirty_ranges);
 /*
  * Non-blocking accept handler for when criu restore connects.
  * Called from epoll loop when restore connects on the Unix socket.
@@ -2558,21 +2559,33 @@ static int create_iovs_for_new_ranges(unsigned long *dirty_ranges,
 		unsigned long start = dirty_ranges[i * 2];
 		unsigned long len = dirty_ranges[i * 2 + 1];
 		unsigned long end = start + len;
-		bool found = false;
+		bool fully_covered = false;
 
-		/* Check if any lpi has IOVs covering this range */
+		/*
+		 * Check if any lpi has IOVs fully covering this range.
+		 * New VMAs shouldn't overlap with existing IOVs since they
+		 * represent memory that didn't exist in Phase 1. But check
+		 * both start and end to be safe (in case ranges were merged).
+		 */
 		list_for_each_entry(lpi, &lpis, l) {
+			struct lazy_iov *iov_start, *iov_end;
+
 			if (lpi->exited)
 				continue;
-			if (find_iov(lpi, start)) {
-				found = true;
+
+			iov_start = find_iov(lpi, start);
+			iov_end = find_iov(lpi, end - 1);
+
+			if (iov_start && iov_end) {
+				/* Both endpoints covered - assume fully covered */
+				fully_covered = true;
 				break;
 			}
 		}
 
-		if (!found) {
+		if (!fully_covered) {
 			/*
-			 * No existing IOV for this range - it's a new VMA.
+			 * Range not fully covered by existing IOVs - likely a new VMA.
 			 * Add IOV to the first active lpi (in COW mode
 			 * there's typically one process being migrated).
 			 */
