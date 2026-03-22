@@ -1612,12 +1612,64 @@ add_region:
 }
 
 /*
+ * cow_extend_tracked_vmas - Add new regions to tracked_vmas array
+ *
+ * Extends g_cow_info->tracked_vmas to include new VMA regions discovered
+ * in Phase 3. This ensures the fault handler can find these regions during
+ * WP_SYNC convergence.
+ *
+ * @ranges: Array of [start, len, ...] pairs
+ * @nr_ranges: Number of ranges
+ *
+ * Returns: 0 on success, -1 on error
+ */
+static int cow_extend_tracked_vmas(unsigned long *ranges, unsigned int nr_ranges)
+{
+	struct cow_dump_info *cdi = g_cow_info;
+	struct cow_tracked_vma *new_tracked;
+	unsigned int new_total;
+	unsigned int i;
+
+	if (!cdi || nr_ranges == 0)
+		return 0;
+
+	new_total = cdi->nr_tracked_vmas + nr_ranges;
+	new_tracked = xrealloc(cdi->tracked_vmas,
+			       new_total * sizeof(*new_tracked));
+	if (!new_tracked) {
+		pr_err("Failed to extend tracked_vmas for %u new regions\n",
+		       nr_ranges);
+		return -1;
+	}
+
+	/* Append new regions (ranges are [start, len] pairs) */
+	for (i = 0; i < nr_ranges; i++) {
+		unsigned long start = ranges[i * 2];
+		unsigned long len = ranges[i * 2 + 1];
+
+		new_tracked[cdi->nr_tracked_vmas + i].start = start;
+		new_tracked[cdi->nr_tracked_vmas + i].end = start + len;
+		pr_info("Added new tracked VMA: 0x%lx-0x%lx\n",
+			start, start + len);
+	}
+
+	cdi->tracked_vmas = new_tracked;
+	cdi->nr_tracked_vmas = new_total;
+	pr_info("Extended tracked_vmas: now %u total\n", new_total);
+
+	return 0;
+}
+
+/*
  * cow_detect_new_vmas - Detect VMAs that appeared after Phase 1
  *
  * Compares the current VMA list with the tracked VMAs from Phase 1.
  * Returns ranges for any new or extended VMA regions that weren't
  * tracked. These regions need to be marked dirty for WP_SYNC since
  * we have no record of their pages from Phase 2.
+ *
+ * Also updates g_cow_info->tracked_vmas to include the new regions
+ * so the fault handler can find them during convergence.
  *
  * @vmas: Current VMA list (from collect_mappings in Phase 3)
  * @new_ranges: Output array of [start, len, ...] pairs
@@ -1634,8 +1686,9 @@ int cow_detect_new_vmas(struct vm_area_list *vmas,
 	unsigned long *ranges = NULL;
 	unsigned int nr_ranges = 0;
 	unsigned int capacity = 0;
+	struct cow_dump_info *cdi = g_cow_info;
 
-	if (!g_cow_info) {
+	if (!cdi) {
 		pr_err("COW dump not initialized\n");
 		return -1;
 	}
@@ -1644,7 +1697,7 @@ int cow_detect_new_vmas(struct vm_area_list *vmas,
 	*nr_new_ranges = 0;
 
 	pr_info("Detecting new VMAs (comparing against %u tracked VMAs)\n",
-		g_cow_info->nr_tracked_vmas);
+		cdi->nr_tracked_vmas);
 
 	list_for_each_entry(vma, &vmas->h, list) {
 		unsigned long start = vma->e->start;
@@ -1666,6 +1719,11 @@ int cow_detect_new_vmas(struct vm_area_list *vmas,
 	*nr_new_ranges = nr_ranges;
 
 	pr_info("Detected %u new VMA regions\n", nr_ranges);
+
+	/* Extend tracked_vmas so fault handler can find new regions */
+	if (cow_extend_tracked_vmas(ranges, nr_ranges))
+		return -1;
+
 	return 0;
 }
 
