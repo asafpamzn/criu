@@ -1232,8 +1232,15 @@ static int uffd_copy(struct lazy_pages_info *lpi, __u64 address, unsigned long *
 			return -1;
 		}
 
-		/* If uffd_check_op_error handled it (e.g., ENOSPC/ESRCH), return success */
-		page_state_print_history(address);
+		/*
+		 * EEXIST means duplicate copy attempt - this is a bug!
+		 * Report and fail to catch coordination issues.
+		 */
+		if (errno == EEXIST) {
+			lp_err(lpi, "BUG: UFFDIO_COPY EEXIST at 0x%llx - duplicate copy!\n", address);
+			page_state_print_history(address);
+			return -1;
+		}
 		page_state_set(address, PAGE_STATE_DISCARDED);
 		return 0;
 	}
@@ -1255,7 +1262,14 @@ static int uffd_copy(struct lazy_pages_info *lpi, __u64 address, unsigned long *
 			page_state_set(address, PAGE_STATE_DISCARDED);
 			return -1;
 		}
-		page_state_print_history(address);
+		/*
+		 * EEXIST means duplicate copy attempt - this is a bug!
+		 */
+		if (errno == EEXIST) {
+			lp_err(lpi, "BUG: UFFDIO_COPY soft EEXIST at 0x%llx - duplicate copy!\n", address);
+			page_state_print_history(address);
+			return -1;
+		}
 		page_state_set(address, PAGE_STATE_DISCARDED);
 		return 0;
 	}
@@ -1774,14 +1788,15 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 
 			if (ioctl(lpi->lpfd.fd, UFFDIO_COPY, &uffd_copy) < 0) {
 				if (errno == EEXIST) {
-					pr_err("COW_TRACE PF_COPY: 0x%llx FAILED errno=EEXIST\n", address);
+					/* Duplicate copy - this is a bug! */
+					lp_err(lpi, "BUG: PF buffer EEXIST at 0x%llx - duplicate copy!\n", address);
 					page_state_print_history(address);
-					page_state_set(address, PAGE_STATE_DISCARDED);
-				} else {
-					pr_err("COW_TRACE PF_COPY: 0x%llx FAILED errno=%d\n", address, errno);
-					page_state_print_history(address);
-					page_state_set(address, PAGE_STATE_DISCARDED);
+					xfree(data);
+					return -1;
 				}
+				pr_err("COW_TRACE PF_COPY: 0x%llx FAILED errno=%d\n", address, errno);
+				page_state_print_history(address);
+				page_state_set(address, PAGE_STATE_DISCARDED);
 			} else {
 				page_state_set(address, PAGE_STATE_COPIED);
 			}

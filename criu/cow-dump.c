@@ -6,6 +6,7 @@
 #include <sys/mman.h>
 #include <sys/ioctl.h>
 #include <errno.h>
+#include <stdbool.h>
 #include <linux/userfaultfd.h>
 #include <pthread.h>
 #include <time.h>
@@ -40,6 +41,7 @@
 struct cow_tracked_vma {
 	unsigned long start;
 	unsigned long end;
+	bool is_new;  /* True if VMA was detected in Phase 3 (needs uffd registration) */
 };
 
 /* MPSC queue node type for COW page entries (multi-producer safe) */
@@ -1670,7 +1672,8 @@ static int cow_extend_tracked_vmas(unsigned long *ranges, unsigned int nr_ranges
 
 		new_tracked[cdi->nr_tracked_vmas + i].start = start;
 		new_tracked[cdi->nr_tracked_vmas + i].end = start + len;
-		pr_info("Added new tracked VMA: 0x%lx-0x%lx\n",
+		new_tracked[cdi->nr_tracked_vmas + i].is_new = true;
+		pr_info("Added new tracked VMA: 0x%lx-0x%lx (needs uffd registration)\n",
 			start, start + len);
 
 		/* Also add to global_lazy_vmas for page transfer */
@@ -1915,6 +1918,33 @@ int cow_setup_sync_for_dirty(unsigned long *dirty_ranges,
 		close(cdi->uffd);
 	cdi->uffd = new_uffd;
 	cdi->uffd_async = -1;
+
+	/*
+	 * Register new VMAs detected in Phase 3 with uffd.
+	 * These weren't registered during Phase 1 parasite setup.
+	 */
+	for (i = 0; i < cdi->nr_tracked_vmas; i++) {
+		if (!cdi->tracked_vmas[i].is_new)
+			continue;
+
+		reg.range.start = cdi->tracked_vmas[i].start;
+		reg.range.len = cdi->tracked_vmas[i].end - cdi->tracked_vmas[i].start;
+		reg.mode = UFFDIO_REGISTER_MODE_WP;
+
+		pr_info("Registering new VMA 0x%lx-0x%lx with WP_SYNC uffd\n",
+			cdi->tracked_vmas[i].start, cdi->tracked_vmas[i].end);
+
+		if (ioctl(cdi->uffd, UFFDIO_REGISTER, &reg)) {
+			if (errno == ENOMEM || errno == EINVAL) {
+				pr_warn("New VMA registration 0x%lx-0x%lx skipped (VMA changed)\n",
+					cdi->tracked_vmas[i].start, cdi->tracked_vmas[i].end);
+				continue;
+			}
+			pr_perror("UFFDIO_REGISTER for new VMA 0x%lx-0x%lx failed",
+				  cdi->tracked_vmas[i].start, cdi->tracked_vmas[i].end);
+			return -1;
+		}
+	}
 
 	/* Register and write-protect each dirty range */
 	for (i = 0; i < nr_dirty_ranges; i++) {
