@@ -89,6 +89,9 @@ extern int send_dirty_bitmap_to_replica(int sk, u64 dst_id,
 /* COW phased migration: send dirty bitmap using current page server connection */
 extern int send_cow_dirty_bitmap(unsigned long *ranges, unsigned int nr_ranges);
 
+/* COW phased migration: signal replica all pages sent, can zero-fill rest */
+extern int send_all_pages_sent_signal(void);
+
 /* COW phased migration: signal replica that inventory.img is ready */
 extern int send_inventory_ready_signal(void);
 

@@ -1815,6 +1815,15 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 			lpi->copied_pages++;
 			return 0;
 		} else {
+			/*
+			 * Page not in buffer. If all pages have been sent,
+			 * zero-fill this page (applies to ALL VMAs).
+			 */
+			if (is_all_pages_sent_received()) {
+				lp_debug(lpi, "Page 0x%llx not in buffer, all pages sent - zero-filling\n", address);
+				page_state_set(address, PAGE_STATE_PF_PENDING);
+				return uffd_zero(lpi, address, 1);
+			}
 			lp_debug(lpi, "DEBUG PF: Page 0x%llx NOT in buffer, will request from server\n", address);
 		}
 	}
@@ -1853,22 +1862,6 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 			}
 			lp_warn(lpi, "Page 0x%llx IOV not found in COW mode - waiting for drain\n", address);
 			return 0;
-		}
-
-		/*
-		 * New VMAs created after Phase 1 don't have pagemap entries.
-		 * Request the page directly from the page server.
-		 */
-		if (iov->is_new_vma) {
-			lp_debug(lpi, "Page 0x%llx in new VMA - requesting from server\n", address);
-			uffd_stats.total_pf_reqs++;
-			pf_tracker_add(address, 1, lpi->pid, true);
-
-			if (request_remote_pages(lpi->pr.img_id, address, 1) < 0) {
-				lp_err(lpi, "Error requesting new VMA page 0x%llx\n", address);
-				return -1;
-			}
-			return 0;  /* Page will arrive via bulk stream */
 		}
 
 		img_addr = iov->img_start + (address - iov->start);
@@ -2386,6 +2379,7 @@ static unsigned long *pending_dirty_ranges = NULL;
 static unsigned int pending_nr_dirty_ranges = 0;
 static bool dirty_bitmap_received = false;
 static bool inventory_ready_received = false;
+static bool all_pages_sent_received = false;
 
 /*
  * Pre-buffer callback: pages arrive before criu restore connects.
@@ -2718,6 +2712,19 @@ void set_inventory_ready_received(void)
 bool is_inventory_ready_received(void)
 {
 	return inventory_ready_received;
+}
+
+/* Set all_pages_sent flag (called when PS_IOV_ALL_PAGES_SENT received) */
+void set_all_pages_sent_received(void)
+{
+	pr_info("All pages sent signal received - can zero-fill new VMA pages\n");
+	all_pages_sent_received = true;
+}
+
+/* Check if all pages have been sent by primary */
+bool is_all_pages_sent_received(void)
+{
+	return all_pages_sent_received;
 }
 
 /*

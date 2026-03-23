@@ -36,6 +36,11 @@ extern bool is_inventory_ready_received(void);
 /* Set inventory ready flag (called by page-xfer when signal received) */
 extern void set_inventory_ready_received(void);
 
+/* Check if all pages have been sent (PS_IOV_ALL_PAGES_SENT received) */
+extern bool is_all_pages_sent_received(void);
+
+/* Set all_pages_sent flag (called by page-xfer when signal received) */
+extern void set_all_pages_sent_received(void);
 
 /* COW Phase 2: Initialize page buffer for pre-buffering */
 extern int page_buffer_init(void);

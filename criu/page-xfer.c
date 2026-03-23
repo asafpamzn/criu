@@ -95,6 +95,7 @@ static void psi2iovec(struct page_server_iov *ps, struct iovec *iov)
 #define PS_IOV_BULK_COMPLETE_ACK 13 /* Replica → Primary: all bulk pages received */
 #define PS_IOV_INVENTORY_READY  14  /* Primary → Replica: inventory.img written */
 #define PS_IOV_DIRTY_BITMAP_ACK 15  /* Replica → Primary: dirty bitmap received */
+#define PS_IOV_ALL_PAGES_SENT   16  /* Primary → Replica: all pages sent, zero-fill rest */
 
 #define PS_IOV_CLOSE	   0x1023
 
@@ -388,6 +389,29 @@ int send_cow_dirty_bitmap(unsigned long *ranges, unsigned int nr_ranges)
 		return -1;
 
 	return 0;
+}
+
+/*
+ * Send "all pages sent" signal to replica (COW phased migration).
+ * Called by primary after dirty bitmap transfer completes, so replica
+ * knows it can zero-fill any remaining page faults for new VMAs.
+ */
+int send_all_pages_sent_signal(void)
+{
+	struct page_server_iov pi = {
+		.cmd = PS_IOV_ALL_PAGES_SENT,
+		.nr_pages = 0,
+		.vaddr = 0,
+		.dst_id = 0,
+	};
+
+	if (page_server_sk < 0) {
+		pr_err("No page server socket for all_pages_sent signal\n");
+		return -1;
+	}
+
+	pr_info("Sending all_pages_sent signal to replica\n");
+	return send_psi(page_server_sk, &pi);
 }
 
 /*
@@ -2383,6 +2407,41 @@ static int final_queue_drain(struct active_image *img, pid_t source_pid,
 	return 0;
 }
 
+/*
+ * Verify all pages in all VMAs have been sent by checking sent_bitmap.
+ * Returns: number of unsent pages (0 = all sent), -1 on error
+ */
+static long verify_all_pages_sent(u64 dst_id)
+{
+	struct lazy_vma_entry *lve;
+	long total_unsent = 0;
+
+	list_for_each_entry(lve, get_global_lazy_vmas(), list) {
+		unsigned long page_idx;
+		long vma_unsent = 0;
+
+		if (lve->dst_id != dst_id)
+			continue;
+
+		/* All VMAs must have sent_bitmap - assert if missing */
+		BUG_ON(!lve->sent_bitmap);
+
+		for (page_idx = 0; page_idx < lve->total_pages; page_idx++) {
+			if (!bitmap_test_nonatomic(lve->sent_bitmap, page_idx))
+				vma_unsent++;
+		}
+
+		if (vma_unsent > 0) {
+			pr_warn("VMA 0x%lx-0x%lx: %ld/%lu pages not sent\n",
+				(unsigned long)lve->start, (unsigned long)lve->end,
+				vma_unsent, lve->total_pages);
+			total_unsent += vma_unsent;
+		}
+	}
+
+	return total_unsent;
+}
+
 /* Unified background thread serving all images */
 static void *unified_page_server_thread(void *arg)
 {
@@ -2424,26 +2483,28 @@ static void *unified_page_server_thread(void *arg)
 			if (final_queue_drain(img, source_pid, &stats) < 0) {
 				pr_err("Error in final queue drain\n");
 			}
-			/*
-			 * In convergence mode, completion requires both:
-			 *   - remaining_pages == 0 (all dirty pages sent)
-			 *   - COW queue empty (all WP_SYNC faults processed)
-			 */
-			if (img->remaining_pages == 0 &&
-			    (!is_convergence_mode() || !cow_has_pending_pages())) {
-				pthread_spin_unlock(&active_images_lock);
-				if (send_image_complete(img) < 0)
-					pr_err("Failed to complete image dst_id=%lu\n",
-					       img->dst_id);
-				pthread_spin_lock(&active_images_lock);
-				list_del(&img->list);
-				xfree(img);
-				continue;
+			pthread_spin_unlock(&active_images_lock);
+
+			if (is_convergence_mode()) {
+				long unsent;
+
+				/* Verify all pages in all VMAs were sent */
+				unsent = verify_all_pages_sent(img->dst_id);
+				BUG_ON(unsent > 0);
+
+				/*
+				 * Signal replica that all pages have been sent.
+				 * Replica can zero-fill any remaining page faults.
+				 */
+				if (send_all_pages_sent_signal() < 0)
+					pr_err("Failed to send all_pages_sent signal\n");
 			}
 
-			pr_err("Failed processing image dst_id=%lu remaining_pages=%lu, closing stream\n",
-			       img->dst_id, img->remaining_pages);
-			shutdown(img->main_sk, SHUT_RDWR);
+			if (send_image_complete(img) < 0)
+				pr_err("Failed to complete image dst_id=%lu\n",
+				       img->dst_id);
+
+			pthread_spin_lock(&active_images_lock);
 			list_del(&img->list);
 			xfree(img);
 		}
@@ -3204,6 +3265,14 @@ static int read_bulk_header(struct ps_async_read *ar, int flags)
 	case PS_IOV_INVENTORY_READY:
 		/* Primary signals inventory.img is ready */
 		set_inventory_ready_received();
+		ar->rb = 0;
+		ar->compress_state = COMPRESS_STATE_READING_HEADER;
+		return BULK_STREAM_PROGRESS;
+
+	case PS_IOV_ALL_PAGES_SENT:
+		/* Primary signals all pages sent - replica can zero-fill rest */
+		pr_info("Received all_pages_sent signal from primary\n");
+		set_all_pages_sent_received();
 		ar->rb = 0;
 		ar->compress_state = COMPRESS_STATE_READING_HEADER;
 		return BULK_STREAM_PROGRESS;

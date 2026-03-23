@@ -2950,11 +2950,16 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 	}
 	pr_info("Dirty bitmap sent successfully\n");
 
-	/* Close Phase 4 socket - replica received dirty bitmap */
-	close_page_server_socket();
-
 	/* === PHASE 5-6: Convergence === */
 	pr_err("=== PHASE 5-6: Convergence page server ===\n");
+
+	/*
+	 * The all_pages_sent signal is sent by unified_page_server_thread
+	 * after final_queue_drain verifies all pages were sent via sent_bitmap.
+	 */
+
+	/* Close socket after thread signals completion */
+	close_page_server_socket();
 	cow_set_phase(COW_PHASE_SYNC_CONVERGE);
 	/* Inventory was already written after skeleton dump - don't duplicate */
 	xfree(dirty_ranges);

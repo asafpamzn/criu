@@ -336,7 +336,7 @@ static void check_and_print_cow_stats(void)
 	time_t last = __atomic_load_n(&cow_stats.last_print_time, __ATOMIC_RELAXED);
 	unsigned long wr, fk, rm, un, cp, up, wk, af, rf, uf, wf, re, ea;
 
-	if (now - last < 1)
+	if (now - last < 60)
 		return;
 	if (!__atomic_compare_exchange_n(&cow_stats.last_print_time, &last, now,
 					 false, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
