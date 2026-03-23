@@ -1864,6 +1864,21 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 			return 0;
 		}
 
+		/*
+		 * New VMAs don't have pagemap entries - they didn't exist in Phase 1.
+		 * Request page directly from page server.
+		 */
+		if (iov->is_new_vma) {
+			lp_debug(lpi, "Page 0x%llx in new VMA - requesting from server\n", address);
+			uffd_stats.total_pf_reqs++;
+			pf_tracker_add(address, 1, lpi->pid, true);
+			if (request_remote_pages(lpi->pr.img_id, address, 1) < 0) {
+				lp_err(lpi, "Error requesting new VMA page 0x%llx\n", address);
+				return -1;
+			}
+			return 0;
+		}
+
 		img_addr = iov->img_start + (address - iov->start);
 
 		uffd_stats.total_pf_reqs++;
