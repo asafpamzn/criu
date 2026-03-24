@@ -26,7 +26,7 @@ sudo rm -rf "$IMAGES_DIR"/*
 
 # Step 2: Start restore on replica (it will wait for page server)
 echo "Step 2: Starting restore on replica..."
-$SSH ubuntu@$REPLICA_SSH_HOST "sudo $SCRIPT_DIR/restore_new.sh" &
+stdbuf -oL $SSH ubuntu@$REPLICA_SSH_HOST "sudo $SCRIPT_DIR/restore_new.sh" 2>&1 | stdbuf -oL sed 's/^/[replica] /' &
 REPLICA_PID=$!
 
 # Step 3: Wait for replica ready signal
