@@ -1672,7 +1672,7 @@ static void add_page_request(unsigned long vaddr, unsigned long nr_pages, int sk
 	entry->sk = sk;
 	entry->dst_id = dst_id;
 
-	pr_err("Requesting page at %lx (nr_pages=%lu, dst_id=%lu)\n", vaddr, nr_pages, dst_id);
+	pr_debug("Requesting page at %lx (nr_pages=%lu, dst_id=%lu)\n", vaddr, nr_pages, dst_id);
 
 	/* Location will be looked up on first access */
 	entry->ppb = NULL;
@@ -2070,7 +2070,7 @@ static int send_request_page_lazy(struct page_request_entry *req, struct active_
 		
 		/* Check if already sent */
 		if (bitmap_test_nonatomic(lve->sent_bitmap, page_idx)) {
-			pr_err("Request page 0x%lx already sent, skipping\n", page_vaddr);
+			pr_debug("Request page 0x%lx already sent, skipping\n", page_vaddr);
 			continue;
 		}
 
@@ -2548,7 +2548,7 @@ static int page_server_get_pages(int sk, struct page_server_iov *pi)
 		add_page_request(pi->vaddr + (i * PAGE_SIZE), 1, sk, pi->dst_id);
 	}
 	
-	pr_err("Split and enqueued %lu page requests starting at vaddr=%lx\n", 
+	pr_debug("Split and enqueued %lu page requests starting at vaddr=%lx\n", 
 		 (unsigned long)pi->nr_pages, (unsigned long)pi->vaddr);
 	
 	/* Return immediately - background thread will send the response */
