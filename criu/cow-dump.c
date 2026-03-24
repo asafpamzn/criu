@@ -1962,7 +1962,7 @@ int cow_setup_sync_for_dirty(unsigned long *dirty_ranges,
 			 * modified during traffic. Skip silently.
 			 */
 			if (errno == ENOMEM || errno == EINVAL) {
-				pr_debug("UFFDIO_REGISTER WP_SYNC 0x%lx-0x%lx skipped "
+				pr_err("UFFDIO_REGISTER WP_SYNC 0x%lx-0x%lx skipped "
 					 "(VMA changed): %s\n",
 					 start, start + len, strerror(errno));
 				register_skip++;
@@ -1972,6 +1972,8 @@ int cow_setup_sync_for_dirty(unsigned long *dirty_ranges,
 				  start, start + len);
 			continue; /* Best effort */
 		}
+
+		pr_err("UFFDIO_REGISTER WP_SYNC 0x%lx-0x%lx OK\n", start, start + len);
 
 		wp.range.start = start;
 		wp.range.len = len;
@@ -1985,7 +1987,7 @@ int cow_setup_sync_for_dirty(unsigned long *dirty_ranges,
 		registered_ok++;
 	}
 	pr_warn("WP_SYNC registration: %u ok, %u skipped (VMA changed), %u total\n",
-		registered_ok, register_skip, nr_dirty_ranges);
+		registered_ok, f, nr_dirty_ranges);
 
 	cdi->phase = COW_PHASE_SYNC_CONVERGE;
 #if 1 //TODO check restarted later on at cr_dump_finish
