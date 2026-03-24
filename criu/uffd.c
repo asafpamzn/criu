@@ -1770,7 +1770,7 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 
 	/* Align requested address to the next page boundary */
 	address = msg->arg.pagefault.address & ~(page_size() - 1);
-	lp_warn(lpi, "#PF at 0x%llx\n", address);
+	lp_debug(lpi, "#PF at 0x%llx\n", address);
 
 	/*
 	 * In COW phased migration, check if the page is already
@@ -1781,7 +1781,7 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 	if (opts.cow_dump) {
 		void *data = cow_page_buffer_lookup_and_remove(address);
 
-		pr_err("COW_TRACE PF_LOOKUP: 0x%llx found=%s\n", address, data ? "YES" : "NO");
+		pr_debug("COW_TRACE PF_LOOKUP: 0x%llx found=%s\n", address, data ? "YES" : "NO");
 
 		if (data) {
 			struct uffdio_copy uffd_copy = {
