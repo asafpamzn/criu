@@ -227,6 +227,7 @@ unsigned long prepare_lazy_vmas_for_convergence(unsigned long *dirty_ranges,
 	list_for_each_entry(lve, &global_lazy_vmas, list) {
 		unsigned long vma_start = lve->start;
 		unsigned long vma_end = lve->end;
+		_Atomic unsigned long *sent_counter = get_sent_pages_counter(lve->dst_id);
 
 		/* Check each dirty range against this VMA */
 		for (i = 0; i < nr_dirty_ranges; i++) {
@@ -253,7 +254,7 @@ unsigned long prepare_lazy_vmas_for_convergence(unsigned long *dirty_ranges,
 			for (; page_idx < page_idx_end; page_idx++) {
 				if (lve->sent_bitmap &&
 				    bitmap_test_nonatomic(lve->sent_bitmap, page_idx)) {
-					bitmap_clear_nonatomic(lve->sent_bitmap, page_idx);
+					bitmap_clear_nonatomic(lve->sent_bitmap, page_idx, sent_counter);
 					total_dirty_pages++;
 				}
 			}

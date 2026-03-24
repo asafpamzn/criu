@@ -95,4 +95,7 @@ extern int send_all_pages_sent_signal(void);
 /* COW phased migration: signal replica that inventory.img is ready */
 extern int send_inventory_ready_signal(void);
 
+/* COW phased migration: get sent_pages counter for a dst_id */
+extern _Atomic unsigned long *get_sent_pages_counter(u64 dst_id);
+
 #endif /* __CR_PAGE_XFER__H__ */

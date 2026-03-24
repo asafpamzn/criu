@@ -72,21 +72,29 @@ static inline bool bitmap_test_nonatomic(const unsigned char *bitmap,
 /*
  * Non-atomic set - plain memory store without ordering guarantees.
  * Safe for single-threaded contexts only (no concurrent writers).
+ * If counter is non-NULL, atomically increments it when bit is set.
  */
 static inline void bitmap_set_nonatomic(unsigned char *bitmap,
-					unsigned long page_idx)
+					unsigned long page_idx,
+					_Atomic unsigned long *counter)
 {
 	bitmap[page_idx / 8] |= (1 << (page_idx % 8));
+	if (counter)
+		(*counter)++;
 }
 
 /*
  * Non-atomic clear - plain memory store without ordering guarantees.
  * Safe for single-threaded contexts only (no concurrent writers).
+ * If counter is non-NULL, atomically decrements it when bit is cleared.
  */
 static inline void bitmap_clear_nonatomic(unsigned char *bitmap,
-					  unsigned long page_idx)
+					  unsigned long page_idx,
+					  _Atomic unsigned long *counter)
 {
 	bitmap[page_idx / 8] &= ~(1 << (page_idx % 8));
+	if (counter)
+		(*counter)--;
 }
 
 #endif /* __CR_ATOMIC_BITMAP_H__ */
