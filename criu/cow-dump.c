@@ -1973,7 +1973,7 @@ int cow_setup_sync_for_dirty(unsigned long *dirty_ranges,
 			continue; /* Best effort */
 		}
 
-		pr_err("UFFDIO_REGISTER WP_SYNC 0x%lx-0x%lx OK\n", start, start + len);
+		pr_debug("UFFDIO_REGISTER WP_SYNC 0x%lx-0x%lx OK\n", start, start + len);
 
 		wp.range.start = start;
 		wp.range.len = len;
