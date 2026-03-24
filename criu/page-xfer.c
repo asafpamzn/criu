@@ -1708,10 +1708,10 @@ static unsigned long get_page_request_queue_size(void)
 struct active_image {
 	u64 dst_id;
 	int main_sk;
-	unsigned long total_pages;
+	_Atomic unsigned long total_pages;  /* Atomic: updated when new VMAs added */
 	unsigned long total_cow_pages;
 	unsigned long total_req_pages;
-	_Atomic unsigned long sent_pages;  /* Atomic count of pages sent (bits set in sent_bitmap) */
+	_Atomic unsigned long sent_pages;   /* Atomic: bits set in sent_bitmap */
 
 	struct list_head list;
 };
@@ -1809,6 +1809,21 @@ _Atomic unsigned long *get_sent_pages_counter(u64 dst_id)
 	pthread_spin_unlock(&active_images_lock);
 
 	return counter;
+}
+
+/*
+ * Increment total_pages counter when new VMAs are added.
+ * Thread-safe: takes lock internally.
+ */
+void increment_total_pages(u64 dst_id, unsigned long nr_pages)
+{
+	struct active_image *img;
+
+	pthread_spin_lock(&active_images_lock);
+	img = find_active_image(dst_id);
+	if (img)
+		img->total_pages += nr_pages;
+	pthread_spin_unlock(&active_images_lock);
 }
 
 static int add_active_image(u64 dst_id, int sk)
@@ -2400,38 +2415,22 @@ static int final_queue_drain(struct active_image *img, pid_t source_pid,
 }
 
 /*
- * Verify all pages in all VMAs have been sent by checking sent_bitmap.
- * Returns: number of unsent pages (0 = all sent), -1 on error
+ * Verify all pages have been sent by comparing sent_pages counter with total_pages.
+ * Returns: number of unsent pages (0 = all sent)
  */
-static long verify_all_pages_sent(u64 dst_id)
+static long verify_all_pages_sent(struct active_image *img)
 {
-	struct lazy_vma_entry *lve;
-	long total_unsent = 0;
+	unsigned long sent = img->sent_pages;
+	unsigned long total = img->total_pages;
 
-	list_for_each_entry(lve, get_global_lazy_vmas(), list) {
-		unsigned long page_idx;
-		long vma_unsent = 0;
-
-		if (lve->dst_id != dst_id)
-			continue;
-
-		/* All VMAs must have sent_bitmap - assert if missing */
-		BUG_ON(!lve->sent_bitmap);
-
-		for (page_idx = 0; page_idx < lve->total_pages; page_idx++) {
-			if (!bitmap_test_nonatomic(lve->sent_bitmap, page_idx))
-				vma_unsent++;
-		}
-
-		if (vma_unsent > 0) {
-			pr_warn("VMA 0x%lx-0x%lx: %ld/%lu pages not sent\n",
-				(unsigned long)lve->start, (unsigned long)lve->end,
-				vma_unsent, lve->total_pages);
-			total_unsent += vma_unsent;
-		}
+	if (sent != total) {
+		pr_warn("Pages mismatch: sent=%lu total=%lu (unsent=%ld)\n",
+			sent, total, (long)(total - sent));
+		return (long)(total - sent);
 	}
 
-	return total_unsent;
+	pr_info("All %lu pages sent successfully\n", total);
+	return 0;
 }
 
 /* Unified background thread serving all images */
@@ -2480,8 +2479,8 @@ static void *unified_page_server_thread(void *arg)
 			if (is_convergence_mode()) {
 				long unsent;
 
-				/* Verify all pages in all VMAs were sent */
-				unsent = verify_all_pages_sent(img->dst_id);
+				/* Verify all pages were sent */
+				unsent = verify_all_pages_sent(img);
 				BUG_ON(unsent > 0);
 
 				/*

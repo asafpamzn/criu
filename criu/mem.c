@@ -157,6 +157,9 @@ int add_lazy_vma_for_new_region(unsigned long start, unsigned long len,
 	list_add_tail(&lve->list, &global_lazy_vmas);
 	pthread_spin_unlock(&lazy_vmas_lock);
 
+	/* Update active image total_pages counter */
+	increment_total_pages(dst_id, nr_pages);
+
 	pr_info("Added lazy VMA for new region 0x%lx-0x%lx "
 		"(%lu pages, dst_id=%lu, pid=%d)\n",
 		start, start + len, nr_pages,

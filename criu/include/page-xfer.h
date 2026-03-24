@@ -98,4 +98,7 @@ extern int send_inventory_ready_signal(void);
 /* COW phased migration: get sent_pages counter for a dst_id */
 extern _Atomic unsigned long *get_sent_pages_counter(u64 dst_id);
 
+/* COW phased migration: increment total_pages when new VMAs added */
+extern void increment_total_pages(u64 dst_id, unsigned long nr_pages);
+
 #endif /* __CR_PAGE_XFER__H__ */
