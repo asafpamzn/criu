@@ -1920,73 +1920,67 @@ int cow_setup_sync_for_dirty(unsigned long *dirty_ranges,
 	cdi->uffd_async = -1;
 
 	/*
-	 * Register new VMAs detected in Phase 3 with uffd.
-	 * These weren't registered during Phase 1 parasite setup.
+	 * Register ALL tracked VMAs (whole VMAs) with WP_SYNC uffd first.
+	 * This avoids VMA splitting when we later write-protect partial
+	 * dirty ranges. Registering partial ranges caused ENOMEM because
+	 * the kernel tried to split VMAs.
 	 */
 	for (i = 0; i < cdi->nr_tracked_vmas; i++) {
-		if (!cdi->tracked_vmas[i].is_new)
-			continue;
-
 		reg.range.start = cdi->tracked_vmas[i].start;
 		reg.range.len = cdi->tracked_vmas[i].end - cdi->tracked_vmas[i].start;
 		reg.mode = UFFDIO_REGISTER_MODE_WP;
 
-		pr_info("Registering new VMA 0x%lx-0x%lx with WP_SYNC uffd\n",
+		pr_debug("Registering VMA 0x%lx-0x%lx with WP_SYNC uffd\n",
 			cdi->tracked_vmas[i].start, cdi->tracked_vmas[i].end);
 
 		if (ioctl(cdi->uffd, UFFDIO_REGISTER, &reg)) {
 			if (errno == ENOMEM || errno == EINVAL) {
-				pr_warn("New VMA registration 0x%lx-0x%lx skipped (VMA changed)\n",
-					cdi->tracked_vmas[i].start, cdi->tracked_vmas[i].end);
+				pr_debug("VMA registration 0x%lx-0x%lx skipped (VMA changed): %s\n",
+					cdi->tracked_vmas[i].start, cdi->tracked_vmas[i].end,
+					strerror(errno));
 				continue;
 			}
-			pr_perror("UFFDIO_REGISTER for new VMA 0x%lx-0x%lx failed",
+			pr_perror("UFFDIO_REGISTER for VMA 0x%lx-0x%lx failed",
 				  cdi->tracked_vmas[i].start, cdi->tracked_vmas[i].end);
-			return -1;
+			/* Continue with other VMAs - best effort */
+			continue;
 		}
 	}
 
-	/* Register and write-protect each dirty range */
+	pr_info("Registered %u VMAs with WP_SYNC uffd, now write-protecting %u dirty ranges\n",
+		cdi->nr_tracked_vmas, nr_dirty_ranges);
+
+	/*
+	 * Write-protect each dirty range. VMAs are already registered above,
+	 * so this only sets the WP bit on the specified pages.
+	 */
 	for (i = 0; i < nr_dirty_ranges; i++) {
 		unsigned long start = dirty_ranges[i * 2];
 		unsigned long len = dirty_ranges[i * 2 + 1];
-
-		reg.range.start = start;
-		reg.range.len = len;
-		reg.mode = UFFDIO_REGISTER_MODE_WP;
-		pr_debug("UFFDIO_REGISTER WP_SYNC 0x%lx-0x%lx len=%ld\n",
-			 start, start + len, len);
-		if (ioctl(cdi->uffd, UFFDIO_REGISTER, &reg)) {
-			/*
-			 * ENOMEM/EINVAL are expected if VMA was unmapped or
-			 * modified during traffic. Skip silently.
-			 */
-			if (errno == ENOMEM || errno == EINVAL) {
-				pr_err("UFFDIO_REGISTER WP_SYNC 0x%lx-0x%lx skipped "
-					 "(VMA changed): %s\n",
-					 start, start + len, strerror(errno));
-				register_skip++;
-				continue;
-			}
-			pr_perror("UFFDIO_REGISTER WP_SYNC 0x%lx-0x%lx failed",
-				  start, start + len);
-			continue; /* Best effort */
-		}
-
-		pr_debug("UFFDIO_REGISTER WP_SYNC 0x%lx-0x%lx OK\n", start, start + len);
 
 		wp.range.start = start;
 		wp.range.len = len;
 		wp.mode = UFFDIO_WRITEPROTECT_MODE_WP;
 
 		if (ioctl(cdi->uffd, UFFDIO_WRITEPROTECT, &wp)) {
+			if (errno == ENOENT) {
+				/*
+				 * VMA not registered (was skipped above) or
+				 * address not in any registered VMA - skip.
+				 */
+				pr_debug("UFFDIO_WRITEPROTECT 0x%lx-0x%lx skipped "
+					 "(not registered): %s\n",
+					 start, start + len, strerror(errno));
+				register_skip++;
+				continue;
+			}
 			pr_perror("UFFDIO_WRITEPROTECT 0x%lx-0x%lx failed",
 				  start, start + len);
 			continue; /* Best effort */
 		}
 		registered_ok++;
 	}
-	pr_warn("WP_SYNC registration: %u ok, %u skipped (VMA changed), %u total\n",
+	pr_info("WP_SYNC write-protect: %u ok, %u skipped, %u total dirty ranges\n",
 		registered_ok, register_skip, nr_dirty_ranges);
 
 	cdi->phase = COW_PHASE_SYNC_CONVERGE;
