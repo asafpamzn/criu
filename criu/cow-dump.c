@@ -1987,7 +1987,7 @@ int cow_setup_sync_for_dirty(unsigned long *dirty_ranges,
 		registered_ok++;
 	}
 	pr_warn("WP_SYNC registration: %u ok, %u skipped (VMA changed), %u total\n",
-		registered_ok, f, nr_dirty_ranges);
+		registered_ok, register_skip, nr_dirty_ranges);
 
 	cdi->phase = COW_PHASE_SYNC_CONVERGE;
 #if 1 //TODO check restarted later on at cr_dump_finish
