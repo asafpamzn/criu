@@ -1935,15 +1935,19 @@ int cow_setup_sync_for_dirty(unsigned long *dirty_ranges,
 
 		if (ioctl(cdi->uffd, UFFDIO_REGISTER, &reg)) {
 			if (errno == ENOMEM || errno == EINVAL) {
-				pr_debug("VMA registration 0x%lx-0x%lx skipped (VMA changed): %s\n",
+				/*
+				 * VMA changed (unmapped, guard page, protection changed).
+				 * Skip this VMA - it's no longer applicable for WP mode.
+				 */
+				pr_perror("VMA registration 0x%lx-0x%lx skipped (VMA changed): %s\n",
 					cdi->tracked_vmas[i].start, cdi->tracked_vmas[i].end,
 					strerror(errno));
 				continue;
 			}
+			/* Unexpected error - fail the run */
 			pr_perror("UFFDIO_REGISTER for VMA 0x%lx-0x%lx failed",
 				  cdi->tracked_vmas[i].start, cdi->tracked_vmas[i].end);
-			/* Continue with other VMAs - best effort */
-			continue;
+			return -1;
 		}
 	}
 
