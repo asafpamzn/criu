@@ -2597,6 +2597,7 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 	struct pstree_item *item;
 	unsigned long *dirty_ranges = NULL;
 	unsigned int nr_dirty_ranges = 0;
+	struct timeval freeze_start, freeze_end, freeze_delta;
 	unsigned long total_dirty_pages = 0;
 	int ret;
 	int exit_code = -1;
@@ -2663,6 +2664,9 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 	/* === PHASE 1: Seize + Pre-dump + WP_ASYNC === */
 	pr_err("=== PHASE 1: Seize + Pre-dump + WP_ASYNC ===\n");
 
+	gettimeofday(&freeze_start, NULL);
+	pr_err("TIMING: Phase 1 freeze started\n");
+
 	if (collect_pstree())
 		goto err;
 
@@ -2693,6 +2697,11 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 		goto err;
 
 	pstree_switch_state(root_item, TASK_ALIVE);
+
+	gettimeofday(&freeze_end, NULL);
+	timersub(&freeze_end, &freeze_start, &freeze_delta);
+	pr_err("TIMING: Phase 1 freeze ended - process frozen for %ld.%06ld seconds\n",
+	       freeze_delta.tv_sec, freeze_delta.tv_usec);
 
 	/* === PHASE 2: Bulk page transfer === */
 	pr_err("=== PHASE 2: Bulk page transfer ===\n");
@@ -2728,6 +2737,9 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 
 	/* === PHASE 3: Re-freeze + skeleton dump + dirty scan === */
 	pr_err("=== PHASE 3: Re-freeze + skeleton dump + dirty scan ===\n");
+
+	gettimeofday(&freeze_start, NULL);
+	pr_err("TIMING: Phase 3 freeze started\n");
 
 	/*
 	 * Re-seize all tasks. After Phase 1, tasks were released via
@@ -2935,6 +2947,11 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 	prepare_lazy_vmas_for_convergence(dirty_ranges, nr_dirty_ranges);
 
 	pstree_switch_state(root_item, TASK_ALIVE);
+
+	gettimeofday(&freeze_end, NULL);
+	timersub(&freeze_end, &freeze_start, &freeze_delta);
+	pr_err("TIMING: Phase 3-4 freeze ended - process frozen for %ld.%06ld seconds\n",
+	       freeze_delta.tv_sec, freeze_delta.tv_usec);
 
 	/*
 	 * Send dirty bitmap to replica so it can proceed with restore.
