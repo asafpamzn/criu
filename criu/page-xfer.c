@@ -47,10 +47,21 @@
 
 static int page_server_sk = -1;
 static bool bulk_stream_done = false;
+static bool all_pages_sent_ack_received = false;
 
 bool page_server_bulk_stream_done(void)
 {
 	return bulk_stream_done;
+}
+
+static void set_all_pages_sent_ack_received(void)
+{
+	all_pages_sent_ack_received = true;
+}
+
+static bool is_all_pages_sent_ack_received(void)
+{
+	return all_pages_sent_ack_received;
 }
 
 int get_page_server_sk(void)
@@ -325,23 +336,18 @@ int send_dirty_bitmap_to_replica(int sk, u64 dst_id,
 /*
  * Wait for all_pages_sent ACK from replica.
  * Called by primary after sending PS_IOV_ALL_PAGES_SENT.
+ *
+ * Note: The ACK is received by page_server_serve() which sets a flag.
+ * We poll the flag here to avoid race conditions with socket reads.
  */
 static int wait_for_all_pages_sent_ack(int sk)
 {
-	struct page_server_iov pi;
+	(void)sk;  /* unused - ACK comes via page_server_serve() */
 
-	pr_info("Waiting for all_pages_sent ACK from replica (sk=%d)...\n", sk);
-	if (__recv(sk, &pi, sizeof(pi), MSG_WAITALL) != sizeof(pi)) {
-		pr_perror("Failed to receive all_pages_sent ACK");
-		return -1;
+	pr_info("Waiting for all_pages_sent ACK from replica...\n");
+	while (!is_all_pages_sent_ack_received()) {
+		usleep(1000);  /* 1ms poll */
 	}
-
-	if (pi.cmd != PS_IOV_ALL_PAGES_SENT_ACK) {
-		pr_err("Expected all_pages_sent ACK (cmd=%u), got cmd=%u\n",
-		       PS_IOV_ALL_PAGES_SENT_ACK, pi.cmd);
-		return -1;
-	}
-
 	pr_info("Received all_pages_sent ACK from replica\n");
 	return 0;
 }
@@ -2692,6 +2698,16 @@ static int page_server_serve(int sk)
 			ret = 0;
 			flushed = true;
 			bulk_ack_received = true;
+			break;
+		case PS_IOV_ALL_PAGES_SENT_ACK:
+			/*
+			 * Replica acknowledges all_pages_sent signal received.
+			 * Set flag so unified_page_server_thread can continue.
+			 */
+			pr_info("Received all_pages_sent ACK from replica\n");
+			set_all_pages_sent_ack_received();
+			ret = 0;
+			flushed = true;
 			break;
 		default:
 			pr_err("Unknown command %u\n", pi.cmd);
