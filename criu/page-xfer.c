@@ -3582,6 +3582,11 @@ static int page_server_async_read_bulk(struct epoll_rfd *f)
 		/* End marker - cleanup stream reader */
 		list_del(&ar->l);
 		xfree(ar);
+		/* Only break epoll loop for all_pages_sent - other COMPLETE cases continue */
+		if (is_all_pages_sent_received()){
+			pr_info("is_all_pages_sent_received\n");
+			return 1;
+		}
 		return 0;
 	}
 	if (ret < 0)
