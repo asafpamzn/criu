@@ -395,8 +395,9 @@ int send_cow_dirty_bitmap(unsigned long *ranges, unsigned int nr_ranges)
  * Send "all pages sent" signal to replica (COW phased migration).
  * Called by primary after dirty bitmap transfer completes, so replica
  * knows it can zero-fill any remaining page faults for new VMAs.
+ * If sk >= 0, use that socket; otherwise use global page_server_sk.
  */
-int send_all_pages_sent_signal(void)
+int send_all_pages_sent_signal(int sk)
 {
 	struct page_server_iov pi = {
 		.cmd = PS_IOV_ALL_PAGES_SENT,
@@ -404,14 +405,15 @@ int send_all_pages_sent_signal(void)
 		.vaddr = 0,
 		.dst_id = 0,
 	};
+	int use_sk = (sk >= 0) ? sk : page_server_sk;
 
-	if (page_server_sk < 0) {
+	if (use_sk < 0) {
 		pr_err("No page server socket for all_pages_sent signal\n");
 		return -1;
 	}
 
-	pr_info("Sending all_pages_sent signal to replica\n");
-	return send_psi(page_server_sk, &pi);
+	pr_info("Sending all_pages_sent signal to replica (sk=%d)\n", use_sk);
+	return send_psi(use_sk, &pi);
 }
 
 /*
@@ -2428,8 +2430,9 @@ static void *unified_page_server_thread(void *arg)
 				/*
 				 * Signal replica that all pages have been sent.
 				 * Replica can zero-fill any remaining page faults.
+				 * Use img->main_sk since global page_server_sk may not be set.
 				 */
-				if (send_all_pages_sent_signal() < 0)
+				if (send_all_pages_sent_signal(img->main_sk) < 0)
 					pr_err("Failed to send all_pages_sent signal\n");
 			}
 
