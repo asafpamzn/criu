@@ -3264,7 +3264,11 @@ static int read_bulk_header(struct ps_async_read *ar, int flags)
 		set_all_pages_sent_received();
 		ar->rb = 0;
 		ar->compress_state = COMPRESS_STATE_READING_HEADER;
-		return BULK_STREAM_PROGRESS;
+		/*
+		 * Return COMPLETE to stop reading - primary is waiting for ACK.
+		 * The main loop will check cow_handle_exit() and send the ACK.
+		 */
+		return BULK_STREAM_COMPLETE;
 
 	case PS_IOV_DIRTY_BITMAP:
 		ret = handle_dirty_bitmap_header(ar);
