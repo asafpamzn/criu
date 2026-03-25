@@ -34,22 +34,25 @@ int cow_handle_exit(struct list_head *lpis)
 {
 	struct lazy_pages_info *lpi, *n;
 
+	pr_info("cow_handle_exit: checking conditions (signal=%d, drain_running=%d, buffer=%lu)\n",
+		is_all_pages_sent_received(), cow_drain_thread_running(), cow_page_buffer_count());
+
 	/* Condition 1: Wait for all_pages_sent signal from primary */
 	if (!is_all_pages_sent_received()) {
-		pr_debug("Waiting for all_pages_sent signal\n");
+		pr_info("cow_handle_exit: waiting for all_pages_sent signal\n");
 		return 0;
 	}
 
 	/* Condition 2: Wait for drain thread to finish */
 	if (cow_drain_thread_running()) {
-		pr_debug("Waiting for drain thread to finish\n");
+		pr_info("cow_handle_exit: waiting for drain thread to finish\n");
 		return 0;
 	}
 
 	/* Condition 3: Wait for buffer to be empty */
 	if (cow_page_buffer_count() > 0) {
-		pr_debug("Waiting for buffer to drain (%lu pages remaining)\n",
-			 cow_page_buffer_count());
+		pr_info("cow_handle_exit: waiting for buffer to drain (%lu pages remaining)\n",
+			cow_page_buffer_count());
 		return 0;
 	}
 

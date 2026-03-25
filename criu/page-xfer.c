@@ -3599,10 +3599,11 @@ static int page_server_async_read_bulk(struct epoll_rfd *f)
 		list_del(&ar->l);
 		xfree(ar);
 		/* Only break epoll loop for all_pages_sent - other COMPLETE cases continue */
-		if (is_all_pages_sent_received()){
-			pr_info("is_all_pages_sent_received\n");
+		if (is_all_pages_sent_received()) {
+			pr_info("page_server_async_read_bulk: BULK_STREAM_COMPLETE + all_pages_sent, returning 1 to break epoll\n");
 			return 1;
 		}
+		pr_info("page_server_async_read_bulk: BULK_STREAM_COMPLETE, returning 0\n");
 		return 0;
 	}
 	if (ret < 0)
