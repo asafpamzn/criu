@@ -152,13 +152,11 @@ int add_lazy_vma_for_new_region(unsigned long start, unsigned long len,
 		xfree(lve);
 		return -1;
 	}
+	lve->sent_pages = 0;
 
 	pthread_spin_lock(&lazy_vmas_lock);
 	list_add_tail(&lve->list, &global_lazy_vmas);
 	pthread_spin_unlock(&lazy_vmas_lock);
-
-	/* Update active image total_pages counter */
-	increment_total_pages(dst_id, nr_pages);
 
 	pr_info("Added lazy VMA for new region 0x%lx-0x%lx "
 		"(%lu pages, dst_id=%lu, pid=%d)\n",
@@ -230,7 +228,6 @@ unsigned long prepare_lazy_vmas_for_convergence(unsigned long *dirty_ranges,
 	list_for_each_entry(lve, &global_lazy_vmas, list) {
 		unsigned long vma_start = lve->start;
 		unsigned long vma_end = lve->end;
-		_Atomic unsigned long *sent_counter = get_sent_pages_counter(lve->dst_id);
 
 		/* Check each dirty range against this VMA */
 		for (i = 0; i < nr_dirty_ranges; i++) {
@@ -257,7 +254,7 @@ unsigned long prepare_lazy_vmas_for_convergence(unsigned long *dirty_ranges,
 			for (; page_idx < page_idx_end; page_idx++) {
 				if (lve->sent_bitmap &&
 				    bitmap_test_nonatomic(lve->sent_bitmap, page_idx)) {
-					bitmap_clear_nonatomic(lve->sent_bitmap, page_idx, sent_counter);
+					bitmap_clear_nonatomic(lve->sent_bitmap, page_idx, &lve->sent_pages);
 					total_dirty_pages++;
 				}
 			}
@@ -279,6 +276,41 @@ unsigned long prepare_lazy_vmas_for_convergence(unsigned long *dirty_ranges,
 		total_dirty_pages, nr_dirty_ranges);
 
 	return total_dirty_pages;
+}
+
+/*
+ * Verify all lazy VMA pages have been sent.
+ * Returns 0 if all sent, or count of unsent pages.
+ */
+long verify_all_lazy_vmas_sent(void)
+{
+	struct lazy_vma_entry *lve;
+	unsigned long total_sent = 0;
+	unsigned long total_pages = 0;
+
+	init_global_lazy_vmas();
+
+	pthread_spin_lock(&lazy_vmas_lock);
+	list_for_each_entry(lve, &global_lazy_vmas, list) {
+		if (lve->sent_pages != lve->total_pages) {
+			pr_warn("VMA %lx-%lx: sent=%lu total=%lu (unsent=%ld)\n",
+				(unsigned long)lve->start, (unsigned long)lve->end,
+				(unsigned long)lve->sent_pages, lve->total_pages,
+				(long)(lve->total_pages - lve->sent_pages));
+		}
+		total_sent += lve->sent_pages;
+		total_pages += lve->total_pages;
+	}
+	pthread_spin_unlock(&lazy_vmas_lock);
+
+	if (total_sent != total_pages) {
+		pr_warn("Total pages mismatch: sent=%lu total=%lu\n",
+			total_sent, total_pages);
+		return (long)(total_pages - total_sent);
+	}
+
+	pr_info("All %lu pages sent across all VMAs\n", total_pages);
+	return 0;
 }
 
 static int task_reset_dirty_track(int pid)
@@ -569,6 +601,7 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 
 		lve->start = vma->e->start;
 		lve->end = vma->e->end;
+		lve->sent_pages = 0;
 
 		/* Add to global list (thread-safe) */
 		pthread_spin_lock(&lazy_vmas_lock);

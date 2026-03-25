@@ -23,6 +23,7 @@ struct lazy_vma_entry {
 	unsigned char *sent_bitmap;   /* Track which pages have been sent */
 	uint8_t *cow_bitmap;          /* Track which pages were write-faulted */
 	unsigned long total_pages;    /* Total pages in this VMA */
+	_Atomic unsigned long sent_pages;  /* Count of set bits in sent_bitmap */
 	u64 dst_id;                   /* Process identifier for this VMA */
 	pid_t source_pid;             /* PID for process_vm_readv */
 };
@@ -85,5 +86,8 @@ extern bool is_convergence_mode(void);
 extern unsigned long get_convergence_dirty_pages(void);
 extern unsigned long prepare_lazy_vmas_for_convergence(unsigned long *dirty_ranges,
 						       unsigned int nr_dirty_ranges);
+
+/* Verify all lazy VMA pages have been sent */
+extern long verify_all_lazy_vmas_sent(void);
 
 #endif /* __CR_MEM_H__ */

@@ -1708,10 +1708,8 @@ static unsigned long get_page_request_queue_size(void)
 struct active_image {
 	u64 dst_id;
 	int main_sk;
-	_Atomic unsigned long total_pages;  /* Atomic: updated when new VMAs added */
 	unsigned long total_cow_pages;
 	unsigned long total_req_pages;
-	_Atomic unsigned long sent_pages;   /* Atomic: bits set in sent_bitmap */
 
 	struct list_head list;
 };
@@ -1792,40 +1790,6 @@ static struct active_image *find_active_image(u64 dst_id)
 	return NULL;
 }
 
-/*
- * Get pointer to sent_pages counter for a given dst_id.
- * Returns NULL if no active image found.
- * Thread-safe: takes lock internally.
- */
-_Atomic unsigned long *get_sent_pages_counter(u64 dst_id)
-{
-	struct active_image *img;
-	_Atomic unsigned long *counter = NULL;
-
-	pthread_spin_lock(&active_images_lock);
-	img = find_active_image(dst_id);
-	if (img)
-		counter = &img->sent_pages;
-	pthread_spin_unlock(&active_images_lock);
-
-	return counter;
-}
-
-/*
- * Increment total_pages counter when new VMAs are added.
- * Thread-safe: takes lock internally.
- */
-void increment_total_pages(u64 dst_id, unsigned long nr_pages)
-{
-	struct active_image *img;
-
-	pthread_spin_lock(&active_images_lock);
-	img = find_active_image(dst_id);
-	if (img)
-		img->total_pages += nr_pages;
-	pthread_spin_unlock(&active_images_lock);
-}
-
 static int add_active_image(u64 dst_id, int sk)
 {
 	struct active_image *img;
@@ -1865,7 +1829,6 @@ static int add_active_image(u64 dst_id, int sk)
 
 	img->dst_id = dst_id;
 	img->main_sk = sk;
-	img->total_pages = total_pages;
 	img->total_cow_pages = 0;
 	img->total_req_pages = 0;
 
@@ -2040,7 +2003,7 @@ static int send_cow_page_lazy(struct cow_page_queue_entry *entry, struct active_
 	}
 
 	/* Mark as sent */
-	bitmap_set_nonatomic(lve->sent_bitmap, page_idx, &img->sent_pages);
+	bitmap_set_nonatomic(lve->sent_bitmap, page_idx, &lve->sent_pages);
 
 	/* Return 1: page was sent successfully */
 	return 1;
@@ -2099,7 +2062,7 @@ static int send_request_page_lazy(struct page_request_entry *req, struct active_
 			return -1;
 
 		/* Mark as sent (ret == 1 means success) */
-		bitmap_set_nonatomic(lve->sent_bitmap, page_idx, &img->sent_pages);
+		bitmap_set_nonatomic(lve->sent_bitmap, page_idx, &lve->sent_pages);
 		sent_count++;
 	}
 
@@ -2299,7 +2262,7 @@ static int send_single_lazy_page(struct active_image *img,
 	}
 
 	/* Mark as sent (ret == 1 means success) */
-	bitmap_set_nonatomic(lve->sent_bitmap, page_idx, &img->sent_pages);
+	bitmap_set_nonatomic(lve->sent_bitmap, page_idx, &lve->sent_pages);
 	stats->priority3_pages++;
 
 	return 1;
@@ -2315,9 +2278,8 @@ static int send_image_complete(struct active_image *img)
 		.dst_id = img->dst_id,
 	};
 
-	pr_warn("Image dst_id=%lu complete: %lu sent of %lu total pages (%lu COW, %lu req)\n",
-		img->dst_id, img->sent_pages, img->total_pages,
-		img->total_cow_pages, img->total_req_pages);
+	pr_warn("Image dst_id=%lu complete (%lu COW, %lu req pages)\n",
+		img->dst_id, img->total_cow_pages, img->total_req_pages);
 
 	/* Send close command */
 	if (send_psi(img->main_sk, &close_cmd)) {
@@ -2414,25 +2376,6 @@ static int final_queue_drain(struct active_image *img, pid_t source_pid,
 	return 0;
 }
 
-/*
- * Verify all pages have been sent by comparing sent_pages counter with total_pages.
- * Returns: number of unsent pages (0 = all sent)
- */
-static long verify_all_pages_sent(struct active_image *img)
-{
-	unsigned long sent = img->sent_pages;
-	unsigned long total = img->total_pages;
-
-	if (sent != total) {
-		pr_warn("Pages mismatch: sent=%lu total=%lu (unsent=%ld)\n",
-			sent, total, (long)(total - sent));
-		return (long)(total - sent);
-	}
-
-	pr_info("All %lu pages sent successfully\n", total);
-	return 0;
-}
-
 /* Unified background thread serving all images */
 static void *unified_page_server_thread(void *arg)
 {
@@ -2452,8 +2395,7 @@ static void *unified_page_server_thread(void *arg)
 
 			pthread_spin_unlock(&active_images_lock);
 
-			pr_info("Processing image dst_id=%lu total=%lu pages\n",
-				img->dst_id, img->total_pages);
+			pr_info("Processing image dst_id=%lu\n", img->dst_id);
 
 			/* Process each lazy VMA */
 			list_for_each_entry(lve, get_global_lazy_vmas(), list) {
@@ -2479,8 +2421,8 @@ static void *unified_page_server_thread(void *arg)
 			if (is_convergence_mode()) {
 				long unsent;
 
-				/* Verify all pages were sent */
-				unsent = verify_all_pages_sent(img);
+				/* Verify all pages were sent across all VMAs */
+				unsent = verify_all_lazy_vmas_sent();
 				BUG_ON(unsent > 0);
 
 				/*
