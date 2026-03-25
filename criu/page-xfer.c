@@ -95,7 +95,8 @@ static void psi2iovec(struct page_server_iov *ps, struct iovec *iov)
 #define PS_IOV_BULK_COMPLETE_ACK 13 /* Replica → Primary: all bulk pages received */
 #define PS_IOV_INVENTORY_READY  14  /* Primary → Replica: inventory.img written */
 #define PS_IOV_DIRTY_BITMAP_ACK 15  /* Replica → Primary: dirty bitmap received */
-#define PS_IOV_ALL_PAGES_SENT   16  /* Primary → Replica: all pages sent, zero-fill rest */
+#define PS_IOV_ALL_PAGES_SENT     16  /* Primary → Replica: all pages sent, zero-fill rest */
+#define PS_IOV_ALL_PAGES_SENT_ACK 17  /* Replica → Primary: ACK, safe to close connection */
 
 #define PS_IOV_CLOSE	   0x1023
 
@@ -322,6 +323,30 @@ int send_dirty_bitmap_to_replica(int sk, u64 dst_id,
 }
 
 /*
+ * Wait for all_pages_sent ACK from replica.
+ * Called by primary after sending PS_IOV_ALL_PAGES_SENT.
+ */
+static int wait_for_all_pages_sent_ack(int sk)
+{
+	struct page_server_iov pi;
+
+	pr_info("Waiting for all_pages_sent ACK from replica (sk=%d)...\n", sk);
+	if (__recv(sk, &pi, sizeof(pi), MSG_WAITALL) != sizeof(pi)) {
+		pr_perror("Failed to receive all_pages_sent ACK");
+		return -1;
+	}
+
+	if (pi.cmd != PS_IOV_ALL_PAGES_SENT_ACK) {
+		pr_err("Expected all_pages_sent ACK (cmd=%u), got cmd=%u\n",
+		       PS_IOV_ALL_PAGES_SENT_ACK, pi.cmd);
+		return -1;
+	}
+
+	pr_info("Received all_pages_sent ACK from replica\n");
+	return 0;
+}
+
+/*
  * Wait for dirty bitmap ACK from replica.
  * Called by primary after sending all dirty bitmaps.
  */
@@ -414,6 +439,29 @@ int send_all_pages_sent_signal(int sk)
 
 	pr_info("Sending all_pages_sent signal to replica (sk=%d)\n", use_sk);
 	return send_psi(use_sk, &pi);
+}
+
+/*
+ * Send ACK for all_pages_sent signal (COW phased migration).
+ * Called by replica after drain thread finishes, so primary knows
+ * it's safe to close the connection.
+ */
+int send_all_pages_sent_ack(void)
+{
+	struct page_server_iov pi = {
+		.cmd = PS_IOV_ALL_PAGES_SENT_ACK,
+		.nr_pages = 0,
+		.vaddr = 0,
+		.dst_id = 0,
+	};
+
+	if (page_server_sk < 0) {
+		pr_err("No page server socket for all_pages_sent ACK\n");
+		return -1;
+	}
+
+	pr_info("Sending all_pages_sent ACK to primary (sk=%d)\n", page_server_sk);
+	return send_psi(page_server_sk, &pi);
 }
 
 /*
@@ -2434,6 +2482,10 @@ static void *unified_page_server_thread(void *arg)
 				 */
 				if (send_all_pages_sent_signal(img->main_sk) < 0)
 					pr_err("Failed to send all_pages_sent signal\n");
+
+				/* Wait for replica to acknowledge (drain complete) */
+				if (wait_for_all_pages_sent_ack(img->main_sk) < 0)
+					pr_err("Failed to receive all_pages_sent ACK\n");
 			}
 
 			if (send_image_complete(img) < 0)

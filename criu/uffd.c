@@ -46,14 +46,10 @@
 #include "pf-tracker.h"
 #include "cow-lazy-pages.h"
 #include "cow-uffd.h"
+#include "uffd-internal.h"
+
 #undef LOG_PREFIX
 #define LOG_PREFIX "uffd: "
-
-#define lp_debug(lpi, fmt, arg...)  pr_debug("%d-%d: " fmt, lpi->pid, lpi->lpfd.fd, ##arg)
-#define lp_info(lpi, fmt, arg...)   pr_info("%d-%d: " fmt, lpi->pid, lpi->lpfd.fd, ##arg)
-#define lp_warn(lpi, fmt, arg...)   pr_warn("%d-%d: " fmt, lpi->pid, lpi->lpfd.fd, ##arg)
-#define lp_err(lpi, fmt, arg...)    pr_err("%d-%d: " fmt, lpi->pid, lpi->lpfd.fd, ##arg)
-#define lp_perror(lpi, fmt, arg...) pr_perror("%d-%d: " fmt, lpi->pid, lpi->lpfd.fd, ##arg)
 
 #define NEED_UFFD_API_FEATURES \
 	(UFFD_FEATURE_EVENT_FORK | UFFD_FEATURE_EVENT_REMAP | UFFD_FEATURE_EVENT_UNMAP | UFFD_FEATURE_EVENT_REMOVE)
@@ -73,38 +69,6 @@
 
 static mutex_t *lazy_sock_mutex;
 
-struct lazy_iov {
-	struct list_head l;
-	unsigned long start;	 /* run-time start address, tracks remaps */
-	unsigned long end;	 /* run-time end address, tracks remaps */
-	unsigned long img_start; /* start address at the dump time */
-	bool is_new_vma;	 /* true if this IOV is for a Phase 3 new VMA */
-};
-
-struct lazy_pages_info {
-	int pid;
-	bool exited;
-
-	struct list_head iovs;
-	struct list_head reqs;
-
-	struct lazy_pages_info *parent;
-	unsigned ref_cnt;
-
-	struct page_read pr;
-
-	unsigned long xfer_len; /* in pages */
-	unsigned long total_pages;
-	unsigned long copied_pages;
-
-	struct epoll_rfd lpfd;
-
-	struct list_head l;
-
-	unsigned long buf_size;
-	void *buf;
-};
-
 /* global lazy-pages daemon state */
 static LIST_HEAD(lpis);
 static LIST_HEAD(exiting_lpis);
@@ -115,14 +79,7 @@ static struct epoll_rfd lazy_sk_rfd;
 /* socket for communication with lazy-pages daemon */
 static int lazy_pages_sk_id = -1;
 
-/* Pending EAGAIN requests (for bulk mode) */
-struct uffd_eagain_request {
-	struct list_head l;
-	struct lazy_pages_info *lpi;
-	__u64 address;
-	unsigned long nr_pages;
-	void *buf;  /* Copy of data that couldn't be written */
-};
+/* Pending EAGAIN requests (for bulk mode) - struct in uffd-internal.h */
 static LIST_HEAD(eagain_requests);
 
 /*
@@ -369,7 +326,8 @@ static void free_iovs(struct lazy_pages_info *lpi)
 
 static void lpi_fini(struct lazy_pages_info *lpi);
 
-static inline void lpi_put(struct lazy_pages_info *lpi)
+/* Non-static for use by uffd_cow.c */
+void lpi_put(struct lazy_pages_info *lpi)
 {
 	lpi->ref_cnt--;
 	if (!lpi->ref_cnt)
@@ -803,8 +761,9 @@ static int drop_iovs(struct lazy_pages_info *lpi, unsigned long addr, unsigned l
 	return 0;
 }
 
-static void dump_lazy_iov_list(struct lazy_pages_info *lpi, const char *name,
-			       struct list_head *iovs, unsigned int max_dump)
+/* Non-static for use by uffd_cow.c */
+void dump_lazy_iov_list(struct lazy_pages_info *lpi, const char *name,
+			struct list_head *iovs, unsigned int max_dump)
 {
 	struct lazy_iov *iov;
 	unsigned long count = 0;
@@ -1977,7 +1936,8 @@ static int handle_uffd_event(struct epoll_rfd *lpfd)
 	return 0;
 }
 
-static void lazy_pages_summary(struct lazy_pages_info *lpi)
+/* Non-static for use by uffd_cow.c */
+void lazy_pages_summary(struct lazy_pages_info *lpi)
 {
 	lp_debug(lpi, "UFFD transferred pages: (%ld/%ld)\n", lpi->copied_pages, lpi->total_pages);
 
@@ -2163,6 +2123,7 @@ static int handle_requests(int epollfd, struct epoll_event **events, int nr_fds)
 		}
 
 		if (!opts.cow_dump) {
+			/* Non-COW mode: background transfer loop */
 			list_for_each_entry_safe(lpi, n, &lpis, l) {
 				if (!list_empty(&lpi->iovs) &&
 				    list_empty(&lpi->reqs)) {
@@ -2186,62 +2147,13 @@ static int handle_requests(int epollfd, struct epoll_event **events, int nr_fds)
 		}
 
 		/*
-		 * COW/bulk mode: no background xfer loop. We just wait for
-		 * bulk pages to arrive and be copied. Once the restorer is
-		 * finished and the bulk stream is done, no more pages will
-		 * come - any remaining ranges mean a bug.
+		 * COW/bulk mode: Wait for exit conditions:
+		 * 1. all_pages_sent signal received
+		 * 2. drain thread finished (buffer empty)
+		 * Then send ACK to primary and exit.
 		 */
-		if (restore_finished && page_server_bulk_stream_done()) {
-			if (!list_empty(&eagain_requests))
-				continue;
-
-			list_for_each_entry_safe(lpi, n, &lpis, l) {
-				if (!lpi->exited &&
-				    (!list_empty(&lpi->reqs) ||
-				     !list_empty(&lpi->iovs))) {
-					lp_err(lpi, "Bulk stream ended but pages remain (iovs=%s reqs=%s)\n",
-					       list_empty(&lpi->iovs) ? "empty" : "non-empty",
-					       list_empty(&lpi->reqs) ? "empty" : "non-empty");
-					if (!list_empty(&lpi->reqs))
-						dump_lazy_iov_list(lpi, "REQ",
-								   &lpi->reqs, 32);
-					if (!list_empty(&lpi->iovs))
-						dump_lazy_iov_list(lpi, "IOV",
-								   &lpi->iovs, 32);
-					ret = -1;
-					goto out;
-				}
-
-				lazy_pages_summary(lpi);
-				list_del(&lpi->l);
-				lpi_put(lpi);
-			}
-
-			if (list_empty(&lpis))
-				break;
-			continue;
-		}
-
-		/* Stream not finished yet. Cleanup only if drained or exited. */
-		list_for_each_entry_safe(lpi, n, &lpis, l) {
-			if (!restore_finished)
-				continue;
-
-			if (!lpi->exited &&
-			    (!list_empty(&lpi->iovs) || !list_empty(&lpi->reqs)))
-				continue;
-
-			lazy_pages_summary(lpi);
-			list_del(&lpi->l);
-			lpi_put(lpi);
-		}
-
-		if (list_empty(&lpis)) {
-			/* In COW mode, keep waiting until restore connects */
-			if (opts.cow_dump && !is_restore_connected())
-				continue;
+		if (cow_handle_exit(&lpis))
 			break;
-		}
 	}
 
 out:

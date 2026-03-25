@@ -92,6 +92,9 @@ extern int send_cow_dirty_bitmap(unsigned long *ranges, unsigned int nr_ranges);
 /* COW phased migration: signal replica all pages sent, can zero-fill rest */
 extern int send_all_pages_sent_signal(int sk);
 
+/* COW phased migration: replica ACK for all_pages_sent, primary can close */
+extern int send_all_pages_sent_ack(void);
+
 /* COW phased migration: signal replica that inventory.img is ready */
 extern int send_inventory_ready_signal(void);
 
