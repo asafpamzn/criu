@@ -2,8 +2,10 @@
 #define __CR_UFFD_INTERNAL_H_
 
 #include <stdbool.h>
+#include <sys/uio.h>
 #include "int.h"
 #include "common/list.h"
+#include "util.h"
 #include "pagemap.h"
 #include "common/lock.h"
 
