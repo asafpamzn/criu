@@ -2452,15 +2452,20 @@ static void *unified_page_server_thread(void *arg)
 
 			pthread_spin_unlock(&active_images_lock);
 
-			pr_info("Processing image dst_id=%lu\n", img->dst_id);
+			pr_info("UNIFIED_THREAD: Processing image dst_id=%lu\n", img->dst_id);
+			pr_info("UNIFIED_THREAD: is_convergence_mode=%d\n", is_convergence_mode());
 
 			/* Get source_pid from first matching VMA */
 			list_for_each_entry(lve, get_global_lazy_vmas(), list) {
+				pr_info("UNIFIED_THREAD: Checking VMA dst_id=%lu vs img->dst_id=%lu\n",
+					(unsigned long)lve->dst_id, img->dst_id);
 				if (lve->dst_id == img->dst_id) {
 					source_pid = lve->source_pid;
+					pr_info("UNIFIED_THREAD: Found source_pid=%d\n", source_pid);
 					break;
 				}
 			}
+			pr_info("UNIFIED_THREAD: Final source_pid=%d\n", source_pid);
 
 			/*
 			 * Phase 2 bulk transfer: use dedicated P3 thread with
