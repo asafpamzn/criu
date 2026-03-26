@@ -457,6 +457,9 @@ static void stop_p3_acceptor_thread(void)
 	pr_info("P3 receivers stopped: %lu total pages\n", total_pages);
 }
 
+/* Forward declaration */
+static void tcp_cork(int sk, bool on);
+
 /*
  * Create multiple connections to page server for parallel P3 transfer.
  * Returns number of connections created, fills sockets array.
