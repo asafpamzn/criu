@@ -19,8 +19,8 @@
 #undef LOG_PREFIX
 #define LOG_PREFIX "cow-uffd: "
 
-#define PAGE_BUFFER_HASH_BITS 16
-#define PAGE_BUFFER_HASH_SIZE (1 << PAGE_BUFFER_HASH_BITS)
+#define PAGE_BUFFER_HASH_BITS 20
+#define PAGE_BUFFER_HASH_SIZE (1 << PAGE_BUFFER_HASH_BITS)  /* 1M buckets */
 
 struct page_buffer_entry {
 	unsigned long vaddr;
@@ -30,6 +30,7 @@ struct page_buffer_entry {
 
 static struct {
 	struct hlist_head *hash_table;
+	unsigned long max_bucket_depth;	/* Max pages in any bucket */
 	unsigned long nr_pages;
 	unsigned long nr_applied;
 	unsigned long nr_discarded;
@@ -67,9 +68,10 @@ int cow_page_buffer_init(void)
 	cow_buffer.nr_applied = 0;
 	cow_buffer.nr_discarded = 0;
 	cow_buffer.nr_eagain = 0;
+	cow_buffer.max_bucket_depth = 0;
 	cow_buffer.initialized = true;
 
-	pr_info("COW page buffer initialized\n");
+	pr_info("COW page buffer initialized (buckets=%d)\n", PAGE_BUFFER_HASH_SIZE);
 	return 0;
 }
 
@@ -131,6 +133,24 @@ int cow_page_buffer_add(unsigned long vaddr, void *data)
 	pthread_spin_lock(&cow_buffer.lock);
 	hlist_add_head(&entry->hash, &cow_buffer.hash_table[hash]);
 	cow_buffer.nr_pages++;
+
+	/* Track max bucket depth - count entries in this bucket */
+	{
+		struct page_buffer_entry *e;
+		unsigned long depth = 0;
+		hlist_for_each_entry(e, &cow_buffer.hash_table[hash], hash)
+			depth++;
+		if (depth > cow_buffer.max_bucket_depth) {
+			unsigned long old_max = cow_buffer.max_bucket_depth;
+			cow_buffer.max_bucket_depth = depth;
+			/* Print every 100 increase */
+			if (depth / 100 > old_max / 100) {
+				pr_info("COW buffer max bucket depth: %lu (total=%lu)\n",
+					depth, cow_buffer.nr_pages);
+			}
+		}
+	}
+
 	pthread_spin_unlock(&cow_buffer.lock);
 
 	/* Track page state: now in buffer */
@@ -247,8 +267,9 @@ void cow_page_buffer_destroy(void)
 
 	pthread_spin_destroy(&cow_buffer.lock);
 
-	pr_info("COW page buffer destroyed: applied=%lu discarded=%lu\n",
-		cow_buffer.nr_applied, cow_buffer.nr_discarded);
+	pr_info("COW page buffer destroyed: applied=%lu discarded=%lu max_bucket=%lu\n",
+		cow_buffer.nr_applied, cow_buffer.nr_discarded,
+		cow_buffer.max_bucket_depth);
 }
 
 /*
