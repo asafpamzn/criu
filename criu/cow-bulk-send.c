@@ -155,11 +155,12 @@ static int send_lazy_vma_pages_batch(int sk, struct lazy_vma_entry *lve,
 	page_idx_base = (base_vaddr - lve->start) / PAGE_SIZE;
 
 	for (i = 0; i < max_pages; i++) {
+		unsigned long page_idx = 0;
 		vaddr = base_vaddr + i * PAGE_SIZE;
 		if (vaddr >= lve->end)
 			break;
 
-		unsigned long page_idx = page_idx_base + i;
+		 page_idx = page_idx_base + i;
 
 		if (bitmap_test_nonatomic(lve->sent_bitmap, page_idx))
 			break;  /* Stop at first already-sent */
