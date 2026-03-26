@@ -407,69 +407,6 @@ static int accept_p3_connections(int *sockets, int max_connections, int timeout_
 	return num_accepted;
 }
 
-/*
- * P3 acceptor thread - accepts connections and spawns receiver threads.
- * Used on REPLICA side to receive pages from PRIMARY.
- */
-static void *p3_acceptor_thread_func(void *arg)
-{
-	int listen_sk = get_listen_socket();
-	int num_accepted = 0;
-	struct sockaddr_storage caddr;
-	socklen_t clen;
-
-	(void)arg;
-
-	if (listen_sk < 0) {
-		pr_err("P3 acceptor: no listening socket\n");
-		return NULL;
-	}
-
-	pr_info("P3 acceptor thread started (listen_sk=%d)\n", listen_sk);
-
-	while (p3_acceptor_running && num_accepted < MAX_P3_RECEIVERS) {
-		int sk;
-		struct pollfd pfd = { .fd = listen_sk, .events = POLLIN };
-
-		/* Poll with timeout so we can check p3_acceptor_running */
-		if (poll(&pfd, 1, 100) <= 0)
-			continue;
-
-		clen = sizeof(caddr);
-		sk = accept(listen_sk, (struct sockaddr *)&caddr, &clen);
-		if (sk < 0) {
-			if (errno == EAGAIN || errno == EWOULDBLOCK)
-				continue;
-			pr_perror("P3 acceptor: accept failed");
-			break;
-		}
-
-		pr_info("P3 acceptor: accepted connection %d (fd=%d)\n", num_accepted, sk);
-
-		/* Start receiver thread for this socket */
-		p3_receivers[num_accepted].thread_id = num_accepted;
-		p3_receivers[num_accepted].socket = sk;
-		p3_receivers[num_accepted].pages_received = 0;
-		p3_receivers[num_accepted].active = true;
-		p3_receivers[num_accepted].error = false;
-		__sync_fetch_and_add(&p3_receivers_active, 1);
-
-		if (pthread_create(&p3_receivers[num_accepted].thread, NULL,
-				   p3_receiver_thread_func, &p3_receivers[num_accepted])) {
-			pr_perror("P3 acceptor: failed to create receiver thread %d", num_accepted);
-			close(sk);
-			p3_receivers[num_accepted].active = false;
-			__sync_fetch_and_sub(&p3_receivers_active, 1);
-		} else {
-			num_accepted++;
-		}
-	}
-
-	pr_info("P3 acceptor done: accepted %d connections\n", num_accepted);
-	return NULL;
-}
-
-
 static void stop_p3_acceptor_thread(void)
 {
 	int i;
