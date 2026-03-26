@@ -45,6 +45,7 @@
 #include "cow-bitmap.h"
 #include "cow-bulk-send.h"
 #include "spsc-queue.h"
+#include "xmalloc.h"
 
 static int page_server_sk = -1;
 static bool bulk_stream_done = false;
@@ -122,6 +123,96 @@ enum compress_read_state {
 };
 #define PS_IOV_FORCE_CLOSE 0x1024
 
+#define PS_CMD_BITS 16
+#define PS_CMD_MASK ((1 << PS_CMD_BITS) - 1)
+
+#define PS_TYPE_BITS 8
+#define PS_TYPE_MASK ((1 << PS_TYPE_BITS) - 1)
+
+#define PS_TYPE_PID   (1)
+#define PS_TYPE_SHMEM (2)
+/*
+ * XXX: When adding new types here check decode_pm for legacy
+ * numbers that can be met from older CRIUs
+ */
+
+static inline u64 encode_pm(int type, unsigned long id)
+{
+	if (type == CR_FD_PAGEMAP)
+		type = PS_TYPE_PID;
+	else if (type == CR_FD_SHMEM_PAGEMAP)
+		type = PS_TYPE_SHMEM;
+	else {
+		BUG();
+		return 0;
+	}
+
+	return ((u64)id) << PS_TYPE_BITS | type;
+}
+
+static int decode_pm(u64 dst_id, unsigned long *id)
+{
+	int type;
+
+	/*
+	 * Magic numbers below came from the older CRIU versions that
+	 * erroneously used the changing CR_FD_* constants. The
+	 * changes were made when we merged images together and moved
+	 * the CR_FD_-s at the tail of the enum
+	 */
+	type = dst_id & PS_TYPE_MASK;
+	switch (type) {
+	case 10: /* 3.1 3.2 */
+	case 11: /* 1.3 1.4 1.5 1.6 1.7 1.8 2.* 3.0 */
+	case 16: /* 1.2 */
+	case 17: /* 1.0 1.1 */
+	case PS_TYPE_PID:
+		*id = dst_id >> PS_TYPE_BITS;
+		type = CR_FD_PAGEMAP;
+		break;
+	case 27: /* 1.3 */
+	case 28: /* 1.4 1.5 */
+	case 29: /* 1.6 1.7 */
+	case 32: /* 1.2 1.8 */
+	case 33: /* 1.0 1.1 3.1 3.2 */
+	case 34: /* 2.* 3.0 */
+	case PS_TYPE_SHMEM:
+		*id = dst_id >> PS_TYPE_BITS;
+		type = CR_FD_SHMEM_PAGEMAP;
+		break;
+	default:
+		type = -1;
+		break;
+	}
+
+	return type;
+}
+
+static inline u32 encode_ps_cmd(u32 cmd, u32 flags)
+{
+	return flags << PS_CMD_BITS | cmd;
+}
+
+static inline u32 decode_ps_cmd(u32 cmd)
+{
+	return cmd & PS_CMD_MASK;
+}
+
+static inline u32 decode_ps_flags(u32 cmd)
+{
+	return cmd >> PS_CMD_BITS;
+}
+
+static inline int __send(int sk, const void *buf, size_t sz, int fl)
+{
+	return opts.tls ? tls_send(buf, sz, fl) : send(sk, buf, sz, fl);
+}
+
+static inline int __recv(int sk, void *buf, size_t sz, int fl)
+{
+	return opts.tls ? tls_recv(buf, sz, fl) : recv(sk, buf, sz, fl);
+}
+
 /*
  * P3 parallel receiver threads for COW bulk transfer.
  * Each thread handles one socket, receives compressed batches,
@@ -143,8 +234,84 @@ static volatile int p3_receivers_active = 0;
 static pthread_t p3_acceptor_thread;
 static volatile bool p3_acceptor_running = false;
 
-/* Forward declaration */
-static int p3_receive_and_buffer(int sk);
+/*
+ * Receive one compressed batch from socket and add to page buffer.
+ * Returns number of pages received, 0 on EOF, -1 on error.
+ */
+static int p3_receive_and_buffer(int sk)
+{
+	struct page_server_iov pi;
+	int compressed_size;
+	char *compressed_buf = NULL;
+	char *decompressed_buf = NULL;
+	int nr_pages, i, ret = -1;
+	int decomp_ret;
+
+	/* Receive header */
+	ret = __recv(sk, &pi, sizeof(pi), MSG_WAITALL);
+	if (ret == 0)
+		return 0;  /* EOF */
+	if (ret != sizeof(pi)) {
+		pr_perror("P3 receive: failed to read header");
+		return -1;
+	}
+
+	nr_pages = pi.nr_pages;
+	if (nr_pages <= 0 || nr_pages > 64) {
+		pr_err("P3 receive: invalid nr_pages %d\n", nr_pages);
+		return -1;
+	}
+
+	/* Receive compressed size */
+	if (__recv(sk, &compressed_size, sizeof(compressed_size), MSG_WAITALL) != sizeof(compressed_size)) {
+		pr_perror("P3 receive: failed to read compressed size");
+		return -1;
+	}
+
+	if (compressed_size <= 0 || compressed_size > LZ4_compressBound(nr_pages * PAGE_SIZE)) {
+		pr_err("P3 receive: invalid compressed size %d\n", compressed_size);
+		return -1;
+	}
+
+	/* Allocate buffers */
+	compressed_buf = xmalloc(compressed_size);
+	decompressed_buf = xmalloc(nr_pages * PAGE_SIZE);
+	if (!compressed_buf || !decompressed_buf) {
+		pr_err("P3 receive: allocation failed\n");
+		goto out;
+	}
+
+	/* Receive compressed data */
+	if (__recv(sk, compressed_buf, compressed_size, MSG_WAITALL) != compressed_size) {
+		pr_perror("P3 receive: failed to read compressed data");
+		goto out;
+	}
+
+	/* Decompress */
+	decomp_ret = LZ4_decompress_safe(compressed_buf, decompressed_buf,
+					 compressed_size, nr_pages * PAGE_SIZE);
+	if (decomp_ret != nr_pages * PAGE_SIZE) {
+		pr_err("P3 receive: decompression failed (expected %d, got %d)\n",
+		       nr_pages * (int)PAGE_SIZE, decomp_ret);
+		goto out;
+	}
+
+	/* Add each page to buffer */
+	for (i = 0; i < nr_pages; i++) {
+		unsigned long vaddr = pi.vaddr + i * PAGE_SIZE;
+		if (cow_page_buffer_add(vaddr, decompressed_buf + i * PAGE_SIZE) < 0) {
+			pr_err("P3 receive: failed to buffer page at 0x%lx\n", vaddr);
+			goto out;
+		}
+	}
+
+	ret = nr_pages;
+
+out:
+	xfree(compressed_buf);
+	xfree(decompressed_buf);
+	return ret;
+}
 
 static void *p3_receiver_thread_func(void *arg)
 {
@@ -241,7 +408,7 @@ static void *p3_acceptor_thread_func(void *arg)
 	return NULL;
 }
 
-int start_p3_acceptor_thread(void)
+static int start_p3_acceptor_thread(void)
 {
 	if (p3_acceptor_running)
 		return 0;
@@ -262,7 +429,7 @@ int start_p3_acceptor_thread(void)
 	return 0;
 }
 
-void stop_p3_acceptor_thread(void)
+static void stop_p3_acceptor_thread(void)
 {
 	int i;
 	unsigned long total_pages = 0;
@@ -291,172 +458,53 @@ void stop_p3_acceptor_thread(void)
 }
 
 /*
- * Receive one compressed batch from socket and add to page buffer.
- * Returns number of pages received, 0 on EOF, -1 on error.
+ * Create multiple connections to page server for parallel P3 transfer.
+ * Returns number of connections created, fills sockets array.
  */
-static int p3_receive_and_buffer(int sk)
+static int connect_p3_sockets(int *sockets, int num_requested)
 {
-	struct page_server_iov pi;
-	int compressed_size;
-	char *compressed_buf = NULL;
-	char *decompressed_buf = NULL;
-	int nr_pages, i, ret = -1;
-	int decomp_ret;
+	int i, num_created = 0;
 
-	/* Receive header */
-	ret = __recv(sk, &pi, sizeof(pi), MSG_WAITALL);
-	if (ret == 0)
-		return 0;  /* EOF */
-	if (ret != sizeof(pi)) {
-		pr_perror("P3 receive: failed to read header");
-		return -1;
+	if (!opts.use_page_server || !opts.addr)
+		return 0;
+
+	for (i = 0; i < num_requested; i++) {
+		int sk = setup_tcp_client(opts.addr);
+		if (sk < 0) {
+			pr_err("Failed to create P3 socket %d/%d\n", i, num_requested);
+			break;
+		}
+
+		/* Initialize TLS if enabled */
+		if (tls_x509_init(sk, false)) {
+			close(sk);
+			pr_err("TLS init failed for P3 socket %d\n", i);
+			break;
+		}
+
+		tcp_cork(sk, true);
+		sockets[i] = sk;
+		num_created++;
+		pr_debug("Created P3 socket %d: fd=%d\n", i, sk);
 	}
 
-	nr_pages = pi.nr_pages;
-	if (nr_pages <= 0 || nr_pages > 64) {
-		pr_err("P3 receive: invalid nr_pages %d\n", nr_pages);
-		return -1;
-	}
+	pr_info("Created %d/%d P3 sockets for parallel transfer\n",
+		num_created, num_requested);
+	return num_created;
+}
 
-	/* Receive compressed size */
-	if (__recv(sk, &compressed_size, sizeof(compressed_size), MSG_WAITALL) != sizeof(compressed_size)) {
-		pr_perror("P3 receive: failed to read compressed size");
-		return -1;
-	}
-
-	if (compressed_size <= 0 || compressed_size > LZ4_compressBound(nr_pages * PAGE_SIZE)) {
-		pr_err("P3 receive: invalid compressed size %d\n", compressed_size);
-		return -1;
-	}
-
-	/* Allocate buffers */
-	compressed_buf = xmalloc(compressed_size);
-	decompressed_buf = xmalloc(nr_pages * PAGE_SIZE);
-	if (!compressed_buf || !decompressed_buf) {
-		pr_err("P3 receive: allocation failed\n");
-		goto out;
-	}
-
-	/* Receive compressed data */
-	if (__recv(sk, compressed_buf, compressed_size, MSG_WAITALL) != compressed_size) {
-		pr_perror("P3 receive: failed to read compressed data");
-		goto out;
-	}
-
-	/* Decompress */
-	decomp_ret = LZ4_decompress_safe(compressed_buf, decompressed_buf,
-					 compressed_size, nr_pages * PAGE_SIZE);
-	if (decomp_ret != nr_pages * PAGE_SIZE) {
-		pr_err("P3 receive: decompression failed (expected %d, got %d)\n",
-		       nr_pages * (int)PAGE_SIZE, decomp_ret);
-		goto out;
-	}
-
-	/* Add each page to buffer */
-	for (i = 0; i < nr_pages; i++) {
-		unsigned long vaddr = pi.vaddr + i * PAGE_SIZE;
-		if (cow_page_buffer_add(vaddr, decompressed_buf + i * PAGE_SIZE) < 0) {
-			pr_err("P3 receive: failed to buffer page at 0x%lx\n", vaddr);
-			goto out;
+/*
+ * Close P3 sockets after transfer completes.
+ */
+static void close_p3_sockets(int *sockets, int num_sockets)
+{
+	int i;
+	for (i = 0; i < num_sockets; i++) {
+		if (sockets[i] >= 0) {
+			close(sockets[i]);
+			sockets[i] = -1;
 		}
 	}
-
-	ret = nr_pages;
-
-out:
-	xfree(compressed_buf);
-	xfree(decompressed_buf);
-	return ret;
-}
-
-#define PS_CMD_BITS 16
-#define PS_CMD_MASK ((1 << PS_CMD_BITS) - 1)
-
-#define PS_TYPE_BITS 8
-#define PS_TYPE_MASK ((1 << PS_TYPE_BITS) - 1)
-
-#define PS_TYPE_PID   (1)
-#define PS_TYPE_SHMEM (2)
-/*
- * XXX: When adding new types here check decode_pm for legacy
- * numbers that can be met from older CRIUs
- */
-
-static inline u64 encode_pm(int type, unsigned long id)
-{
-	if (type == CR_FD_PAGEMAP)
-		type = PS_TYPE_PID;
-	else if (type == CR_FD_SHMEM_PAGEMAP)
-		type = PS_TYPE_SHMEM;
-	else {
-		BUG();
-		return 0;
-	}
-
-	return ((u64)id) << PS_TYPE_BITS | type;
-}
-
-static int decode_pm(u64 dst_id, unsigned long *id)
-{
-	int type;
-
-	/*
-	 * Magic numbers below came from the older CRIU versions that
-	 * erroneously used the changing CR_FD_* constants. The
-	 * changes were made when we merged images together and moved
-	 * the CR_FD_-s at the tail of the enum
-	 */
-	type = dst_id & PS_TYPE_MASK;
-	switch (type) {
-	case 10: /* 3.1 3.2 */
-	case 11: /* 1.3 1.4 1.5 1.6 1.7 1.8 2.* 3.0 */
-	case 16: /* 1.2 */
-	case 17: /* 1.0 1.1 */
-	case PS_TYPE_PID:
-		*id = dst_id >> PS_TYPE_BITS;
-		type = CR_FD_PAGEMAP;
-		break;
-	case 27: /* 1.3 */
-	case 28: /* 1.4 1.5 */
-	case 29: /* 1.6 1.7 */
-	case 32: /* 1.2 1.8 */
-	case 33: /* 1.0 1.1 3.1 3.2 */
-	case 34: /* 2.* 3.0 */
-	case PS_TYPE_SHMEM:
-		*id = dst_id >> PS_TYPE_BITS;
-		type = CR_FD_SHMEM_PAGEMAP;
-		break;
-	default:
-		type = -1;
-		break;
-	}
-
-	return type;
-}
-
-static inline u32 encode_ps_cmd(u32 cmd, u32 flags)
-{
-	return flags << PS_CMD_BITS | cmd;
-}
-
-static inline u32 decode_ps_cmd(u32 cmd)
-{
-	return cmd & PS_CMD_MASK;
-}
-
-static inline u32 decode_ps_flags(u32 cmd)
-{
-	return cmd >> PS_CMD_BITS;
-}
-
-static inline int __send(int sk, const void *buf, size_t sz, int fl)
-{
-	return opts.tls ? tls_send(buf, sz, fl) : send(sk, buf, sz, fl);
-}
-
-static inline int __recv(int sk, void *buf, size_t sz, int fl)
-{
-	return opts.tls ? tls_recv(buf, sz, fl) : recv(sk, buf, sz, fl);
 }
 
 static inline int send_psi_flags(int sk, struct page_server_iov *pi, int flags)
@@ -3267,56 +3315,6 @@ out:
 int connect_to_page_server_to_send(void)
 {
 	return connect_to_page_server();
-}
-
-/*
- * Create multiple connections to page server for parallel P3 transfer.
- * Returns number of connections created, fills sockets array.
- */
-int connect_p3_sockets(int *sockets, int num_requested)
-{
-	int i, num_created = 0;
-
-	if (!opts.use_page_server || !opts.addr)
-		return 0;
-
-	for (i = 0; i < num_requested; i++) {
-		int sk = setup_tcp_client(opts.addr);
-		if (sk < 0) {
-			pr_err("Failed to create P3 socket %d/%d\n", i, num_requested);
-			break;
-		}
-
-		/* Initialize TLS if enabled */
-		if (tls_x509_init(sk, false)) {
-			close(sk);
-			pr_err("TLS init failed for P3 socket %d\n", i);
-			break;
-		}
-
-		tcp_cork(sk, true);
-		sockets[i] = sk;
-		num_created++;
-		pr_debug("Created P3 socket %d: fd=%d\n", i, sk);
-	}
-
-	pr_info("Created %d/%d P3 sockets for parallel transfer\n",
-		num_created, num_requested);
-	return num_created;
-}
-
-/*
- * Close P3 sockets after transfer completes.
- */
-void close_p3_sockets(int *sockets, int num_sockets)
-{
-	int i;
-	for (i = 0; i < num_sockets; i++) {
-		if (sockets[i] >= 0) {
-			close(sockets[i]);
-			sockets[i] = -1;
-		}
-	}
 }
 
 /*
