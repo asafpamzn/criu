@@ -180,6 +180,11 @@ int cr_lazy_pages_cow_phase2(bool daemon)
 		goto err_epoll;
 	}
 
+	/* 5b. Create P3 parallel connections for bulk transfer */
+	if (start_p3_receiver_connections(10) > 0) {
+		pr_info("P3 parallel receiver enabled\n");
+	}
+
 	/* 6. Set up async bulk reader (uses prebuffer_io_complete in uffd.c) */
 	if (setup_prebuffer_reader()) {
 		pr_err("Failed to setup prebuffer reader\n");
@@ -209,8 +214,9 @@ int cr_lazy_pages_cow_phase2(bool daemon)
 	/*
 	 * Phase 3: Dirty bitmap received, skeleton dump is ready.
 	 * Primary closed the socket after sending dirty bitmap.
-	 * Disconnect and reconnect for convergence phase.
+	 * Stop P3 receivers and reconnect for convergence phase.
 	 */
+	stop_p3_receiver_connections();
 	close_page_server_socket();
 
 	/* Small delay for primary to start new page server */
@@ -258,6 +264,7 @@ int cr_lazy_pages_cow_phase2(bool daemon)
 
 err_disconnect:
 	/* Print page state statistics and cleanup */
+	stop_p3_receiver_connections();
 	page_state_destroy();
 	disconnect_from_page_server();
 err_epoll:
