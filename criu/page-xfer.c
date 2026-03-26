@@ -3278,7 +3278,7 @@ int cr_page_server(bool daemon_mode, bool lazy_dump, int cfd)
 	int sk = -1;
 	int ret;
 
-	pr_err("DEBUG_SOCKET: cr_page_server ENTRY daemon=%d lazy=%d\n",
+	pr_debug("DEBUG_SOCKET: cr_page_server ENTRY daemon=%d lazy=%d\n",
 	       daemon_mode, lazy_dump);
 
 	/*
@@ -3391,7 +3391,7 @@ int connect_to_page_server_to_send(void)
  */
 void close_page_server_socket(void)
 {
-	pr_err("DEBUG_SOCKET: close_page_server_socket called fd=%d\n", page_server_sk);
+	pr_debug("DEBUG_SOCKET: close_page_server_socket called fd=%d\n", page_server_sk);
 	if (page_server_sk >= 0) {
 		pr_info("Closing page server socket (server-side)\n");
 		close_safe(&page_server_sk);

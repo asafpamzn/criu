@@ -1220,7 +1220,7 @@ int setup_tcp_server(char *type, char *addr, unsigned short *port)
 		return -1;
 	}
 
-	pr_err("DEBUG_SOCKET: setup_tcp_server type=%s port=%u\n", type, *port);
+	pr_debug("DEBUG_SOCKET: setup_tcp_server type=%s port=%u\n", type, *port);
 	pr_info("Starting %s server on port %u\n", type, *port);
 
 	sk = socket(saddr.ss_family, SOCK_STREAM, IPPROTO_TCP);
@@ -1240,7 +1240,7 @@ int setup_tcp_server(char *type, char *addr, unsigned short *port)
 		goto out;
 	}
 
-	pr_err("DEBUG_SOCKET: Bound socket fd=%d to port %u\n", sk, *port);
+	pr_debug("DEBUG_SOCKET: Bound socket fd=%d to port %u\n", sk, *port);
 
 	if (listen(sk, 1)) {
 		pr_perror("Can't listen on %s server socket", type);
@@ -1279,7 +1279,7 @@ int get_listen_socket(void)
 
 void close_listen_socket(void)
 {
-	pr_err("DEBUG_SOCKET: close_listen_socket called fd=%d\n", g_listen_sk);
+	pr_debug("DEBUG_SOCKET: close_listen_socket called fd=%d\n", g_listen_sk);
 	if (g_listen_sk >= 0) {
 		close(g_listen_sk);
 		g_listen_sk = -1;

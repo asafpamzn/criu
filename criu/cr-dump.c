@@ -2533,13 +2533,13 @@ static int cr_dump_finish(int ret)
 
 		pr_err("START RESTORE!!!\n");
 
-		pr_err("DEBUG_SOCKET: About to call cr_lazy_mem_dump (COW path)\n");
+		pr_debug("DEBUG_SOCKET: About to call cr_lazy_mem_dump (COW path)\n");
 		/* Now start lazy page transfer with process running */
 		ret = cr_lazy_mem_dump();
 	} else {
 		/* Standard path: transfer pages then resume */
 		if (!ret && opts.lazy_pages) {
-			pr_err("DEBUG_SOCKET: About to call cr_lazy_mem_dump (standard path)\n");
+			pr_debug("DEBUG_SOCKET: About to call cr_lazy_mem_dump (standard path)\n");
 			ret = cr_lazy_mem_dump();
 		}
 		
@@ -2604,7 +2604,7 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 	int ret;
 	int exit_code = -1;
 
-	pr_err("DEBUG_SOCKET: cr_dump_tasks_cow_phased ENTRY\n");
+	pr_debug("DEBUG_SOCKET: cr_dump_tasks_cow_phased ENTRY\n");
 
 	kerndat_warn_about_madv_guards();
 
@@ -3012,7 +3012,7 @@ int cr_dump_tasks(pid_t pid)
 	int ret;
 	int exit_code = -1;
 
-	pr_err("DEBUG_SOCKET: cr_dump_tasks ENTRY cow_dump=%d lazy_pages=%d\n",
+	pr_debug("DEBUG_SOCKET: cr_dump_tasks ENTRY cow_dump=%d lazy_pages=%d\n",
 	       opts.cow_dump, opts.lazy_pages);
 
 	/*
@@ -3021,7 +3021,7 @@ int cr_dump_tasks(pid_t pid)
 	 * source downtime.
 	 */
 	if (opts.cow_dump && opts.lazy_pages) {
-		pr_err("DEBUG_SOCKET: Redirecting to cr_dump_tasks_cow_phased\n");
+		pr_debug("DEBUG_SOCKET: Redirecting to cr_dump_tasks_cow_phased\n");
 		return cr_dump_tasks_cow_phased(pid);
 	}
 
