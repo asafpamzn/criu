@@ -386,9 +386,6 @@ static void *background_drain_thread(void *arg)
 		}
 
 		pthread_spin_unlock(&cow_buffer.lock);
-
-		/* Yield to let page faults be handled with priority */
-		usleep(100);
 	}
 
 	pr_info("Drain thread done: %lu drained, %lu applied, %lu discarded, %lu eagain\n",
