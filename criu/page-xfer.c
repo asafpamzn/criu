@@ -317,7 +317,7 @@ static void *p3_receiver_thread_func(void *arg)
 {
 	struct p3_receiver_ctx *ctx = (struct p3_receiver_ctx *)arg;
 	unsigned long pages = 0;
-	int ret;
+	int ret = 0;
 
 	pr_info("P3 receiver[%d] started on socket %d\n", ctx->thread_id, ctx->socket);
 	pr_err("DEBUG_THREAD: P3 receiver[%d] STARTED socket=%d\n",
