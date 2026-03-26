@@ -180,11 +180,6 @@ int cr_lazy_pages_cow_phase2(bool daemon)
 		goto err_epoll;
 	}
 
-	/* 5b. Create P3 parallel connections for bulk transfer */
-	if (start_p3_receiver_connections(10) > 0) {
-		pr_info("P3 parallel receiver enabled\n");
-	}
-
 	/* 6. Set up async bulk reader (uses prebuffer_io_complete in uffd.c) */
 	if (setup_prebuffer_reader()) {
 		pr_err("Failed to setup prebuffer reader\n");
@@ -198,6 +193,14 @@ int cr_lazy_pages_cow_phase2(bool daemon)
 			pr_err("Failed to request pages for pid=%d\n", ct->pid);
 			goto err_disconnect;
 		}
+	}
+
+	/*
+	 * 7b. Create P3 parallel connections AFTER sending page requests.
+	 * PRIMARY is now in unified_page_server_thread and ready to accept.
+	 */
+	if (start_p3_receiver_connections(10) > 0) {
+		pr_info("P3 parallel receiver enabled\n");
 	}
 
 	pr_err("Waiting to receive pages from primary...\n");
