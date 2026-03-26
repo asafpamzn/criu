@@ -3053,10 +3053,6 @@ static int page_server_serve(int sk)
 	} else {
 		pipe_read_dest_init(&pipe_read_dest);
 		tcp_cork(sk, true);
-
-		/* Start P3 acceptor thread for parallel bulk transfer */
-		if (opts.cow_dump)
-			start_p3_acceptor_thread();
 	}
 
 
