@@ -1503,16 +1503,19 @@ int epoll_run_rfds(int epollfd, struct epoll_event *evs, int nr_fds, int timeout
 		}
 		
 		clock_gettime(CLOCK_MONOTONIC, &t_wait_start);
-		ret = epoll_wait(epollfd, evs, nr_fds, 1000);
+		/* Use passed-in timeout, default to 1000ms if not specified */
+		ret = epoll_wait(epollfd, evs, nr_fds, timeout > 0 ? timeout : 1000);
 		clock_gettime(CLOCK_MONOTONIC, &t_wait_end);
 		epoll_stats.epoll_wait_calls++;
 		epoll_stats.epoll_wait_time_ns += (t_wait_end.tv_sec - t_wait_start.tv_sec) * 1000000000 + (t_wait_end.tv_nsec - t_wait_start.tv_nsec);
-		
+
 		if (ret <= 0) {
 			if (ret < 0) {
 				pr_perror("polling failed");
 				break;
 			}
+			/* Timeout - return 0 so caller can check exit conditions */
+			return 0;
 		}
 		
 

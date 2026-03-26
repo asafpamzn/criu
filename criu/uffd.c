@@ -2099,6 +2099,9 @@ static int handle_requests(int epollfd, struct epoll_event **events, int nr_fds)
 	int ret;
 
 	for (;;) {
+		if (restore_finished) {
+			pr_warn("DEBUG: restore_finished=true epoll_run_rfds with poll_timeout=%d\n", poll_timeout);
+		}
 		ret = epoll_run_rfds(epollfd, *events, nr_fds, poll_timeout);
 		if (ret < 0) {
 			pr_err("DEBUG: epoll_run_rfds returned %d, goto out\n", ret);
@@ -2110,7 +2113,10 @@ static int handle_requests(int epollfd, struct epoll_event **events, int nr_fds)
 		if (ret > 0) {
 			ret = complete_forks(epollfd, events, &nr_fds);
 			if (ret < 0)
+			{
+				pr_warn("DEBUG: goto out\n");
 				goto out;
+			}
 			if (restore_finished) {
 				pr_warn("DEBUG: restore_finished=true, setting poll_timeout=%d\n",
 					opts.cow_dump ? 100 : 0);
@@ -2133,6 +2139,7 @@ static int handle_requests(int epollfd, struct epoll_event **events, int nr_fds)
 		if (opts.cow_dump && !list_empty(&eagain_requests)) {
 			if (process_eagain_requests()) {
 				ret = -1;
+				pr_warn("DEBUG: process_eagain_requests goto out\n");
 				goto out;
 			}
 		}
