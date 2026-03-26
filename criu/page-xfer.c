@@ -3396,6 +3396,8 @@ void close_page_server_socket(void)
 		pr_info("Closing page server socket (server-side)\n");
 		close_safe(&page_server_sk);
 	}
+	/* Also close the listen socket to release the port */
+	close_listen_socket();
 }
 
 int disconnect_from_page_server(void)
