@@ -22,9 +22,18 @@
 #define PAGE_BUFFER_HASH_BITS 20
 #define PAGE_BUFFER_HASH_SIZE (1 << PAGE_BUFFER_HASH_BITS)  /* 1M buckets */
 
-struct page_buffer_entry {
-	unsigned long vaddr;
-	void *data;
+/*
+ * Unrolled linked list node - holds up to 32 entries per node.
+ * Gives ~32x better cache locality during traversal vs single-entry nodes.
+ */
+#define PAGE_NODE_ENTRIES 32
+
+struct page_buffer_node {
+	struct {
+		unsigned long vaddr;
+		void *data;
+	} entries[PAGE_NODE_ENTRIES];
+	int count;			/* Number of valid entries in this node */
 	struct hlist_node hash;
 };
 
@@ -77,9 +86,11 @@ int cow_page_buffer_init(void)
 
 int cow_page_buffer_add(unsigned long vaddr, void *data)
 {
-	struct page_buffer_entry *entry;
+	struct page_buffer_node *node;
 	unsigned int hash;
 	enum page_state state;
+	void *page_data;
+	int i;
 
 	if (!cow_buffer.initialized)
 		return -1;
@@ -101,56 +112,55 @@ int cow_page_buffer_add(unsigned long vaddr, void *data)
 
 	hash = page_buffer_hash(vaddr);
 
+	/* Allocate page data outside lock */
+	page_data = xmalloc(PAGE_SIZE);
+	if (!page_data)
+		return -1;
+	memcpy(page_data, data, PAGE_SIZE);
+
 	pthread_spin_lock(&cow_buffer.lock);
 
-	/* Check for duplicate while holding lock */
-	hlist_for_each_entry(entry, &cow_buffer.hash_table[hash], hash) {
-		if (entry->vaddr == vaddr) {
-			/* Update existing entry with newer data */
-			memcpy(entry->data, data, PAGE_SIZE);
+	/* Check for duplicate and find space in existing nodes (cache-friendly) */
+	hlist_for_each_entry(node, &cow_buffer.hash_table[hash], hash) {
+		/* Check all entries in this node - contiguous in memory */
+		for (i = 0; i < node->count; i++) {
+			if (node->entries[i].vaddr == vaddr) {
+				/* Update existing entry with newer data */
+				xfree(node->entries[i].data);
+				node->entries[i].data = page_data;
+				pthread_spin_unlock(&cow_buffer.lock);
+				return 0;
+			}
+		}
+		/* If this node has space, add here */
+		if (node->count < PAGE_NODE_ENTRIES) {
+			node->entries[node->count].vaddr = vaddr;
+			node->entries[node->count].data = page_data;
+			node->count++;
+			cow_buffer.nr_pages++;
 			pthread_spin_unlock(&cow_buffer.lock);
+			page_state_set(vaddr, PAGE_STATE_IN_BUFFER);
 			return 0;
 		}
 	}
 
 	pthread_spin_unlock(&cow_buffer.lock);
 
-	/* Allocate new entry outside lock */
-	entry = xmalloc(sizeof(*entry));
-	if (!entry)
-		return -1;
-
-	entry->data = xmalloc(PAGE_SIZE);
-	if (!entry->data) {
-		xfree(entry);
+	/* Need new node - allocate outside lock */
+	node = xmalloc(sizeof(*node));
+	if (!node) {
+		xfree(page_data);
 		return -1;
 	}
 
-	memcpy(entry->data, data, PAGE_SIZE);
-	entry->vaddr = vaddr;
-	INIT_HLIST_NODE(&entry->hash);
+	node->entries[0].vaddr = vaddr;
+	node->entries[0].data = page_data;
+	node->count = 1;
+	INIT_HLIST_NODE(&node->hash);
 
 	pthread_spin_lock(&cow_buffer.lock);
-	hlist_add_head(&entry->hash, &cow_buffer.hash_table[hash]);
+	hlist_add_head(&node->hash, &cow_buffer.hash_table[hash]);
 	cow_buffer.nr_pages++;
-
-	/* Track max bucket depth - count entries in this bucket */
-	{
-		struct page_buffer_entry *e;
-		unsigned long depth = 0;
-		hlist_for_each_entry(e, &cow_buffer.hash_table[hash], hash)
-			depth++;
-		if (depth > cow_buffer.max_bucket_depth) {
-			unsigned long old_max = cow_buffer.max_bucket_depth;
-			cow_buffer.max_bucket_depth = depth;
-			/* Print every 100 increase */
-			if (depth / 10 > old_max / 10) {
-				pr_info("COW buffer max bucket depth: %lu (total=%lu)\n",
-					depth, cow_buffer.nr_pages);
-			}
-		}
-	}
-
 	pthread_spin_unlock(&cow_buffer.lock);
 
 	/* Track page state: now in buffer */
@@ -163,9 +173,10 @@ int cow_page_buffer_add(unsigned long vaddr, void *data)
 
 void *cow_page_buffer_lookup_and_remove(unsigned long vaddr)
 {
-	struct page_buffer_entry *entry;
+	struct page_buffer_node *node;
 	unsigned int hash;
 	void *data = NULL;
+	int i;
 
 	if (!cow_buffer.initialized)
 		return NULL;
@@ -173,13 +184,24 @@ void *cow_page_buffer_lookup_and_remove(unsigned long vaddr)
 	hash = page_buffer_hash(vaddr);
 
 	pthread_spin_lock(&cow_buffer.lock);
-	hlist_for_each_entry(entry, &cow_buffer.hash_table[hash], hash) {
-		if (entry->vaddr == vaddr) {
-			data = entry->data;
-			hlist_del(&entry->hash);
-			cow_buffer.nr_pages--;
-			xfree(entry);
-			break;
+	hlist_for_each_entry(node, &cow_buffer.hash_table[hash], hash) {
+		for (i = 0; i < node->count; i++) {
+			if (node->entries[i].vaddr == vaddr) {
+				data = node->entries[i].data;
+				/* Move last entry to fill gap */
+				node->count--;
+				if (i < node->count) {
+					node->entries[i] = node->entries[node->count];
+				}
+				cow_buffer.nr_pages--;
+				/* Remove empty nodes */
+				if (node->count == 0) {
+					hlist_del(&node->hash);
+					xfree(node);
+				}
+				pthread_spin_unlock(&cow_buffer.lock);
+				return data;
+			}
 		}
 	}
 	pthread_spin_unlock(&cow_buffer.lock);
@@ -195,7 +217,7 @@ unsigned long cow_page_buffer_count(void)
 void cow_page_buffer_discard_dirty(unsigned long *dirty_ranges,
 				   unsigned int nr_dirty_ranges)
 {
-	unsigned int i;
+	unsigned int r;
 	unsigned long discarded = 0;
 
 	if (!cow_buffer.initialized || !dirty_ranges || nr_dirty_ranges == 0)
@@ -204,29 +226,44 @@ void cow_page_buffer_discard_dirty(unsigned long *dirty_ranges,
 	pthread_spin_lock(&cow_buffer.lock);
 
 	/* Iterate dirty ranges and do O(1) hash lookups */
-	for (i = 0; i < nr_dirty_ranges; i++) {
-		unsigned long start = dirty_ranges[i * 2];
-		unsigned long len = dirty_ranges[i * 2 + 1];
+	for (r = 0; r < nr_dirty_ranges; r++) {
+		unsigned long start = dirty_ranges[r * 2];
+		unsigned long len = dirty_ranges[r * 2 + 1];
 		unsigned long vaddr;
 
 		/* Iterate each page in this dirty range */
 		for (vaddr = start; vaddr < start + len; vaddr += PAGE_SIZE) {
 			unsigned int hash = page_buffer_hash(vaddr);
-			struct page_buffer_entry *entry;
+			struct page_buffer_node *node;
 			struct hlist_node *tmp;
+			int i;
+			bool found = false;
 
-			hlist_for_each_entry_safe(entry, tmp,
+			hlist_for_each_entry_safe(node, tmp,
 						  &cow_buffer.hash_table[hash], hash) {
-				if (entry->vaddr == vaddr) {
-					hlist_del(&entry->hash);
-					xfree(entry->data);
-					xfree(entry);
-					cow_buffer.nr_pages--;
-					cow_buffer.nr_discarded++;
-					discarded++;
-					page_state_set(vaddr, PAGE_STATE_DIRTY);
-					break;  /* Found and removed, move to next page */
+				for (i = 0; i < node->count; i++) {
+					if (node->entries[i].vaddr == vaddr) {
+						xfree(node->entries[i].data);
+						/* Move last entry to fill gap */
+						node->count--;
+						if (i < node->count) {
+							node->entries[i] = node->entries[node->count];
+						}
+						cow_buffer.nr_pages--;
+						cow_buffer.nr_discarded++;
+						discarded++;
+						page_state_set(vaddr, PAGE_STATE_DIRTY);
+						/* Remove empty nodes */
+						if (node->count == 0) {
+							hlist_del(&node->hash);
+							xfree(node);
+						}
+						found = true;
+						break;
+					}
 				}
+				if (found)
+					break;
 			}
 		}
 	}
@@ -238,9 +275,9 @@ void cow_page_buffer_discard_dirty(unsigned long *dirty_ranges,
 
 void cow_page_buffer_destroy(void)
 {
-	struct page_buffer_entry *entry;
+	struct page_buffer_node *node;
 	struct hlist_node *tmp;
-	int i;
+	int i, j;
 
 	if (!cow_buffer.initialized)
 		return;
@@ -251,11 +288,12 @@ void cow_page_buffer_destroy(void)
 	pthread_spin_lock(&cow_buffer.lock);
 
 	for (i = 0; i < PAGE_BUFFER_HASH_SIZE; i++) {
-		hlist_for_each_entry_safe(entry, tmp,
+		hlist_for_each_entry_safe(node, tmp,
 					  &cow_buffer.hash_table[i], hash) {
-			hlist_del(&entry->hash);
-			xfree(entry->data);
-			xfree(entry);
+			for (j = 0; j < node->count; j++)
+				xfree(node->entries[j].data);
+			hlist_del(&node->hash);
+			xfree(node);
 		}
 	}
 
@@ -278,24 +316,43 @@ void cow_page_buffer_destroy(void)
  */
 static void cow_page_buffer_readd(unsigned long vaddr, void *data)
 {
-	struct page_buffer_entry *entry;
+	struct page_buffer_node *node;
 	unsigned int hash;
 
-	entry = xmalloc(sizeof(*entry));
-	if (!entry) {
+	hash = page_buffer_hash(vaddr);
+
+	pthread_spin_lock(&cow_buffer.lock);
+
+	/* Try to find space in existing node */
+	hlist_for_each_entry(node, &cow_buffer.hash_table[hash], hash) {
+		if (node->count < PAGE_NODE_ENTRIES) {
+			node->entries[node->count].vaddr = vaddr;
+			node->entries[node->count].data = data;
+			node->count++;
+			cow_buffer.nr_pages++;
+			pthread_spin_unlock(&cow_buffer.lock);
+			page_state_set(vaddr, PAGE_STATE_EAGAIN_QUEUED);
+			return;
+		}
+	}
+
+	pthread_spin_unlock(&cow_buffer.lock);
+
+	/* Need new node */
+	node = xmalloc(sizeof(*node));
+	if (!node) {
 		pr_err("Failed to re-add page 0x%lx on EAGAIN\n", vaddr);
 		xfree(data);
 		return;
 	}
 
-	entry->data = data;
-	entry->vaddr = vaddr;
-	INIT_HLIST_NODE(&entry->hash);
-
-	hash = page_buffer_hash(vaddr);
+	node->entries[0].vaddr = vaddr;
+	node->entries[0].data = data;
+	node->count = 1;
+	INIT_HLIST_NODE(&node->hash);
 
 	pthread_spin_lock(&cow_buffer.lock);
-	hlist_add_head(&entry->hash, &cow_buffer.hash_table[hash]);
+	hlist_add_head(&node->hash, &cow_buffer.hash_table[hash]);
 	cow_buffer.nr_pages++;
 	pthread_spin_unlock(&cow_buffer.lock);
 
@@ -309,9 +366,9 @@ static void cow_page_buffer_readd(unsigned long vaddr, void *data)
  */
 static void *background_drain_thread(void *arg)
 {
-	struct page_buffer_entry *entry;
+	struct page_buffer_node *node;
 	struct hlist_node *tmp;
-	int i;
+	int bucket;
 	unsigned long drained = 0;
 
 	pr_info("Background drain thread started (%lu pages buffered)\n",
@@ -320,89 +377,86 @@ static void *background_drain_thread(void *arg)
 	while (!drain_thread_stop && cow_buffer.nr_pages > 0) {
 		pthread_spin_lock(&cow_buffer.lock);
 
-		for (i = 0; i < PAGE_BUFFER_HASH_SIZE && !drain_thread_stop; i++) {
-			hlist_for_each_entry_safe(entry, tmp,
-						  &cow_buffer.hash_table[i], hash) {
-				unsigned long vaddr = entry->vaddr;
-				void *data = entry->data;
-				int uffd;
-				bool free_data = true;
+		for (bucket = 0; bucket < PAGE_BUFFER_HASH_SIZE && !drain_thread_stop; bucket++) {
+			hlist_for_each_entry_safe(node, tmp,
+						  &cow_buffer.hash_table[bucket], hash) {
+				/* Process all entries in this node */
+				while (node->count > 0 && !drain_thread_stop) {
+					/* Take last entry (avoids moving data) */
+					int idx = node->count - 1;
+					unsigned long vaddr = node->entries[idx].vaddr;
+					void *data = node->entries[idx].data;
+					int uffd;
+					bool free_data = true;
 
-				/* Remove from hash while holding lock */
-				hlist_del(&entry->hash);
-				cow_buffer.nr_pages--;
-				xfree(entry);
+					node->count--;
+					cow_buffer.nr_pages--;
 
-				/* Track: removed from buffer, about to copy */
-				page_state_set(vaddr, PAGE_STATE_DRAIN_PENDING);
+					/* Track: removed from buffer, about to copy */
+					page_state_set(vaddr, PAGE_STATE_DRAIN_PENDING);
 
-				pr_debug("COW_TRACE DRAIN_REMOVE: 0x%lx (remaining=%lu)\n", vaddr, cow_buffer.nr_pages);
+					pr_debug("COW_TRACE DRAIN_REMOVE: 0x%lx (remaining=%lu)\n", vaddr, cow_buffer.nr_pages);
 
-				pthread_spin_unlock(&cow_buffer.lock);
+					pthread_spin_unlock(&cow_buffer.lock);
 
-				/* Find uffd for this address and UFFDIO_COPY */
-				uffd = get_uffd_for_vaddr(vaddr);
-				if (uffd >= 0) {
-					struct uffdio_copy uffd_copy = {
-						.dst = vaddr,
-						.src = (unsigned long)data,
-						.len = PAGE_SIZE,
-						.mode = 0,
-						.copy = 0,
-					};
+					/* Find uffd for this address and UFFDIO_COPY */
+					uffd = get_uffd_for_vaddr(vaddr);
+					if (uffd >= 0) {
+						struct uffdio_copy uffd_copy = {
+							.dst = vaddr,
+							.src = (unsigned long)data,
+							.len = PAGE_SIZE,
+							.mode = 0,
+							.copy = 0,
+						};
 
-					if (ioctl(uffd, UFFDIO_COPY, &uffd_copy) < 0) {
-						if (errno == EEXIST) {
-							/*
-							 * EEXIST: page already present. BUG - duplicate copy!
-							 */
-							cow_buffer.nr_discarded++;
-							pr_err("BUG: DRAIN_COPY EEXIST at 0x%lx - duplicate copy!\n", vaddr);
-							page_state_print_history(vaddr);
-							/* Don't set DISCARDED if DIRTY - illegal transition */
-							if (page_state_get(vaddr) != PAGE_STATE_DIRTY)
-								page_state_set(vaddr, PAGE_STATE_DISCARDED);
-						} else if (errno == ENOENT) {
-							/* ENOENT: VMA was unmapped (app freed memory) */
-							cow_buffer.nr_discarded++;
-							pr_err("COW_TRACE DRAIN_COPY: 0x%lx FAILED errno=ENOENT (VMA unmapped)\n", vaddr);
-							page_state_print_history(vaddr);
-							/* Don't set DISCARDED if DIRTY - illegal transition */
-							if (page_state_get(vaddr) != PAGE_STATE_DIRTY)
-								page_state_set(vaddr, PAGE_STATE_DISCARDED);
-						} else if (errno == EAGAIN) {
-							/*
-							 * EAGAIN: page table locked. Re-add to buffer
-							 * for retry on next pass.
-							 */
-							cow_buffer.nr_eagain++;
-							cow_page_buffer_readd(vaddr, data);
-							free_data = false;  /* Data transferred to buffer */
-							pr_debug("COW_TRACE DRAIN_COPY: 0x%lx EAGAIN, re-buffered\n", vaddr);
+						if (ioctl(uffd, UFFDIO_COPY, &uffd_copy) < 0) {
+							if (errno == EEXIST) {
+								cow_buffer.nr_discarded++;
+								pr_err("BUG: DRAIN_COPY EEXIST at 0x%lx - duplicate copy!\n", vaddr);
+								page_state_print_history(vaddr);
+								if (page_state_get(vaddr) != PAGE_STATE_DIRTY)
+									page_state_set(vaddr, PAGE_STATE_DISCARDED);
+							} else if (errno == ENOENT) {
+								cow_buffer.nr_discarded++;
+								pr_err("COW_TRACE DRAIN_COPY: 0x%lx FAILED errno=ENOENT (VMA unmapped)\n", vaddr);
+								page_state_print_history(vaddr);
+								if (page_state_get(vaddr) != PAGE_STATE_DIRTY)
+									page_state_set(vaddr, PAGE_STATE_DISCARDED);
+							} else if (errno == EAGAIN) {
+								cow_buffer.nr_eagain++;
+								cow_page_buffer_readd(vaddr, data);
+								free_data = false;
+								pr_debug("COW_TRACE DRAIN_COPY: 0x%lx EAGAIN, re-buffered\n", vaddr);
+							} else {
+								pr_err("COW_TRACE DRAIN_COPY: 0x%lx FAILED errno=%d\n", vaddr, errno);
+								page_state_print_history(vaddr);
+								if (page_state_get(vaddr) != PAGE_STATE_DIRTY)
+									page_state_set(vaddr, PAGE_STATE_DISCARDED);
+							}
 						} else {
-							pr_err("COW_TRACE DRAIN_COPY: 0x%lx FAILED errno=%d\n", vaddr, errno);
-							page_state_print_history(vaddr);
-							/* Don't set DISCARDED if DIRTY - illegal transition */
-							if (page_state_get(vaddr) != PAGE_STATE_DIRTY)
-								page_state_set(vaddr, PAGE_STATE_DISCARDED);
+							cow_buffer.nr_applied++;
+							page_state_set(vaddr, PAGE_STATE_COPIED);
+							drained++;
 						}
 					} else {
-						cow_buffer.nr_applied++;
-						page_state_set(vaddr, PAGE_STATE_COPIED);
-						drained++;
+						cow_buffer.nr_discarded++;
+						pr_err("COW_TRACE DRAIN_COPY: 0x%lx no uffd found\n", vaddr);
+						page_state_print_history(vaddr);
+						if (page_state_get(vaddr) != PAGE_STATE_DIRTY)
+							page_state_set(vaddr, PAGE_STATE_DISCARDED);
 					}
-				} else {
-					cow_buffer.nr_discarded++;
-					pr_err("COW_TRACE DRAIN_COPY: 0x%lx no uffd found\n", vaddr);
-					page_state_print_history(vaddr);
-					/* Don't set DISCARDED if DIRTY - illegal transition */
-					if (page_state_get(vaddr) != PAGE_STATE_DIRTY)
-						page_state_set(vaddr, PAGE_STATE_DISCARDED);
+
+					if (free_data)
+						xfree(data);
+					pthread_spin_lock(&cow_buffer.lock);
 				}
 
-				if (free_data)
-					xfree(data);
-				pthread_spin_lock(&cow_buffer.lock);
+				/* Remove empty node */
+				if (node->count == 0) {
+					hlist_del(&node->hash);
+					xfree(node);
+				}
 			}
 		}
 
