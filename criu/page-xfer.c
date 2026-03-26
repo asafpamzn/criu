@@ -320,7 +320,7 @@ static void *p3_receiver_thread_func(void *arg)
 	int ret = 0;
 
 	pr_info("P3 receiver[%d] started on socket %d\n", ctx->thread_id, ctx->socket);
-	pr_err("DEBUG_THREAD: P3 receiver[%d] STARTED socket=%d\n",
+	pr_debug("DEBUG_THREAD: P3 receiver[%d] STARTED socket=%d\n",
 	       ctx->thread_id, ctx->socket);
 
 	/* Initialize TLS if enabled */
@@ -334,7 +334,7 @@ static void *p3_receiver_thread_func(void *arg)
 	while ((ret = p3_receive_and_buffer(ctx->socket)) > 0) {
 		pages += ret;
 		if (pages % 1000 == 0 && pages > 0)
-			pr_err("DEBUG_THREAD: P3 receiver[%d] progress: %lu pages received\n",
+			pr_debug("DEBUG_THREAD: P3 receiver[%d] progress: %lu pages received\n",
 			       ctx->thread_id, pages);
 	}
 
@@ -344,13 +344,13 @@ static void *p3_receiver_thread_func(void *arg)
 	}
 
 out:
-	pr_err("DEBUG_THREAD: P3 receiver[%d] CLOSING socket=%d pages_received=%lu ret=%d\n",
+	pr_debug("DEBUG_THREAD: P3 receiver[%d] CLOSING socket=%d pages_received=%lu ret=%d\n",
 	       ctx->thread_id, ctx->socket, pages, ret);
 	ctx->pages_received = pages;
 	ctx->active = false;
 	__sync_fetch_and_sub(&p3_receivers_active, 1);
 	pr_info("P3 receiver[%d] done: %lu pages\n", ctx->thread_id, pages);
-	pr_err("DEBUG_THREAD: P3 receiver[%d] TERMINATED pages=%lu\n", ctx->thread_id, pages);
+	pr_debug("DEBUG_THREAD: P3 receiver[%d] TERMINATED pages=%lu\n", ctx->thread_id, pages);
 	return NULL;
 }
 
@@ -552,13 +552,13 @@ void stop_p3_receiver_connections(void)
 
 	for (i = 0; i < MAX_P3_RECEIVERS; i++) {
 		if (p3_receivers[i].thread) {
-			pr_err("DEBUG_THREAD: Waiting for P3 receiver[%d] to join\n", i);
+			pr_debug("DEBUG_THREAD: Waiting for P3 receiver[%d] to join\n", i);
 			pthread_join(p3_receivers[i].thread, NULL);
-			pr_err("DEBUG_THREAD: P3 receiver[%d] JOINED pages=%lu\n",
+			pr_debug("DEBUG_THREAD: P3 receiver[%d] JOINED pages=%lu\n",
 			       i, p3_receivers[i].pages_received);
 			total_pages += p3_receivers[i].pages_received;
 			if (p3_receivers[i].socket >= 0) {
-				pr_err("DEBUG_THREAD: P3 receiver[%d] closing socket=%d\n",
+				pr_debug("DEBUG_THREAD: P3 receiver[%d] closing socket=%d\n",
 				       i, p3_receivers[i].socket);
 				close(p3_receivers[i].socket);
 				p3_receivers[i].socket = -1;
@@ -568,7 +568,7 @@ void stop_p3_receiver_connections(void)
 	}
 
 	p3_receivers_active = 0;
-	pr_err("DEBUG_THREAD: All P3 receivers stopped: %lu total pages\n", total_pages);
+	pr_debug("DEBUG_THREAD: All P3 receivers stopped: %lu total pages\n", total_pages);
 	pr_info("P3 receiver connections stopped: %lu total pages received\n", total_pages);
 }
 
