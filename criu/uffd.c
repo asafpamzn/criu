@@ -2100,8 +2100,8 @@ static int handle_requests(int epollfd, struct epoll_event **events, int nr_fds)
 
 	for (;;) {
 		ret = epoll_run_rfds(epollfd, *events, nr_fds, poll_timeout);
-		if (ret < 0){
-			pr_err("DEBUG: ret <0 goto out\n");
+		if (ret < 0) {
+			pr_err("DEBUG: epoll_run_rfds returned %d, goto out\n", ret);
 			goto out;
 		}
 		if (ret == 0) {
@@ -2111,8 +2111,9 @@ static int handle_requests(int epollfd, struct epoll_event **events, int nr_fds)
 			ret = complete_forks(epollfd, events, &nr_fds);
 			if (ret < 0)
 				goto out;
-			if (restore_finished){
-				pr_warn("DEBUG: continue because !restore_finished\n");
+			if (restore_finished) {
+				pr_warn("DEBUG: restore_finished=true, setting poll_timeout=%d\n",
+					opts.cow_dump ? 100 : 0);
 				poll_timeout = opts.cow_dump ? 100 : 0;
 			}
 			if (!restore_finished) {
@@ -2123,8 +2124,7 @@ static int handle_requests(int epollfd, struct epoll_event **events, int nr_fds)
 				pr_warn("DEBUG: continue because !cow_dump && !ret\n");
 				continue;
 			}
-			pr_warn("DEBUG: falling through after ret>0 block (restore_finished=%d, cow_dump=%d, ret=%d)\n",
-				restore_finished, opts.cow_dump, ret);
+			pr_warn("DEBUG: falling through after ret>0 block\n");
 		}
 
 		/* make sure we return success if there is nothing to xfer */

@@ -34,30 +34,37 @@ int cow_handle_exit(struct list_head *lpis)
 {
 	struct lazy_pages_info *lpi, *n;
 
-	pr_info("cow_handle_exit: checking conditions (signal=%d, drain_running=%d, buffer=%lu)\n",
-		is_all_pages_sent_received(), cow_drain_thread_running(), cow_page_buffer_count());
+	/* Only log when state changes to avoid log spam */
+	static int last_signal = -1, last_drain = -1;
+	int cur_signal = is_all_pages_sent_received();
+	int cur_drain = cow_drain_thread_running();
+
+	if (cur_signal != last_signal || cur_drain != last_drain) {
+		pr_err("cow_handle_exit: conditions changed (signal=%d->%d, drain=%d->%d, buffer=%lu)\n",
+		       last_signal, cur_signal, last_drain, cur_drain, cow_page_buffer_count());
+		last_signal = cur_signal;
+		last_drain = cur_drain;
+	}
 
 	/* Condition 1: Wait for all_pages_sent signal from primary */
-	if (!is_all_pages_sent_received()) {
-		pr_info("cow_handle_exit: waiting for all_pages_sent signal\n");
+	if (!cur_signal) {
 		return 0;
 	}
 
 	/* Condition 2: Wait for drain thread to finish */
-	if (cow_drain_thread_running()) {
-		pr_info("cow_handle_exit: waiting for drain thread to finish\n");
+	if (cur_drain) {
 		return 0;
 	}
 
 	/* Condition 3: Wait for buffer to be empty */
 	if (cow_page_buffer_count() > 0) {
-		pr_info("cow_handle_exit: waiting for buffer to drain (%lu pages remaining)\n",
-			cow_page_buffer_count());
+		pr_err("cow_handle_exit: waiting for buffer to drain (%lu pages remaining)\n",
+		       cow_page_buffer_count());
 		return 0;
 	}
 
 	/* All conditions met - send ACK to primary */
-	pr_info("All pages received and drained, sending ACK to primary\n");
+	pr_err("All pages received and drained, sending ACK to primary\n");
 	if (send_all_pages_sent_ack() < 0)
 		pr_warn("Failed to send all_pages_sent ACK\n");
 
