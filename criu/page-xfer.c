@@ -395,7 +395,6 @@ static int accept_p3_connections(int *sockets, int max_connections, int timeout_
 			continue;
 		}
 
-		tcp_nodelay(sk, true);
 		sockets[num_accepted] = sk;
 		num_accepted++;
 		pr_info("Accepted P3 connection %d (fd=%d)\n", num_accepted, sk);
@@ -519,9 +518,8 @@ static void stop_p3_acceptor_thread(void)
 	pr_info("P3 receivers stopped: %lu total pages\n", total_pages);
 }
 
-/* Forward declarations */
+/* Forward declaration */
 static void tcp_cork(int sk, bool on);
-static void tcp_nodelay(int sk, bool on);
 
 /*
  * Create multiple connections to page server for parallel P3 transfer.
