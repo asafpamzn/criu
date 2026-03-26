@@ -2104,6 +2104,9 @@ static int handle_requests(int epollfd, struct epoll_event **events, int nr_fds)
 			pr_err("DEBUG: ret <0 goto out\n");
 			goto out;
 		}
+		if (ret == 0) {
+			pr_warn("DEBUG: epoll timeout (ret=0), falling through\n");
+		}
 		if (ret > 0) {
 			ret = complete_forks(epollfd, events, &nr_fds);
 			if (ret < 0)
@@ -2120,6 +2123,8 @@ static int handle_requests(int epollfd, struct epoll_event **events, int nr_fds)
 				pr_warn("DEBUG: continue because !cow_dump && !ret\n");
 				continue;
 			}
+			pr_warn("DEBUG: falling through after ret>0 block (restore_finished=%d, cow_dump=%d, ret=%d)\n",
+				restore_finished, opts.cow_dump, ret);
 		}
 
 		/* make sure we return success if there is nothing to xfer */
