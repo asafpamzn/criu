@@ -469,26 +469,6 @@ static void *p3_acceptor_thread_func(void *arg)
 	return NULL;
 }
 
-static int start_p3_acceptor_thread(void)
-{
-	if (p3_acceptor_running)
-		return 0;
-
-	if (get_listen_socket() < 0) {
-		pr_warn("Cannot start P3 acceptor: no listening socket\n");
-		return -1;
-	}
-
-	p3_acceptor_running = true;
-	if (pthread_create(&p3_acceptor_thread, NULL, p3_acceptor_thread_func, NULL)) {
-		pr_perror("Failed to create P3 acceptor thread");
-		p3_acceptor_running = false;
-		return -1;
-	}
-
-	pr_info("Started P3 acceptor thread\n");
-	return 0;
-}
 
 static void stop_p3_acceptor_thread(void)
 {
