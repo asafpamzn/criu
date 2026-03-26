@@ -2532,14 +2532,16 @@ static int cr_dump_finish(int ret)
 		timing_stop(TIME_FROZEN);
 
 		pr_err("START RESTORE!!!\n");
-		
-		
+
+		pr_err("DEBUG_SOCKET: About to call cr_lazy_mem_dump (COW path)\n");
 		/* Now start lazy page transfer with process running */
 		ret = cr_lazy_mem_dump();
 	} else {
 		/* Standard path: transfer pages then resume */
-		if (!ret && opts.lazy_pages)
+		if (!ret && opts.lazy_pages) {
+			pr_err("DEBUG_SOCKET: About to call cr_lazy_mem_dump (standard path)\n");
 			ret = cr_lazy_mem_dump();
+		}
 		
 		if (arch_set_thread_regs(root_item, true) < 0)
 			ret = -1;
@@ -2601,6 +2603,8 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 	unsigned long total_dirty_pages = 0;
 	int ret;
 	int exit_code = -1;
+
+	pr_err("DEBUG_SOCKET: cr_dump_tasks_cow_phased ENTRY\n");
 
 	kerndat_warn_about_madv_guards();
 
@@ -3008,13 +3012,18 @@ int cr_dump_tasks(pid_t pid)
 	int ret;
 	int exit_code = -1;
 
+	pr_err("DEBUG_SOCKET: cr_dump_tasks ENTRY cow_dump=%d lazy_pages=%d\n",
+	       opts.cow_dump, opts.lazy_pages);
+
 	/*
 	 * COW phased migration: when both --cow-dump and --lazy-pages are
 	 * enabled, use the phased WP_ASYNC → WP_SYNC flow for minimal
 	 * source downtime.
 	 */
-	if (opts.cow_dump && opts.lazy_pages)
+	if (opts.cow_dump && opts.lazy_pages) {
+		pr_err("DEBUG_SOCKET: Redirecting to cr_dump_tasks_cow_phased\n");
 		return cr_dump_tasks_cow_phased(pid);
+	}
 
 	kerndat_warn_about_madv_guards();
 
