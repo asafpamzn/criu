@@ -2108,7 +2108,9 @@ static int handle_requests(int epollfd, struct epoll_event **events, int nr_fds)
 				goto out;
 			if (restore_finished)
 				poll_timeout = opts.cow_dump ? 100 : 0;
-			if (!restore_finished || !ret)
+			if (!restore_finished)
+				continue;
+			if (!opts.cow_dump && !ret)
 				continue;
 		}
 
