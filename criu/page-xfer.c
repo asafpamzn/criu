@@ -3358,8 +3358,11 @@ static int read_compressed_size(struct ps_async_read *ar, int flags)
 	if (ar->compressed_rb < sizeof(ar->compressed_size))
 		return BULK_STREAM_PROGRESS;
 
-	if (ar->compressed_size <= 0 || ar->compressed_size > LZ4_compressBound(PAGE_SIZE)) {
-		pr_err("Invalid compressed size: %d\n", ar->compressed_size);
+	/* Validate compressed size - allow up to COW_BATCH_PAGES (64 pages) */
+	if (ar->compressed_size <= 0 ||
+	    ar->compressed_size > LZ4_compressBound(COW_BATCH_SIZE)) {
+		pr_err("Invalid compressed size: %d (max=%d)\n",
+		       ar->compressed_size, LZ4_compressBound(COW_BATCH_SIZE));
 		return -1;
 	}
 
@@ -3397,14 +3400,31 @@ static int read_compressed_data(struct ps_async_read *ar, int flags)
 	if (ar->compressed_rb < ar->compressed_size)
 		return BULK_STREAM_PROGRESS;
 
-	/* Decompress and invoke callback */
+	/* Decompress and invoke callback for each page in batch */
 	{
 		int decomp_ret;
 		struct timespec t1, t2;
+		int expected_size = ar->pi.nr_pages * PAGE_SIZE;
+		void *decomp_buf;
+		unsigned long i;
+
+		/* Allocate buffer for batch decompression */
+		if (ar->pi.nr_pages > 1) {
+			decomp_buf = xmalloc(expected_size);
+			if (!decomp_buf) {
+				pr_err("Failed to allocate decompression buffer for %lu pages\n",
+				       (unsigned long)ar->pi.nr_pages);
+				xfree(ar->compressed_buf);
+				ar->compressed_buf = NULL;
+				return -1;
+			}
+		} else {
+			decomp_buf = ar->pages;  /* Single page - use existing buffer */
+		}
 
 		clock_gettime(CLOCK_MONOTONIC, &t1);
-		decomp_ret = LZ4_decompress_safe(ar->compressed_buf, ar->pages,
-						 ar->compressed_size, PAGE_SIZE);
+		decomp_ret = LZ4_decompress_safe(ar->compressed_buf, decomp_buf,
+						 ar->compressed_size, expected_size);
 		clock_gettime(CLOCK_MONOTONIC, &t2);
 		bulk_stats.decompress_calls++;
 		bulk_stats.decompress_time_ns +=
@@ -3412,19 +3432,36 @@ static int read_compressed_data(struct ps_async_read *ar, int flags)
 		xfree(ar->compressed_buf);
 		ar->compressed_buf = NULL;
 
-		if (decomp_ret != PAGE_SIZE) {
-			pr_err("LZ4 decompression failed: expected %lu, got %d\n",
-			       PAGE_SIZE, decomp_ret);
+		if (decomp_ret != expected_size) {
+			pr_err("LZ4 decompression failed: expected %d, got %d\n",
+			       expected_size, decomp_ret);
+			if (ar->pi.nr_pages > 1)
+				xfree(decomp_buf);
 			return -1;
 		}
-	}
 
-	bulk_stats.callback_calls++;
-	bulk_stats.pages_completed++;
-	ret = ar->complete((int)ar->pi.dst_id, (unsigned long)ar->pi.vaddr,
-			   (int)ar->pi.nr_pages, ar->priv);
-	if (ret < 0)
-		return ret;
+		/* Invoke callback for each page in batch */
+		for (i = 0; i < ar->pi.nr_pages; i++) {
+			void *page_data = decomp_buf + i * PAGE_SIZE;
+			unsigned long page_vaddr = ar->pi.vaddr + i * PAGE_SIZE;
+
+			/* Copy to ar->pages for single-page compat, or pass directly */
+			if (ar->pi.nr_pages > 1)
+				memcpy(ar->pages, page_data, PAGE_SIZE);
+
+			bulk_stats.callback_calls++;
+			bulk_stats.pages_completed++;
+			ret = ar->complete((int)ar->pi.dst_id, page_vaddr, 1, ar->priv);
+			if (ret < 0) {
+				if (ar->pi.nr_pages > 1)
+					xfree(decomp_buf);
+				return ret;
+			}
+		}
+
+		if (ar->pi.nr_pages > 1)
+			xfree(decomp_buf);
+	}
 
 	ar->rb = 0;
 	ar->goal = 0;
