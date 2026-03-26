@@ -1444,7 +1444,7 @@ int cow_scan_dirty_pages(unsigned long **dirty_ranges,
 
 		do {
 			args.start = args.walk_end;
-			pr_info("PAGEMAP_SCAN: scanning VMA 0x%lx-0x%lx "
+			pr_debug("PAGEMAP_SCAN: scanning VMA 0x%lx-0x%lx "
 				"(start=0x%lx walk_end=0x%lx)\n",
 				vma_start, vma_end,
 				(unsigned long)args.start,
@@ -1456,7 +1456,7 @@ int cow_scan_dirty_pages(unsigned long **dirty_ranges,
 				goto out;
 			}
 
-			pr_info("PAGEMAP_SCAN: returned %ld regions, "
+			pr_debug("PAGEMAP_SCAN: returned %ld regions, "
 				"walk_end=0x%lx (vma_end=0x%lx)\n",
 				regs_len,
 				(unsigned long)args.walk_end, vma_end);
