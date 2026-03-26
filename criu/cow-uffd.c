@@ -23,6 +23,13 @@
 #define PAGE_BUFFER_HASH_SIZE (1 << PAGE_BUFFER_HASH_BITS)  /* 1M buckets */
 
 /*
+ * Fine-grained locking: 8K locks, each covering 128 buckets.
+ * Allows 10 threads to operate with minimal contention.
+ */
+#define NUM_HASH_LOCKS 8192
+#define BUCKETS_PER_LOCK 128  /* 1M / 8K = 128 buckets per lock */
+
+/*
  * Unrolled linked list node - holds up to 32 entries per node.
  * Gives ~32x better cache locality during traversal vs single-entry nodes.
  */
@@ -44,9 +51,19 @@ static struct {
 	unsigned long nr_applied;
 	unsigned long nr_discarded;
 	unsigned long nr_eagain;
-	pthread_spinlock_t lock;
 	bool initialized;
 } cow_buffer = { .initialized = false };
+
+/* Fine-grained locks: 8K locks for 1M buckets */
+static pthread_spinlock_t hash_locks[NUM_HASH_LOCKS];
+
+/* Global lock for counters (nr_pages, nr_applied, etc.) */
+static pthread_spinlock_t counter_lock;
+
+static inline int lock_index(unsigned int hash)
+{
+	return hash / BUCKETS_PER_LOCK;
+}
 
 static pthread_t drain_thread;
 static volatile bool drain_thread_stop = false;
@@ -72,7 +89,13 @@ int cow_page_buffer_init(void)
 	for (i = 0; i < PAGE_BUFFER_HASH_SIZE; i++)
 		INIT_HLIST_HEAD(&cow_buffer.hash_table[i]);
 
-	pthread_spin_init(&cow_buffer.lock, PTHREAD_PROCESS_PRIVATE);
+	/* Initialize 8K fine-grained locks */
+	for (i = 0; i < NUM_HASH_LOCKS; i++)
+		pthread_spin_init(&hash_locks[i], PTHREAD_PROCESS_PRIVATE);
+
+	/* Initialize counter lock */
+	pthread_spin_init(&counter_lock, PTHREAD_PROCESS_PRIVATE);
+
 	cow_buffer.nr_pages = 0;
 	cow_buffer.nr_applied = 0;
 	cow_buffer.nr_discarded = 0;
@@ -80,7 +103,8 @@ int cow_page_buffer_init(void)
 	cow_buffer.max_bucket_depth = 0;
 	cow_buffer.initialized = true;
 
-	pr_info("COW page buffer initialized (buckets=%d)\n", PAGE_BUFFER_HASH_SIZE);
+	pr_info("COW page buffer initialized (buckets=%d, locks=%d)\n",
+		PAGE_BUFFER_HASH_SIZE, NUM_HASH_LOCKS);
 	return 0;
 }
 
@@ -90,6 +114,7 @@ int cow_page_buffer_add(unsigned long vaddr, void *data)
 	unsigned int hash;
 	enum page_state state;
 	void *page_data;
+	int lock_idx;
 	int i;
 
 	if (!cow_buffer.initialized)
@@ -111,6 +136,7 @@ int cow_page_buffer_add(unsigned long vaddr, void *data)
 	/* PAGE_STATE_DIRTY is OK - page being re-sent with newer data */
 
 	hash = page_buffer_hash(vaddr);
+	lock_idx = lock_index(hash);
 
 	/* Allocate page data outside lock */
 	page_data = xmalloc(PAGE_SIZE);
@@ -118,7 +144,7 @@ int cow_page_buffer_add(unsigned long vaddr, void *data)
 		return -1;
 	memcpy(page_data, data, PAGE_SIZE);
 
-	pthread_spin_lock(&cow_buffer.lock);
+	pthread_spin_lock(&hash_locks[lock_idx]);
 
 	/* Check for duplicate and find space in existing nodes (cache-friendly) */
 	hlist_for_each_entry(node, &cow_buffer.hash_table[hash], hash) {
@@ -128,7 +154,7 @@ int cow_page_buffer_add(unsigned long vaddr, void *data)
 				/* Update existing entry with newer data */
 				xfree(node->entries[i].data);
 				node->entries[i].data = page_data;
-				pthread_spin_unlock(&cow_buffer.lock);
+				pthread_spin_unlock(&hash_locks[lock_idx]);
 				return 0;
 			}
 		}
@@ -137,14 +163,14 @@ int cow_page_buffer_add(unsigned long vaddr, void *data)
 			node->entries[node->count].vaddr = vaddr;
 			node->entries[node->count].data = page_data;
 			node->count++;
-			cow_buffer.nr_pages++;
-			pthread_spin_unlock(&cow_buffer.lock);
+			pthread_spin_unlock(&hash_locks[lock_idx]);
+			__sync_fetch_and_add(&cow_buffer.nr_pages, 1);
 			page_state_set(vaddr, PAGE_STATE_IN_BUFFER);
 			return 0;
 		}
 	}
 
-	pthread_spin_unlock(&cow_buffer.lock);
+	pthread_spin_unlock(&hash_locks[lock_idx]);
 
 	/* Need new node - allocate outside lock */
 	node = xmalloc(sizeof(*node));
@@ -158,10 +184,11 @@ int cow_page_buffer_add(unsigned long vaddr, void *data)
 	node->count = 1;
 	INIT_HLIST_NODE(&node->hash);
 
-	pthread_spin_lock(&cow_buffer.lock);
+	pthread_spin_lock(&hash_locks[lock_idx]);
 	hlist_add_head(&node->hash, &cow_buffer.hash_table[hash]);
-	cow_buffer.nr_pages++;
-	pthread_spin_unlock(&cow_buffer.lock);
+	pthread_spin_unlock(&hash_locks[lock_idx]);
+
+	__sync_fetch_and_add(&cow_buffer.nr_pages, 1);
 
 	/* Track page state: now in buffer */
 	page_state_set(vaddr, PAGE_STATE_IN_BUFFER);
@@ -175,6 +202,7 @@ void *cow_page_buffer_lookup_and_remove(unsigned long vaddr)
 {
 	struct page_buffer_node *node;
 	unsigned int hash;
+	int lock_idx;
 	void *data = NULL;
 	int i;
 
@@ -182,8 +210,9 @@ void *cow_page_buffer_lookup_and_remove(unsigned long vaddr)
 		return NULL;
 
 	hash = page_buffer_hash(vaddr);
+	lock_idx = lock_index(hash);
 
-	pthread_spin_lock(&cow_buffer.lock);
+	pthread_spin_lock(&hash_locks[lock_idx]);
 	hlist_for_each_entry(node, &cow_buffer.hash_table[hash], hash) {
 		for (i = 0; i < node->count; i++) {
 			if (node->entries[i].vaddr == vaddr) {
@@ -193,18 +222,18 @@ void *cow_page_buffer_lookup_and_remove(unsigned long vaddr)
 				if (i < node->count) {
 					node->entries[i] = node->entries[node->count];
 				}
-				cow_buffer.nr_pages--;
 				/* Remove empty nodes */
 				if (node->count == 0) {
 					hlist_del(&node->hash);
 					xfree(node);
 				}
-				pthread_spin_unlock(&cow_buffer.lock);
+				pthread_spin_unlock(&hash_locks[lock_idx]);
+				__sync_fetch_and_sub(&cow_buffer.nr_pages, 1);
 				return data;
 			}
 		}
 	}
-	pthread_spin_unlock(&cow_buffer.lock);
+	pthread_spin_unlock(&hash_locks[lock_idx]);
 
 	return data;
 }
@@ -223,9 +252,7 @@ void cow_page_buffer_discard_dirty(unsigned long *dirty_ranges,
 	if (!cow_buffer.initialized || !dirty_ranges || nr_dirty_ranges == 0)
 		return;
 
-	pthread_spin_lock(&cow_buffer.lock);
-
-	/* Iterate dirty ranges and do O(1) hash lookups */
+	/* Iterate dirty ranges and do O(1) hash lookups with fine-grained locks */
 	for (r = 0; r < nr_dirty_ranges; r++) {
 		unsigned long start = dirty_ranges[r * 2];
 		unsigned long len = dirty_ranges[r * 2 + 1];
@@ -234,11 +261,13 @@ void cow_page_buffer_discard_dirty(unsigned long *dirty_ranges,
 		/* Iterate each page in this dirty range */
 		for (vaddr = start; vaddr < start + len; vaddr += PAGE_SIZE) {
 			unsigned int hash = page_buffer_hash(vaddr);
+			int lock_idx = lock_index(hash);
 			struct page_buffer_node *node;
 			struct hlist_node *tmp;
 			int i;
 			bool found = false;
 
+			pthread_spin_lock(&hash_locks[lock_idx]);
 			hlist_for_each_entry_safe(node, tmp,
 						  &cow_buffer.hash_table[hash], hash) {
 				for (i = 0; i < node->count; i++) {
@@ -249,10 +278,6 @@ void cow_page_buffer_discard_dirty(unsigned long *dirty_ranges,
 						if (i < node->count) {
 							node->entries[i] = node->entries[node->count];
 						}
-						cow_buffer.nr_pages--;
-						cow_buffer.nr_discarded++;
-						discarded++;
-						page_state_set(vaddr, PAGE_STATE_DIRTY);
 						/* Remove empty nodes */
 						if (node->count == 0) {
 							hlist_del(&node->hash);
@@ -265,10 +290,16 @@ void cow_page_buffer_discard_dirty(unsigned long *dirty_ranges,
 				if (found)
 					break;
 			}
+			pthread_spin_unlock(&hash_locks[lock_idx]);
+
+			if (found) {
+				__sync_fetch_and_sub(&cow_buffer.nr_pages, 1);
+				__sync_fetch_and_add(&cow_buffer.nr_discarded, 1);
+				discarded++;
+				page_state_set(vaddr, PAGE_STATE_DIRTY);
+			}
 		}
 	}
-
-	pthread_spin_unlock(&cow_buffer.lock);
 
 	pr_info("Discarded %lu dirty pages from buffer\n", discarded);
 }
@@ -285,9 +316,10 @@ void cow_page_buffer_destroy(void)
 	/* Stop drain thread first */
 	cow_stop_drain_thread();
 
-	pthread_spin_lock(&cow_buffer.lock);
-
+	/* Lock all buckets and destroy contents */
 	for (i = 0; i < PAGE_BUFFER_HASH_SIZE; i++) {
+		int lock_idx = lock_index(i);
+		pthread_spin_lock(&hash_locks[lock_idx]);
 		hlist_for_each_entry_safe(node, tmp,
 					  &cow_buffer.hash_table[i], hash) {
 			for (j = 0; j < node->count; j++)
@@ -295,15 +327,17 @@ void cow_page_buffer_destroy(void)
 			hlist_del(&node->hash);
 			xfree(node);
 		}
+		pthread_spin_unlock(&hash_locks[lock_idx]);
 	}
-
-	pthread_spin_unlock(&cow_buffer.lock);
 
 	xfree(cow_buffer.hash_table);
 	cow_buffer.hash_table = NULL;
 	cow_buffer.initialized = false;
 
-	pthread_spin_destroy(&cow_buffer.lock);
+	/* Destroy all fine-grained locks */
+	for (i = 0; i < NUM_HASH_LOCKS; i++)
+		pthread_spin_destroy(&hash_locks[i]);
+	pthread_spin_destroy(&counter_lock);
 
 	pr_info("COW page buffer destroyed: applied=%lu discarded=%lu max_bucket=%lu\n",
 		cow_buffer.nr_applied, cow_buffer.nr_discarded,
@@ -318,10 +352,12 @@ static void cow_page_buffer_readd(unsigned long vaddr, void *data)
 {
 	struct page_buffer_node *node;
 	unsigned int hash;
+	int lock_idx;
 
 	hash = page_buffer_hash(vaddr);
+	lock_idx = lock_index(hash);
 
-	pthread_spin_lock(&cow_buffer.lock);
+	pthread_spin_lock(&hash_locks[lock_idx]);
 
 	/* Try to find space in existing node */
 	hlist_for_each_entry(node, &cow_buffer.hash_table[hash], hash) {
@@ -329,14 +365,14 @@ static void cow_page_buffer_readd(unsigned long vaddr, void *data)
 			node->entries[node->count].vaddr = vaddr;
 			node->entries[node->count].data = data;
 			node->count++;
-			cow_buffer.nr_pages++;
-			pthread_spin_unlock(&cow_buffer.lock);
+			pthread_spin_unlock(&hash_locks[lock_idx]);
+			__sync_fetch_and_add(&cow_buffer.nr_pages, 1);
 			page_state_set(vaddr, PAGE_STATE_EAGAIN_QUEUED);
 			return;
 		}
 	}
 
-	pthread_spin_unlock(&cow_buffer.lock);
+	pthread_spin_unlock(&hash_locks[lock_idx]);
 
 	/* Need new node */
 	node = xmalloc(sizeof(*node));
@@ -351,11 +387,11 @@ static void cow_page_buffer_readd(unsigned long vaddr, void *data)
 	node->count = 1;
 	INIT_HLIST_NODE(&node->hash);
 
-	pthread_spin_lock(&cow_buffer.lock);
+	pthread_spin_lock(&hash_locks[lock_idx]);
 	hlist_add_head(&node->hash, &cow_buffer.hash_table[hash]);
-	cow_buffer.nr_pages++;
-	pthread_spin_unlock(&cow_buffer.lock);
+	pthread_spin_unlock(&hash_locks[lock_idx]);
 
+	__sync_fetch_and_add(&cow_buffer.nr_pages, 1);
 	page_state_set(vaddr, PAGE_STATE_EAGAIN_QUEUED);
 	pr_debug("COW_TRACE DRAIN_READD: 0x%lx re-buffered for EAGAIN retry\n", vaddr);
 }
@@ -375,9 +411,10 @@ static void *background_drain_thread(void *arg)
 		cow_buffer.nr_pages);
 
 	while (!drain_thread_stop && cow_buffer.nr_pages > 0) {
-		pthread_spin_lock(&cow_buffer.lock);
-
 		for (bucket = 0; bucket < PAGE_BUFFER_HASH_SIZE && !drain_thread_stop; bucket++) {
+			int lock_idx = lock_index(bucket);
+
+			pthread_spin_lock(&hash_locks[lock_idx]);
 			hlist_for_each_entry_safe(node, tmp,
 						  &cow_buffer.hash_table[bucket], hash) {
 				/* Process all entries in this node */
@@ -390,14 +427,14 @@ static void *background_drain_thread(void *arg)
 					bool free_data = true;
 
 					node->count--;
-					cow_buffer.nr_pages--;
 
 					/* Track: removed from buffer, about to copy */
 					page_state_set(vaddr, PAGE_STATE_DRAIN_PENDING);
 
 					pr_debug("COW_TRACE DRAIN_REMOVE: 0x%lx (remaining=%lu)\n", vaddr, cow_buffer.nr_pages);
 
-					pthread_spin_unlock(&cow_buffer.lock);
+					pthread_spin_unlock(&hash_locks[lock_idx]);
+					__sync_fetch_and_sub(&cow_buffer.nr_pages, 1);
 
 					/* Find uffd for this address and UFFDIO_COPY */
 					uffd = get_uffd_for_vaddr(vaddr);
@@ -412,19 +449,19 @@ static void *background_drain_thread(void *arg)
 
 						if (ioctl(uffd, UFFDIO_COPY, &uffd_copy) < 0) {
 							if (errno == EEXIST) {
-								cow_buffer.nr_discarded++;
+								__sync_fetch_and_add(&cow_buffer.nr_discarded, 1);
 								pr_err("BUG: DRAIN_COPY EEXIST at 0x%lx - duplicate copy!\n", vaddr);
 								page_state_print_history(vaddr);
 								if (page_state_get(vaddr) != PAGE_STATE_DIRTY)
 									page_state_set(vaddr, PAGE_STATE_DISCARDED);
 							} else if (errno == ENOENT) {
-								cow_buffer.nr_discarded++;
+								__sync_fetch_and_add(&cow_buffer.nr_discarded, 1);
 								pr_err("COW_TRACE DRAIN_COPY: 0x%lx FAILED errno=ENOENT (VMA unmapped)\n", vaddr);
 								page_state_print_history(vaddr);
 								if (page_state_get(vaddr) != PAGE_STATE_DIRTY)
 									page_state_set(vaddr, PAGE_STATE_DISCARDED);
 							} else if (errno == EAGAIN) {
-								cow_buffer.nr_eagain++;
+								__sync_fetch_and_add(&cow_buffer.nr_eagain, 1);
 								cow_page_buffer_readd(vaddr, data);
 								free_data = false;
 								pr_debug("COW_TRACE DRAIN_COPY: 0x%lx EAGAIN, re-buffered\n", vaddr);
@@ -435,12 +472,12 @@ static void *background_drain_thread(void *arg)
 									page_state_set(vaddr, PAGE_STATE_DISCARDED);
 							}
 						} else {
-							cow_buffer.nr_applied++;
+							__sync_fetch_and_add(&cow_buffer.nr_applied, 1);
 							page_state_set(vaddr, PAGE_STATE_COPIED);
 							drained++;
 						}
 					} else {
-						cow_buffer.nr_discarded++;
+						__sync_fetch_and_add(&cow_buffer.nr_discarded, 1);
 						pr_err("COW_TRACE DRAIN_COPY: 0x%lx no uffd found\n", vaddr);
 						page_state_print_history(vaddr);
 						if (page_state_get(vaddr) != PAGE_STATE_DIRTY)
@@ -449,7 +486,7 @@ static void *background_drain_thread(void *arg)
 
 					if (free_data)
 						xfree(data);
-					pthread_spin_lock(&cow_buffer.lock);
+					pthread_spin_lock(&hash_locks[lock_idx]);
 				}
 
 				/* Remove empty node */
@@ -458,9 +495,8 @@ static void *background_drain_thread(void *arg)
 					xfree(node);
 				}
 			}
+			pthread_spin_unlock(&hash_locks[lock_idx]);
 		}
-
-		pthread_spin_unlock(&cow_buffer.lock);
 	}
 
 	pr_info("Drain thread done: %lu drained, %lu applied, %lu discarded, %lu eagain\n",
