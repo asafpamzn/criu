@@ -144,7 +144,7 @@ int cow_page_buffer_add(unsigned long vaddr, void *data)
 			unsigned long old_max = cow_buffer.max_bucket_depth;
 			cow_buffer.max_bucket_depth = depth;
 			/* Print every 100 increase */
-			if (depth / 100 > old_max / 100) {
+			if (depth / 10 > old_max / 10) {
 				pr_info("COW buffer max bucket depth: %lu (total=%lu)\n",
 					depth, cow_buffer.nr_pages);
 			}
