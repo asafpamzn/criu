@@ -1,50 +1,14 @@
 #ifndef __CR_PF_TRACKER_H__
 #define __CR_PF_TRACKER_H__
 
-#include <stdbool.h>
-#include "int.h"
-
-enum pf_state {
-	PF_STATE_PENDING_SERVER,  /* Waiting for page data from server */
-	PF_STATE_PENDING_EAGAIN,  /* UFFDIO_COPY got EAGAIN, queued for retry */
-	PF_STATE_COMPLETED,       /* UFFDIO_COPY succeeded */
-};
-
-extern void pf_tracker_add(unsigned long long address, unsigned long nr_pages, int pid, bool is_pf);
-extern void pf_tracker_set_state(unsigned long long address, enum pf_state state);
-extern void pf_tracker_print_stats(void);
-
 /*
- * Comprehensive page state tracking for COW lazy restore debugging.
- * Tracks all state transitions and validates them to detect bugs.
+ * Backward compatibility header - includes both tracker headers.
+ * New code should include the specific header it needs:
+ *   - page-state-tracker.h for page state tracking
+ *   - hung-page-tracker.h for hung page fault tracking
  */
-enum page_state {
-	PAGE_STATE_UNKNOWN = 0,       /* Not yet tracked */
-	PAGE_STATE_IN_BUFFER,         /* In COW buffer (after cow_page_buffer_add) */
-	PAGE_STATE_PF_PENDING,        /* PF handler found in buffer, about to copy */
-	PAGE_STATE_DRAIN_PENDING,     /* Drain thread removed from buffer, about to copy */
-	PAGE_STATE_URGENT_PENDING,    /* Urgent request received, about to copy */
-	PAGE_STATE_EAGAIN_QUEUED,     /* UFFDIO_COPY got EAGAIN, queued for retry */
-	PAGE_STATE_COPIED,            /* UFFDIO_COPY succeeded */
-	PAGE_STATE_DIRTY,             /* Discarded due to dirty bitmap, will be re-sent */
-	PAGE_STATE_DISCARDED,         /* Discarded due to error (EEXIST, ENOENT, etc.) */
-	PAGE_STATE_UNMAPPED,          /* Region was unmapped, page no longer valid */
-};
 
-extern int page_state_init(void);
-extern void page_state_destroy(void);
-extern int page_state_set(unsigned long vaddr, enum page_state new_state);
-extern enum page_state page_state_get(unsigned long vaddr);
-extern void page_state_print_stats(void);
-extern const char *page_state_name(enum page_state state);
-
-/* Print full history of state changes for a page - call on error for debugging */
-extern void page_state_print_history(unsigned long vaddr);
-
-/* Mark all pages in a range as unmapped (for REMOVE/UNMAP events) */
-extern void page_state_mark_range_unmapped(unsigned long start, unsigned long len);
-
-/* Mark COPIED/DISCARDED pages in dirty ranges as DIRTY for re-receive */
-extern void page_state_mark_dirty_ranges(unsigned long *ranges, unsigned int nr_ranges);
+#include "page-state-tracker.h"
+#include "hung-page-tracker.h"
 
 #endif /* __CR_PF_TRACKER_H__ */

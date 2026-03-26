@@ -1,0 +1,87 @@
+#ifndef __CR_PAGE_STATE_TRACKER_H__
+#define __CR_PAGE_STATE_TRACKER_H__
+
+#include <stdbool.h>
+#include "int.h"
+
+/*
+ * Compile-time flag to enable/disable page state tracking.
+ * When disabled, all functions become no-ops for zero overhead.
+ * Define CONFIG_PAGE_STATE_TRACKER to enable.
+ */
+/* #define CONFIG_PAGE_STATE_TRACKER */
+
+/*
+ * Comprehensive page state tracking for COW lazy restore debugging.
+ * Tracks all state transitions and validates them to detect bugs.
+ */
+enum page_state {
+	PAGE_STATE_UNKNOWN = 0,       /* Not yet tracked */
+	PAGE_STATE_IN_BUFFER,         /* In COW buffer (after cow_page_buffer_add) */
+	PAGE_STATE_PF_PENDING,        /* PF handler found in buffer, about to copy */
+	PAGE_STATE_DRAIN_PENDING,     /* Drain thread removed from buffer, about to copy */
+	PAGE_STATE_URGENT_PENDING,    /* Urgent request received, about to copy */
+	PAGE_STATE_EAGAIN_QUEUED,     /* UFFDIO_COPY got EAGAIN, queued for retry */
+	PAGE_STATE_COPIED,            /* UFFDIO_COPY succeeded */
+	PAGE_STATE_DIRTY,             /* Discarded due to dirty bitmap, will be re-sent */
+	PAGE_STATE_DISCARDED,         /* Discarded due to error (EEXIST, ENOENT, etc.) */
+	PAGE_STATE_UNMAPPED,          /* Region was unmapped, page no longer valid */
+};
+
+#ifdef CONFIG_PAGE_STATE_TRACKER
+
+extern int page_state_init(void);
+extern void page_state_destroy(void);
+extern int page_state_set(unsigned long vaddr, enum page_state new_state);
+extern enum page_state page_state_get(unsigned long vaddr);
+extern void page_state_print_stats(void);
+extern const char *page_state_name(enum page_state state);
+
+/* Print full history of state changes for a page - call on error for debugging */
+extern void page_state_print_history(unsigned long vaddr);
+
+/* Mark all pages in a range as unmapped (for REMOVE/UNMAP events) */
+extern void page_state_mark_range_unmapped(unsigned long start, unsigned long len);
+
+/* Mark COPIED/DISCARDED pages in dirty ranges as DIRTY for re-receive */
+extern void page_state_mark_dirty_ranges(unsigned long *ranges, unsigned int nr_ranges);
+
+#else /* !CONFIG_PAGE_STATE_TRACKER */
+
+static inline int page_state_init(void) { return 0; }
+static inline void page_state_destroy(void) { }
+static inline int page_state_set(unsigned long vaddr, enum page_state new_state)
+{
+	(void)vaddr;
+	(void)new_state;
+	return 0;
+}
+static inline enum page_state page_state_get(unsigned long vaddr)
+{
+	(void)vaddr;
+	return PAGE_STATE_UNKNOWN;
+}
+static inline void page_state_print_stats(void) { }
+static inline const char *page_state_name(enum page_state state)
+{
+	(void)state;
+	return "DISABLED";
+}
+static inline void page_state_print_history(unsigned long vaddr)
+{
+	(void)vaddr;
+}
+static inline void page_state_mark_range_unmapped(unsigned long start, unsigned long len)
+{
+	(void)start;
+	(void)len;
+}
+static inline void page_state_mark_dirty_ranges(unsigned long *ranges, unsigned int nr_ranges)
+{
+	(void)ranges;
+	(void)nr_ranges;
+}
+
+#endif /* CONFIG_PAGE_STATE_TRACKER */
+
+#endif /* __CR_PAGE_STATE_TRACKER_H__ */
