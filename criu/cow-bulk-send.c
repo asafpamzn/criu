@@ -234,6 +234,8 @@ static void *p3_bulk_sender_thread(void *arg)
 
 	pr_info("P3[%d] bulk sender thread started (batch=%d pages)\n",
 		thread_id, COW_BATCH_PAGES);
+	pr_err("DEBUG_THREAD: P3 sender[%d] STARTED socket=%d dst_id=%lu\n",
+	       thread_id, ctx->socket, (unsigned long)ctx->dst_id);
 	clock_gettime(CLOCK_MONOTONIC, &t_start);
 
 	lazy_vmas = get_global_lazy_vmas();
@@ -290,10 +292,15 @@ static void *p3_bulk_sender_thread(void *arg)
 			}
 
 			total_sent += sent;
+			if (total_sent % 1000 == 0 && total_sent > 0)
+				pr_err("DEBUG_THREAD: P3 sender[%d] progress: %lu pages sent\n",
+				       thread_id, total_sent);
 		}
 	}
 
 out:
+	pr_err("DEBUG_THREAD: P3 sender[%d] CLOSING socket=%d pages_sent=%lu\n",
+	       thread_id, ctx->socket, total_sent);
 	clock_gettime(CLOCK_MONOTONIC, &t_end);
 	{
 		long elapsed_ms = (t_end.tv_sec - t_start.tv_sec) * 1000 +
@@ -307,6 +314,7 @@ out:
 	ctx->pages_sent = total_sent;
 	ctx->active = false;
 	__sync_fetch_and_sub(&p3_threads_active, 1);
+	pr_err("DEBUG_THREAD: P3 sender[%d] TERMINATED pages=%lu\n", thread_id, total_sent);
 	return NULL;
 }
 
@@ -364,7 +372,10 @@ void cow_wait_p3_threads(void)
 
 	for (i = 0; i < NUM_P3_THREADS; i++) {
 		if (p3_threads[i].thread) {
+			pr_err("DEBUG_THREAD: Waiting for P3 sender[%d] to join\n", i);
 			pthread_join(p3_threads[i].thread, NULL);
+			pr_err("DEBUG_THREAD: P3 sender[%d] JOINED pages=%lu error=%d\n",
+			       i, p3_threads[i].pages_sent, p3_threads[i].error);
 			total += p3_threads[i].pages_sent;
 			if (p3_threads[i].error)
 				errors++;
