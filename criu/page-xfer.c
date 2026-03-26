@@ -122,6 +122,253 @@ enum compress_read_state {
 };
 #define PS_IOV_FORCE_CLOSE 0x1024
 
+/*
+ * P3 parallel receiver threads for COW bulk transfer.
+ * Each thread handles one socket, receives compressed batches,
+ * decompresses, and adds pages to the buffer.
+ */
+#define MAX_P3_RECEIVERS 10
+
+struct p3_receiver_ctx {
+	pthread_t thread;
+	int thread_id;
+	int socket;
+	unsigned long pages_received;
+	volatile bool active;
+	volatile bool error;
+};
+
+static struct p3_receiver_ctx p3_receivers[MAX_P3_RECEIVERS];
+static volatile int p3_receivers_active = 0;
+static pthread_t p3_acceptor_thread;
+static volatile bool p3_acceptor_running = false;
+
+/* Forward declaration */
+static int p3_receive_and_buffer(int sk);
+
+static void *p3_receiver_thread_func(void *arg)
+{
+	struct p3_receiver_ctx *ctx = (struct p3_receiver_ctx *)arg;
+	unsigned long pages = 0;
+	int ret;
+
+	pr_info("P3 receiver[%d] started on socket %d\n", ctx->thread_id, ctx->socket);
+
+	/* Initialize TLS if enabled */
+	if (tls_x509_init(ctx->socket, true)) {
+		pr_err("P3 receiver[%d]: TLS init failed\n", ctx->thread_id);
+		ctx->error = true;
+		goto out;
+	}
+
+	/* Receive pages until socket closes */
+	while ((ret = p3_receive_and_buffer(ctx->socket)) > 0) {
+		pages += ret;
+	}
+
+	if (ret < 0) {
+		pr_err("P3 receiver[%d]: error receiving pages\n", ctx->thread_id);
+		ctx->error = true;
+	}
+
+out:
+	ctx->pages_received = pages;
+	ctx->active = false;
+	__sync_fetch_and_sub(&p3_receivers_active, 1);
+	pr_info("P3 receiver[%d] done: %lu pages\n", ctx->thread_id, pages);
+	return NULL;
+}
+
+/*
+ * P3 acceptor thread - accepts connections and spawns receiver threads.
+ * Runs in background while page_server_serve handles main socket.
+ */
+static void *p3_acceptor_thread_func(void *arg)
+{
+	int listen_sk = get_listen_socket();
+	int num_accepted = 0;
+	struct sockaddr_storage caddr;
+	socklen_t clen;
+
+	(void)arg;
+
+	if (listen_sk < 0) {
+		pr_err("P3 acceptor: no listening socket\n");
+		return NULL;
+	}
+
+	pr_info("P3 acceptor thread started (listen_sk=%d)\n", listen_sk);
+
+	while (p3_acceptor_running && num_accepted < MAX_P3_RECEIVERS) {
+		int sk;
+		struct pollfd pfd = { .fd = listen_sk, .events = POLLIN };
+
+		/* Poll with timeout so we can check p3_acceptor_running */
+		if (poll(&pfd, 1, 100) <= 0)
+			continue;
+
+		clen = sizeof(caddr);
+		sk = accept(listen_sk, (struct sockaddr *)&caddr, &clen);
+		if (sk < 0) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK)
+				continue;
+			pr_perror("P3 acceptor: accept failed");
+			break;
+		}
+
+		pr_info("P3 acceptor: accepted connection %d (fd=%d)\n", num_accepted, sk);
+
+		/* Start receiver thread for this socket */
+		p3_receivers[num_accepted].thread_id = num_accepted;
+		p3_receivers[num_accepted].socket = sk;
+		p3_receivers[num_accepted].pages_received = 0;
+		p3_receivers[num_accepted].active = true;
+		p3_receivers[num_accepted].error = false;
+		__sync_fetch_and_add(&p3_receivers_active, 1);
+
+		if (pthread_create(&p3_receivers[num_accepted].thread, NULL,
+				   p3_receiver_thread_func, &p3_receivers[num_accepted])) {
+			pr_perror("P3 acceptor: failed to create receiver thread %d", num_accepted);
+			close(sk);
+			p3_receivers[num_accepted].active = false;
+			__sync_fetch_and_sub(&p3_receivers_active, 1);
+		} else {
+			num_accepted++;
+		}
+	}
+
+	pr_info("P3 acceptor done: accepted %d connections\n", num_accepted);
+	return NULL;
+}
+
+int start_p3_acceptor_thread(void)
+{
+	if (p3_acceptor_running)
+		return 0;
+
+	if (get_listen_socket() < 0) {
+		pr_warn("Cannot start P3 acceptor: no listening socket\n");
+		return -1;
+	}
+
+	p3_acceptor_running = true;
+	if (pthread_create(&p3_acceptor_thread, NULL, p3_acceptor_thread_func, NULL)) {
+		pr_perror("Failed to create P3 acceptor thread");
+		p3_acceptor_running = false;
+		return -1;
+	}
+
+	pr_info("Started P3 acceptor thread\n");
+	return 0;
+}
+
+void stop_p3_acceptor_thread(void)
+{
+	int i;
+	unsigned long total_pages = 0;
+
+	if (!p3_acceptor_running)
+		return;
+
+	p3_acceptor_running = false;
+	pthread_join(p3_acceptor_thread, NULL);
+
+	/* Wait for all receiver threads */
+	for (i = 0; i < MAX_P3_RECEIVERS; i++) {
+		if (p3_receivers[i].thread) {
+			pthread_join(p3_receivers[i].thread, NULL);
+			total_pages += p3_receivers[i].pages_received;
+			if (p3_receivers[i].socket >= 0) {
+				close(p3_receivers[i].socket);
+				p3_receivers[i].socket = -1;
+			}
+			p3_receivers[i].thread = 0;
+		}
+	}
+
+	close_listen_socket();
+	pr_info("P3 receivers stopped: %lu total pages\n", total_pages);
+}
+
+/*
+ * Receive one compressed batch from socket and add to page buffer.
+ * Returns number of pages received, 0 on EOF, -1 on error.
+ */
+static int p3_receive_and_buffer(int sk)
+{
+	struct page_server_iov pi;
+	int compressed_size;
+	char *compressed_buf = NULL;
+	char *decompressed_buf = NULL;
+	int nr_pages, i, ret = -1;
+	int decomp_ret;
+
+	/* Receive header */
+	ret = __recv(sk, &pi, sizeof(pi), MSG_WAITALL);
+	if (ret == 0)
+		return 0;  /* EOF */
+	if (ret != sizeof(pi)) {
+		pr_perror("P3 receive: failed to read header");
+		return -1;
+	}
+
+	nr_pages = pi.nr_pages;
+	if (nr_pages <= 0 || nr_pages > 64) {
+		pr_err("P3 receive: invalid nr_pages %d\n", nr_pages);
+		return -1;
+	}
+
+	/* Receive compressed size */
+	if (__recv(sk, &compressed_size, sizeof(compressed_size), MSG_WAITALL) != sizeof(compressed_size)) {
+		pr_perror("P3 receive: failed to read compressed size");
+		return -1;
+	}
+
+	if (compressed_size <= 0 || compressed_size > LZ4_compressBound(nr_pages * PAGE_SIZE)) {
+		pr_err("P3 receive: invalid compressed size %d\n", compressed_size);
+		return -1;
+	}
+
+	/* Allocate buffers */
+	compressed_buf = xmalloc(compressed_size);
+	decompressed_buf = xmalloc(nr_pages * PAGE_SIZE);
+	if (!compressed_buf || !decompressed_buf) {
+		pr_err("P3 receive: allocation failed\n");
+		goto out;
+	}
+
+	/* Receive compressed data */
+	if (__recv(sk, compressed_buf, compressed_size, MSG_WAITALL) != compressed_size) {
+		pr_perror("P3 receive: failed to read compressed data");
+		goto out;
+	}
+
+	/* Decompress */
+	decomp_ret = LZ4_decompress_safe(compressed_buf, decompressed_buf,
+					 compressed_size, nr_pages * PAGE_SIZE);
+	if (decomp_ret != nr_pages * PAGE_SIZE) {
+		pr_err("P3 receive: decompression failed (expected %d, got %d)\n",
+		       nr_pages * (int)PAGE_SIZE, decomp_ret);
+		goto out;
+	}
+
+	/* Add each page to buffer */
+	for (i = 0; i < nr_pages; i++) {
+		unsigned long vaddr = pi.vaddr + i * PAGE_SIZE;
+		if (cow_page_buffer_add(vaddr, decompressed_buf + i * PAGE_SIZE) < 0) {
+			pr_err("P3 receive: failed to buffer page at 0x%lx\n", vaddr);
+			goto out;
+		}
+	}
+
+	ret = nr_pages;
+
+out:
+	xfree(compressed_buf);
+	xfree(decompressed_buf);
+	return ret;
+}
+
 #define PS_CMD_BITS 16
 #define PS_CMD_MASK ((1 << PS_CMD_BITS) - 1)
 
@@ -2463,18 +2710,31 @@ static void *unified_page_server_thread(void *arg)
 			}
 
 			/*
-			 * Phase 2 bulk transfer: use dedicated P3 thread with
+			 * Phase 2 bulk transfer: use dedicated P3 threads with
 			 * batched sends (64 pages / 256KB per batch).
+			 * Each thread has its own socket for true parallel transfer.
 			 * Convergence phase still uses inline processing for P1/P2/P3.
 			 */
 			if (!is_convergence_mode() && source_pid != 0) {
-				pr_info("Starting P3 bulk sender thread for dst_id=%lu\n",
-					img->dst_id);
-				if (cow_start_p3_thread(img->main_sk, img->dst_id, source_pid) < 0) {
-					pr_err("Failed to start P3 thread\n");
+				int num_threads = cow_get_num_p3_threads();
+				int p3_sockets[10];
+				int num_sockets = 0;
+
+				/* Create sockets for parallel transfer */
+				num_sockets = connect_p3_sockets(p3_sockets, num_threads);
+				if (num_sockets == 0) {
+					pr_err("Failed to create P3 sockets\n");
 				} else {
-					cow_wait_p3_thread();
-					stats.priority3_pages += cow_p3_pages_sent();
+					pr_info("Starting %d P3 bulk sender threads for dst_id=%lu\n",
+						num_sockets, img->dst_id);
+					if (cow_start_p3_threads(p3_sockets, num_sockets,
+								 img->dst_id, source_pid) < 0) {
+						pr_err("Failed to start P3 threads\n");
+					} else {
+						cow_wait_p3_threads();
+						stats.priority3_pages += cow_p3_pages_sent();
+					}
+					close_p3_sockets(p3_sockets, num_sockets);
 				}
 			} else {
 				/* Convergence: use original per-page processing for P1/P2/P3 */
@@ -2609,6 +2869,10 @@ static int page_server_serve(int sk)
 	} else {
 		pipe_read_dest_init(&pipe_read_dest);
 		tcp_cork(sk, true);
+
+		/* Start P3 acceptor thread for parallel bulk transfer */
+		if (opts.cow_dump)
+			start_p3_acceptor_thread();
 	}
 
 
@@ -2962,6 +3226,9 @@ no_server:
 	if (ask >= 0)
 		ret = page_server_serve(ask);
 
+	/* Clean up P3 parallel receiver threads */
+	stop_p3_acceptor_thread();
+
 	if (daemon_mode)
 		exit(ret);
 
@@ -3000,6 +3267,56 @@ out:
 int connect_to_page_server_to_send(void)
 {
 	return connect_to_page_server();
+}
+
+/*
+ * Create multiple connections to page server for parallel P3 transfer.
+ * Returns number of connections created, fills sockets array.
+ */
+int connect_p3_sockets(int *sockets, int num_requested)
+{
+	int i, num_created = 0;
+
+	if (!opts.use_page_server || !opts.addr)
+		return 0;
+
+	for (i = 0; i < num_requested; i++) {
+		int sk = setup_tcp_client(opts.addr);
+		if (sk < 0) {
+			pr_err("Failed to create P3 socket %d/%d\n", i, num_requested);
+			break;
+		}
+
+		/* Initialize TLS if enabled */
+		if (tls_x509_init(sk, false)) {
+			close(sk);
+			pr_err("TLS init failed for P3 socket %d\n", i);
+			break;
+		}
+
+		tcp_cork(sk, true);
+		sockets[i] = sk;
+		num_created++;
+		pr_debug("Created P3 socket %d: fd=%d\n", i, sk);
+	}
+
+	pr_info("Created %d/%d P3 sockets for parallel transfer\n",
+		num_created, num_requested);
+	return num_created;
+}
+
+/*
+ * Close P3 sockets after transfer completes.
+ */
+void close_p3_sockets(int *sockets, int num_sockets)
+{
+	int i;
+	for (i = 0; i < num_sockets; i++) {
+		if (sockets[i] >= 0) {
+			close(sockets[i]);
+			sockets[i] = -1;
+		}
+	}
 }
 
 /*

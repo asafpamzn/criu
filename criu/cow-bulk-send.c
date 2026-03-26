@@ -61,15 +61,24 @@ static inline int __send(int sk, const void *buf, size_t sz, int fl)
 extern unsigned long g_compress_uncompressed_bytes;
 extern unsigned long g_compress_compressed_bytes;
 
-/* Thread state */
-static pthread_t p3_thread;
-static volatile bool p3_thread_active = false;
-static unsigned long p3_total_pages_sent = 0;
+/* Number of parallel P3 threads */
+#define NUM_P3_THREADS 10
 
-/* Thread parameters */
-static int p3_socket;
-static u64 p3_dst_id;
-static pid_t p3_source_pid;
+/* Per-thread state */
+struct p3_thread_ctx {
+	pthread_t thread;
+	int thread_id;
+	int socket;           /* Per-thread socket for parallel transfer */
+	u64 dst_id;
+	pid_t source_pid;
+	unsigned long pages_sent;
+	volatile bool active;
+	volatile bool error;  /* Set if thread encountered an error */
+};
+
+static struct p3_thread_ctx p3_threads[NUM_P3_THREADS];
+static volatile int p3_threads_active = 0;
+static unsigned long p3_total_pages_sent = 0;
 
 /*
  * Send a batch of pages with LZ4 compression.
@@ -107,9 +116,9 @@ static int send_pages_batch_compressed(int sk, const void *data,
 		return -1;
 	}
 
-	/* Track compression statistics */
-	g_compress_uncompressed_bytes += total_uncompressed;
-	g_compress_compressed_bytes += *compressed_size;
+	/* Track compression statistics (atomic for multi-threaded access) */
+	__sync_fetch_and_add(&g_compress_uncompressed_bytes, total_uncompressed);
+	__sync_fetch_and_add(&g_compress_compressed_bytes, *compressed_size);
 
 	pr_debug("Compressed batch at %lx: %d pages, %d -> %d bytes (%.1f%%)\n",
 		 base_vaddr, nr_pages, total_uncompressed, *compressed_size,
@@ -161,7 +170,7 @@ static int send_lazy_vma_pages_batch(int sk, struct lazy_vma_entry *lve,
 
 		 page_idx = page_idx_base + i;
 
-		if (bitmap_test_nonatomic(lve->sent_bitmap, page_idx))
+		if (atomic_bitmap_test(lve->sent_bitmap, page_idx))
 			break;  /* Stop at first already-sent */
 
 		if (lve->cow_bitmap && atomic_bitmap_test(lve->cow_bitmap, page_idx))
@@ -199,10 +208,12 @@ static int send_lazy_vma_pages_batch(int sk, struct lazy_vma_entry *lve,
 	if (ret < 0)
 		return -1;
 
-	/* Mark all pages as sent */
+	/* Mark all pages as sent (atomic for multi-threaded access) */
 	for (i = 0; i < nr_pages; i++) {
 		unsigned long page_idx = page_idx_base + i;
-		bitmap_set_nonatomic(lve->sent_bitmap, page_idx, &lve->sent_pages);
+		/* atomic_bitmap_test_and_set returns true if already set */
+		if (!atomic_bitmap_test_and_set(lve->sent_bitmap, page_idx))
+			__sync_fetch_and_add(&lve->sent_pages, 1);
 	}
 
 	return nr_pages;
@@ -210,38 +221,71 @@ static int send_lazy_vma_pages_batch(int sk, struct lazy_vma_entry *lve,
 
 /*
  * P3 bulk sender thread - sends regular pages in batches.
+ * Each thread handles 1/NUM_P3_THREADS of each VMA's address range.
  */
 static void *p3_bulk_sender_thread(void *arg)
 {
+	struct p3_thread_ctx *ctx = (struct p3_thread_ctx *)arg;
 	struct lazy_vma_entry *lve;
 	struct list_head *lazy_vmas;
 	unsigned long total_sent = 0;
 	struct timespec t_start, t_end;
+	int thread_id = ctx->thread_id;
 
-	pr_info("P3 bulk sender thread started (batch=%d pages)\n", COW_BATCH_PAGES);
+	pr_info("P3[%d] bulk sender thread started (batch=%d pages)\n",
+		thread_id, COW_BATCH_PAGES);
 	clock_gettime(CLOCK_MONOTONIC, &t_start);
 
 	lazy_vmas = get_global_lazy_vmas();
 
 	list_for_each_entry(lve, lazy_vmas, list) {
+		unsigned long vma_size, chunk_size;
+		unsigned long my_start, my_end;
 		unsigned long vaddr;
 
-		if (lve->dst_id != p3_dst_id)
+		if (lve->dst_id != ctx->dst_id)
 			continue;
 
-		pr_info("P3: Processing VMA %lx-%lx (%lu pages)\n",
-			(unsigned long)lve->start, (unsigned long)lve->end,
-			lve->total_pages);
+		/* Calculate this thread's chunk of the VMA */
+		vma_size = lve->end - lve->start;
+		chunk_size = vma_size / NUM_P3_THREADS;
+		/* Align to page boundary */
+		chunk_size = (chunk_size / PAGE_SIZE) * PAGE_SIZE;
 
-		for (vaddr = lve->start; vaddr < lve->end;
+		if (chunk_size == 0) {
+			/* VMA too small to partition - only thread 0 handles it */
+			if (thread_id > 0)
+				continue;
+			my_start = lve->start;
+			my_end = lve->end;
+		} else {
+			my_start = lve->start + thread_id * chunk_size;
+			/* Last thread takes remainder */
+			if (thread_id == NUM_P3_THREADS - 1)
+				my_end = lve->end;
+			else
+				my_end = my_start + chunk_size;
+
+			if (my_start >= lve->end)
+				continue;
+		}
+
+		pr_info("P3[%d]: Processing VMA %lx-%lx chunk %lx-%lx\n",
+			thread_id,
+			(unsigned long)lve->start, (unsigned long)lve->end,
+			my_start, my_end);
+
+		for (vaddr = my_start; vaddr < my_end;
 		     vaddr += COW_BATCH_PAGES * PAGE_SIZE) {
 
 			int sent = send_lazy_vma_pages_batch(
-				p3_socket, lve, vaddr, COW_BATCH_PAGES,
-				p3_dst_id, p3_source_pid);
+				ctx->socket, lve, vaddr, COW_BATCH_PAGES,
+				ctx->dst_id, ctx->source_pid);
 
 			if (sent < 0) {
-				pr_err("P3: Failed to send batch at %lx\n", vaddr);
+				pr_err("P3[%d]: Failed to send batch at %lx\n",
+				       thread_id, vaddr);
+				ctx->error = true;
 				goto out;
 			}
 
@@ -256,54 +300,105 @@ out:
 				  (t_end.tv_nsec - t_start.tv_nsec) / 1000000;
 		float rate = elapsed_ms > 0 ? (float)total_sent * 1000 / elapsed_ms : 0;
 
-		pr_info("P3 bulk sender done: %lu pages in %ld ms (%.0f pages/sec)\n",
-			total_sent, elapsed_ms, rate);
+		pr_info("P3[%d] done: %lu pages in %ld ms (%.0f pages/sec)\n",
+			thread_id, total_sent, elapsed_ms, rate);
 	}
 
-	p3_total_pages_sent = total_sent;
-	p3_thread_active = false;
+	ctx->pages_sent = total_sent;
+	ctx->active = false;
+	__sync_fetch_and_sub(&p3_threads_active, 1);
 	return NULL;
 }
 
-int cow_start_p3_thread(int sk, u64 dst_id, pid_t source_pid)
+int cow_start_p3_threads(int *sockets, int num_sockets, u64 dst_id, pid_t source_pid)
 {
-	if (p3_thread_active) {
-		pr_warn("P3 thread already running\n");
+	int i;
+	int threads_to_start;
+
+	if (p3_threads_active > 0) {
+		pr_warn("P3 threads already running\n");
 		return 0;
 	}
 
-	p3_socket = sk;
-	p3_dst_id = dst_id;
-	p3_source_pid = source_pid;
-	p3_thread_active = true;
+	/* Start one thread per socket */
+	threads_to_start = num_sockets < NUM_P3_THREADS ? num_sockets : NUM_P3_THREADS;
 	p3_total_pages_sent = 0;
 
-	if (pthread_create(&p3_thread, NULL, p3_bulk_sender_thread, NULL)) {
-		pr_perror("Failed to create P3 bulk sender thread");
-		p3_thread_active = false;
-		return -1;
+	for (i = 0; i < threads_to_start; i++) {
+		p3_threads[i].thread_id = i;
+		p3_threads[i].socket = sockets[i];
+		p3_threads[i].dst_id = dst_id;
+		p3_threads[i].source_pid = source_pid;
+		p3_threads[i].pages_sent = 0;
+		p3_threads[i].active = true;
+		p3_threads[i].error = false;
+		p3_threads[i].thread = 0;
+		__sync_fetch_and_add(&p3_threads_active, 1);
+
+		if (pthread_create(&p3_threads[i].thread, NULL,
+				   p3_bulk_sender_thread, &p3_threads[i])) {
+			pr_perror("Failed to create P3 thread %d", i);
+			p3_threads[i].active = false;
+			__sync_fetch_and_sub(&p3_threads_active, 1);
+			/* Continue with remaining threads */
+		}
 	}
 
-	pr_info("Started P3 bulk sender thread\n");
-	return 0;
+	pr_info("Started %d P3 bulk sender threads (%d sockets)\n",
+		p3_threads_active, threads_to_start);
+	return p3_threads_active > 0 ? 0 : -1;
 }
 
+/* Legacy single-thread interface for backward compatibility */
+int cow_start_p3_thread(int sk, u64 dst_id, pid_t source_pid)
+{
+	int sockets[1] = { sk };
+	return cow_start_p3_threads(sockets, 1, dst_id, source_pid);
+}
+
+void cow_wait_p3_threads(void)
+{
+	int i;
+	unsigned long total = 0;
+	int errors = 0;
+
+	for (i = 0; i < NUM_P3_THREADS; i++) {
+		if (p3_threads[i].thread) {
+			pthread_join(p3_threads[i].thread, NULL);
+			total += p3_threads[i].pages_sent;
+			if (p3_threads[i].error)
+				errors++;
+			p3_threads[i].thread = 0;
+		}
+	}
+
+	p3_total_pages_sent = total;
+	p3_threads_active = 0;
+
+	if (errors > 0)
+		pr_warn("P3 threads completed with %d errors, %lu pages sent\n",
+			errors, total);
+	else
+		pr_info("All P3 threads joined: %lu total pages\n", total);
+}
+
+/* Legacy single-thread interface */
 void cow_wait_p3_thread(void)
 {
-	if (!p3_thread_active)
-		return;
-
-	pthread_join(p3_thread, NULL);
-	p3_thread_active = false;
-	pr_info("P3 bulk sender thread joined\n");
+	cow_wait_p3_threads();
 }
 
 bool cow_p3_thread_running(void)
 {
-	return p3_thread_active;
+	return p3_threads_active > 0;
 }
 
 unsigned long cow_p3_pages_sent(void)
 {
 	return p3_total_pages_sent;
+}
+
+int cow_get_num_p3_threads(void)
+{
+	return NUM_P3_THREADS;
 }
