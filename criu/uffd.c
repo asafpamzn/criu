@@ -2100,18 +2100,26 @@ static int handle_requests(int epollfd, struct epoll_event **events, int nr_fds)
 
 	for (;;) {
 		ret = epoll_run_rfds(epollfd, *events, nr_fds, poll_timeout);
-		if (ret < 0)
+		if (ret < 0){
+			pr_err("DEBUG: ret <0 goto out\n");
 			goto out;
+		}
 		if (ret > 0) {
 			ret = complete_forks(epollfd, events, &nr_fds);
 			if (ret < 0)
 				goto out;
-			if (restore_finished)
+			if (restore_finished){
+				pr_warn("DEBUG: continue because !restore_finished\n");
 				poll_timeout = opts.cow_dump ? 100 : 0;
-			if (!restore_finished)
+			}
+			if (!restore_finished) {
+				pr_warn("DEBUG: continue because !restore_finished\n");
 				continue;
-			if (!opts.cow_dump && !ret)
+			}
+			if (!opts.cow_dump && !ret) {
+				pr_warn("DEBUG: continue because !cow_dump && !ret\n");
 				continue;
+			}
 		}
 
 		/* make sure we return success if there is nothing to xfer */
@@ -2154,6 +2162,7 @@ static int handle_requests(int epollfd, struct epoll_event **events, int nr_fds)
 		 * 2. drain thread finished (buffer empty)
 		 * Then send ACK to primary and exit.
 		 */
+		pr_err("DEBUG: About to call cow_handle_exit (cow_dump=%d)\n", opts.cow_dump);
 		if (cow_handle_exit(&lpis))
 			break;
 	}
