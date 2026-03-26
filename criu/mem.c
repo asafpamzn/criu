@@ -608,10 +608,11 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 		list_add_tail(&lve->list, &global_lazy_vmas);
 		pthread_spin_unlock(&lazy_vmas_lock);
 
-		pr_info("LAZY_VMA ADD: 0x%llx-0x%llx dst_id=%lu source_pid=%d (total_pages=%lu)\n",
+		pr_debug("Added lazy VMA 0x%llx-0x%llx to global list "
+			"(%lu pages, dst_id=%lu, pid=%d)\n",
 			(unsigned long long)vma->e->start,
-			(unsigned long long)vma->e->end,
-			(unsigned long)lve->dst_id, lve->source_pid, nr_pages);
+			(unsigned long long)vma->e->end, nr_pages,
+			(unsigned long)lve->dst_id, lve->source_pid);
 		return 0;
 	}
 

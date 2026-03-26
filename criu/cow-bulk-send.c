@@ -63,7 +63,6 @@ extern unsigned long g_compress_compressed_bytes;
 
 /* Thread state */
 static pthread_t p3_thread;
-static volatile bool p3_thread_stop = false;
 static volatile bool p3_thread_active = false;
 static unsigned long p3_total_pages_sent = 0;
 
@@ -218,23 +217,11 @@ static void *p3_bulk_sender_thread(void *arg)
 	struct list_head *lazy_vmas;
 	unsigned long total_sent = 0;
 	struct timespec t_start, t_end;
-	int vma_count = 0;
 
 	pr_info("P3 bulk sender thread started (batch=%d pages)\n", COW_BATCH_PAGES);
-	pr_info("P3 DEBUG: Looking for dst_id=%lu, source_pid=%d\n",
-		(unsigned long)p3_dst_id, p3_source_pid);
 	clock_gettime(CLOCK_MONOTONIC, &t_start);
 
 	lazy_vmas = get_global_lazy_vmas();
-
-	/* Debug: enumerate all VMAs in global list */
-	list_for_each_entry(lve, lazy_vmas, list) {
-		vma_count++;
-		pr_info("P3 DEBUG: VMA %d: %lx-%lx dst_id=%lu source_pid=%d\n",
-			vma_count, lve->start, lve->end,
-			(unsigned long)lve->dst_id, lve->source_pid);
-	}
-	pr_info("P3 DEBUG: Total %d VMAs in global_lazy_vmas\n", vma_count);
 
 	list_for_each_entry(lve, lazy_vmas, list) {
 		unsigned long vaddr;
@@ -246,7 +233,7 @@ static void *p3_bulk_sender_thread(void *arg)
 			(unsigned long)lve->start, (unsigned long)lve->end,
 			lve->total_pages);
 
-		for (vaddr = lve->start; vaddr < lve->end && !p3_thread_stop;
+		for (vaddr = lve->start; vaddr < lve->end;
 		     vaddr += COW_BATCH_PAGES * PAGE_SIZE) {
 
 			int sent = send_lazy_vma_pages_batch(
@@ -288,7 +275,6 @@ int cow_start_p3_thread(int sk, u64 dst_id, pid_t source_pid)
 	p3_socket = sk;
 	p3_dst_id = dst_id;
 	p3_source_pid = source_pid;
-	p3_thread_stop = false;
 	p3_thread_active = true;
 	p3_total_pages_sent = 0;
 
@@ -307,7 +293,6 @@ void cow_wait_p3_thread(void)
 	if (!p3_thread_active)
 		return;
 
-	p3_thread_stop = true;
 	pthread_join(p3_thread, NULL);
 	p3_thread_active = false;
 	pr_info("P3 bulk sender thread joined\n");
