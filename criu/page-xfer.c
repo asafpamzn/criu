@@ -43,6 +43,7 @@
 #include "mem.h"
 #include "atomic-bitmap.h"
 #include "cow-bitmap.h"
+#include "cow-bulk-send.h"
 #include "spsc-queue.h"
 
 static int page_server_sk = -1;
@@ -74,9 +75,9 @@ int get_page_server_sk(void)
 #define BULK_STREAM_COMPLETE 2
 /* No ACK on bulk close: end-of-stream marker is enough. */
 
-/* Global compression statistics for stats printing */
-static unsigned long g_compress_uncompressed_bytes = 0;
-static unsigned long g_compress_compressed_bytes = 0;
+/* Global compression statistics for stats printing (used by cow-bulk-send.c too) */
+unsigned long g_compress_uncompressed_bytes = 0;
+unsigned long g_compress_compressed_bytes = 0;
 
 struct page_server_iov {
 	u32 cmd;
@@ -2453,17 +2454,41 @@ static void *unified_page_server_thread(void *arg)
 
 			pr_info("Processing image dst_id=%lu\n", img->dst_id);
 
-			/* Process each lazy VMA */
+			/* Get source_pid from first matching VMA */
 			list_for_each_entry(lve, get_global_lazy_vmas(), list) {
-				if (lve->dst_id != img->dst_id)
-					continue;
-
-				source_pid = lve->source_pid;
-
-				if (process_vma_pages(img, lve, source_pid, &stats) < 0) {
-					pr_err("Error processing VMA %lx-%lx\n",
-					       lve->start, lve->end);
+				if (lve->dst_id == img->dst_id) {
+					source_pid = lve->source_pid;
 					break;
+				}
+			}
+
+			/*
+			 * Phase 2 bulk transfer: use dedicated P3 thread with
+			 * batched sends (64 pages / 256KB per batch).
+			 * Convergence phase still uses inline processing for P1/P2/P3.
+			 */
+			if (!is_convergence_mode() && source_pid != 0) {
+				pr_info("Starting P3 bulk sender thread for dst_id=%lu\n",
+					img->dst_id);
+				if (cow_start_p3_thread(img->main_sk, img->dst_id, source_pid) < 0) {
+					pr_err("Failed to start P3 thread\n");
+				} else {
+					cow_wait_p3_thread();
+					stats.priority3_pages += cow_p3_pages_sent();
+				}
+			} else {
+				/* Convergence: use original per-page processing for P1/P2/P3 */
+				list_for_each_entry(lve, get_global_lazy_vmas(), list) {
+					if (lve->dst_id != img->dst_id)
+						continue;
+
+					source_pid = lve->source_pid;
+
+					if (process_vma_pages(img, lve, source_pid, &stats) < 0) {
+						pr_err("Error processing VMA %lx-%lx\n",
+						       lve->start, lve->end);
+						break;
+					}
 				}
 			}
 			print_thread_stats(&stats);
