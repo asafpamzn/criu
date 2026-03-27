@@ -77,9 +77,9 @@ static int page_pool_grow(void)
 
 	page_pool.chunks[page_pool.nr_chunks++] = chunk;
 
-	pr_info("Allocated chunk %d: %d pages (total: %d MB)\n",
+	pr_info("Allocated chunk %d: %d pages (total: %lu MB)\n",
 		page_pool.nr_chunks, PAGES_PER_CHUNK,
-		page_pool.nr_chunks * CHUNK_SIZE / (1024 * 1024));
+		(unsigned long)(page_pool.nr_chunks * CHUNK_SIZE / (1024 * 1024)));
 	return 0;
 }
 
