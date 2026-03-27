@@ -220,6 +220,11 @@ static inline int __recv(int sk, void *buf, size_t sz, int fl)
  */
 #define MAX_P3_RECEIVERS 10
 
+/* Max batch size for P3 transfer */
+#define P3_MAX_BATCH_PAGES 64
+#define P3_DECOMPRESS_BUF_SIZE (P3_MAX_BATCH_PAGES * PAGE_SIZE)
+#define P3_COMPRESS_BUF_SIZE LZ4_compressBound(P3_DECOMPRESS_BUF_SIZE)
+
 struct p3_receiver_ctx {
 	pthread_t thread;
 	int thread_id;
@@ -227,6 +232,9 @@ struct p3_receiver_ctx {
 	unsigned long pages_received;
 	volatile bool active;
 	volatile bool error;
+	/* Pre-allocated buffers to avoid malloc/mprotect contention */
+	char *compressed_buf;
+	char *decompressed_buf;
 };
 
 static struct p3_receiver_ctx p3_receivers[MAX_P3_RECEIVERS];
@@ -236,14 +244,16 @@ static volatile bool p3_acceptor_running = false;
 
 /*
  * Receive one compressed batch from socket and add to page buffer.
+ * Uses pre-allocated buffers from ctx to avoid malloc contention.
  * Returns number of pages received, 0 on EOF, -1 on error.
  */
-static int p3_receive_and_buffer(int sk)
+static int p3_receive_and_buffer(struct p3_receiver_ctx *ctx)
 {
 	struct page_server_iov pi;
 	int compressed_size;
-	char *compressed_buf = NULL;
-	char *decompressed_buf = NULL;
+	char *compressed_buf = ctx->compressed_buf;
+	char *decompressed_buf = ctx->decompressed_buf;
+	int sk = ctx->socket;
 	int nr_pages, i, ret = -1;
 	int decomp_ret;
 
@@ -268,23 +278,15 @@ static int p3_receive_and_buffer(int sk)
 		return -1;
 	}
 
-	if (compressed_size <= 0 || compressed_size > LZ4_compressBound(nr_pages * PAGE_SIZE)) {
+	if (compressed_size <= 0 || compressed_size > P3_COMPRESS_BUF_SIZE) {
 		pr_err("P3 receive: invalid compressed size %d\n", compressed_size);
 		return -1;
 	}
 
-	/* Allocate buffers */
-	compressed_buf = xmalloc(compressed_size);
-	decompressed_buf = xmalloc(nr_pages * PAGE_SIZE);
-	if (!compressed_buf || !decompressed_buf) {
-		pr_err("P3 receive: allocation failed\n");
-		goto out;
-	}
-
-	/* Receive compressed data */
+	/* Receive compressed data (using pre-allocated buffer) */
 	if (__recv(sk, compressed_buf, compressed_size, MSG_WAITALL) != compressed_size) {
 		pr_perror("P3 receive: failed to read compressed data");
-		goto out;
+		return -1;
 	}
 
 	/* Decompress */
@@ -293,7 +295,7 @@ static int p3_receive_and_buffer(int sk)
 	if (decomp_ret != nr_pages * PAGE_SIZE) {
 		pr_err("P3 receive: decompression failed (expected %d, got %d)\n",
 		       nr_pages * (int)PAGE_SIZE, decomp_ret);
-		goto out;
+		return -1;
 	}
 
 	/* Add each page to buffer */
@@ -301,16 +303,11 @@ static int p3_receive_and_buffer(int sk)
 		unsigned long vaddr = pi.vaddr + i * PAGE_SIZE;
 		if (cow_page_buffer_add(vaddr, decompressed_buf + i * PAGE_SIZE) < 0) {
 			pr_err("P3 receive: failed to buffer page at 0x%lx\n", vaddr);
-			goto out;
+			return -1;
 		}
 	}
 
-	ret = nr_pages;
-
-out:
-	xfree(compressed_buf);
-	xfree(decompressed_buf);
-	return ret;
+	return nr_pages;
 }
 
 static void *p3_receiver_thread_func(void *arg)
@@ -331,7 +328,7 @@ static void *p3_receiver_thread_func(void *arg)
 	}
 
 	/* Receive pages until socket closes */
-	while ((ret = p3_receive_and_buffer(ctx->socket)) > 0) {
+	while ((ret = p3_receive_and_buffer(ctx)) > 0) {
 		pages += ret;
 		if (pages % 1000 == 0 && pages > 0)
 			pr_debug("DEBUG_THREAD: P3 receiver[%d] progress: %lu pages received\n",
@@ -435,6 +432,15 @@ static void stop_p3_acceptor_thread(void)
 				close(p3_receivers[i].socket);
 				p3_receivers[i].socket = -1;
 			}
+			/* Free pre-allocated buffers */
+			if (p3_receivers[i].compressed_buf) {
+				munmap(p3_receivers[i].compressed_buf, P3_COMPRESS_BUF_SIZE);
+				p3_receivers[i].compressed_buf = NULL;
+			}
+			if (p3_receivers[i].decompressed_buf) {
+				munmap(p3_receivers[i].decompressed_buf, P3_DECOMPRESS_BUF_SIZE);
+				p3_receivers[i].decompressed_buf = NULL;
+			}
 			p3_receivers[i].thread = 0;
 		}
 	}
@@ -524,14 +530,34 @@ int start_p3_receiver_connections(int num_connections)
 		p3_receivers[i].pages_received = 0;
 		p3_receivers[i].active = true;
 		p3_receivers[i].error = false;
+
+		/* Pre-allocate buffers to avoid malloc/mprotect contention */
+		p3_receivers[i].compressed_buf = mmap(NULL, P3_COMPRESS_BUF_SIZE,
+						      PROT_READ | PROT_WRITE,
+						      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		p3_receivers[i].decompressed_buf = mmap(NULL, P3_DECOMPRESS_BUF_SIZE,
+							PROT_READ | PROT_WRITE,
+							MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (p3_receivers[i].compressed_buf == MAP_FAILED ||
+		    p3_receivers[i].decompressed_buf == MAP_FAILED) {
+			pr_perror("Failed to allocate P3 receiver buffers");
+			close(p3_sockets[i]);
+			p3_receivers[i].socket = -1;
+			continue;
+		}
+
 		__sync_fetch_and_add(&p3_receivers_active, 1);
 
 		if (pthread_create(&p3_receivers[i].thread, NULL,
 				   p3_receiver_thread_func, &p3_receivers[i])) {
 			pr_perror("Failed to create P3 receiver thread %d", i);
 			close(p3_sockets[i]);
+			munmap(p3_receivers[i].compressed_buf, P3_COMPRESS_BUF_SIZE);
+			munmap(p3_receivers[i].decompressed_buf, P3_DECOMPRESS_BUF_SIZE);
 			p3_receivers[i].active = false;
 			p3_receivers[i].socket = -1;
+			p3_receivers[i].compressed_buf = NULL;
+			p3_receivers[i].decompressed_buf = NULL;
 			__sync_fetch_and_sub(&p3_receivers_active, 1);
 		}
 	}
@@ -562,6 +588,15 @@ void stop_p3_receiver_connections(void)
 				       i, p3_receivers[i].socket);
 				close(p3_receivers[i].socket);
 				p3_receivers[i].socket = -1;
+			}
+			/* Free pre-allocated buffers */
+			if (p3_receivers[i].compressed_buf) {
+				munmap(p3_receivers[i].compressed_buf, P3_COMPRESS_BUF_SIZE);
+				p3_receivers[i].compressed_buf = NULL;
+			}
+			if (p3_receivers[i].decompressed_buf) {
+				munmap(p3_receivers[i].decompressed_buf, P3_DECOMPRESS_BUF_SIZE);
+				p3_receivers[i].decompressed_buf = NULL;
 			}
 			p3_receivers[i].thread = 0;
 		}
