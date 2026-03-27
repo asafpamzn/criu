@@ -15,6 +15,7 @@
 #include "common/list.h"
 #include "common/bug.h"
 #include "pf-tracker.h"
+#include "page-pool.h"
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "cow-uffd: "
@@ -81,6 +82,10 @@ int cow_page_buffer_init(void)
 	if (cow_buffer.initialized)
 		return 0;
 
+	/* Initialize page pool for fast page allocation */
+	if (page_pool_init() < 0)
+		return -1;
+
 	cow_buffer.hash_table = xmalloc(PAGE_BUFFER_HASH_SIZE *
 					sizeof(struct hlist_head));
 	if (!cow_buffer.hash_table)
@@ -138,8 +143,8 @@ int cow_page_buffer_add(unsigned long vaddr, void *data)
 	hash = page_buffer_hash(vaddr);
 	lock_idx = lock_index(hash);
 
-	/* Allocate page data outside lock */
-	page_data = xmalloc(PAGE_SIZE);
+	/* Allocate page data outside lock (using pool to avoid malloc contention) */
+	page_data = page_pool_get();
 	if (!page_data)
 		return -1;
 	memcpy(page_data, data, PAGE_SIZE);
@@ -152,7 +157,7 @@ int cow_page_buffer_add(unsigned long vaddr, void *data)
 		for (i = 0; i < node->count; i++) {
 			if (node->entries[i].vaddr == vaddr) {
 				/* Update existing entry with newer data */
-				xfree(node->entries[i].data);
+				page_pool_put(node->entries[i].data);
 				node->entries[i].data = page_data;
 				pthread_spin_unlock(&hash_locks[lock_idx]);
 				return 0;
@@ -175,7 +180,7 @@ int cow_page_buffer_add(unsigned long vaddr, void *data)
 	/* Need new node - allocate outside lock */
 	node = xmalloc(sizeof(*node));
 	if (!node) {
-		xfree(page_data);
+		page_pool_put(page_data);
 		return -1;
 	}
 
@@ -272,7 +277,7 @@ void cow_page_buffer_discard_dirty(unsigned long *dirty_ranges,
 						  &cow_buffer.hash_table[hash], hash) {
 				for (i = 0; i < node->count; i++) {
 					if (node->entries[i].vaddr == vaddr) {
-						xfree(node->entries[i].data);
+						page_pool_put(node->entries[i].data);
 						/* Move last entry to fill gap */
 						node->count--;
 						if (i < node->count) {
@@ -323,7 +328,7 @@ void cow_page_buffer_destroy(void)
 		hlist_for_each_entry_safe(node, tmp,
 					  &cow_buffer.hash_table[i], hash) {
 			for (j = 0; j < node->count; j++)
-				xfree(node->entries[j].data);
+				page_pool_put(node->entries[j].data);
 			hlist_del(&node->hash);
 			xfree(node);
 		}
@@ -342,6 +347,9 @@ void cow_page_buffer_destroy(void)
 	pr_info("COW page buffer destroyed: applied=%lu discarded=%lu max_bucket=%lu\n",
 		cow_buffer.nr_applied, cow_buffer.nr_discarded,
 		cow_buffer.max_bucket_depth);
+
+	/* Destroy page pool last */
+	page_pool_destroy();
 }
 
 /*
@@ -378,7 +386,7 @@ static void cow_page_buffer_readd(unsigned long vaddr, void *data)
 	node = xmalloc(sizeof(*node));
 	if (!node) {
 		pr_err("Failed to re-add page 0x%lx on EAGAIN\n", vaddr);
-		xfree(data);
+		page_pool_put(data);
 		return;
 	}
 
@@ -485,7 +493,7 @@ static void *background_drain_thread(void *arg)
 					}
 
 					if (free_data)
-						xfree(data);
+						page_pool_put(data);
 					pthread_spin_lock(&hash_locks[lock_idx]);
 				}
 
