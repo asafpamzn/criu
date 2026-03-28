@@ -2338,9 +2338,7 @@ static bool all_pages_sent_received = false;
 static int prebuffer_io_complete(unsigned long dst_id, unsigned long vaddr,
 				 unsigned long nr_pages, void *priv)
 {
-	void *buf = priv;
-	int i;
-
+	
 	/*
 	 * This callback should not be called - P3 bulk transfer handles
 	 * all pages before restore connects. If we get here, something
@@ -2713,7 +2711,7 @@ int cow_phase3_restore_loop(int ep_fd, struct epoll_event **events, int nr_fds)
 
 	pr_err("COW Phase 3: Waiting for restore to connect\n");
 
-	/* Re-initialize async bulk reader for Phase 3 convergence */
+	/* Re-initialize async bulk reader for Phase 3 convergence */ //TODO may be a dead code.
 	if (setup_prebuffer_reader()) {
 		pr_err("Failed to setup prebuffer reader for Phase 3\n");
 		close(lazy_sk);
