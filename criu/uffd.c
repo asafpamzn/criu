@@ -2711,12 +2711,13 @@ int cow_phase3_restore_loop(int ep_fd, struct epoll_event **events, int nr_fds)
 
 	pr_err("COW Phase 3: Waiting for restore to connect\n");
 
-	/* Re-initialize async bulk reader for Phase 3 convergence */ //TODO may be a dead code.
+	/* Initialize buffer and switch directly to convergence callback for Phase 3 */
 	if (setup_prebuffer_reader()) {
 		pr_err("Failed to setup prebuffer reader for Phase 3\n");
 		close(lazy_sk);
 		return -1;
 	}
+	switch_to_convergence_callback(); //TODO register to the callback at setup_prebuffer_reader
 
 	/* 5. Request all pages from primary for each task */
 	for_each_pstree_item(pi) {
