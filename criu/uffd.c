@@ -2330,6 +2330,7 @@ static unsigned int pending_nr_dirty_ranges = 0;
 static bool dirty_bitmap_received = false;
 static bool inventory_ready_received = false;
 static bool all_pages_sent_received = false;
+static bool phase3_active = false;
 
 /*
  * Pre-buffer callback: pages arrive before criu restore connects.
@@ -2492,6 +2493,24 @@ static int handle_lazy_accept(struct epoll_rfd *rfd)
 		pr_info("Dirty bitmap already received, entering convergence\n");
 		switch_to_convergence_callback();
 		cow_start_drain_thread();
+	}
+
+	/* Phase 3: request all pages now that lpis are created */
+	if (phase3_active) {
+		struct pstree_item *pi;
+
+		pr_info("Phase 3: Requesting all remote pages\n");
+		for_each_pstree_item(pi) {
+			if (task_alive(pi)) {
+				pr_info("Requesting all remote pages for pid=%d\n",
+					vpid(pi));
+				if (request_all_remote_pages(vpid(pi)) < 0) {
+					pr_err("Failed to request pages for pid=%d\n",
+						vpid(pi));
+					goto err;
+				}
+			}
+		}
 	}
 
 	return 0;
@@ -2686,10 +2705,10 @@ int cow_phase3_restore_loop(int ep_fd, struct epoll_event **events, int nr_fds)
 	int lazy_sk;
 	int flags;
 	int ret;
-	struct pstree_item *pi;
 
 	/* Set global epollfd for use by handle_lazy_accept() */
 	epollfd = ep_fd;
+	phase3_active = true;
 
 	/* Create lazy socket for restore to connect */
 	lazy_sk = prepare_lazy_socket();
@@ -2719,19 +2738,7 @@ int cow_phase3_restore_loop(int ep_fd, struct epoll_event **events, int nr_fds)
 	}
 	switch_to_convergence_callback(); //TODO register to the callback at setup_prebuffer_reader
 
-	/* 5. Request all pages from primary for each task */
-	for_each_pstree_item(pi) {
-		if (task_alive(pi)) {
-			pr_info("Requesting all remote pages for pid=%d\n",
-				vpid(pi));
-			if (request_all_remote_pages(vpid(pi)) < 0) {
-				pr_err("Failed to request pages for pid=%d\n",
-						vpid(pi));
-				xfree(events);
-				return -1;
-			}
-		}
-	}
+	/* Pages will be requested in handle_lazy_accept() after restore connects */
 
 	/* Enter main event loop - handle page faults until restore finishes */
 	ret = handle_requests(epollfd, events, nr_fds);
