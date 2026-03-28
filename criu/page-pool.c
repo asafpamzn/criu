@@ -30,8 +30,8 @@
 
 #include "page.h"
 #include "page-pool.h"
-#include "xmalloc.h"
 #include "criu-log.h"
+#include "common/bug.h"
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "page-pool: "
@@ -179,13 +179,10 @@ void page_pool_put(void *page)
 	/* Calculate chunk base from page address (256MB aligned) */
 	hdr = (struct chunk_header *)((unsigned long)page & CHUNK_ALIGN_MASK);
 
-	/*
-	 * Validate - check self-pointer. If validation fails, this page
-	 * was allocated via xmalloc (fallback path), so free it that way.
-	 */
+	/* Validate - check self-pointer */
 	if (hdr->base != hdr) {
-		xfree(page);
-		return;
+		pr_err("BUG: page_pool_put called with invalid page %p\n", page);
+		BUG();
 	}
 
 	/* Atomic decrement */

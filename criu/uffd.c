@@ -2341,17 +2341,14 @@ static int prebuffer_io_complete(unsigned long dst_id, unsigned long vaddr,
 	void *buf = priv;
 	int i;
 
-	for (i = 0; i < nr_pages; i++) {
-		/* Use -1 for single-threaded callback (xmalloc fallback) */
-		if (cow_page_buffer_add(vaddr + i * PAGE_SIZE,
-					(char *)buf + i * PAGE_SIZE, -1) < 0) {
-			pr_err("Failed to buffer page at 0x%lx\n",
-			       vaddr + i * PAGE_SIZE);
-			return -1;
-		}
-	}
-	pr_debug("Pre-buffered %lu pages at 0x%lx\n", nr_pages, vaddr);
-	return 0;
+	/*
+	 * This callback should not be called - P3 bulk transfer handles
+	 * all pages before restore connects. If we get here, something
+	 * is wrong with the transfer flow.
+	 */
+	pr_err("BUG: prebuffer_io_complete called - P3 should handle all pages\n");
+	BUG();
+	return -1;  /* unreachable */
 }
 
 int setup_prebuffer_reader(void)

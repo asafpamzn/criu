@@ -145,15 +145,19 @@ int cow_page_buffer_add(unsigned long vaddr, void *data, int thread_id)
 	lock_idx = lock_index(hash);
 
 	/*
-	 * Allocate page data outside lock.
-	 * Use per-thread pool for lock-free allocation (thread_id >= 0),
-	 * or fallback to xmalloc for single-threaded callers (thread_id < 0).
+	 * Allocate page data outside lock using per-thread pool.
+	 * All callers must have a valid thread_id with initialized pool.
 	 */
-	page_data = (thread_id >= 0) ? page_pool_get(thread_id) : NULL;
-	if (!page_data)
-		page_data = xmalloc(PAGE_SIZE);
-	if (!page_data)
-		return -1;
+	if (thread_id < 0) {
+		pr_err("BUG: cow_page_buffer_add called with invalid thread_id %d\n",
+		       thread_id);
+		BUG();
+	}
+	page_data = page_pool_get(thread_id);
+	if (!page_data) {
+		pr_err("BUG: page_pool_get failed for thread %d\n", thread_id);
+		BUG();
+	}
 	memcpy(page_data, data, PAGE_SIZE);
 
 	pthread_spin_lock(&hash_locks[lock_idx]);
