@@ -3,14 +3,21 @@
 
 #include <stdbool.h>
 
-/* Initialize COW page buffer with spinlock */
+/* Initialize COW page buffer (hash table, locks) */
 int cow_page_buffer_init(void);
+
+/* Initialize page pool for a receiver thread (call once per thread) */
+int cow_page_buffer_thread_init(int thread_id);
 
 /* Lookup page in buffer (thread-safe) - returns data pointer or NULL */
 void *cow_page_buffer_lookup_and_remove(unsigned long vaddr);
 
-/* Add page to buffer (thread-safe) */
-int cow_page_buffer_add(unsigned long vaddr, void *data);
+/*
+ * Add page to buffer (thread-safe).
+ * thread_id: receiver thread id for lock-free pool allocation (0-15)
+ *            use -1 to fallback to xmalloc (for single-threaded callers)
+ */
+int cow_page_buffer_add(unsigned long vaddr, void *data, int thread_id);
 
 /* Get current page count */
 unsigned long cow_page_buffer_count(void);

@@ -2342,8 +2342,9 @@ static int prebuffer_io_complete(unsigned long dst_id, unsigned long vaddr,
 	int i;
 
 	for (i = 0; i < nr_pages; i++) {
+		/* Use -1 for single-threaded callback (xmalloc fallback) */
 		if (cow_page_buffer_add(vaddr + i * PAGE_SIZE,
-					(char *)buf + i * PAGE_SIZE) < 0) {
+					(char *)buf + i * PAGE_SIZE, -1) < 0) {
 			pr_err("Failed to buffer page at 0x%lx\n",
 			       vaddr + i * PAGE_SIZE);
 			return -1;
@@ -2395,9 +2396,10 @@ static int convergence_io_complete(unsigned long dst_id, unsigned long vaddr,
 		return 0;
 	}
 
-	/* No matching lpi - shouldn't happen in convergence, log warning */
-	pr_warn("Convergence: no lpi for vaddr 0x%lx, buffering\n", vaddr);
-	return cow_page_buffer_add(vaddr, buf);
+	/* No matching lpi - this should never happen in convergence mode */
+	pr_err("BUG: Convergence callback with no lpi for vaddr 0x%lx\n", vaddr);
+	BUG();
+	return -1;  /* unreachable */
 }
 
 /*

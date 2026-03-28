@@ -298,10 +298,11 @@ static int p3_receive_and_buffer(struct p3_receiver_ctx *ctx)
 		return -1;
 	}
 
-	/* Add each page to buffer */
+	/* Add each page to buffer using per-thread pool for lock-free allocation */
 	for (i = 0; i < nr_pages; i++) {
 		unsigned long vaddr = pi.vaddr + i * PAGE_SIZE;
-		if (cow_page_buffer_add(vaddr, decompressed_buf + i * PAGE_SIZE) < 0) {
+		if (cow_page_buffer_add(vaddr, decompressed_buf + i * PAGE_SIZE,
+					ctx->thread_id) < 0) {
 			pr_err("P3 receive: failed to buffer page at 0x%lx\n", vaddr);
 			return -1;
 		}
@@ -319,6 +320,13 @@ static void *p3_receiver_thread_func(void *arg)
 	pr_info("P3 receiver[%d] started on socket %d\n", ctx->thread_id, ctx->socket);
 	pr_debug("DEBUG_THREAD: P3 receiver[%d] STARTED socket=%d\n",
 	       ctx->thread_id, ctx->socket);
+
+	/* Initialize per-thread page pool for lock-free allocation */
+	if (cow_page_buffer_thread_init(ctx->thread_id) < 0) {
+		pr_err("P3 receiver[%d]: page pool init failed\n", ctx->thread_id);
+		ctx->error = true;
+		goto out;
+	}
 
 	/* Initialize TLS if enabled */
 	if (tls_x509_init(ctx->socket, true)) {

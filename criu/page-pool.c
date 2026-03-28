@@ -1,22 +1,32 @@
 /*
- * Page Pool - Pre-allocated page buffers to avoid malloc/mprotect contention
+ * Per-Thread Page Pool - Lock-free allocation to avoid malloc/mprotect contention
  *
- * When multiple threads allocate PAGE_SIZE buffers via malloc, glibc's heap
+ * When 10 receiver threads allocate PAGE_SIZE buffers via malloc, glibc's heap
  * management triggers mprotect calls that serialize on the kernel's mmap_sem
- * write lock. This pool uses mmap to pre-allocate pages in 4MB chunks,
- * eliminating the contention.
+ * write lock. This pool eliminates contention via:
  *
- * Design:
- *   - Chunks: 4MB each (1024 pages), allocated via mmap on demand
- *   - Free stack: LIFO stack of available page pointers
- *   - Growth: New chunk allocated when stack is empty
- *   - Fallback: Returns to malloc if pool hits max capacity
+ *   - Per-thread bump allocator (zero locks on allocation path)
+ *   - 256MB aligned chunks (O(1) chunk lookup from page address)
+ *   - Atomic reference counting per chunk
+ *   - munmap entire chunk when refcount reaches 0
+ *
+ * Memory layout per chunk (256MB aligned):
+ *   +------------------+  <- 256MB aligned base
+ *   | Chunk header     |     (refcount, validation pointer)
+ *   | (4KB page 0)     |
+ *   +------------------+
+ *   | Page 1 (4KB)     |  <- First allocatable page
+ *   | Page 2 (4KB)     |
+ *   | ...              |
+ *   | Page 65535       |
+ *   +------------------+
  */
 
 #include <sys/mman.h>
-#include <pthread.h>
+#include <stdatomic.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include <pthread.h>
 
 #include "page.h"
 #include "page-pool.h"
@@ -26,147 +36,202 @@
 #undef LOG_PREFIX
 #define LOG_PREFIX "page-pool: "
 
-#define PAGES_PER_CHUNK  1024		/* 4MB per chunk */
-#define CHUNK_SIZE       (PAGES_PER_CHUNK * PAGE_SIZE)
-#define MAX_CHUNKS       64		/* Max 256MB total */
+#define CHUNK_SIZE       (256UL * 1024 * 1024)     /* 256MB */
+#define CHUNK_ALIGN      CHUNK_SIZE
+#define CHUNK_ALIGN_MASK (~(CHUNK_ALIGN - 1))
+#define PAGES_PER_CHUNK  (CHUNK_SIZE / PAGE_SIZE)  /* 65536 */
+#define MAX_THREADS      16
+#define MAX_CHUNKS       512  /* 512 * 256MB = 128GB max */
 
-static struct {
-	void *chunks[MAX_CHUNKS];	/* Array of mmap'd 4MB chunks */
-	int nr_chunks;			/* Number of allocated chunks */
-	void **free_stack;		/* Stack of free page pointers */
-	int stack_size;			/* Allocated stack capacity */
-	int stack_top;			/* Next free slot (0 = empty) */
-	pthread_spinlock_t lock;
+/* Chunk header - stored at start of each 256MB region (uses page 0) */
+struct chunk_header {
+	atomic_int refcount;     /* Pages still in use */
+	void *base;              /* Self-pointer for validation */
+};
+
+/* Per-thread pool state */
+struct thread_pool {
+	void *current_chunk;     /* Current chunk base address */
+	int next_page;           /* Next page index to allocate */
 	bool initialized;
-} page_pool;
+};
 
-/* Allocate a new 4MB chunk and add all pages to free stack */
-static int page_pool_grow(void)
+static struct thread_pool pools[MAX_THREADS];
+static void *all_chunks[MAX_CHUNKS];
+static atomic_int nr_chunks;
+static pthread_spinlock_t chunk_list_lock;  /* Only for chunk tracking */
+static atomic_bool global_init_done;
+
+/* Allocate a new 256MB aligned chunk */
+static void *alloc_chunk(void)
 {
 	void *chunk;
-	int i;
+	void *raw;
+	struct chunk_header *hdr;
+	size_t front_excess, back_excess;
+	int idx;
 
-	if (page_pool.nr_chunks >= MAX_CHUNKS) {
-		pr_warn("Page pool at max capacity (%d chunks)\n", MAX_CHUNKS);
-		return -1;
+	/*
+	 * mmap with MAP_ANONYMOUS gives page-aligned memory.
+	 * To get 256MB alignment, allocate extra and align manually.
+	 */
+	raw = mmap(NULL, CHUNK_SIZE + CHUNK_ALIGN, PROT_READ | PROT_WRITE,
+		   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (raw == MAP_FAILED) {
+		pr_perror("Failed to mmap 256MB chunk");
+		return NULL;
 	}
 
-	chunk = mmap(NULL, CHUNK_SIZE, PROT_READ | PROT_WRITE,
-		     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-	if (chunk == MAP_FAILED) {
-		pr_perror("Failed to mmap page pool chunk");
-		return -1;
+	/* Align to 256MB boundary */
+	chunk = (void *)(((unsigned long)raw + CHUNK_ALIGN - 1) & CHUNK_ALIGN_MASK);
+
+	/* Unmap the excess at front and back */
+	front_excess = (size_t)(chunk - raw);
+	back_excess = CHUNK_ALIGN - front_excess;
+	if (front_excess > 0)
+		munmap(raw, front_excess);
+	if (back_excess > 0)
+		munmap((char *)chunk + CHUNK_SIZE, back_excess);
+
+	/* Initialize header (page 0) */
+	hdr = (struct chunk_header *)chunk;
+	atomic_init(&hdr->refcount, PAGES_PER_CHUNK - 1);  /* -1 for header page */
+	hdr->base = chunk;
+
+	/* Track for cleanup */
+	pthread_spin_lock(&chunk_list_lock);
+	idx = atomic_load(&nr_chunks);
+	if (idx < MAX_CHUNKS) {
+		all_chunks[idx] = chunk;
+		atomic_fetch_add(&nr_chunks, 1);
 	}
+	pthread_spin_unlock(&chunk_list_lock);
 
-	/* Grow free stack if needed */
-	if (page_pool.stack_top + PAGES_PER_CHUNK > page_pool.stack_size) {
-		int new_size = page_pool.stack_size + PAGES_PER_CHUNK;
-		void **new_stack = xrealloc(page_pool.free_stack,
-					    new_size * sizeof(void *));
-		if (!new_stack) {
-			munmap(chunk, CHUNK_SIZE);
-			return -1;
-		}
-		page_pool.free_stack = new_stack;
-		page_pool.stack_size = new_size;
-	}
+	pr_info("Allocated 256MB chunk at %p (total: %d chunks)\n",
+		chunk, atomic_load(&nr_chunks));
 
-	/* Add all pages from new chunk to free stack */
-	for (i = 0; i < PAGES_PER_CHUNK; i++)
-		page_pool.free_stack[page_pool.stack_top++] = chunk + i * PAGE_SIZE;
-
-	page_pool.chunks[page_pool.nr_chunks++] = chunk;
-
-	pr_info("Allocated chunk %d: %d pages (total: %lu MB)\n",
-		page_pool.nr_chunks, PAGES_PER_CHUNK,
-		(unsigned long)(page_pool.nr_chunks * CHUNK_SIZE / (1024 * 1024)));
-	return 0;
+	return chunk;
 }
 
-int page_pool_init(void)
+int page_pool_thread_init(int thread_id)
 {
-	if (page_pool.initialized)
+	if (thread_id < 0 || thread_id >= MAX_THREADS) {
+		pr_err("Invalid thread_id %d (max %d)\n", thread_id, MAX_THREADS);
+		return -1;
+	}
+
+	if (pools[thread_id].initialized)
 		return 0;
 
-	page_pool.nr_chunks = 0;
-	page_pool.stack_top = 0;
-	page_pool.stack_size = PAGES_PER_CHUNK;
-	page_pool.free_stack = xmalloc(page_pool.stack_size * sizeof(void *));
-	if (!page_pool.free_stack)
-		return -1;
-
-	pthread_spin_init(&page_pool.lock, PTHREAD_PROCESS_PRIVATE);
-	page_pool.initialized = true;
-
-	/* Allocate first chunk */
-	if (page_pool_grow() < 0) {
-		xfree(page_pool.free_stack);
-		page_pool.initialized = false;
-		return -1;
+	/* First thread initializes the chunk list lock */
+	if (!atomic_exchange(&global_init_done, true)) {
+		pthread_spin_init(&chunk_list_lock, PTHREAD_PROCESS_PRIVATE);
+		atomic_init(&nr_chunks, 0);
 	}
 
+	pools[thread_id].current_chunk = alloc_chunk();
+	if (!pools[thread_id].current_chunk)
+		return -1;
+
+	pools[thread_id].next_page = 1;  /* Skip header page */
+	pools[thread_id].initialized = true;
+
+	pr_info("Thread %d pool initialized\n", thread_id);
 	return 0;
 }
 
-void page_pool_destroy(void)
+void *page_pool_get(int thread_id)
 {
-	int i;
+	struct thread_pool *pool;
+	void *page;
 
-	if (!page_pool.initialized)
-		return;
+	if (thread_id < 0 || thread_id >= MAX_THREADS)
+		return NULL;
 
-	for (i = 0; i < page_pool.nr_chunks; i++) {
-		if (page_pool.chunks[i])
-			munmap(page_pool.chunks[i], CHUNK_SIZE);
+	pool = &pools[thread_id];
+
+	if (!pool->initialized)
+		return NULL;
+
+	/* Need new chunk? */
+	if (pool->next_page >= PAGES_PER_CHUNK) {
+		pool->current_chunk = alloc_chunk();
+		if (!pool->current_chunk)
+			return NULL;
+		pool->next_page = 1;  /* Skip header */
 	}
 
-	xfree(page_pool.free_stack);
-	page_pool.free_stack = NULL;
-	page_pool.nr_chunks = 0;
-	page_pool.stack_top = 0;
-	page_pool.initialized = false;
+	/* Lock-free allocation: just bump the pointer */
+	page = (char *)pool->current_chunk + (pool->next_page * PAGE_SIZE);
+	pool->next_page++;
 
-	pr_info("Page pool destroyed\n");
-}
-
-void *page_pool_get(void)
-{
-	void *page = NULL;
-
-	if (!page_pool.initialized)
-		return xmalloc(PAGE_SIZE);
-
-	pthread_spin_lock(&page_pool.lock);
-
-	/* If stack empty, grow pool */
-	if (page_pool.stack_top == 0) {
-		if (page_pool_grow() < 0) {
-			pthread_spin_unlock(&page_pool.lock);
-			return xmalloc(PAGE_SIZE);  /* Fallback */
-		}
-	}
-
-	page_pool.stack_top--;
-	page = page_pool.free_stack[page_pool.stack_top];
-
-	pthread_spin_unlock(&page_pool.lock);
 	return page;
 }
 
 void page_pool_put(void *page)
 {
+	struct chunk_header *hdr;
+	int old_ref;
+
 	if (!page)
 		return;
 
-	if (!page_pool.initialized) {
+	/* Calculate chunk base from page address (256MB aligned) */
+	hdr = (struct chunk_header *)((unsigned long)page & CHUNK_ALIGN_MASK);
+
+	/*
+	 * Validate - check self-pointer. If validation fails, this page
+	 * was allocated via xmalloc (fallback path), so free it that way.
+	 */
+	if (hdr->base != hdr) {
 		xfree(page);
 		return;
 	}
 
-	pthread_spin_lock(&page_pool.lock);
+	/* Atomic decrement */
+	old_ref = atomic_fetch_sub(&hdr->refcount, 1);
 
-	/* Always return to pool - stack was sized for all allocated pages */
-	page_pool.free_stack[page_pool.stack_top++] = page;
+	/* Last reference? munmap the entire chunk */
+	if (old_ref == 1) {
+		pr_info("Freeing 256MB chunk at %p (all pages returned)\n", hdr);
 
-	pthread_spin_unlock(&page_pool.lock);
+		/* Remove from tracking list */
+		pthread_spin_lock(&chunk_list_lock);
+		for (int i = 0; i < atomic_load(&nr_chunks); i++) {
+			if (all_chunks[i] == hdr) {
+				all_chunks[i] = NULL;
+				break;
+			}
+		}
+		pthread_spin_unlock(&chunk_list_lock);
+
+		munmap(hdr, CHUNK_SIZE);
+	}
+}
+
+void page_pool_destroy_all(void)
+{
+	int i, n;
+
+	if (!atomic_load(&global_init_done))
+		return;
+
+	pthread_spin_lock(&chunk_list_lock);
+	n = atomic_load(&nr_chunks);
+	for (i = 0; i < n; i++) {
+		if (all_chunks[i]) {
+			munmap(all_chunks[i], CHUNK_SIZE);
+			all_chunks[i] = NULL;
+		}
+	}
+	atomic_store(&nr_chunks, 0);
+	pthread_spin_unlock(&chunk_list_lock);
+
+	for (i = 0; i < MAX_THREADS; i++) {
+		pools[i].initialized = false;
+		pools[i].current_chunk = NULL;
+		pools[i].next_page = 0;
+	}
+
+	pr_info("All page pools destroyed\n");
 }

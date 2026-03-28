@@ -82,10 +82,6 @@ int cow_page_buffer_init(void)
 	if (cow_buffer.initialized)
 		return 0;
 
-	/* Initialize page pool for fast page allocation */
-	if (page_pool_init() < 0)
-		return -1;
-
 	cow_buffer.hash_table = xmalloc(PAGE_BUFFER_HASH_SIZE *
 					sizeof(struct hlist_head));
 	if (!cow_buffer.hash_table)
@@ -113,7 +109,12 @@ int cow_page_buffer_init(void)
 	return 0;
 }
 
-int cow_page_buffer_add(unsigned long vaddr, void *data)
+int cow_page_buffer_thread_init(int thread_id)
+{
+	return page_pool_thread_init(thread_id);
+}
+
+int cow_page_buffer_add(unsigned long vaddr, void *data, int thread_id)
 {
 	struct page_buffer_node *node;
 	unsigned int hash;
@@ -143,8 +144,14 @@ int cow_page_buffer_add(unsigned long vaddr, void *data)
 	hash = page_buffer_hash(vaddr);
 	lock_idx = lock_index(hash);
 
-	/* Allocate page data outside lock (using pool to avoid malloc contention) */
-	page_data = page_pool_get();
+	/*
+	 * Allocate page data outside lock.
+	 * Use per-thread pool for lock-free allocation (thread_id >= 0),
+	 * or fallback to xmalloc for single-threaded callers (thread_id < 0).
+	 */
+	page_data = (thread_id >= 0) ? page_pool_get(thread_id) : NULL;
+	if (!page_data)
+		page_data = xmalloc(PAGE_SIZE);
 	if (!page_data)
 		return -1;
 	memcpy(page_data, data, PAGE_SIZE);
@@ -348,8 +355,8 @@ void cow_page_buffer_destroy(void)
 		cow_buffer.nr_applied, cow_buffer.nr_discarded,
 		cow_buffer.max_bucket_depth);
 
-	/* Destroy page pool last */
-	page_pool_destroy();
+	/* Destroy all page pools last */
+	page_pool_destroy_all();
 }
 
 /*
