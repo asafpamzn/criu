@@ -166,7 +166,7 @@ int cow_page_buffer_add(unsigned long vaddr, void *data, int thread_id, bool noc
 	}
 
 	pthread_spin_lock(&hash_locks[lock_idx]);
-
+	pr_err("DEBUG: cow_page_buffer_add existing vaddr=0x%lx nocopy=%d\n", vaddr, nocopy);
 	/* Check for duplicate and find space in existing nodes (cache-friendly) */
 	hlist_for_each_entry(node, &cow_buffer.hash_table[hash], hash) {
 		/* Check all entries in this node - contiguous in memory */
