@@ -7,6 +7,7 @@
 #include <poll.h>
 #include <string.h>
 #include <time.h>
+#include <signal.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
@@ -50,6 +51,13 @@
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "uffd: "
+
+/* Debug signal handler to catch segfault from xfree(page_pool_data) bug */
+static void debug_sigsegv_handler(int sig)
+{
+	pr_err("DEBUG: SIGSEGV caught! Likely xfree(page_pool_data) bug\n");
+	_exit(139);
+}
 
 #define NEED_UFFD_API_FEATURES \
 	(UFFD_FEATURE_EVENT_FORK | UFFD_FEATURE_EVENT_REMAP | UFFD_FEATURE_EVENT_UNMAP | UFFD_FEATURE_EVENT_REMOVE)
@@ -1801,9 +1809,13 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 				page_state_set(address, PAGE_STATE_DISCARDED);
 			} else {
 				pr_err("DEBUG_PF: UFFDIO_COPY succeeded\n");
+				pr_err("DEBUG_PF: about to call page_state_set\n");
 				page_state_set(address, PAGE_STATE_COPIED);
+				pr_err("DEBUG_PF: page_state_set done\n");
 			}
+			pr_err("DEBUG_PF: about to xfree(data)\n");
 			xfree(data);
+			pr_err("DEBUG_PF: xfree done, incrementing copied_pages\n");
 			lpi->copied_pages++;
 			pr_err("DEBUG_PF: buffer-found path returning 0\n");
 			return 0;
@@ -2159,6 +2171,10 @@ static int handle_requests(int epollfd, struct epoll_event **events, int nr_fds)
 	struct lazy_pages_info *lpi, *n;
 	int poll_timeout = -1;
 	int ret;
+
+	/* Install debug signal handler to catch segfaults */
+	signal(SIGSEGV, debug_sigsegv_handler);
+	pr_err("DEBUG: Installed SIGSEGV handler\n");
 
 	for (;;) {
 		static unsigned long loop_count = 0;
