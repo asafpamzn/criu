@@ -75,6 +75,7 @@ static LIST_HEAD(exiting_lpis);
 static LIST_HEAD(pending_lpis);
 static int epollfd;
 static bool restore_finished;
+static bool phase3_active = false;
 static struct epoll_rfd lazy_sk_rfd;
 /* socket for communication with lazy-pages daemon */
 static int lazy_pages_sk_id = -1;
@@ -2357,7 +2358,6 @@ static unsigned int pending_nr_dirty_ranges = 0;
 static bool dirty_bitmap_received = false;
 static bool inventory_ready_received = false;
 static bool all_pages_sent_received = false;
-static bool phase3_active = false;
 
 /*
  * Pre-buffer callback: pages arrive before criu restore connects.
