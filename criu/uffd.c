@@ -2133,12 +2133,18 @@ static int handle_requests(int epollfd, struct epoll_event **events, int nr_fds)
 	int ret;
 
 	for (;;) {
-		if (restore_finished) {
-			pr_warn("DEBUG: restore_finished=true epoll_run_rfds with poll_timeout=%d\n", poll_timeout);
+		static unsigned long loop_count = 0;
+		loop_count++;
+		if (restore_finished || loop_count % 100 == 0) {
+			pr_warn("DEBUG: handle_requests loop[%lu] restore_finished=%d poll_timeout=%d\n",
+				loop_count, restore_finished, poll_timeout);
 		}
 		ret = epoll_run_rfds(epollfd, *events, nr_fds, poll_timeout);
+		if (restore_finished || loop_count % 100 == 0) {
+			pr_warn("DEBUG: epoll_run_rfds returned %d\n", ret);
+		}
 		if (ret < 0) {
-			pr_err("DEBUG: epoll_run_rfds returned %d, goto out\n", ret);
+			pr_err("DEBUG: epoll_run_rfds returned %d (ERROR), goto out\n", ret);
 			goto out;
 		}
 		if (ret == 0) {
@@ -2209,11 +2215,18 @@ static int handle_requests(int epollfd, struct epoll_event **events, int nr_fds)
 		 * Then send ACK to primary and exit.
 		 */
 		pr_err("DEBUG: About to call cow_handle_exit (cow_dump=%d)\n", opts.cow_dump);
-		if (cow_handle_exit(&lpis))
+		ret = cow_handle_exit(&lpis);
+		pr_err("DEBUG: cow_handle_exit returned %d\n", ret);
+		if (ret) {
+			pr_err("DEBUG: cow_handle_exit returned 1, breaking loop\n");
 			break;
+		}
 	}
 
+	pr_err("DEBUG: handle_requests loop exited, ret=%d\n", ret);
+
 out:
+	pr_err("DEBUG: handle_requests returning ret=%d\n", ret);
 	return ret;
 }
 
@@ -2970,8 +2983,10 @@ int cr_lazy_pages(bool daemon)
 		}
 
 		ret = handle_requests(epollfd, &events, nr_fds);
+		pr_err("DEBUG: handle_requests returned %d\n", ret);
 	}
 
+	pr_err("DEBUG: cr_lazy_pages calling disconnect_from_page_server\n");
 	disconnect_from_page_server();
 
 	/* Clean up page buffer if it was initialized */

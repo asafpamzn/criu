@@ -36,12 +36,14 @@ int cow_handle_exit(struct list_head *lpis)
 
 	/* Only log when state changes to avoid log spam */
 	static int last_signal = -1, last_drain = -1;
+	static unsigned long call_count = 0;
 	int cur_signal = is_all_pages_sent_received();
 	int cur_drain = cow_drain_thread_running();
 
-	if (cur_signal != last_signal || cur_drain != last_drain) {
-		pr_err("cow_handle_exit: conditions changed (signal=%d->%d, drain=%d->%d, buffer=%lu)\n",
-		       last_signal, cur_signal, last_drain, cur_drain, cow_page_buffer_count());
+	call_count++;
+	if (cur_signal != last_signal || cur_drain != last_drain || call_count % 100 == 0) {
+		pr_err("cow_handle_exit[%lu]: signal=%d drain=%d buffer=%lu\n",
+		       call_count, cur_signal, cur_drain, cow_page_buffer_count());
 		last_signal = cur_signal;
 		last_drain = cur_drain;
 	}
