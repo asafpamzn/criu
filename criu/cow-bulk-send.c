@@ -63,6 +63,8 @@ extern unsigned long g_compress_compressed_bytes;
 
 /* Number of parallel P3 threads */
 #define NUM_P3_THREADS 10
+#define NUM_P3_SPLITTER_THREADS 9  /* Threads 1-9 split large VMAs */
+#define MIN_VMA_SIZE_FOR_SPLIT (256 * 1024)  /* 256KB threshold */
 
 /* Per-thread state */
 struct p3_thread_ctx {
@@ -250,26 +252,36 @@ static void *p3_bulk_sender_thread(void *arg)
 
 		/* Calculate this thread's chunk of the VMA */
 		vma_size = lve->end - lve->start;
-		chunk_size = vma_size / NUM_P3_THREADS;
-		/* Align to page boundary */
-		chunk_size = (chunk_size / PAGE_SIZE) * PAGE_SIZE;
 
-		if (chunk_size == 0) {
-			/* VMA too small to partition - only thread 0 handles it */
-			if (thread_id > 0)
+		if (vma_size < MIN_VMA_SIZE_FOR_SPLIT) {
+			/*
+			 * Small VMAs (< 256KB) - only thread 0 handles them.
+			 * No splitting to avoid overhead and edge cases.
+			 */
+			if (thread_id != 0)
 				continue;
 			my_start = lve->start;
 			my_end = lve->end;
 		} else {
-			my_start = lve->start + thread_id * chunk_size;
-			/* Last thread takes remainder */
+			/*
+			 * Large VMAs (>= 256KB) - threads 1-9 split them.
+			 * Thread 0 skips these entirely.
+			 */
+			if (thread_id == 0)
+				continue;
+
+			/* 9 splitter threads (thread_id 1-9) */
+			chunk_size = vma_size / NUM_P3_SPLITTER_THREADS;
+			chunk_size = (chunk_size / PAGE_SIZE) * PAGE_SIZE;
+
+			/* Map thread_id 1-9 to index 0-8 */
+			my_start = lve->start + (thread_id - 1) * chunk_size;
+
+			/* Last splitter thread (id=9) takes remainder */
 			if (thread_id == NUM_P3_THREADS - 1)
 				my_end = lve->end;
 			else
 				my_end = my_start + chunk_size;
-
-			if (my_start >= lve->end)
-				continue;
 		}
 
 		pr_info("P3[%d]: Processing VMA %lx-%lx chunk %lx-%lx\n",
@@ -279,9 +291,16 @@ static void *p3_bulk_sender_thread(void *arg)
 
 		for (vaddr = my_start; vaddr < my_end;
 		     vaddr += COW_BATCH_PAGES * PAGE_SIZE) {
+			int batch_pages;
+			int sent;
 
-			int sent = send_lazy_vma_pages_batch(
-				ctx->socket, lve, vaddr, COW_BATCH_PAGES,
+			/* Limit batch to not exceed this thread's assigned range */
+			batch_pages = (my_end - vaddr) / PAGE_SIZE;
+			if (batch_pages > COW_BATCH_PAGES)
+				batch_pages = COW_BATCH_PAGES;
+
+			sent = send_lazy_vma_pages_batch(
+				ctx->socket, lve, vaddr, batch_pages,
 				ctx->dst_id, ctx->source_pid);
 
 			if (sent < 0) {
