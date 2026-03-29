@@ -1355,13 +1355,8 @@ static int uffd_io_complete_bulk(struct page_read *pr, unsigned long vaddr, unsi
 	struct lazy_iov *iov;
 	int ret;
 	struct timespec t_start, t_copy, t_drop, t_end;
-	static unsigned long bulk_cb_count = 0;
 
 	uffd_stats.io_complete_bulk_count_start++;
-
-	if (bulk_cb_count == 0 || bulk_cb_count % 1000 == 0)
-		pr_err("DEBUG_CALLBACK: uffd_io_complete_bulk vaddr=0x%lx nr=%lu count=%lu\n", vaddr, nr, bulk_cb_count);
-	bulk_cb_count++;
 
 	clock_gettime(CLOCK_MONOTONIC, &t_start);
 
@@ -2311,7 +2306,6 @@ static int lazy_sk_read_event(struct epoll_rfd *rfd)
 	uint32_t fin;
 	int ret;
 
-	pr_err("DEBUG_FD: lazy_sk_read_event called fd=%d (restore communication)\n", rfd->fd);
 	ret = recv(rfd->fd, &fin, sizeof(fin), 0);
 	/*
 	 * epoll sets POLLIN | POLLHUP for the EOF case, so we get short
@@ -2456,13 +2450,7 @@ static int convergence_io_complete(unsigned long dst_id, unsigned long vaddr,
 	struct lazy_pages_info *lpi;
 	int ret;
 
-	{
-		static unsigned long conv_cb_count = 0;
-		if (conv_cb_count == 0 || conv_cb_count % 1000 == 0)
-			pr_err("DEBUG_CALLBACK: convergence_io_complete vaddr=0x%lx nr_pages=%lu count=%lu\n", vaddr, nr_pages, conv_cb_count);
-		conv_cb_count++;
-	}
-
+	
 	/* Find lpi for this vaddr */
 	list_for_each_entry(lpi, &lpis, l) {
 		unsigned long pages;
@@ -2504,7 +2492,7 @@ static void switch_to_convergence_callback(void)
 	}
 
 	if (page_server_update_async_callback(convergence_io_complete, prebuffer_buf) == 0)
-		pr_err("DEBUG_CALLBACK: switched to convergence_io_complete callback\n");
+		pr_debug("DEBUG_CALLBACK: switched to convergence_io_complete callback\n");
 	else
 		pr_warn("Failed to switch to convergence callback\n");
 }

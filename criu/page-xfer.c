@@ -4291,8 +4291,6 @@ int request_remote_pages(unsigned long img_id, unsigned long addr, unsigned long
 		.dst_id = img_id,
 	};
 
-	pr_err("DEBUG_FD: request_remote_pages addr=0x%lx page_server_sk=%d\n", addr, page_server_sk);
-
 	/* XXX: why MSG_DONTWAIT here? */
 	if (send_psi_flags(page_server_sk, &pi, MSG_DONTWAIT))
 		return -1;
