@@ -1747,12 +1747,13 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 	int bucket;
 	static unsigned long pf_count = 0;
 
+	pr_err("DEBUG_PF: ENTER handle_page_fault pf_count=%lu\n", pf_count);
+
 	/* Align requested address to the next page boundary */
 	address = msg->arg.pagefault.address & ~(page_size() - 1);
 
-	if (pf_count == 0 || pf_count % 100 == 0)
-		pr_err("DEBUG_PF: handle_page_fault addr=0x%llx count=%lu phase3=%d restore_finished=%d\n",
-		       address, pf_count, phase3_active, restore_finished);
+	pr_err("DEBUG_PF: addr=0x%llx phase3=%d restore_finished=%d cow_dump=%d\n",
+	       address, phase3_active, restore_finished, opts.cow_dump);
 	pf_count++;
 
 	lp_debug(lpi, "#PF at 0x%llx\n", address);
@@ -1764,7 +1765,10 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 	 * otherwise we may copy a page that will be re-sent as dirty.
 	 */
 	if (opts.cow_dump) {
-		void *data = cow_page_buffer_lookup_and_remove(address);
+		void *data;
+		pr_err("DEBUG_PF: about to lookup buffer addr=0x%llx\n", address);
+		data = cow_page_buffer_lookup_and_remove(address);
+		pr_err("DEBUG_PF: buffer lookup done, data=%p\n", data);
 
 		pr_debug("COW_TRACE PF_LOOKUP: 0x%llx found=%s\n", address, data ? "YES" : "NO");
 
@@ -1777,11 +1781,13 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 				.copy = 0,
 			};
 
+			pr_err("DEBUG_PF: page found in buffer, about to UFFDIO_COPY\n");
 			/* Track: found in buffer, about to copy */
 			page_state_set(address, PAGE_STATE_PF_PENDING);
 
 			lp_debug(lpi, "Page 0x%llx served from COW buffer\n", address);
 
+			pr_err("DEBUG_PF: calling UFFDIO_COPY ioctl fd=%d\n", lpi->lpfd.fd);
 			if (ioctl(lpi->lpfd.fd, UFFDIO_COPY, &uffd_copy) < 0) {
 				if (errno == EEXIST) {
 					/* Duplicate copy - this is a bug! */
@@ -1794,21 +1800,26 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 				page_state_print_history(address);
 				page_state_set(address, PAGE_STATE_DISCARDED);
 			} else {
+				pr_err("DEBUG_PF: UFFDIO_COPY succeeded\n");
 				page_state_set(address, PAGE_STATE_COPIED);
 			}
 			xfree(data);
 			lpi->copied_pages++;
+			pr_err("DEBUG_PF: buffer-found path returning 0\n");
 			return 0;
 		} else {
 			/*
 			 * Page not in buffer. If all pages have been sent,
 			 * zero-fill this page (applies to ALL VMAs).
 			 */
+			pr_err("DEBUG_PF: page NOT in buffer, checking all_pages_sent\n");
 			if (is_all_pages_sent_received()) {
+				pr_err("DEBUG_PF: all_pages_sent=true, zero-filling\n");
 				lp_debug(lpi, "Page 0x%llx not in buffer, all pages sent - zero-filling\n", address);
 				page_state_set(address, PAGE_STATE_PF_PENDING);
 				return uffd_zero(lpi, address, 1);
 			}
+			pr_err("DEBUG_PF: all_pages_sent=false, will request from server\n");
 			lp_debug(lpi, "DEBUG PF: Page 0x%llx NOT in buffer, will request from server\n", address);
 		}
 	}
@@ -1824,6 +1835,7 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 		unsigned long long img_addr;
 
 		/* Check if server is available for convergence requests */
+		pr_err("DEBUG_PF: about to call get_page_server_sk()\n");
 		if (get_page_server_sk() < 0) {
 			/*
 			 * In COW mode, don't zero-fill - the correct data should
@@ -1833,8 +1845,11 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 			lp_warn(lpi, "Page 0x%llx server unavailable in COW mode - waiting for drain\n", address);
 			return 0;
 		}
+		pr_err("DEBUG_PF: get_page_server_sk() returned ok\n");
 
+		pr_err("DEBUG_PF: about to call find_iov()\n");
 		iov = find_iov(lpi, address);
+		pr_err("DEBUG_PF: find_iov returned iov=%p\n", iov);
 		if (!iov) {
 			/*
 			 * IOV not found. If dirty bitmap received, all pages should
@@ -1871,17 +1886,22 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 
 		if (phase3_active) {
 			/* In Phase 3, pages arrive via convergence stream */
+			pr_err("DEBUG_PF: phase3 - about to call request_remote_pages addr=0x%llx\n", address);
 			if (request_remote_pages(lpi->pr.img_id, address, 1) < 0) {
 				lp_err(lpi, "Error requesting page 0x%llx in Phase 3\n", address);
 				return -1;
 			}
+			pr_err("DEBUG_PF: request_remote_pages returned ok\n");
 		} else {
+			pr_err("DEBUG_PF: not phase3, calling uffd_handle_pages\n");
 			ret = uffd_handle_pages(lpi, img_addr, 1, PR_ASYNC | PR_ASAP);
+			pr_err("DEBUG_PF: uffd_handle_pages returned %d\n", ret);
 			if (ret < 0) {
 				lp_err(lpi, "Error during COW page fault request\n");
 				return -1;
 			}
 		}
+		pr_err("DEBUG_PF: COW path returning 0\n");
 		return 0;
 	}
 
