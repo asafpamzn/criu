@@ -222,17 +222,6 @@ void page_pool_put(void *page)
 	if (!page)
 		return;
 
-	/* Debug: print stack trace on first call */
-	{
-		void *bt[20];
-		int n = backtrace(bt, 20);
-		char **syms = backtrace_symbols(bt, n);
-		pr_err("page_pool_put FIRST CALL - stack trace:\n");
-		for (int i = 0; i < n; i++)
-			pr_err("  [%d] %s\n", i, syms[i]);
-		free(syms);		
-	}
-
 	/* Mark that freeing has started - no more allocations allowed */
 	atomic_store(&freeing_started, true);
 
