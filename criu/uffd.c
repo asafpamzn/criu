@@ -302,6 +302,7 @@ static struct lazy_pages_info *lpi_init(void)
 	INIT_LIST_HEAD(&lpi->reqs);
 	INIT_LIST_HEAD(&lpi->l);
 	lpi->lpfd.read_event = handle_uffd_event;
+	pr_err("DEBUG_CALLBACK: set read_event=handle_uffd_event for lpi pid=%d fd=%d\n", lpi->pid, lpi->lpfd.fd);
 	lpi->xfer_len = DEFAULT_XFER_LEN;
 	lpi->ref_cnt = 1;
 
@@ -2307,6 +2308,7 @@ static int prepare_uffds(int listen, int epollfd)
 	lazy_sk_rfd.fd = client;
 	lazy_sk_rfd.read_event = lazy_sk_read_event;
 	lazy_sk_rfd.hangup_event = lazy_sk_hangup_event;
+	pr_err("DEBUG_CALLBACK: set read_event=lazy_sk_read_event fd=%d\n", client);
 	if (epoll_add_rfd(epollfd, &lazy_sk_rfd))
 		goto close_uffd;
 
@@ -2479,6 +2481,7 @@ static int handle_lazy_accept(struct epoll_rfd *rfd)
 	lazy_sk_rfd.fd = client;
 	lazy_sk_rfd.read_event = lazy_sk_read_event;
 	lazy_sk_rfd.hangup_event = lazy_sk_hangup_event;
+	pr_err("DEBUG_CALLBACK: set read_event=lazy_sk_read_event fd=%d (handle_lazy_accept)\n", client);
 	if (epoll_add_rfd(epollfd, &lazy_sk_rfd))
 		goto err;
 
@@ -2755,6 +2758,7 @@ int cow_phase3_restore_loop(int ep_fd, struct epoll_event **events, int nr_fds)
 
 	lazy_listen_rfd.fd = lazy_sk;
 	lazy_listen_rfd.read_event = handle_lazy_accept;
+	pr_err("DEBUG_CALLBACK: set read_event=handle_lazy_accept fd=%d (phase3)\n", lazy_sk);
 	if (epoll_add_rfd(epollfd, &lazy_listen_rfd)) {
 		close(lazy_sk);
 		return -1;
@@ -2873,6 +2877,7 @@ int cr_lazy_pages(bool daemon)
 
 		lazy_listen_rfd.fd = lazy_sk;
 		lazy_listen_rfd.read_event = handle_lazy_accept;
+		pr_err("DEBUG_CALLBACK: set read_event=handle_lazy_accept fd=%d (cr_lazy_pages)\n", lazy_sk);
 		if (epoll_add_rfd(epollfd, &lazy_listen_rfd)) {
 			xfree(events);
 			return -1;

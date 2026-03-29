@@ -4247,6 +4247,9 @@ static int page_server_async_read(struct epoll_rfd *f)
 
 static int page_server_hangup_event(struct epoll_rfd *rfd)
 {
+	pr_err("DEBUG_CALLBACK: page_server_hangup_event called fd=%d cow_dump=%d dirty_bitmap=%d bulk_done=%d\n",
+	       rfd->fd, opts.cow_dump, is_dirty_bitmap_received(), bulk_stream_done);
+
 	if (opts.cow_dump && is_dirty_bitmap_received()) {
 		pr_err("Page server closed connection after dirty bitmap received\n");
 		return 1;
@@ -4274,10 +4277,13 @@ int connect_to_page_server_to_recv(int epfd)
 
 	ps_rfd.fd = page_server_sk;
 	/* Use bulk stream reader in bulk mode, regular reader in on-demand mode */
-	if (opts.cow_dump)
+	if (opts.cow_dump) {
 		ps_rfd.read_event = page_server_async_read_bulk;
-	else
+		pr_err("DEBUG_CALLBACK: set read_event=page_server_async_read_bulk fd=%d\n", page_server_sk);
+	} else {
 		ps_rfd.read_event = page_server_async_read;
+		pr_err("DEBUG_CALLBACK: set read_event=page_server_async_read fd=%d\n", page_server_sk);
+	}
 	ps_rfd.hangup_event = page_server_hangup_event;
 
 	return epoll_add_rfd(epfd, &ps_rfd);

@@ -1431,8 +1431,11 @@ static int epoll_hangup_event(int epollfd, struct epoll_rfd *rfd)
 {
 	int ret = 0;
 
+	pr_err("DEBUG_CALLBACK: epoll_hangup_event called fd=%d\n", rfd->fd);
+
 	if (rfd->hangup_event) {
 		ret = rfd->hangup_event(rfd);
+		pr_err("DEBUG_CALLBACK: hangup_event returned %d, will remove fd=%d from epoll\n", ret, rfd->fd);
 		if (ret < 0)
 			return ret;
 	}
@@ -1440,6 +1443,7 @@ static int epoll_hangup_event(int epollfd, struct epoll_rfd *rfd)
 	if (epoll_del_rfd(epollfd, rfd))
 		return -1;
 
+	pr_err("DEBUG_CALLBACK: closing fd=%d after hangup\n", rfd->fd);
 	close_safe(&rfd->fd);
 
 	return ret;
@@ -1539,6 +1543,7 @@ int epoll_run_rfds(int epollfd, struct epoll_event *evs, int nr_fds, int timeout
 			}
 
 			if (events & (EPOLLHUP | EPOLLRDHUP)) {
+				pr_err("DEBUG_CALLBACK: EPOLLHUP/EPOLLRDHUP detected fd=%d events=0x%x\n", rfd->fd, events);
 				ret = epoll_hangup_event(epollfd, rfd);
 				if (ret < 0)
 					goto out;
