@@ -55,7 +55,9 @@
 /* Debug signal handler to catch segfault from xfree(page_pool_data) bug */
 static void debug_sigsegv_handler(int sig)
 {
-	pr_err("DEBUG: SIGSEGV caught! Likely xfree(page_pool_data) bug\n");
+	/* pr_err is NOT async-signal-safe, use raw write() */
+	const char msg[] = "DEBUG: SIGSEGV caught! Likely xfree(page_pool_data) bug\n";
+	write(STDERR_FILENO, msg, sizeof(msg) - 1);
 	_exit(139);
 }
 
