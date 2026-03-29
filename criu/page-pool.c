@@ -74,9 +74,10 @@ static void *alloc_chunk(void)
 	/*
 	 * mmap with MAP_ANONYMOUS gives page-aligned memory.
 	 * To get 256MB alignment, allocate extra and align manually.
+	 * MAP_POPULATE pre-faults pages to avoid page faults during memcpy.
 	 */
 	raw = mmap(NULL, CHUNK_SIZE + CHUNK_ALIGN, PROT_READ | PROT_WRITE,
-		   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		   MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
 	if (raw == MAP_FAILED) {
 		pr_perror("Failed to mmap 256MB chunk");
 		return NULL;
