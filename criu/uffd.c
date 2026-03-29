@@ -2231,6 +2231,7 @@ int lazy_pages_finish_restore(void)
 		return -1;
 	}
 
+	pr_err("DEBUG_FD: lazy_pages_finish_restore sending on fd=%d\n", fd);
 	ret = send(fd, &fin, sizeof(fin), 0);
 	if (ret != sizeof(fin)) {
 		if (ret < 0 && errno == EPIPE) {
@@ -2262,6 +2263,7 @@ static int prepare_lazy_socket(void)
 		return -1;
 	}
 
+	pr_err("DEBUG_FD: prepare_lazy_socket created listen_fd=%d for restore communication\n", listen);
 	return listen;
 }
 
@@ -2270,6 +2272,7 @@ static int lazy_sk_read_event(struct epoll_rfd *rfd)
 	uint32_t fin;
 	int ret;
 
+	pr_err("DEBUG_FD: lazy_sk_read_event called fd=%d (restore communication)\n", rfd->fd);
 	ret = recv(rfd->fd, &fin, sizeof(fin), 0);
 	/*
 	 * epoll sets POLLIN | POLLHUP for the EOF case, so we get short
@@ -2295,6 +2298,8 @@ static int lazy_sk_read_event(struct epoll_rfd *rfd)
 
 static int lazy_sk_hangup_event(struct epoll_rfd *rfd)
 {
+	pr_err("DEBUG_FD: lazy_sk_hangup_event called fd=%d restore_finished=%d\n",
+	       rfd->fd, restore_finished);
 	if (!restore_finished) {
 		pr_err("Restorer unexpectedly closed the connection\n");
 		return -1;
@@ -2485,7 +2490,8 @@ static int handle_lazy_accept(struct epoll_rfd *rfd)
 		return -1;
 	}
 
-	pr_err("DEBUG_CALLBACK: handle_lazy_accept - restore connected, phase3_active=%d\n", phase3_active);
+	pr_err("DEBUG_FD: handle_lazy_accept - restore connected on listen_fd=%d, client_fd=%d, phase3_active=%d\n",
+	       rfd->fd, client, phase3_active);
 
 	/* Set up lpi for each task (reads uffd from restore) */
 	for (i = 0; i < task_entries->nr_tasks; i++) {
@@ -2901,7 +2907,7 @@ int cr_lazy_pages(bool daemon)
 
 		lazy_listen_rfd.fd = lazy_sk;
 		lazy_listen_rfd.read_event = handle_lazy_accept;
-		pr_err("DEBUG_CALLBACK: set read_event=handle_lazy_accept fd=%d (cr_lazy_pages)\n", lazy_sk);
+		pr_err("DEBUG_FD: cr_lazy_pages set lazy_listen_rfd.fd=%d read_event=handle_lazy_accept\n", lazy_sk);
 		if (epoll_add_rfd(epollfd, &lazy_listen_rfd)) {
 			xfree(events);
 			return -1;
