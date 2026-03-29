@@ -2352,12 +2352,19 @@ static int prebuffer_io_complete(unsigned long dst_id, unsigned long vaddr,
 
 int setup_prebuffer_reader(void)
 {
+	int ret;
+
+	pr_err("DEBUG_CALLBACK: setup_prebuffer_reader called\n");
+
 	prebuffer_buf = xmalloc(PAGE_SIZE);
 	if (!prebuffer_buf)
 		return -1;
 
-	return page_server_start_async_read_bulk(
+	ret = page_server_start_async_read_bulk(
 		prebuffer_buf, 1, prebuffer_io_complete, prebuffer_buf);
+
+	pr_err("DEBUG_CALLBACK: setup_prebuffer_reader registered prebuffer_io_complete callback (ret=%d)\n", ret);
+	return ret;
 }
 
 /*
@@ -2370,6 +2377,8 @@ static int convergence_io_complete(unsigned long dst_id, unsigned long vaddr,
 	void *buf = priv;
 	struct lazy_pages_info *lpi;
 	int ret;
+
+	pr_err("DEBUG_CALLBACK: convergence_io_complete called vaddr=0x%lx nr_pages=%lu\n", vaddr, nr_pages);
 
 	/* Find lpi for this vaddr */
 	list_for_each_entry(lpi, &lpis, l) {
@@ -2404,13 +2413,15 @@ static int convergence_io_complete(unsigned long dst_id, unsigned long vaddr,
  */
 static void switch_to_convergence_callback(void)
 {
+	pr_err("DEBUG_CALLBACK: switch_to_convergence_callback called (prebuffer_buf=%p)\n", prebuffer_buf);
+
 	if (!prebuffer_buf) {
 		pr_warn("Cannot switch to convergence: no prebuffer_buf\n");
 		return;
 	}
 
 	if (page_server_update_async_callback(convergence_io_complete, prebuffer_buf) == 0)
-		pr_info("Switched to convergence callback - direct copy enabled\n");
+		pr_err("DEBUG_CALLBACK: switched to convergence_io_complete callback\n");
 	else
 		pr_warn("Failed to switch to convergence callback\n");
 }
@@ -2435,7 +2446,7 @@ static int handle_lazy_accept(struct epoll_rfd *rfd)
 		return -1;
 	}
 
-	pr_info("criu restore connected — setting up uffds\n");
+	pr_err("DEBUG_CALLBACK: handle_lazy_accept - restore connected, phase3_active=%d\n", phase3_active);
 
 	/* Set up lpi for each task (reads uffd from restore) */
 	for (i = 0; i < task_entries->nr_tasks; i++) {
@@ -2498,8 +2509,13 @@ static int handle_lazy_accept(struct epoll_rfd *rfd)
 	/* Phase 3: request all pages now that lpis are created */
 	if (phase3_active) {
 		struct pstree_item *pi;
+		int lpi_count = 0;
+		struct lazy_pages_info *lpi_iter;
 
-		pr_info("Phase 3: Requesting all remote pages\n");
+		list_for_each_entry(lpi_iter, &lpis, l)
+			lpi_count++;
+
+		pr_err("DEBUG_CALLBACK: Phase 3 - requesting pages, lpis count=%d\n", lpi_count);
 		for_each_pstree_item(pi) {
 			if (task_alive(pi)) {
 				pr_info("Requesting all remote pages for pid=%d\n",
@@ -2709,6 +2725,7 @@ int cow_phase3_restore_loop(int ep_fd, struct epoll_event **events, int nr_fds)
 	/* Set global epollfd for use by handle_lazy_accept() */
 	epollfd = ep_fd;
 	phase3_active = true;
+	pr_err("DEBUG_CALLBACK: cow_phase3_restore_loop started, phase3_active=true\n");
 
 	/* Create lazy socket for restore to connect */
 	lazy_sk = prepare_lazy_socket();

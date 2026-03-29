@@ -3878,6 +3878,7 @@ static int read_compressed_data(struct ps_async_read *ar, int flags)
 
 			bulk_stats.callback_calls++;
 			bulk_stats.pages_completed++;
+			pr_err("DEBUG_CALLBACK: invoking callback=%p vaddr=0x%lx\n", ar->complete, page_vaddr);
 			ret = ar->complete((int)ar->pi.dst_id, page_vaddr, 1, ar->priv);
 			if (ret < 0) {
 				if (ar->pi.nr_pages > 1)
@@ -3921,6 +3922,7 @@ static int read_uncompressed_data(struct ps_async_read *ar, int flags)
 
 	bulk_stats.callback_calls++;
 	bulk_stats.pages_completed++;
+	pr_err("DEBUG_CALLBACK: invoking callback=%p vaddr=0x%lx (uncompressed)\n", ar->complete, (unsigned long)ar->pi.vaddr);
 	ret = ar->complete((int)ar->pi.dst_id, (unsigned long)ar->pi.vaddr,
 			   (int)ar->pi.nr_pages, ar->priv);
 	if (ret < 0)
@@ -4102,14 +4104,17 @@ static int page_server_async_read_bulk(struct epoll_rfd *f)
 	return 0;
 }
 
-int page_server_start_async_read_bulk(void *buf, unsigned long nr_pages, 
+int page_server_start_async_read_bulk(void *buf, unsigned long nr_pages,
 					      ps_async_read_complete complete, void *priv)
 {
 	struct ps_async_read *ar;
-	
+
+	pr_err("DEBUG_CALLBACK: page_server_start_async_read_bulk called complete=%p\n", complete);
+
 	/* In bulk mode, only create reader once - it processes continuous stream */
 	if (!list_empty(&async_reads)) {
 		/* Already have a stream reader */
+		pr_err("DEBUG_CALLBACK: stream reader already exists, skipping\n");
 		return 0;
 	}
 
@@ -4148,10 +4153,15 @@ int page_server_update_async_callback(ps_async_read_complete complete, void *pri
 {
 	struct ps_async_read *ar;
 
-	if (list_empty(&async_reads))
+	pr_err("DEBUG_CALLBACK: page_server_update_async_callback called complete=%p\n", complete);
+
+	if (list_empty(&async_reads)) {
+		pr_err("DEBUG_CALLBACK: async_reads is empty, cannot update callback\n");
 		return -1;
+	}
 
 	ar = list_first_entry(&async_reads, struct ps_async_read, l);
+	pr_err("DEBUG_CALLBACK: old callback=%p, new callback=%p\n", ar->complete, complete);
 	ar->complete = complete;
 	ar->priv = priv;
 	pr_info("Updated async bulk reader callback for convergence\n");
