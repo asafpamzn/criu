@@ -1278,12 +1278,7 @@ static int uffd_io_complete(struct page_read *pr, unsigned long img_addr, unsign
 	unsigned long addr = 0, req_pages;
 	struct lazy_iov *req;
 	int ret;
-	static unsigned long io_cb_count = 0;
-
-	if (io_cb_count == 0 || io_cb_count % 1000 == 0)
-		pr_err("DEBUG_CALLBACK: uffd_io_complete vaddr=0x%lx nr=%lu count=%lu\n", img_addr, nr, io_cb_count);
-	io_cb_count++;
-
+	
 	lpi = container_of(pr, struct lazy_pages_info, pr);
 	/*
 	 * The process may exit while we still have requests in

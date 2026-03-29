@@ -3879,12 +3879,7 @@ static int read_compressed_data(struct ps_async_read *ar, int flags)
 
 			bulk_stats.callback_calls++;
 			bulk_stats.pages_completed++;
-			{
-				static unsigned long cb_count = 0;
-				if (cb_count == 0 || cb_count % 1000 == 0)
-					pr_err("DEBUG_CALLBACK: invoking callback=%p vaddr=0x%lx count=%lu\n", ar->complete, page_vaddr, cb_count);
-				cb_count++;
-			}
+			
 			ret = ar->complete((int)ar->pi.dst_id, page_vaddr, 1, ar->priv);
 			if (ret < 0) {
 				if (ar->pi.nr_pages > 1)
@@ -3928,12 +3923,7 @@ static int read_uncompressed_data(struct ps_async_read *ar, int flags)
 
 	bulk_stats.callback_calls++;
 	bulk_stats.pages_completed++;
-	{
-		static unsigned long cb_count_uncomp = 0;
-		if (cb_count_uncomp == 0 || cb_count_uncomp % 1000 == 0)
-			pr_err("DEBUG_CALLBACK: invoking callback=%p vaddr=0x%lx (uncompressed) count=%lu\n", ar->complete, (unsigned long)ar->pi.vaddr, cb_count_uncomp);
-		cb_count_uncomp++;
-	}
+
 	ret = ar->complete((int)ar->pi.dst_id, (unsigned long)ar->pi.vaddr,
 			   (int)ar->pi.nr_pages, ar->priv);
 	if (ret < 0)
@@ -4082,12 +4072,7 @@ static int page_server_async_read_bulk(struct epoll_rfd *f)
 {
 	struct ps_async_read *ar;
 	int ret;
-	static unsigned long bulk_call_count = 0;
-
-	bulk_call_count++;
-	if (bulk_call_count % 1000 == 0) {
-		pr_err("DEBUG_BULK: page_server_async_read_bulk called[%lu]\n", bulk_call_count);
-	}
+	
 
 	check_and_print_bulk_stats();
 
@@ -4103,7 +4088,6 @@ static int page_server_async_read_bulk(struct epoll_rfd *f)
 
 	if (ret == BULK_STREAM_COMPLETE) {
 		/* End marker - cleanup stream reader */
-		pr_err("DEBUG_BULK: BULK_STREAM_COMPLETE received\n");
 		list_del(&ar->l);
 		xfree(ar);
 		/* Only break epoll loop for all_pages_sent - other COMPLETE cases continue */
