@@ -1028,7 +1028,7 @@ static int ud_open(int client, struct lazy_pages_info **_lpi)
 		pr_err("recv_fd error\n");
 		goto out;
 	}
-	pr_err("Received PID: %d, uffd: %d\n", lpi->pid, lpi->lpfd.fd);
+	pr_err("DEBUG_FD: ud_open received pid=%d uffd=%d\n", lpi->pid, lpi->lpfd.fd);
 
 	if (opts.use_page_server)
 		pr_flags |= PR_REMOTE;
@@ -1674,6 +1674,7 @@ static int handle_fork(struct lazy_pages_info *parent_lpi, struct uffd_msg *msg)
 
 	lpi->pid = parent_lpi->pid;
 	lpi->lpfd.fd = uffd;
+	pr_err("DEBUG_FD: fork lpi pid=%d lpfd.fd=%d\n", lpi->pid, lpi->lpfd.fd);
 	lpi->parent = parent_lpi->parent ? parent_lpi->parent : parent_lpi;
 	lpi->copied_pages = lpi->parent->copied_pages;
 	lpi->total_pages = lpi->parent->total_pages;
@@ -1714,6 +1715,8 @@ static int complete_forks(int epollfd, struct epoll_event **events, int *nr_fds)
 	*events = tmp;
 
 	list_for_each_entry_safe(lpi, n, &pending_lpis, l) {
+		pr_err("DEBUG_FD: complete_forks adding lpi pid=%d fd=%d to epoll\n",
+		       lpi->pid, lpi->lpfd.fd);
 		if (epoll_add_rfd(epollfd, &lpi->lpfd))
 			return -1;
 
@@ -2492,6 +2495,8 @@ static int handle_lazy_accept(struct epoll_rfd *rfd)
 			goto err;
 		if (lpi == NULL)
 			continue;
+		pr_err("DEBUG_FD: handle_lazy_accept adding lpi pid=%d fd=%d\n",
+		       lpi->pid, lpi->lpfd.fd);
 		if (epoll_add_rfd(epollfd, &lpi->lpfd))
 			goto err;
 	}

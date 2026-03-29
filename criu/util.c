@@ -1407,10 +1407,13 @@ int epoll_add_rfd(int epfd, struct epoll_rfd *rfd)
 {
 	struct epoll_event ev;
 
+	pr_err("DEBUG_FD: epoll_add_rfd fd=%d read_event=%p hangup_event=%p\n",
+	       rfd->fd, rfd->read_event, rfd->hangup_event);
+
 	ev.events = EPOLLIN | EPOLLRDHUP;
 	ev.data.ptr = rfd;
 	if (epoll_ctl(epfd, EPOLL_CTL_ADD, rfd->fd, &ev) == -1) {
-		pr_perror("epoll_ctl failed");
+		pr_perror("epoll_ctl failed for fd=%d", rfd->fd);
 		return -1;
 	}
 
@@ -1419,8 +1422,10 @@ int epoll_add_rfd(int epfd, struct epoll_rfd *rfd)
 
 int epoll_del_rfd(int epfd, struct epoll_rfd *rfd)
 {
+	pr_err("DEBUG_FD: epoll_del_rfd fd=%d\n", rfd->fd);
+
 	if (epoll_ctl(epfd, EPOLL_CTL_DEL, rfd->fd, NULL) == -1) {
-		pr_perror("epoll_ctl failed");
+		pr_perror("epoll_ctl DEL failed for fd=%d", rfd->fd);
 		return -1;
 	}
 

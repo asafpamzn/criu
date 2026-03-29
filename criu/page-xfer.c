@@ -3399,11 +3399,12 @@ static int connect_to_page_server(void)
 
 	if (opts.ps_socket != -1) {
 		page_server_sk = opts.ps_socket;
-		pr_info("Reusing ps socket %d\n", page_server_sk);
+		pr_err("DEBUG_FD: connect_to_page_server reusing ps_socket=%d\n", page_server_sk);
 		goto out;
 	}
 
 	page_server_sk = setup_tcp_client(opts.addr);
+	pr_err("DEBUG_FD: connect_to_page_server setup_tcp_client returned page_server_sk=%d\n", page_server_sk);
 	if (page_server_sk == -1)
 		return -1;
 
@@ -4297,6 +4298,8 @@ int request_remote_pages(unsigned long img_id, unsigned long addr, unsigned long
 		.vaddr = addr,
 		.dst_id = img_id,
 	};
+
+	pr_err("DEBUG_FD: request_remote_pages addr=0x%lx page_server_sk=%d\n", addr, page_server_sk);
 
 	/* XXX: why MSG_DONTWAIT here? */
 	if (send_psi_flags(page_server_sk, &pi, MSG_DONTWAIT))
