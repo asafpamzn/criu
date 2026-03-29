@@ -1932,9 +1932,13 @@ static int handle_uffd_event(struct epoll_rfd *lpfd)
 	struct uffd_msg msg;
 	int ret;
 
+	pr_err("DEBUG_UFFD: handle_uffd_event ENTER fd=%d\n", lpfd->fd);
+
 	lpi = container_of(lpfd, struct lazy_pages_info, lpfd);
 
+	pr_err("DEBUG_UFFD: about to read from uffd fd=%d\n", lpfd->fd);
 	ret = read(lpfd->fd, &msg, sizeof(msg));
+	pr_err("DEBUG_UFFD: read returned %d\n", ret);
 	if (ret < 0) {
 		/* we've already handled the page fault for another thread */
 		if (errno == EAGAIN)
@@ -1952,9 +1956,13 @@ static int handle_uffd_event(struct epoll_rfd *lpfd)
 		return -1;
 	}
 
+	pr_err("DEBUG_UFFD: got event %u\n", msg.event);
 	switch (msg.event) {
 	case UFFD_EVENT_PAGEFAULT:
-		return handle_page_fault(lpi, &msg);
+		pr_err("DEBUG_UFFD: calling handle_page_fault\n");
+		ret = handle_page_fault(lpi, &msg);
+		pr_err("DEBUG_UFFD: handle_page_fault returned %d\n", ret);
+		return ret;
 	case UFFD_EVENT_REMOVE:
 	case UFFD_EVENT_UNMAP:
 		return handle_remove(lpi, &msg);
