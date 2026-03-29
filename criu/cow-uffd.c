@@ -114,7 +114,7 @@ int cow_page_buffer_thread_init(int thread_id)
 	return page_pool_thread_init(thread_id);
 }
 
-int cow_page_buffer_add(unsigned long vaddr, void *data, int thread_id)
+int cow_page_buffer_add(unsigned long vaddr, void *data, int thread_id, bool nocopy)
 {
 	struct page_buffer_node *node;
 	unsigned int hash;
@@ -144,21 +144,26 @@ int cow_page_buffer_add(unsigned long vaddr, void *data, int thread_id)
 	hash = page_buffer_hash(vaddr);
 	lock_idx = lock_index(hash);
 
-	/*
-	 * Allocate page data outside lock using per-thread pool.
-	 * All callers must have a valid thread_id with initialized pool.
-	 */
-	if (thread_id < 0) {
-		pr_err("BUG: cow_page_buffer_add called with invalid thread_id %d\n",
-		       thread_id);
-		BUG();
+	if (nocopy) {
+		/* Take ownership of data pointer directly (from page_pool_get_chunk) */
+		page_data = data;
+	} else {
+		/*
+		 * Allocate page data outside lock using per-thread pool.
+		 * All callers must have a valid thread_id with initialized pool.
+		 */
+		if (thread_id < 0) {
+			pr_err("BUG: cow_page_buffer_add called with invalid thread_id %d\n",
+			       thread_id);
+			BUG();
+		}
+		page_data = page_pool_get(thread_id);
+		if (!page_data) {
+			pr_err("BUG: page_pool_get failed for thread %d\n", thread_id);
+			BUG();
+		}
+		memcpy(page_data, data, PAGE_SIZE);
 	}
-	page_data = page_pool_get(thread_id);
-	if (!page_data) {
-		pr_err("BUG: page_pool_get failed for thread %d\n", thread_id);
-		BUG();
-	}
-	memcpy(page_data, data, PAGE_SIZE);
 
 	pthread_spin_lock(&hash_locks[lock_idx]);
 

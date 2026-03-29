@@ -37,6 +37,7 @@
 #include "uffd.h"
 #include "cow-uffd.h"
 #include "cow-dump.h"
+#include "page-pool.h"
 #include "criu-plugin.h"
 #include "plugin.h"
 #include "dump.h"
@@ -252,10 +253,11 @@ static int p3_receive_and_buffer(struct p3_receiver_ctx *ctx)
 	struct page_server_iov pi;
 	int compressed_size;
 	char *compressed_buf = ctx->compressed_buf;
-	char *decompressed_buf = ctx->decompressed_buf;
 	int sk = ctx->socket;
 	int nr_pages, i, ret = -1;
 	int decomp_ret;
+	int chunk_nr_pages;
+	char *chunk_buf;
 
 	/* Receive header */
 	ret = __recv(sk, &pi, sizeof(pi), MSG_WAITALL);
@@ -289,21 +291,37 @@ static int p3_receive_and_buffer(struct p3_receiver_ctx *ctx)
 		return -1;
 	}
 
-	/* Decompress */
-	decomp_ret = LZ4_decompress_safe(compressed_buf, decompressed_buf,
+	/*
+	 * Get a contiguous chunk from page pool for direct decompression.
+	 * This eliminates the double-copy (decompress -> temp buf -> page pool).
+	 */
+	chunk_buf = page_pool_get_chunk(ctx->thread_id, &chunk_nr_pages);
+	if (!chunk_buf || chunk_nr_pages < nr_pages) {
+		pr_err("P3 receive: failed to get chunk (need %d, got %d)\n",
+		       nr_pages, chunk_nr_pages);
+		return -1;
+	}
+
+	/* Decompress directly into page pool chunk */
+	decomp_ret = LZ4_decompress_safe(compressed_buf, chunk_buf,
 					 compressed_size, nr_pages * PAGE_SIZE);
 	if (decomp_ret != nr_pages * PAGE_SIZE) {
 		pr_err("P3 receive: decompression failed (expected %d, got %d)\n",
 		       nr_pages * (int)PAGE_SIZE, decomp_ret);
+		/* Free the allocated pages */
+		for (i = 0; i < nr_pages; i++)
+			page_pool_put(chunk_buf + i * PAGE_SIZE);
 		return -1;
 	}
 
-	/* Add each page to buffer using per-thread pool for lock-free allocation */
+	/* Add each page to buffer - no copy, just store the pointer */
 	for (i = 0; i < nr_pages; i++) {
 		unsigned long vaddr = pi.vaddr + i * PAGE_SIZE;
-		if (cow_page_buffer_add(vaddr, decompressed_buf + i * PAGE_SIZE,
-					ctx->thread_id) < 0) {
+		if (cow_page_buffer_add(vaddr, chunk_buf + i * PAGE_SIZE, ctx->thread_id, true) < 0) {
 			pr_err("P3 receive: failed to buffer page at 0x%lx\n", vaddr);
+			/* Free remaining pages */
+			for (; i < nr_pages; i++)
+				page_pool_put(chunk_buf + i * PAGE_SIZE);
 			return -1;
 		}
 	}

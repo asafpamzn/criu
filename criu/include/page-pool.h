@@ -21,6 +21,9 @@ int page_pool_thread_init(int thread_id);
 /* Get a page from this thread's pool (lock-free) */
 void *page_pool_get(int thread_id);
 
+/* Get contiguous chunk for direct decompression (returns first page after header) */
+void *page_pool_get_chunk(int thread_id, int *out_nr_pages);
+
 /* Return a page - any thread can call (atomic refcount) */
 void page_pool_put(void *page);
 

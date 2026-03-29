@@ -16,8 +16,10 @@ void *cow_page_buffer_lookup_and_remove(unsigned long vaddr);
  * Add page to buffer (thread-safe).
  * thread_id: receiver thread id for lock-free pool allocation (0-15)
  *            must have called cow_page_buffer_thread_init(thread_id) first
+ * nocopy: if true, takes ownership of data pointer (from page_pool_get_chunk)
+ *         if false, copies data to new page pool allocation
  */
-int cow_page_buffer_add(unsigned long vaddr, void *data, int thread_id);
+int cow_page_buffer_add(unsigned long vaddr, void *data, int thread_id, bool nocopy);
 
 /* Get current page count */
 unsigned long cow_page_buffer_count(void);

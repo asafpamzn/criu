@@ -39,7 +39,8 @@
 #define CHUNK_SIZE       (256UL * 1024 * 1024)     /* 256MB */
 #define CHUNK_ALIGN      CHUNK_SIZE
 #define CHUNK_ALIGN_MASK (~(CHUNK_ALIGN - 1))
-#define PAGES_PER_CHUNK  (CHUNK_SIZE / PAGE_SIZE)  /* 65536 */
+#define ALLOC_BATCH      64                        /* 64 pages = 256KB per allocation */
+#define PAGES_PER_CHUNK  (CHUNK_SIZE / PAGE_SIZE)  /* 65536 pages */
 #define MAX_THREADS      16
 #define MAX_CHUNKS       512  /* 512 * 256MB = 128GB max */
 
@@ -61,6 +62,7 @@ static void *all_chunks[MAX_CHUNKS];
 static atomic_int nr_chunks;
 static pthread_spinlock_t chunk_list_lock;  /* Only for chunk tracking */
 static atomic_bool global_init_done;
+static atomic_bool freeing_started;  /* Once true, no more allocations allowed */
 
 /* Allocate a new 256MB aligned chunk */
 static void *alloc_chunk(void)
@@ -74,10 +76,9 @@ static void *alloc_chunk(void)
 	/*
 	 * mmap with MAP_ANONYMOUS gives page-aligned memory.
 	 * To get 256MB alignment, allocate extra and align manually.
-	 * MAP_POPULATE pre-faults pages to avoid page faults during memcpy.
 	 */
 	raw = mmap(NULL, CHUNK_SIZE + CHUNK_ALIGN, PROT_READ | PROT_WRITE,
-		   MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
+		   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	if (raw == MAP_FAILED) {
 		pr_perror("Failed to mmap 256MB chunk");
 		return NULL;
@@ -169,6 +170,48 @@ void *page_pool_get(int thread_id)
 	return page;
 }
 
+/*
+ * Get a contiguous 256KB batch (64 pages) for direct decompression.
+ * Returns pointer to first page of the batch.
+ * Each page must be freed individually with page_pool_put().
+ * Cannot be called after page_pool_put() has been called (assert).
+ */
+void *page_pool_get_chunk(int thread_id, int *out_nr_pages)
+{
+	struct thread_pool *pool;
+	void *batch_start;
+
+	if (thread_id < 0 || thread_id >= MAX_THREADS)
+		return NULL;
+
+	pool = &pools[thread_id];
+
+	if (!pool->initialized)
+		return NULL;
+
+	/* Assert: cannot allocate after freeing has started */
+	if (atomic_load(&freeing_started)) {
+		pr_err("BUG: page_pool_get_chunk called after freeing started\n");
+		BUG();
+	}
+
+	/* Need new chunk if not enough pages left for a batch */
+	if (pool->next_page + ALLOC_BATCH > PAGES_PER_CHUNK) {
+		pool->current_chunk = alloc_chunk();
+		if (!pool->current_chunk)
+			return NULL;
+		pool->next_page = 1;  /* Skip header page */
+	}
+
+	/* Allocate ALLOC_BATCH contiguous pages */
+	batch_start = (char *)pool->current_chunk + (pool->next_page * PAGE_SIZE);
+	pool->next_page += ALLOC_BATCH;
+
+	*out_nr_pages = ALLOC_BATCH;
+
+	return batch_start;
+}
+
 void page_pool_put(void *page)
 {
 	struct chunk_header *hdr;
@@ -176,6 +219,9 @@ void page_pool_put(void *page)
 
 	if (!page)
 		return;
+
+	/* Mark that freeing has started - no more allocations allowed */
+	atomic_store(&freeing_started, true);
 
 	/* Calculate chunk base from page address (256MB aligned) */
 	hdr = (struct chunk_header *)((unsigned long)page & CHUNK_ALIGN_MASK);
