@@ -173,6 +173,7 @@ int cow_page_buffer_add(unsigned long vaddr, void *data, int thread_id, bool noc
 		for (i = 0; i < node->count; i++) {
 			if (node->entries[i].vaddr == vaddr) {
 				/* Update existing entry with newer data */
+				pr_err("DEBUG: cow_page_buffer_add REPLACING existing entry vaddr=0x%lx nocopy=%d\n", vaddr, nocopy);
 				page_pool_put(node->entries[i].data);
 				node->entries[i].data = page_data;
 				pthread_spin_unlock(&hash_locks[lock_idx]);
