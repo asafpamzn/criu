@@ -1494,16 +1494,9 @@ int epoll_run_rfds(int epollfd, struct epoll_event *evs, int nr_fds, int timeout
 {
 	int ret, i, nr_events;
 	bool have_a_break = false;
-	static unsigned long epoll_loop_count = 0;
 
 	while (1) {
 		struct timespec t_wait_start, t_wait_end;
-
-		epoll_loop_count++;
-		if (epoll_loop_count % 100 == 0) {
-			pr_err("DEBUG_EPOLL: epoll_run_rfds loop[%lu] timeout=%d\n",
-			       epoll_loop_count, timeout);
-		}
 
 		/* Check and print stats periodically */
 		check_and_print_epoll_stats();
@@ -1521,16 +1514,10 @@ int epoll_run_rfds(int epollfd, struct epoll_event *evs, int nr_fds, int timeout
 		}
 
 		clock_gettime(CLOCK_MONOTONIC, &t_wait_start);
-		if (epoll_loop_count % 100 == 0) {
-			pr_err("DEBUG_EPOLL: calling epoll_wait timeout=%d\n",
-			       timeout > 0 ? timeout : 1000);
-		}
+
 		/* Use passed-in timeout, default to 1000ms if not specified */
 		ret = epoll_wait(epollfd, evs, nr_fds, timeout > 0 ? timeout : 1000);
 		clock_gettime(CLOCK_MONOTONIC, &t_wait_end);
-		if (epoll_loop_count % 100 == 0) {
-			pr_err("DEBUG_EPOLL: epoll_wait returned %d\n", ret);
-		}
 		epoll_stats.epoll_wait_calls++;
 		epoll_stats.epoll_wait_time_ns += (t_wait_end.tv_sec - t_wait_start.tv_sec) * 1000000000 + (t_wait_end.tv_nsec - t_wait_start.tv_nsec);
 
@@ -1540,17 +1527,10 @@ int epoll_run_rfds(int epollfd, struct epoll_event *evs, int nr_fds, int timeout
 				break;
 			}
 			/* Timeout - return 0 so caller can check exit conditions */
-			if (epoll_loop_count % 10 == 0) {
-				pr_err("DEBUG_EPOLL: epoll_wait timeout, returning 0\n");
-			}
 			return 0;
 		}
 
 		nr_events = ret;
-		if (epoll_loop_count % 100 == 0) {
-			pr_err("DEBUG_EPOLL: epoll_wait returned %d events\n", nr_events);
-		}
-
 		for (i = 0; i < nr_events; i++) {
 			struct epoll_rfd *rfd;
 			uint32_t events;
@@ -1559,20 +1539,11 @@ int epoll_run_rfds(int epollfd, struct epoll_event *evs, int nr_fds, int timeout
 			events = evs[i].events;
 
 			if (events & EPOLLIN) {
-				/* Print every event when timeout is small (restore_finished) */
-				if (timeout > 0 && timeout <= 100) {
-					pr_err("DEBUG_EPOLL[%lu]: EPOLLIN fd=%d BEFORE read_event\n",
-					       epoll_loop_count, rfd->fd);
-				}
+				/* Print every event when timeout is small (restore_finished) */				
 				epoll_stats.total_read_calls++;
 				ret = rfd->read_event(rfd);
-				if (timeout > 0 && timeout <= 100) {
-					pr_err("DEBUG_EPOLL[%lu]: fd=%d read_event returned %d\n",
-					       epoll_loop_count, rfd->fd, ret);
-				}
+				
 				if (ret < 0) {
-					pr_err("DEBUG_EPOLL: read_event fd=%d returned %d (ERROR)\n",
-					       rfd->fd, ret);
 					goto out;
 				}
 				if (ret > 0) {
