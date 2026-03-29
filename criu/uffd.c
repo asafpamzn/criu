@@ -1866,15 +1866,19 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 		uffd_stats.total_pf_reqs++;
 		pf_tracker_add(address, 1, lpi->pid, true);
 
-		pr_err("DEBUG_PF: handle_page_fault calling uffd_handle_pages addr=0x%llx phase3=%d\n",
-		       address, phase3_active);
-
-		ret = uffd_handle_pages(lpi, img_addr, 1, PR_ASYNC | PR_ASAP);
-		if (ret < 0) {
-			lp_err(lpi, "Error during COW page fault request\n");
-			return -1;
+		if (phase3_active) {
+			/* In Phase 3, pages arrive via convergence stream */
+			if (request_remote_pages(lpi->pr.img_id, address, 1) < 0) {
+				lp_err(lpi, "Error requesting page 0x%llx in Phase 3\n", address);
+				return -1;
+			}
+		} else {
+			ret = uffd_handle_pages(lpi, img_addr, 1, PR_ASYNC | PR_ASAP);
+			if (ret < 0) {
+				lp_err(lpi, "Error during COW page fault request\n");
+				return -1;
+			}
 		}
-		pr_err("DEBUG_PF: uffd_handle_pages returned %d\n", ret);
 		return 0;
 	}
 
