@@ -3878,7 +3878,12 @@ static int read_compressed_data(struct ps_async_read *ar, int flags)
 
 			bulk_stats.callback_calls++;
 			bulk_stats.pages_completed++;
-			pr_err("DEBUG_CALLBACK: invoking callback=%p vaddr=0x%lx\n", ar->complete, page_vaddr);
+			{
+				static unsigned long cb_count = 0;
+				if (cb_count == 0 || cb_count % 1000 == 0)
+					pr_err("DEBUG_CALLBACK: invoking callback=%p vaddr=0x%lx count=%lu\n", ar->complete, page_vaddr, cb_count);
+				cb_count++;
+			}
 			ret = ar->complete((int)ar->pi.dst_id, page_vaddr, 1, ar->priv);
 			if (ret < 0) {
 				if (ar->pi.nr_pages > 1)
@@ -3922,7 +3927,12 @@ static int read_uncompressed_data(struct ps_async_read *ar, int flags)
 
 	bulk_stats.callback_calls++;
 	bulk_stats.pages_completed++;
-	pr_err("DEBUG_CALLBACK: invoking callback=%p vaddr=0x%lx (uncompressed)\n", ar->complete, (unsigned long)ar->pi.vaddr);
+	{
+		static unsigned long cb_count_uncomp = 0;
+		if (cb_count_uncomp == 0 || cb_count_uncomp % 1000 == 0)
+			pr_err("DEBUG_CALLBACK: invoking callback=%p vaddr=0x%lx (uncompressed) count=%lu\n", ar->complete, (unsigned long)ar->pi.vaddr, cb_count_uncomp);
+		cb_count_uncomp++;
+	}
 	ret = ar->complete((int)ar->pi.dst_id, (unsigned long)ar->pi.vaddr,
 			   (int)ar->pi.nr_pages, ar->priv);
 	if (ret < 0)

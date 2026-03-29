@@ -1265,9 +1265,13 @@ static int uffd_io_complete(struct page_read *pr, unsigned long img_addr, unsign
 	unsigned long addr = 0, req_pages;
 	struct lazy_iov *req;
 	int ret;
+	static unsigned long io_cb_count = 0;
+
+	if (io_cb_count == 0 || io_cb_count % 1000 == 0)
+		pr_err("DEBUG_CALLBACK: uffd_io_complete vaddr=0x%lx nr=%lu count=%lu\n", img_addr, nr, io_cb_count);
+	io_cb_count++;
 
 	lpi = container_of(pr, struct lazy_pages_info, pr);
-	pr_err("uffd_io_complete\n");
 	/*
 	 * The process may exit while we still have requests in
 	 * flight. We just drop the request and the received data in
@@ -1343,8 +1347,14 @@ static int uffd_io_complete_bulk(struct page_read *pr, unsigned long vaddr, unsi
 	struct lazy_iov *iov;
 	int ret;
 	struct timespec t_start, t_copy, t_drop, t_end;
+	static unsigned long bulk_cb_count = 0;
+
 	uffd_stats.io_complete_bulk_count_start++;
-	
+
+	if (bulk_cb_count == 0 || bulk_cb_count % 1000 == 0)
+		pr_err("DEBUG_CALLBACK: uffd_io_complete_bulk vaddr=0x%lx nr=%lu count=%lu\n", vaddr, nr, bulk_cb_count);
+	bulk_cb_count++;
+
 	clock_gettime(CLOCK_MONOTONIC, &t_start);
 
 	lpi = container_of(pr, struct lazy_pages_info, pr);
@@ -2378,7 +2388,12 @@ static int convergence_io_complete(unsigned long dst_id, unsigned long vaddr,
 	struct lazy_pages_info *lpi;
 	int ret;
 
-	pr_err("DEBUG_CALLBACK: convergence_io_complete called vaddr=0x%lx nr_pages=%lu\n", vaddr, nr_pages);
+	{
+		static unsigned long conv_cb_count = 0;
+		if (conv_cb_count == 0 || conv_cb_count % 1000 == 0)
+			pr_err("DEBUG_CALLBACK: convergence_io_complete vaddr=0x%lx nr_pages=%lu count=%lu\n", vaddr, nr_pages, conv_cb_count);
+		conv_cb_count++;
+	}
 
 	/* Find lpi for this vaddr */
 	list_for_each_entry(lpi, &lpis, l) {
