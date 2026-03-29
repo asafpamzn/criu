@@ -4082,8 +4082,13 @@ static int page_server_async_read_bulk(struct epoll_rfd *f)
 {
 	struct ps_async_read *ar;
 	int ret;
-	pr_debug("page_server_async_read_bulk\n");
-	
+	static unsigned long bulk_call_count = 0;
+
+	bulk_call_count++;
+	if (bulk_call_count % 1000 == 0) {
+		pr_err("DEBUG_BULK: page_server_async_read_bulk called[%lu]\n", bulk_call_count);
+	}
+
 	check_and_print_bulk_stats();
 
 	if (list_empty(&async_reads)) {
@@ -4098,6 +4103,7 @@ static int page_server_async_read_bulk(struct epoll_rfd *f)
 
 	if (ret == BULK_STREAM_COMPLETE) {
 		/* End marker - cleanup stream reader */
+		pr_err("DEBUG_BULK: BULK_STREAM_COMPLETE received\n");
 		list_del(&ar->l);
 		xfree(ar);
 		/* Only break epoll loop for all_pages_sent - other COMPLETE cases continue */
@@ -4108,8 +4114,10 @@ static int page_server_async_read_bulk(struct epoll_rfd *f)
 		pr_info("page_server_async_read_bulk: BULK_STREAM_COMPLETE, returning 0\n");
 		return 0;
 	}
-	if (ret < 0)
+	if (ret < 0) {
+		pr_err("DEBUG_BULK: page_server_read_bulk_stream returned %d (ERROR)\n", ret);
 		return -1;
+	}
 
 	/* ret == BULK_STREAM_WOULD_BLOCK or BULK_STREAM_PROGRESS - keep going */
 	return 0;

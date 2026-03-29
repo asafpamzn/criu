@@ -2135,13 +2135,15 @@ static int handle_requests(int epollfd, struct epoll_event **events, int nr_fds)
 	for (;;) {
 		static unsigned long loop_count = 0;
 		loop_count++;
-		if (restore_finished || loop_count % 100 == 0) {
-			pr_warn("DEBUG: handle_requests loop[%lu] restore_finished=%d poll_timeout=%d\n",
+		if (restore_finished) {
+			pr_warn("DEBUG: handle_requests loop[%lu] restore_finished=%d poll_timeout=%d BEFORE epoll_run_rfds\n",
 				loop_count, restore_finished, poll_timeout);
+		} else if (loop_count % 100 == 0) {
+			pr_warn("DEBUG: handle_requests loop[%lu]\n", loop_count);
 		}
 		ret = epoll_run_rfds(epollfd, *events, nr_fds, poll_timeout);
-		if (restore_finished || loop_count % 100 == 0) {
-			pr_warn("DEBUG: epoll_run_rfds returned %d\n", ret);
+		if (restore_finished) {
+			pr_warn("DEBUG: handle_requests loop[%lu] epoll_run_rfds returned %d AFTER\n", loop_count, ret);
 		}
 		if (ret < 0) {
 			pr_err("DEBUG: epoll_run_rfds returned %d (ERROR), goto out\n", ret);
