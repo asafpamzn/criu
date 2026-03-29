@@ -48,6 +48,7 @@
 #include "cow-lazy-pages.h"
 #include "cow-uffd.h"
 #include "uffd-internal.h"
+#include "page-pool.h"
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "uffd: "
@@ -1324,7 +1325,7 @@ static int uffd_io_complete(struct page_read *pr, unsigned long img_addr, unsign
 			void *buffered = cow_page_buffer_lookup_and_remove(page_addr);
 			if (buffered) {
 				page_state_set(page_addr, PAGE_STATE_URGENT_PENDING);
-				xfree(buffered);
+				page_pool_put(buffered);
 			} else {
 				page_state_set(page_addr, PAGE_STATE_URGENT_PENDING);
 			}
@@ -1803,7 +1804,7 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 					/* Duplicate copy - this is a bug! */
 					lp_err(lpi, "BUG: PF buffer EEXIST at 0x%llx - duplicate copy!\n", address);
 					page_state_print_history(address);
-					xfree(data);
+					page_pool_put(data);
 					return -1;
 				}
 				pr_err("COW_TRACE PF_COPY: 0x%llx FAILED errno=%d\n", address, errno);
@@ -1815,9 +1816,9 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 				page_state_set(address, PAGE_STATE_COPIED);
 				pr_err("DEBUG_PF: page_state_set done\n");
 			}
-			pr_err("DEBUG_PF: about to xfree(data)\n");
-			xfree(data);
-			pr_err("DEBUG_PF: xfree done, incrementing copied_pages\n");
+			pr_err("DEBUG_PF: about to page_pool_put(data)\n");
+			page_pool_put(data);
+			pr_err("DEBUG_PF: page_pool_put done, incrementing copied_pages\n");
 			lpi->copied_pages++;
 			pr_err("DEBUG_PF: buffer-found path returning 0\n");
 			return 0;
