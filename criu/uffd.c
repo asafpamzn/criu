@@ -1526,6 +1526,9 @@ static int uffd_handle_pages(struct lazy_pages_info *lpi, __u64 address, unsigne
 {
 	int ret;
 
+	pr_err("DEBUG_PF: uffd_handle_pages addr=0x%llx nr=%lu flags=0x%x (will call lpi->pr.read_pages)\n",
+	       address, nr, flags);
+
 	ret = uffd_seek_pages(lpi, address, nr);
 	if (ret) {
 		lp_warn(lpi, "#PF at 0x%llx uffd_seek_pages failed\n", address);
@@ -1533,6 +1536,7 @@ static int uffd_handle_pages(struct lazy_pages_info *lpi, __u64 address, unsigne
 	}
 
 	ret = lpi->pr.read_pages(&lpi->pr, address, nr, lpi->buf, flags);
+	pr_err("DEBUG_PF: lpi->pr.read_pages returned %d\n", ret);
 	if (ret <= 0) {
 		lp_err(lpi, "failed reading pages at %llx\n", address);
 		return ret;
@@ -1737,9 +1741,16 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 	int ret;
 	unsigned long nr_pages;
 	int bucket;
+	static unsigned long pf_count = 0;
 
 	/* Align requested address to the next page boundary */
 	address = msg->arg.pagefault.address & ~(page_size() - 1);
+
+	if (pf_count == 0 || pf_count % 100 == 0)
+		pr_err("DEBUG_PF: handle_page_fault addr=0x%llx count=%lu phase3=%d restore_finished=%d\n",
+		       address, pf_count, phase3_active, restore_finished);
+	pf_count++;
+
 	lp_debug(lpi, "#PF at 0x%llx\n", address);
 
 	/*
@@ -1854,11 +1865,15 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 		uffd_stats.total_pf_reqs++;
 		pf_tracker_add(address, 1, lpi->pid, true);
 
+		pr_err("DEBUG_PF: handle_page_fault calling uffd_handle_pages addr=0x%llx phase3=%d\n",
+		       address, phase3_active);
+
 		ret = uffd_handle_pages(lpi, img_addr, 1, PR_ASYNC | PR_ASAP);
 		if (ret < 0) {
 			lp_err(lpi, "Error during COW page fault request\n");
 			return -1;
 		}
+		pr_err("DEBUG_PF: uffd_handle_pages returned %d\n", ret);
 		return 0;
 	}
 
@@ -2264,7 +2279,7 @@ static int lazy_sk_read_event(struct epoll_rfd *rfd)
 		pr_err("Unexpected response: %x\n", fin);
 		return -1;
 	}
-	pr_perror("restore_finished = true\n");
+	pr_err("DEBUG_PF: restore_finished = true (restore process signaled it's done, app will resume)\n");
 	restore_finished = true;
 
 	return 1;
