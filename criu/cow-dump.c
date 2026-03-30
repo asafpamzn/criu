@@ -1066,6 +1066,9 @@ int cow_start_monitor_thread(void)
 {
 	unsigned int nr, i, created = 0;
 	int ret;
+	struct timeval t_start, t_end, t_delta;
+
+	pr_err("TIMING: cow_start_monitor_thread ENTRY\n");
 
 	pthread_mutex_lock(&g_monitor_state_lock);
 
@@ -1092,6 +1095,7 @@ int cow_start_monitor_thread(void)
 
 	if (__atomic_load_n(&g_workers_running, __ATOMIC_ACQUIRE)) {
 		pthread_mutex_unlock(&g_monitor_state_lock);
+		pr_err("TIMING: cow_start_monitor_thread workers already running, returning early\n");
 		return 0;
 	}
 
@@ -1105,6 +1109,7 @@ int cow_start_monitor_thread(void)
 	__atomic_store_n(&g_stop_monitoring, false, __ATOMIC_RELEASE);
 	__atomic_store_n(&g_workers_running, true, __ATOMIC_RELEASE);
 
+	gettimeofday(&t_start, NULL);
 	for (i = 0; i < nr; i++) {
 		g_workers[i].id = i;
 		g_workers[i].cdi = g_cow_info;
@@ -1118,6 +1123,10 @@ int cow_start_monitor_thread(void)
 		}
 		created++;
 	}
+	gettimeofday(&t_end, NULL);
+	timersub(&t_end, &t_start, &t_delta);
+	pr_err("TIMING: pthread_create loop (%u threads) took %ld.%06ld seconds\n",
+	       created, t_delta.tv_sec, t_delta.tv_usec);
 
 	g_nr_workers = created;
 	pthread_mutex_unlock(&g_monitor_state_lock);
@@ -1888,6 +1897,10 @@ int cow_setup_sync_for_dirty(unsigned long *dirty_ranges,
 	unsigned int i;
 	unsigned int registered_ok = 0, register_skip = 0;
 	struct timeval t_start, t_end, t_delta;
+	struct timeval t_func_start;
+
+	gettimeofday(&t_func_start, NULL);
+	pr_err("TIMING: cow_setup_sync_for_dirty ENTRY\n");
 
 	if (!cdi) {
 		pr_err("COW dump not initialized\n");
@@ -1915,8 +1928,14 @@ int cow_setup_sync_for_dirty(unsigned long *dirty_ranges,
 	}
 
 	/* Close old async uffd */
+	gettimeofday(&t_start, NULL);
 	if (cdi->uffd >= 0)
 		close(cdi->uffd);
+	gettimeofday(&t_end, NULL);
+	timersub(&t_end, &t_start, &t_delta);
+	pr_err("TIMING: close(old uffd) took %ld.%06ld seconds\n",
+	       t_delta.tv_sec, t_delta.tv_usec);
+
 	cdi->uffd = new_uffd;
 	cdi->uffd_async = -1;
 
@@ -2001,11 +2020,21 @@ int cow_setup_sync_for_dirty(unsigned long *dirty_ranges,
 	cdi->phase = COW_PHASE_SYNC_CONVERGE;
 #if 1 //TODO check restarted later on at cr_dump_finish
 	/* Start monitor thread for convergence */
+	gettimeofday(&t_start, NULL);
 	if (cow_start_monitor_thread()) {
 		pr_err("Failed to start monitor thread for convergence\n");
 		return -1;
 	}
+	gettimeofday(&t_end, NULL);
+	timersub(&t_end, &t_start, &t_delta);
+	pr_err("TIMING: cow_start_monitor_thread took %ld.%06ld seconds\n",
+	       t_delta.tv_sec, t_delta.tv_usec);
 #endif
+
+	gettimeofday(&t_end, NULL);
+	timersub(&t_end, &t_func_start, &t_delta);
+	pr_err("TIMING: cow_setup_sync_for_dirty TOTAL took %ld.%06ld seconds\n",
+	       t_delta.tv_sec, t_delta.tv_usec);
 
 	pr_info("WP_SYNC convergence mode active\n");
 	return 0;
