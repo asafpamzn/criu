@@ -108,6 +108,28 @@ static void *cow_wp_worker(void *arg)
 	return NULL;
 }
 
+/* Parallel unregister worker - same pattern as cow_wp_worker */
+static void *cow_unreg_worker(void *arg)
+{
+	struct cow_wp_job *job = arg;
+	struct uffdio_range unreg;
+	unsigned int i;
+
+	for (i = job->start_idx; i < job->end_idx; i++) {
+		unreg.start = job->ranges[i].start;
+		unreg.len = job->ranges[i].len;
+
+		if (ioctl(job->uffd, UFFDIO_UNREGISTER, &unreg)) {
+			/* Ignore errors - VMA may have changed */
+			pr_debug("UFFDIO_UNREGISTER 0x%lx-0x%lx: %s\n",
+				 unreg.start, unreg.start + unreg.len,
+				 strerror(errno));
+		}
+	}
+
+	return NULL;
+}
+
 static unsigned int cow_wp_nr_threads(unsigned int nr_ranges)
 {
 	long nproc;
@@ -1932,25 +1954,70 @@ int cow_setup_sync_for_dirty(unsigned long *dirty_ranges,
 	 * registered with one userfaultfd at a time - trying to register
 	 * with the new uffd while still registered with the old one fails
 	 * with EBUSY.
+	 *
+	 * Use parallel threads (same as cow_apply_writeprotect) for speed.
 	 */
-	gettimeofday(&t_start, NULL);
-	for (i = 0; i < cdi->nr_tracked_vmas; i++) {
-		struct uffdio_range unreg_range;
-		unreg_range.start = cdi->tracked_vmas[i].start;
-		unreg_range.len = cdi->tracked_vmas[i].end - cdi->tracked_vmas[i].start;
+	{
+		struct cow_wp_range *unreg_ranges;
+		struct cow_wp_job *unreg_jobs;
+		pthread_t *unreg_threads;
+		unsigned int nr_threads, per, created = 0;
 
-		if (ioctl(cdi->uffd, UFFDIO_UNREGISTER, &unreg_range)) {
-			/* Ignore errors - VMA may have changed */
-			pr_debug("UFFDIO_UNREGISTER 0x%lx-0x%lx: %s\n",
-				 cdi->tracked_vmas[i].start,
-				 cdi->tracked_vmas[i].end,
-				 strerror(errno));
+		unreg_ranges = xmalloc(cdi->nr_tracked_vmas * sizeof(*unreg_ranges));
+		if (!unreg_ranges) {
+			pr_err("Failed to allocate unregister ranges\n");
+			return -1;
 		}
+
+		for (i = 0; i < cdi->nr_tracked_vmas; i++) {
+			unreg_ranges[i].start = cdi->tracked_vmas[i].start;
+			unreg_ranges[i].len = cdi->tracked_vmas[i].end - cdi->tracked_vmas[i].start;
+		}
+
+		nr_threads = cow_wp_nr_threads(cdi->nr_tracked_vmas);
+		unreg_threads = xmalloc(nr_threads * sizeof(*unreg_threads));
+		unreg_jobs = xzalloc(nr_threads * sizeof(*unreg_jobs));
+		if (!unreg_threads || !unreg_jobs) {
+			xfree(unreg_ranges);
+			xfree(unreg_threads);
+			xfree(unreg_jobs);
+			pr_err("Failed to allocate unregister threads/jobs\n");
+			return -1;
+		}
+
+		per = (cdi->nr_tracked_vmas + nr_threads - 1) / nr_threads;
+		for (i = 0; i < nr_threads; i++) {
+			unreg_jobs[i].uffd = cdi->uffd;
+			unreg_jobs[i].ranges = unreg_ranges;
+			unreg_jobs[i].start_idx = i * per;
+			unreg_jobs[i].end_idx = unreg_jobs[i].start_idx + per;
+			if (unreg_jobs[i].end_idx > cdi->nr_tracked_vmas)
+				unreg_jobs[i].end_idx = cdi->nr_tracked_vmas;
+		}
+
+		gettimeofday(&t_start, NULL);
+		for (i = 0; i < nr_threads; i++) {
+			if (unreg_jobs[i].start_idx >= unreg_jobs[i].end_idx)
+				break;
+			if (pthread_create(&unreg_threads[i], NULL, cow_unreg_worker, &unreg_jobs[i])) {
+				pr_err("Failed to create unregister worker thread\n");
+				break;
+			}
+			created++;
+		}
+
+		for (i = 0; i < created; i++)
+			pthread_join(unreg_threads[i], NULL);
+
+		gettimeofday(&t_end, NULL);
+		timersub(&t_end, &t_start, &t_delta);
+		pr_err("TIMING: VMA unregister loop (%u VMAs, %u threads) took %ld.%06ld seconds\n",
+		       cdi->nr_tracked_vmas, created, t_delta.tv_sec, t_delta.tv_usec);
+
+		xfree(unreg_ranges);
+		xfree(unreg_threads);
+		xfree(unreg_jobs);
 	}
-	gettimeofday(&t_end, NULL);
-	timersub(&t_end, &t_start, &t_delta);
-	pr_err("TIMING: VMA unregister loop (%u VMAs) took %ld.%06ld seconds\n",
-	       cdi->nr_tracked_vmas, t_delta.tv_sec, t_delta.tv_usec);
 
 	/*
 	 * Now we can close the old uffd. Since VMAs are unregistered,
