@@ -686,6 +686,22 @@ void cow_dump_fini(void)
 	if (queue_remaining > 0)
 		pr_warn("Freed %d remaining queue entries\n", queue_remaining);
 
+	/*
+	 * Close the deferred async uffd. This was saved during
+	 * cow_setup_sync_for_dirty to avoid ~2.4s kernel cleanup
+	 * during the freeze window.
+	 */
+	if (g_cow_info->uffd_async >= 0) {
+		struct timeval t_start, t_end, t_delta;
+		gettimeofday(&t_start, NULL);
+		close(g_cow_info->uffd_async);
+		gettimeofday(&t_end, NULL);
+		timersub(&t_end, &t_start, &t_delta);
+		pr_err("TIMING: close(deferred uffd_async) took %ld.%06ld seconds\n",
+		       t_delta.tv_sec, t_delta.tv_usec);
+		g_cow_info->uffd_async = -1;
+	}
+
 	if (g_cow_info->uffd >= 0)
 		close(g_cow_info->uffd);
 	if (g_cow_info->uffd_async >= 0 && g_cow_info->uffd_async != g_cow_info->uffd)
@@ -1927,17 +1943,14 @@ int cow_setup_sync_for_dirty(unsigned long *dirty_ranges,
 		return -1;
 	}
 
-	/* Close old async uffd */
-	gettimeofday(&t_start, NULL);
-	if (cdi->uffd >= 0)
-		close(cdi->uffd);
-	gettimeofday(&t_end, NULL);
-	timersub(&t_end, &t_start, &t_delta);
-	pr_err("TIMING: close(old uffd) took %ld.%06ld seconds\n",
-	       t_delta.tv_sec, t_delta.tv_usec);
-
+	/*
+	 * Don't close the old async uffd here - it triggers expensive kernel
+	 * cleanup of all registered VMAs and their WP tracking structures,
+	 * which takes ~2.4 seconds. Instead, save it and close AFTER unfreezing
+	 * the process. The old uffd is no longer needed once we switch to sync.
+	 */
+	cdi->uffd_async = cdi->uffd;  /* Save for deferred close */
 	cdi->uffd = new_uffd;
-	cdi->uffd_async = -1;
 
 	/*
 	 * Register ALL tracked VMAs (whole VMAs) with WP_SYNC uffd first.
