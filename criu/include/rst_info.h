@@ -48,6 +48,9 @@ struct rst_info {
 
 	void *munmap_restorer;
 
+	void *bootstrap_start;
+	unsigned long bootstrap_unmap_len;
+
 	int service_fd_id;
 	struct fdt *fdt;
 

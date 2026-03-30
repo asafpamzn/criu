@@ -190,6 +190,9 @@ struct cr_options {
 	unsigned int empty_ns;
 	int tcp_skip_in_flight;
 	bool lazy_pages;
+	bool cow_dump;
+	int serve_images_port;	/* --serve-images PORT: serve .img files on TCP */
+	char *fetch_images;	/* --fetch-images HOST:PORT: download .img files */
 	char *work_dir;
 	int network_lock_method;
 	int skip_file_rwx_check;
