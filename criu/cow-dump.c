@@ -1887,7 +1887,7 @@ int cow_setup_sync_for_dirty(unsigned long *dirty_ranges,
 	int new_uffd;
 	unsigned int i;
 	unsigned int registered_ok = 0, register_skip = 0;
-	
+	struct timeval t_start, t_end, t_delta;
 
 	if (!cdi) {
 		pr_err("COW dump not initialized\n");
@@ -1901,7 +1901,8 @@ int cow_setup_sync_for_dirty(unsigned long *dirty_ranges,
 		return 0;
 	}
 
-	pr_err("Setting up WP_SYNC for %u dirty ranges\n", nr_dirty_ranges);
+	pr_err("Setting up WP_SYNC for %u dirty ranges, %u tracked VMAs\n",
+	       nr_dirty_ranges, cdi->nr_tracked_vmas);
 
 	if (cdi->uffd_sync >= 0) {
 		/* Use pre-created WP_SYNC uffd from parasite */
@@ -1925,6 +1926,7 @@ int cow_setup_sync_for_dirty(unsigned long *dirty_ranges,
 	 * dirty ranges. Registering partial ranges caused ENOMEM because
 	 * the kernel tried to split VMAs.
 	 */
+	gettimeofday(&t_start, NULL);
 	for (i = 0; i < cdi->nr_tracked_vmas; i++) {
 		reg.range.start = cdi->tracked_vmas[i].start;
 		reg.range.len = cdi->tracked_vmas[i].end - cdi->tracked_vmas[i].start;
@@ -1950,6 +1952,10 @@ int cow_setup_sync_for_dirty(unsigned long *dirty_ranges,
 			return -1;
 		}
 	}
+	gettimeofday(&t_end, NULL);
+	timersub(&t_end, &t_start, &t_delta);
+	pr_err("TIMING: VMA registration loop (%u VMAs) took %ld.%06ld seconds\n",
+	       cdi->nr_tracked_vmas, t_delta.tv_sec, t_delta.tv_usec);
 
 	pr_info("Registered %u VMAs with WP_SYNC uffd, now write-protecting %u dirty ranges\n",
 		cdi->nr_tracked_vmas, nr_dirty_ranges);
@@ -1958,6 +1964,7 @@ int cow_setup_sync_for_dirty(unsigned long *dirty_ranges,
 	 * Write-protect each dirty range. VMAs are already registered above,
 	 * so this only sets the WP bit on the specified pages.
 	 */
+	gettimeofday(&t_start, NULL);
 	for (i = 0; i < nr_dirty_ranges; i++) {
 		unsigned long start = dirty_ranges[i * 2];
 		unsigned long len = dirty_ranges[i * 2 + 1];
@@ -1984,6 +1991,10 @@ int cow_setup_sync_for_dirty(unsigned long *dirty_ranges,
 		}
 		registered_ok++;
 	}
+	gettimeofday(&t_end, NULL);
+	timersub(&t_end, &t_start, &t_delta);
+	pr_err("TIMING: Write-protect loop (%u ranges) took %ld.%06ld seconds\n",
+	       nr_dirty_ranges, t_delta.tv_sec, t_delta.tv_usec);
 	pr_info("WP_SYNC write-protect: %u ok, %u skipped, %u total dirty ranges\n",
 		registered_ok, register_skip, nr_dirty_ranges);
 

@@ -2750,13 +2750,29 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 	 * pstree_switch_state(TASK_ALIVE) which detached from ptrace.
 	 * We need to re-attach to perform the skeleton dump.
 	 */
-	ret = reseize_pstree();
+	{
+		struct timeval t_start, t_end, t_delta;
+		gettimeofday(&t_start, NULL);
+		ret = reseize_pstree();
+		gettimeofday(&t_end, NULL);
+		timersub(&t_end, &t_start, &t_delta);
+		pr_err("TIMING: reseize_pstree took %ld.%06ld seconds\n",
+		       t_delta.tv_sec, t_delta.tv_usec);
+	}
 	if (ret) {
 		pr_err("Failed to re-seize tasks\n");
 		goto err;
 	}
 
-	ret = cow_scan_dirty_pages(&dirty_ranges, &nr_dirty_ranges, &total_dirty_pages);
+	{
+		struct timeval t_start, t_end, t_delta;
+		gettimeofday(&t_start, NULL);
+		ret = cow_scan_dirty_pages(&dirty_ranges, &nr_dirty_ranges, &total_dirty_pages);
+		gettimeofday(&t_end, NULL);
+		timersub(&t_end, &t_start, &t_delta);
+		pr_err("TIMING: cow_scan_dirty_pages took %ld.%06ld seconds\n",
+		       t_delta.tv_sec, t_delta.tv_usec);
+	}
 	if (ret) {
 		pr_err("Failed to scan dirty pages\n");
 		goto err;
@@ -2769,8 +2785,16 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 	 * Collect pstree IDs now so vpid(item) is valid for the VMA detection.
 	 * This must happen before cow_detect_new_vmas() which uses dst_id.
 	 */
-	if (collect_pstree_ids())
-		goto err;
+	{
+		struct timeval t_start, t_end, t_delta;
+		gettimeofday(&t_start, NULL);
+		if (collect_pstree_ids())
+			goto err;
+		gettimeofday(&t_end, NULL);
+		timersub(&t_end, &t_start, &t_delta);
+		pr_err("TIMING: collect_pstree_ids took %ld.%06ld seconds\n",
+		       t_delta.tv_sec, t_delta.tv_usec);
+	}
 
 	/* Update COW dst_id now that collect_pstree_ids() has populated vpid */
 	cow_set_dst_id(vpid(root_item));
@@ -2785,16 +2809,27 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 		struct vm_area_list phase3_vmas;
 		unsigned long *new_vma_ranges = NULL;
 		unsigned int nr_new_vma_ranges = 0;
+		struct timeval t_start, t_end, t_delta;
 
 		vm_area_list_init(&phase3_vmas);
 
+		gettimeofday(&t_start, NULL);
 		ret = collect_mappings(root_item->pid->real, &phase3_vmas, NULL);
+		gettimeofday(&t_end, NULL);
+		timersub(&t_end, &t_start, &t_delta);
+		pr_err("TIMING: Phase3 collect_mappings took %ld.%06ld seconds\n",
+		       t_delta.tv_sec, t_delta.tv_usec);
 		if (ret) {
 			pr_err("Failed to collect Phase 3 VMAs\n");
 			goto err;
 		}
 
+		gettimeofday(&t_start, NULL);
 		ret = cow_detect_new_vmas(&phase3_vmas, &new_vma_ranges, &nr_new_vma_ranges);
+		gettimeofday(&t_end, NULL);
+		timersub(&t_end, &t_start, &t_delta);
+		pr_err("TIMING: cow_detect_new_vmas took %ld.%06ld seconds\n",
+		       t_delta.tv_sec, t_delta.tv_usec);
 		free_mappings(&phase3_vmas);
 
 		if (ret) {
@@ -2831,8 +2866,16 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 		}
 	}
 
-	if (network_lock())
-		goto err;
+	{
+		struct timeval t_start, t_end, t_delta;
+		gettimeofday(&t_start, NULL);
+		if (network_lock())
+			goto err;
+		gettimeofday(&t_end, NULL);
+		timersub(&t_end, &t_start, &t_delta);
+		pr_err("TIMING: network_lock took %ld.%06ld seconds\n",
+		       t_delta.tv_sec, t_delta.tv_usec);
+	}
 
 	if (rpc_query_external_files())
 		goto err;
@@ -2852,9 +2895,17 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 		goto err;
 
 	/* Dump skeleton (everything except pages) */
-	for_each_pstree_item(item) {
-		if (dump_skeleton_one_task(item, parent_ie))
-			goto err;
+	{
+		struct timeval t_start, t_end, t_delta;
+		gettimeofday(&t_start, NULL);
+		for_each_pstree_item(item) {
+			if (dump_skeleton_one_task(item, parent_ie))
+				goto err;
+		}
+		gettimeofday(&t_end, NULL);
+		timersub(&t_end, &t_start, &t_delta);
+		pr_err("TIMING: skeleton dump loop took %ld.%06ld seconds\n",
+		       t_delta.tv_sec, t_delta.tv_usec);
 	}
 
 	if (parent_ie) {
@@ -2924,11 +2975,27 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 		he.has_allow_uprobes = true;
 		he.allow_uprobes = true;
 	}
-	if (write_img_inventory(&he))
-		goto err;
+	{
+		struct timeval t_start, t_end, t_delta;
+		gettimeofday(&t_start, NULL);
+		if (write_img_inventory(&he))
+			goto err;
+		gettimeofday(&t_end, NULL);
+		timersub(&t_end, &t_start, &t_delta);
+		pr_err("TIMING: write_img_inventory took %ld.%06ld seconds\n",
+		       t_delta.tv_sec, t_delta.tv_usec);
+	}
 
 	/* Signal replica that inventory.img is ready */
-	ret = send_inventory_ready_signal();
+	{
+		struct timeval t_start, t_end, t_delta;
+		gettimeofday(&t_start, NULL);
+		ret = send_inventory_ready_signal();
+		gettimeofday(&t_end, NULL);
+		timersub(&t_end, &t_start, &t_delta);
+		pr_err("TIMING: send_inventory_ready_signal took %ld.%06ld seconds\n",
+		       t_delta.tv_sec, t_delta.tv_usec);
+	}
 	if (ret) {
 		pr_err("Failed to send inventory ready signal\n");
 		goto err;
@@ -2937,7 +3004,15 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 	/* === PHASE 4: WP_SYNC on dirty + unfreeze === */
 	pr_err("=== PHASE 4: WP_SYNC on dirty + unfreeze ===\n");
 
-	ret = cow_setup_sync_for_dirty(dirty_ranges, nr_dirty_ranges);
+	{
+		struct timeval t_start, t_end, t_delta;
+		gettimeofday(&t_start, NULL);
+		ret = cow_setup_sync_for_dirty(dirty_ranges, nr_dirty_ranges);
+		gettimeofday(&t_end, NULL);
+		timersub(&t_end, &t_start, &t_delta);
+		pr_err("TIMING: cow_setup_sync_for_dirty took %ld.%06ld seconds\n",
+		       t_delta.tv_sec, t_delta.tv_usec);
+	}
 	if (ret) {
 		pr_err("Failed to set up WP_SYNC for dirty pages\n");
 		goto err;
@@ -2948,9 +3023,25 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 	 * so P3 will re-send them. Also sets convergence mode so add_active_image()
 	 * uses dirty page count instead of total page count.
 	 */
-	prepare_lazy_vmas_for_convergence(dirty_ranges, nr_dirty_ranges);
+	{
+		struct timeval t_start, t_end, t_delta;
+		gettimeofday(&t_start, NULL);
+		prepare_lazy_vmas_for_convergence(dirty_ranges, nr_dirty_ranges);
+		gettimeofday(&t_end, NULL);
+		timersub(&t_end, &t_start, &t_delta);
+		pr_err("TIMING: prepare_lazy_vmas_for_convergence took %ld.%06ld seconds\n",
+		       t_delta.tv_sec, t_delta.tv_usec);
+	}
 
-	pstree_switch_state(root_item, TASK_ALIVE);
+	{
+		struct timeval t_start, t_end, t_delta;
+		gettimeofday(&t_start, NULL);
+		pstree_switch_state(root_item, TASK_ALIVE);
+		gettimeofday(&t_end, NULL);
+		timersub(&t_end, &t_start, &t_delta);
+		pr_err("TIMING: pstree_switch_state took %ld.%06ld seconds\n",
+		       t_delta.tv_sec, t_delta.tv_usec);
+	}
 
 	gettimeofday(&freeze_end, NULL);
 	timersub(&freeze_end, &freeze_start, &freeze_delta);
