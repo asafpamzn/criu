@@ -686,25 +686,9 @@ void cow_dump_fini(void)
 	if (queue_remaining > 0)
 		pr_warn("Freed %d remaining queue entries\n", queue_remaining);
 
-	/*
-	 * Close the deferred async uffd. This was saved during
-	 * cow_setup_sync_for_dirty to avoid ~2.4s kernel cleanup
-	 * during the freeze window.
-	 */
-	if (g_cow_info->uffd_async >= 0) {
-		struct timeval t_start, t_end, t_delta;
-		gettimeofday(&t_start, NULL);
-		close(g_cow_info->uffd_async);
-		gettimeofday(&t_end, NULL);
-		timersub(&t_end, &t_start, &t_delta);
-		pr_err("TIMING: close(deferred uffd_async) took %ld.%06ld seconds\n",
-		       t_delta.tv_sec, t_delta.tv_usec);
-		g_cow_info->uffd_async = -1;
-	}
-
 	if (g_cow_info->uffd >= 0)
 		close(g_cow_info->uffd);
-	if (g_cow_info->uffd_async >= 0 && g_cow_info->uffd_async != g_cow_info->uffd)
+	if (g_cow_info->uffd_async >= 0)
 		close(g_cow_info->uffd_async);
 	if (g_cow_info->uffd_sync >= 0)
 		close(g_cow_info->uffd_sync);
@@ -1944,13 +1928,43 @@ int cow_setup_sync_for_dirty(unsigned long *dirty_ranges,
 	}
 
 	/*
-	 * Don't close the old async uffd here - it triggers expensive kernel
-	 * cleanup of all registered VMAs and their WP tracking structures,
-	 * which takes ~2.4 seconds. Instead, save it and close AFTER unfreezing
-	 * the process. The old uffd is no longer needed once we switch to sync.
+	 * Unregister VMAs from the old async uffd first. A VMA can only be
+	 * registered with one userfaultfd at a time - trying to register
+	 * with the new uffd while still registered with the old one fails
+	 * with EBUSY.
 	 */
-	cdi->uffd_async = cdi->uffd;  /* Save for deferred close */
+	gettimeofday(&t_start, NULL);
+	for (i = 0; i < cdi->nr_tracked_vmas; i++) {
+		struct uffdio_range unreg_range;
+		unreg_range.start = cdi->tracked_vmas[i].start;
+		unreg_range.len = cdi->tracked_vmas[i].end - cdi->tracked_vmas[i].start;
+
+		if (ioctl(cdi->uffd, UFFDIO_UNREGISTER, &unreg_range)) {
+			/* Ignore errors - VMA may have changed */
+			pr_debug("UFFDIO_UNREGISTER 0x%lx-0x%lx: %s\n",
+				 cdi->tracked_vmas[i].start,
+				 cdi->tracked_vmas[i].end,
+				 strerror(errno));
+		}
+	}
+	gettimeofday(&t_end, NULL);
+	timersub(&t_end, &t_start, &t_delta);
+	pr_err("TIMING: VMA unregister loop (%u VMAs) took %ld.%06ld seconds\n",
+	       cdi->nr_tracked_vmas, t_delta.tv_sec, t_delta.tv_usec);
+
+	/*
+	 * Now we can close the old uffd. Since VMAs are unregistered,
+	 * the close should be fast.
+	 */
+	gettimeofday(&t_start, NULL);
+	close(cdi->uffd);
+	gettimeofday(&t_end, NULL);
+	timersub(&t_end, &t_start, &t_delta);
+	pr_err("TIMING: close(old uffd after unregister) took %ld.%06ld seconds\n",
+	       t_delta.tv_sec, t_delta.tv_usec);
+
 	cdi->uffd = new_uffd;
+	cdi->uffd_async = -1;
 
 	/*
 	 * Register ALL tracked VMAs (whole VMAs) with WP_SYNC uffd first.
