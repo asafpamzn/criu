@@ -122,7 +122,8 @@ static void *cow_unreg_worker(void *arg)
 		if (ioctl(job->uffd, UFFDIO_UNREGISTER, &unreg)) {
 			/* Ignore errors - VMA may have changed */
 			pr_debug("UFFDIO_UNREGISTER 0x%lx-0x%lx: %s\n",
-				 unreg.start, unreg.start + unreg.len,
+				 (unsigned long)unreg.start,
+				 (unsigned long)(unreg.start + unreg.len),
 				 strerror(errno));
 		}
 	}
