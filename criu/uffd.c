@@ -1763,6 +1763,8 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 	 */
 	if (opts.cow_dump) {
 		void *data;
+		int retries = 0;
+		const int max_retries = 10;
 		data = cow_page_buffer_lookup_and_remove(address);
 
 		pr_debug("COW_TRACE PF_LOOKUP: 0x%llx found=%s\n", address, data ? "YES" : "NO");
@@ -1781,8 +1783,6 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 
 			lp_debug(lpi, "Page 0x%llx served from COW buffer\n", address);
 
-			int retries = 0;
-			const int max_retries = 10;
 
 retry_uffdio_copy:
 			if (ioctl(lpi->lpfd.fd, UFFDIO_COPY, &uffd_copy) < 0) {
