@@ -98,7 +98,7 @@ static void *alloc_chunk(void)
 
 	/* Initialize header (page 0) */
 	hdr = (struct chunk_header *)chunk;
-	atomic_init(&hdr->refcount, PAGES_PER_CHUNK - 1);  /* -1 for header page */
+	atomic_init(&hdr->refcount, 0);  /* Incremented on each allocation */
 	hdr->base = chunk;
 
 	/* Track for cleanup */
@@ -167,6 +167,7 @@ void *page_pool_get(int thread_id)
 	/* Lock-free allocation: just bump the pointer */
 	page = (char *)pool->current_chunk + (pool->next_page * PAGE_SIZE);
 	pool->next_page++;
+	atomic_fetch_add(&((struct chunk_header *)pool->current_chunk)->refcount, 1);
 
 	return page;
 }
@@ -201,6 +202,7 @@ void *page_pool_get_chunk(int thread_id, int *out_nr_pages)
 	/* Allocate ALLOC_BATCH contiguous pages */
 	batch_start = (char *)pool->current_chunk + (pool->next_page * PAGE_SIZE);
 	pool->next_page += ALLOC_BATCH;
+	atomic_fetch_add(&((struct chunk_header *)pool->current_chunk)->refcount, ALLOC_BATCH);
 
 	*out_nr_pages = ALLOC_BATCH;
 
