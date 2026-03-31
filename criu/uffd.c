@@ -1762,10 +1762,7 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 	 * otherwise we may copy a page that will be re-sent as dirty.
 	 */
 	if (opts.cow_dump) {
-		void *data;
-		int retries = 0;
-		const int max_retries = 1000;
-		data = cow_page_buffer_lookup_and_remove(address);
+		void *data = cow_page_buffer_lookup_and_remove(address);
 
 		pr_debug("COW_TRACE PF_LOOKUP: 0x%llx found=%s\n", address, data ? "YES" : "NO");
 
@@ -1783,8 +1780,6 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 
 			lp_debug(lpi, "Page 0x%llx served from COW buffer\n", address);
 
-
-retry_uffdio_copy:
 			if (ioctl(lpi->lpfd.fd, UFFDIO_COPY, &uffd_copy) < 0) {
 				if (errno == EEXIST) {
 					/* Duplicate copy - drain already handled it */
@@ -1794,16 +1789,15 @@ retry_uffdio_copy:
 					return 0;
 				}
 				if (errno == EAGAIN) {
-					if (retries < max_retries) {
-						retries++;
-						usleep(100 * retries);  /* Backoff: 100us, 200us, ... 1ms */
-						goto retry_uffdio_copy;
+					/* Queue for later retry instead of blocking */
+					pf_tracker_set_state(address, PF_STATE_PENDING_EAGAIN);
+					page_state_set(address, PAGE_STATE_EAGAIN_QUEUED);
+					if (queue_eagain_request(lpi, address, 1, data, "pf_buffer") < 0) {
+						page_pool_put(data);
+						return -1;
 					}
-					/* Max retries exceeded - something is seriously wrong */
-					pr_err("BUG: PF buffer EAGAIN at 0x%llx after %d retries\n",
-					       address, retries);
-					page_state_print_history(address);
-					BUG();
+					page_pool_put(data);
+					return 0;
 				}
 				if (errno == ENOENT) {
 					/* VMA was unmapped */
