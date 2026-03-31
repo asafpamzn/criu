@@ -3011,6 +3011,8 @@ int cr_lazy_pages(bool daemon)
 	if (opts.cow_dump) {
 		cow_page_buffer_destroy();
 		pf_tracker_destroy();
+		/* Verify all pages reached terminal states before cleanup */
+		page_state_verify_all_terminal();
 		page_state_destroy();
 	}
 

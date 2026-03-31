@@ -278,7 +278,6 @@ int page_state_set(unsigned long vaddr, enum page_state new_state)
 	enum page_state old_state;
 	unsigned int hash;
 	struct timespec now;
-	bool illegal_transition = false;
 
 	if (!g_page_state.initialized)
 		return -1;
@@ -296,17 +295,18 @@ int page_state_set(unsigned long vaddr, enum page_state new_state)
 
 		/* Validate transition */
 		if (!is_valid_transition(old_state, new_state)) {
-			illegal_transition = true;
-			pr_err("PAGE_STATE ILLEGAL_TRANSITION: 0x%lx %s -> %s\n",
+			pr_err("BUG: PAGE_STATE ILLEGAL_TRANSITION: 0x%lx %s -> %s\n",
 			       vaddr, page_state_name(old_state),
 			       page_state_name(new_state));
 			/*
 			 * Print history while holding lock to ensure consistent
-			 * state. This is acceptable for error paths.
+			 * state before crashing.
 			 */
 			pr_err("PAGE_HISTORY 0x%lx: %d transitions, current=%s\n",
 			       vaddr, entry->history_count,
 			       page_state_name(entry->state));
+			pthread_spin_unlock(&bucket->lock);
+			BUG();
 		}
 
 		entry->state = new_state;
@@ -320,8 +320,6 @@ int page_state_set(unsigned long vaddr, enum page_state new_state)
 		/* Update stats with dedicated lock (less contention) */
 		pthread_spin_lock(&g_page_state.stats_lock);
 		g_page_state.transitions[old_state][new_state]++;
-		if (illegal_transition)
-			g_page_state.illegal_transitions++;
 		pthread_spin_unlock(&g_page_state.stats_lock);
 	} else {
 		/* New entry */
@@ -547,6 +545,52 @@ void page_state_print_stats(void)
 		}
 	}
 	pr_info("=== END PAGE STATE STATS ===\n");
+}
+
+/*
+ * Verify all tracked pages reached terminal states (COPIED, DISCARDED, UNMAPPED).
+ * Call at end of run to ensure no pages were left in intermediate states.
+ * Returns 0 on success, -1 if any pages are in non-terminal states.
+ */
+int page_state_verify_all_terminal(void)
+{
+	struct page_state_entry *entry;
+	int i;
+	unsigned long non_terminal = 0;
+	unsigned long first_bad_vaddr = 0;
+	enum page_state first_bad_state = PAGE_STATE_UNKNOWN;
+
+	if (!g_page_state.initialized)
+		return 0;
+
+	for (i = 0; i < PAGE_STATE_HASH_SIZE; i++) {
+		pthread_spin_lock(&g_page_state.buckets[i].lock);
+		hlist_for_each_entry(entry, &g_page_state.buckets[i].head, hash) {
+			/* Terminal states: COPIED, DISCARDED, UNMAPPED */
+			if (entry->state != PAGE_STATE_COPIED &&
+			    entry->state != PAGE_STATE_DISCARDED &&
+			    entry->state != PAGE_STATE_UNMAPPED) {
+				if (non_terminal == 0) {
+					first_bad_vaddr = entry->vaddr;
+					first_bad_state = entry->state;
+				}
+				non_terminal++;
+			}
+		}
+		pthread_spin_unlock(&g_page_state.buckets[i].lock);
+	}
+
+	if (non_terminal > 0) {
+		pr_err("BUG: %lu pages in non-terminal states!\n", non_terminal);
+		pr_err("  First: vaddr=0x%lx state=%s\n",
+		       first_bad_vaddr, page_state_name(first_bad_state));
+		page_state_print_history(first_bad_vaddr);
+		BUG();
+	}
+
+	pr_info("Page state verification passed: all %lu pages in terminal states\n",
+		g_page_state.total_pages);
+	return 0;
 }
 
 void page_state_destroy(void)

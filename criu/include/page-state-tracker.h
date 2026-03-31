@@ -46,6 +46,9 @@ extern void page_state_mark_range_unmapped(unsigned long start, unsigned long le
 /* Mark COPIED/DISCARDED pages in dirty ranges as DIRTY for re-receive */
 extern void page_state_mark_dirty_ranges(unsigned long *ranges, unsigned int nr_ranges);
 
+/* Verify all pages reached terminal states (COPIED, DISCARDED, UNMAPPED) - BUGs if not */
+extern int page_state_verify_all_terminal(void);
+
 #else /* !CONFIG_PAGE_STATE_TRACKER */
 
 static inline int page_state_init(void) { return 0; }
@@ -81,6 +84,7 @@ static inline void page_state_mark_dirty_ranges(unsigned long *ranges, unsigned 
 	(void)ranges;
 	(void)nr_ranges;
 }
+static inline int page_state_verify_all_terminal(void) { return 0; }
 
 #endif /* CONFIG_PAGE_STATE_TRACKER */
 

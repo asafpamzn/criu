@@ -274,6 +274,8 @@ err_disconnect:
 	/* Print page state statistics and cleanup */
 	stop_p3_receiver_connections();
 	pf_tracker_destroy();
+	/* Verify all pages reached terminal states before cleanup */
+	page_state_verify_all_terminal();
 	page_state_destroy();
 	disconnect_from_page_server();
 err_epoll:
