@@ -146,6 +146,11 @@ int cr_lazy_pages_cow_phase2(bool daemon)
 		pr_warn("Failed to initialize page state tracker (non-fatal)\n");
 	}
 
+	/* Initialize hung page tracker for debugging */
+	if (pf_tracker_init()) {
+		pr_warn("Failed to init hung page tracker (non-fatal)\n");
+	}
+
 	/* 3. Daemonize if requested */
 	if (daemon) {
 		ret = cr_daemon(1, 0, -1);
@@ -268,6 +273,7 @@ int cr_lazy_pages_cow_phase2(bool daemon)
 err_disconnect:
 	/* Print page state statistics and cleanup */
 	stop_p3_receiver_connections();
+	pf_tracker_destroy();
 	page_state_destroy();
 	disconnect_from_page_server();
 err_epoll:

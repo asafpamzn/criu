@@ -2915,6 +2915,10 @@ int cr_lazy_pages(bool daemon)
 		if (page_state_init())
 			pr_warn("Failed to initialize page state tracker (non-fatal)\n");
 
+		/* Initialize hung page tracker for debugging */
+		if (pf_tracker_init())
+			pr_warn("Failed to init hung page tracker (non-fatal)\n");
+
 		/* 2. Connect to page server and add socket to epoll */
 		if (connect_to_page_server_to_recv(epollfd)) {
 			xfree(events);
@@ -3004,8 +3008,11 @@ int cr_lazy_pages(bool daemon)
 	disconnect_from_page_server();
 
 	/* Clean up page buffer if it was initialized */
-	if (opts.cow_dump)
+	if (opts.cow_dump) {
 		cow_page_buffer_destroy();
+		pf_tracker_destroy();
+		page_state_destroy();
+	}
 
 	/* Clean up prebuffer */
 	if (prebuffer_buf) {

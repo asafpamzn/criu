@@ -9,7 +9,7 @@
  * When disabled, all functions become no-ops for zero overhead.
  * Define CONFIG_HUNG_PAGE_TRACKER to enable.
  */
-/* #define CONFIG_HUNG_PAGE_TRACKER */
+#define CONFIG_HUNG_PAGE_TRACKER
 
 /*
  * Hung page (page fault) tracker for debugging slow/stuck page requests.
@@ -23,11 +23,16 @@ enum pf_state {
 
 #ifdef CONFIG_HUNG_PAGE_TRACKER
 
+extern int pf_tracker_init(void);
+extern void pf_tracker_destroy(void);
 extern void pf_tracker_add(unsigned long long address, unsigned long nr_pages, int pid, bool is_pf);
 extern void pf_tracker_set_state(unsigned long long address, enum pf_state state);
 extern void pf_tracker_print_stats(void);
 
 #else /* !CONFIG_HUNG_PAGE_TRACKER */
+
+static inline int pf_tracker_init(void) { return 0; }
+static inline void pf_tracker_destroy(void) { }
 
 static inline void pf_tracker_add(unsigned long long address, unsigned long nr_pages,
 				  int pid, bool is_pf)
