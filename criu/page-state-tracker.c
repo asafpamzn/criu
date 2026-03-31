@@ -13,6 +13,7 @@
 #include "criu-log.h"
 #include "xmalloc.h"
 #include "common/list.h"
+#include "common/bug.h"
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "page-state: "
