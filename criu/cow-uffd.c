@@ -17,6 +17,7 @@
 #include "common/bug.h"
 #include "pf-tracker.h"
 #include "page-pool.h"
+#include "unmapped-tracker.h"
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "cow-uffd: "
@@ -543,14 +544,14 @@ static void *background_drain_thread(void *arg)
 								__sync_fetch_and_add(&cow_buffer.nr_discarded, 1);
 								pr_err("BUG: DRAIN_COPY EEXIST at 0x%lx - duplicate copy!\n", vaddr);
 								page_state_print_history(vaddr);
-								if (page_state_get(vaddr) != PAGE_STATE_DIRTY)
+								if (!unmapped_tracker_is_unmapped(vaddr) &&
+								    page_state_get(vaddr) != PAGE_STATE_DIRTY)
 									page_state_set(vaddr, PAGE_STATE_DISCARDED);
 							} else if (errno == ENOENT) {
 								__sync_fetch_and_add(&cow_buffer.nr_discarded, 1);
-								pr_err("COW_TRACE DRAIN_COPY: 0x%lx FAILED errno=ENOENT (VMA unmapped)\n", vaddr);
-								page_state_print_history(vaddr);
-								if (page_state_get(vaddr) != PAGE_STATE_DIRTY)
-									page_state_set(vaddr, PAGE_STATE_DISCARDED);
+								pr_debug("COW_TRACE DRAIN_COPY: 0x%lx ENOENT (VMA unmapped)\n", vaddr);
+								/* Mark as unmapped - this is expected, not an error */
+								unmapped_tracker_mark_range(vaddr, PAGE_SIZE);
 							} else if (errno == EAGAIN) {
 								__sync_fetch_and_add(&cow_buffer.nr_eagain, 1);
 								cow_page_buffer_readd(vaddr, data);
@@ -559,7 +560,8 @@ static void *background_drain_thread(void *arg)
 							} else {
 								pr_err("COW_TRACE DRAIN_COPY: 0x%lx FAILED errno=%d\n", vaddr, errno);
 								page_state_print_history(vaddr);
-								if (page_state_get(vaddr) != PAGE_STATE_DIRTY)
+								if (!unmapped_tracker_is_unmapped(vaddr) &&
+								    page_state_get(vaddr) != PAGE_STATE_DIRTY)
 									page_state_set(vaddr, PAGE_STATE_DISCARDED);
 							}
 						} else {
@@ -571,7 +573,8 @@ static void *background_drain_thread(void *arg)
 						__sync_fetch_and_add(&cow_buffer.nr_discarded, 1);
 						pr_err("COW_TRACE DRAIN_COPY: 0x%lx no uffd found\n", vaddr);
 						page_state_print_history(vaddr);
-						if (page_state_get(vaddr) != PAGE_STATE_DIRTY)
+						if (!unmapped_tracker_is_unmapped(vaddr) &&
+						    page_state_get(vaddr) != PAGE_STATE_DIRTY)
 							page_state_set(vaddr, PAGE_STATE_DISCARDED);
 					}
 

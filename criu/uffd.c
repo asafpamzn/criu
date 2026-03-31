@@ -48,6 +48,7 @@
 #include "cow-lazy-pages.h"
 #include "cow-uffd.h"
 #include "uffd-internal.h"
+#include "unmapped-tracker.h"
 #include "page-pool.h"
 
 #undef LOG_PREFIX
@@ -1201,10 +1202,11 @@ static int uffd_copy(struct lazy_pages_info *lpi, __u64 address, unsigned long *
 			lp_err(lpi, "UFFDIO_COPY got error\n");
 			page_state_print_history(address);
 			/*
-			 * Don't set DISCARDED if page is DIRTY - it will be re-sent.
-			 * DIRTY -> DISCARDED is an illegal transition.
+			 * Don't set DISCARDED if page is DIRTY/UNMAPPED.
+			 * These are terminal states or will be re-sent.
 			 */
-			if (page_state_get(address) != PAGE_STATE_DIRTY)
+			if (!unmapped_tracker_is_unmapped(address) &&
+			    page_state_get(address) != PAGE_STATE_DIRTY)
 				page_state_set(address, PAGE_STATE_DISCARDED);
 			return -1;
 		}
@@ -1218,8 +1220,9 @@ static int uffd_copy(struct lazy_pages_info *lpi, __u64 address, unsigned long *
 			page_state_print_history(address);
 			return -1;
 		}
-		/* Don't set DISCARDED if page is DIRTY - illegal transition */
-		if (page_state_get(address) != PAGE_STATE_DIRTY)
+		/* Don't set DISCARDED if page is DIRTY/UNMAPPED */
+		if (!unmapped_tracker_is_unmapped(address) &&
+		    page_state_get(address) != PAGE_STATE_DIRTY)
 			page_state_set(address, PAGE_STATE_DISCARDED);
 		return 0;
 	}
@@ -1238,8 +1241,9 @@ static int uffd_copy(struct lazy_pages_info *lpi, __u64 address, unsigned long *
 		if (uffd_check_op_error(lpi, "copy", nr_pages, uffdio_copy.copy)) {
 			lp_err(lpi, "UFFDIO_COPY err \n");
 			page_state_print_history(address);
-			/* Don't set DISCARDED if page is DIRTY - illegal transition */
-			if (page_state_get(address) != PAGE_STATE_DIRTY)
+			/* Don't set DISCARDED if page is DIRTY/UNMAPPED */
+			if (!unmapped_tracker_is_unmapped(address) &&
+			    page_state_get(address) != PAGE_STATE_DIRTY)
 				page_state_set(address, PAGE_STATE_DISCARDED);
 			return -1;
 		}
@@ -1251,8 +1255,9 @@ static int uffd_copy(struct lazy_pages_info *lpi, __u64 address, unsigned long *
 			page_state_print_history(address);
 			return -1;
 		}
-		/* Don't set DISCARDED if page is DIRTY - illegal transition */
-		if (page_state_get(address) != PAGE_STATE_DIRTY)
+		/* Don't set DISCARDED if page is DIRTY/UNMAPPED */
+		if (!unmapped_tracker_is_unmapped(address) &&
+		    page_state_get(address) != PAGE_STATE_DIRTY)
 			page_state_set(address, PAGE_STATE_DISCARDED);
 		return 0;
 	}
@@ -1621,6 +1626,9 @@ static int handle_remove(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 	/* Mark all pages in range as unmapped for state tracking */
 	page_state_mark_range_unmapped(unreg.start, unreg.len);
 
+	/* Track unmapped pages for production validation */
+	unmapped_tracker_mark_range(unreg.start, unreg.len);
+
 	/* Remove these pages from buffer - no point draining them */
 	cow_page_buffer_remove_range(unreg.start, unreg.len);
 
@@ -1784,7 +1792,8 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 				if (errno == EEXIST) {
 					/* Duplicate copy - drain already handled it */
 					lp_debug(lpi, "PF buffer EEXIST at 0x%llx - drain won race\n", address);
-					page_state_set(address, PAGE_STATE_DISCARDED);
+					if (!unmapped_tracker_is_unmapped(address))
+						page_state_set(address, PAGE_STATE_DISCARDED);
 					page_pool_put(data);
 					return 0;
 				}
@@ -1800,15 +1809,16 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 					return 0;
 				}
 				if (errno == ENOENT) {
-					/* VMA was unmapped */
+					/* VMA was unmapped - mark in tracker if not already */
 					lp_debug(lpi, "PF buffer ENOENT at 0x%llx - VMA unmapped\n", address);
-					page_state_set(address, PAGE_STATE_DISCARDED);
+					unmapped_tracker_mark_range(address, PAGE_SIZE);
 					page_pool_put(data);
 					return 0;
 				}
 				pr_err("COW_TRACE PF_COPY: 0x%llx FAILED errno=%d\n", address, errno);
 				page_state_print_history(address);
-				page_state_set(address, PAGE_STATE_DISCARDED);
+				if (!unmapped_tracker_is_unmapped(address))
+					page_state_set(address, PAGE_STATE_DISCARDED);
 			} else {
 				page_state_set(address, PAGE_STATE_COPIED);
 			}
@@ -2935,6 +2945,10 @@ int cr_lazy_pages(bool daemon)
 		if (page_state_init())
 			pr_warn("Failed to initialize page state tracker (non-fatal)\n");
 
+		/* Initialize unmapped pages tracker */
+		if (unmapped_tracker_init())
+			pr_warn("Failed to initialize unmapped tracker (non-fatal)\n");
+
 		/* Initialize hung page tracker for debugging */
 		if (pf_tracker_init())
 			pr_warn("Failed to init hung page tracker (non-fatal)\n");
@@ -3034,6 +3048,7 @@ int cr_lazy_pages(bool daemon)
 		/* Verify all pages reached terminal states before cleanup */
 		page_state_verify_all_terminal();
 		page_state_destroy();
+		unmapped_tracker_destroy();
 	}
 
 	/* Clean up prebuffer */

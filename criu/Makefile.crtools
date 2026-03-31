@@ -89,6 +89,7 @@ obj-y			+= fdstore.o
 obj-y			+= uffd.o
 obj-y			+= uffd_cow.o
 obj-y			+= page-state-tracker.o
+obj-y			+= unmapped-tracker.o
 obj-y			+= hung-page-tracker.o
 obj-y			+= cow-dump.o
 obj-y			+= cow-bitmap.o
