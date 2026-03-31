@@ -27,6 +27,7 @@
 #include "cow-uffd.h"
 #include "pstree.h"
 #include "pf-tracker.h"
+#include "unmapped-tracker.h"
 #include "rst_info.h"
 #include "cow-lazy-pages.h"
 
@@ -149,6 +150,11 @@ int cr_lazy_pages_cow_phase2(bool daemon)
 	/* Initialize hung page tracker for debugging */
 	if (pf_tracker_init()) {
 		pr_warn("Failed to init hung page tracker (non-fatal)\n");
+	}
+
+	/* Initialize unmapped pages tracker */
+	if (unmapped_tracker_init()) {
+		pr_warn("Failed to init unmapped tracker (non-fatal)\n");
 	}
 
 	/* 3. Daemonize if requested */
