@@ -1764,7 +1764,7 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 	if (opts.cow_dump) {
 		void *data;
 		int retries = 0;
-		const int max_retries = 10;
+		const int max_retries = 1000;
 		data = cow_page_buffer_lookup_and_remove(address);
 
 		pr_debug("COW_TRACE PF_LOOKUP: 0x%llx found=%s\n", address, data ? "YES" : "NO");
