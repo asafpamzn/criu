@@ -305,13 +305,15 @@ static int p3_receive_and_buffer(struct p3_receiver_ctx *ctx)
 	/* Decompress directly into page pool chunk */
 	decomp_ret = LZ4_decompress_safe(compressed_buf, chunk_buf,
 					 compressed_size, nr_pages * PAGE_SIZE);
+	if (decomp_ret <= 0 || decomp_ret % PAGE_SIZE != 0) {
+		pr_err("BUG: P3 receive: decompression failed or not page-aligned (got %d)\n",
+		       decomp_ret);
+		BUG();
+	}
 	if (decomp_ret != nr_pages * PAGE_SIZE) {
-		pr_err("P3 receive: decompression failed (expected %d, got %d)\n",
+		pr_err("BUG: P3 receive: decompression size mismatch (expected %d, got %d)\n",
 		       nr_pages * (int)PAGE_SIZE, decomp_ret);
-		/* Free the allocated pages */
-		for (i = 0; i < nr_pages; i++)
-			page_pool_put(chunk_buf + i * PAGE_SIZE);
-		return -1;
+		BUG();
 	}
 
 	/* Add each page to buffer - no copy, just store the pointer */
@@ -319,12 +321,19 @@ static int p3_receive_and_buffer(struct p3_receiver_ctx *ctx)
 		unsigned long vaddr = pi.vaddr + i * PAGE_SIZE;
 		if (cow_page_buffer_add(vaddr, chunk_buf + i * PAGE_SIZE, ctx->thread_id, true) < 0) {
 			pr_err("P3 receive: failed to buffer page at 0x%lx\n", vaddr);
-			/* Free remaining pages */
+			/* Free remaining used pages */
 			for (; i < nr_pages; i++)
+				page_pool_put(chunk_buf + i * PAGE_SIZE);
+			/* Free unused chunk pages */
+			for (i = nr_pages; i < chunk_nr_pages; i++)
 				page_pool_put(chunk_buf + i * PAGE_SIZE);
 			return -1;
 		}
 	}
+
+	/* Free unused pages from the chunk (if nr_pages < chunk_nr_pages) */
+	for (i = nr_pages; i < chunk_nr_pages; i++)
+		page_pool_put(chunk_buf + i * PAGE_SIZE);
 
 	return nr_pages;
 }
