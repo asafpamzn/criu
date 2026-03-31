@@ -14,6 +14,7 @@
 #include "xmalloc.h"
 #include "common/list.h"
 #include "common/bug.h"
+#include "util.h"
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "page-state: "
@@ -315,6 +316,8 @@ int page_state_set(unsigned long vaddr, enum page_state new_state)
 			       vaddr, entry->history_count,
 			       page_state_name(entry->state));
 			pthread_spin_unlock(&bucket->lock);
+			pr_err("Stack trace:\n");
+			print_stack_trace(0);
 			BUG();
 		}
 
