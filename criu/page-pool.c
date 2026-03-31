@@ -64,7 +64,6 @@ static void *all_chunks[MAX_CHUNKS];
 static atomic_int nr_chunks;
 static pthread_spinlock_t chunk_list_lock;  /* Only for chunk tracking */
 static atomic_bool global_init_done;
-static atomic_bool freeing_started;  /* Once true, no more allocations allowed */
 
 /* Allocate a new 256MB aligned chunk */
 static void *alloc_chunk(void)
@@ -176,7 +175,7 @@ void *page_pool_get(int thread_id)
  * Get a contiguous 256KB batch (64 pages) for direct decompression.
  * Returns pointer to first page of the batch.
  * Each page must be freed individually with page_pool_put().
- * Cannot be called after page_pool_put() has been called (assert).
+ * Interleaved alloc/free is allowed (unused pages can be freed immediately).
  */
 void *page_pool_get_chunk(int thread_id, int *out_nr_pages)
 {
@@ -190,12 +189,6 @@ void *page_pool_get_chunk(int thread_id, int *out_nr_pages)
 
 	if (!pool->initialized)
 		return NULL;
-
-	/* Assert: cannot allocate after freeing has started */
-	if (atomic_load(&freeing_started)) {
-		pr_err("BUG: page_pool_get_chunk called after freeing started\n");
-		BUG();
-	}
 
 	/* Need new chunk if not enough pages left for a batch */
 	if (pool->next_page + ALLOC_BATCH > PAGES_PER_CHUNK) {
@@ -218,12 +211,9 @@ void page_pool_put(void *page)
 {
 	struct chunk_header *hdr;
 	int old_ref;
-	
+
 	if (!page)
 		return;
-
-	/* Mark that freeing has started - no more allocations allowed */
-	atomic_store(&freeing_started, true);
 
 	/* Calculate chunk base from page address (256MB aligned) */
 	hdr = (struct chunk_header *)((unsigned long)page & CHUNK_ALIGN_MASK);
