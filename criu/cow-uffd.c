@@ -185,9 +185,9 @@ int cow_page_buffer_add(unsigned long vaddr, void *data, int thread_id, bool noc
 			node->entries[node->count].vaddr = vaddr;
 			node->entries[node->count].data = page_data;
 			node->count++;
+			page_state_set(vaddr, PAGE_STATE_IN_BUFFER);
 			pthread_spin_unlock(&hash_locks[lock_idx]);
 			__sync_fetch_and_add(&cow_buffer.nr_pages, 1);
-			page_state_set(vaddr, PAGE_STATE_IN_BUFFER);
 			return 0;
 		}
 	}
@@ -208,12 +208,11 @@ int cow_page_buffer_add(unsigned long vaddr, void *data, int thread_id, bool noc
 
 	pthread_spin_lock(&hash_locks[lock_idx]);
 	hlist_add_head(&node->hash, &cow_buffer.hash_table[hash]);
+	/* Track page state while holding lock to prevent race with drain */
+	page_state_set(vaddr, PAGE_STATE_IN_BUFFER);
 	pthread_spin_unlock(&hash_locks[lock_idx]);
 
 	__sync_fetch_and_add(&cow_buffer.nr_pages, 1);
-
-	/* Track page state: now in buffer */
-	page_state_set(vaddr, PAGE_STATE_IN_BUFFER);
 
 	pr_debug("COW_TRACE ADD: 0x%lx (total=%lu)\n", vaddr, cow_buffer.nr_pages);
 
