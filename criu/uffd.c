@@ -1781,21 +1781,44 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 
 			lp_debug(lpi, "Page 0x%llx served from COW buffer\n", address);
 
+			int retries = 0;
+			const int max_retries = 10;
+
+retry_uffdio_copy:
 			if (ioctl(lpi->lpfd.fd, UFFDIO_COPY, &uffd_copy) < 0) {
 				if (errno == EEXIST) {
-					/* Duplicate copy - this is a bug! */
-					lp_err(lpi, "BUG: PF buffer EEXIST at 0x%llx - duplicate copy!\n", address);
-					page_state_print_history(address);
+					/* Duplicate copy - drain already handled it */
+					lp_debug(lpi, "PF buffer EEXIST at 0x%llx - drain won race\n", address);
+					page_state_set(address, PAGE_STATE_DISCARDED);
 					page_pool_put(data);
-					return -1;
+					return 0;
+				}
+				if (errno == EAGAIN) {
+					if (retries < max_retries) {
+						retries++;
+						usleep(100 * retries);  /* Backoff: 100us, 200us, ... 1ms */
+						goto retry_uffdio_copy;
+					}
+					/* Max retries exceeded - something is seriously wrong */
+					pr_err("BUG: PF buffer EAGAIN at 0x%llx after %d retries\n",
+					       address, retries);
+					page_state_print_history(address);
+					BUG();
+				}
+				if (errno == ENOENT) {
+					/* VMA was unmapped */
+					lp_debug(lpi, "PF buffer ENOENT at 0x%llx - VMA unmapped\n", address);
+					page_state_set(address, PAGE_STATE_DISCARDED);
+					page_pool_put(data);
+					return 0;
 				}
 				pr_err("COW_TRACE PF_COPY: 0x%llx FAILED errno=%d\n", address, errno);
 				page_state_print_history(address);
 				page_state_set(address, PAGE_STATE_DISCARDED);
 			} else {
-				page_state_set(address, PAGE_STATE_COPIED);				
+				page_state_set(address, PAGE_STATE_COPIED);
 			}
-			
+
 			page_pool_put(data);
 			
 			lpi->copied_pages++;

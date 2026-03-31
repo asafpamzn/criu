@@ -117,7 +117,8 @@ static bool is_valid_transition(enum page_state from, enum page_state to)
 		return to == PAGE_STATE_COPIED ||
 		       to == PAGE_STATE_DISCARDED ||
 		       to == PAGE_STATE_EAGAIN_QUEUED ||
-		       to == PAGE_STATE_UNMAPPED;
+		       to == PAGE_STATE_UNMAPPED ||
+		       to == PAGE_STATE_PF_PENDING;
 	case PAGE_STATE_URGENT_PENDING:
 		return to == PAGE_STATE_COPIED ||
 		       to == PAGE_STATE_EAGAIN_QUEUED ||

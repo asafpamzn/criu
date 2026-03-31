@@ -42,4 +42,7 @@ bool cow_drain_thread_running(void);
 /* Remove all pages in range from buffer (for UNMAP/REMOVE events) */
 void cow_page_buffer_remove_range(unsigned long start, unsigned long len);
 
+/* Re-add page to buffer for EAGAIN retry (takes ownership of data) */
+void cow_page_buffer_readd(unsigned long vaddr, void *data);
+
 #endif /* __CR_COW_UFFD_H__ */

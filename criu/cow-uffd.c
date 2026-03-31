@@ -439,7 +439,7 @@ next_page:;
  * Re-add a page to the buffer for EAGAIN retry.
  * Called when UFFDIO_COPY fails with EAGAIN.
  */
-static void cow_page_buffer_readd(unsigned long vaddr, void *data)
+void cow_page_buffer_readd(unsigned long vaddr, void *data)
 {
 	struct page_buffer_node *node;
 	unsigned int hash;
