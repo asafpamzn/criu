@@ -39,4 +39,7 @@ void cow_stop_drain_thread(void);
 /* Check if drain thread is running */
 bool cow_drain_thread_running(void);
 
+/* Remove all pages in range from buffer (for UNMAP/REMOVE events) */
+void cow_page_buffer_remove_range(unsigned long start, unsigned long len);
+
 #endif /* __CR_COW_UFFD_H__ */

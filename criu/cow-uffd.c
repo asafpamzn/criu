@@ -369,6 +369,72 @@ void cow_page_buffer_destroy(void)
 }
 
 /*
+ * Remove all pages in a range from the buffer.
+ * Called when VMA is unmapped - no point keeping these pages.
+ */
+void cow_page_buffer_remove_range(unsigned long start, unsigned long len)
+{
+	struct page_buffer_node *node;
+	unsigned long vaddr, end;
+	unsigned int hash, last_hash = UINT_MAX;
+	unsigned long removed = 0;
+	int i;
+
+	if (!cow_buffer.initialized)
+		return;
+
+	end = start + len;
+
+	for (vaddr = start; vaddr < end; vaddr += PAGE_SIZE) {
+		hash = page_buffer_hash(vaddr);
+
+		/* Switch locks when hash changes lock group */
+		if (lock_index(hash) != lock_index(last_hash)) {
+			if (last_hash != UINT_MAX)
+				pthread_spin_unlock(&hash_locks[lock_index(last_hash)]);
+			pthread_spin_lock(&hash_locks[lock_index(hash)]);
+		}
+		last_hash = hash;
+
+		/* Search for page in bucket */
+		hlist_for_each_entry(node, &cow_buffer.hash_table[hash], hash) {
+			for (i = 0; i < node->count; i++) {
+				if (node->entries[i].vaddr == vaddr) {
+					void *data = node->entries[i].data;
+
+					/* Remove by moving last entry here */
+					node->count--;
+					if (i < node->count)
+						node->entries[i] = node->entries[node->count];
+
+					/* Free page data */
+					page_pool_put(data);
+					removed++;
+
+					/* Remove empty nodes */
+					if (node->count == 0) {
+						hlist_del(&node->hash);
+						xfree(node);
+					}
+					goto next_page;
+				}
+			}
+		}
+next_page:;
+	}
+
+	if (last_hash != UINT_MAX)
+		pthread_spin_unlock(&hash_locks[lock_index(last_hash)]);
+
+	if (removed > 0) {
+		__sync_fetch_and_sub(&cow_buffer.nr_pages, removed);
+		__sync_fetch_and_add(&cow_buffer.nr_discarded, removed);
+		pr_info("Removed %lu pages from buffer for UNMAP range 0x%lx-0x%lx\n",
+			removed, start, end);
+	}
+}
+
+/*
  * Re-add a page to the buffer for EAGAIN retry.
  * Called when UFFDIO_COPY fails with EAGAIN.
  */

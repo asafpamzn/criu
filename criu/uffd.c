@@ -1621,6 +1621,9 @@ static int handle_remove(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 	/* Mark all pages in range as unmapped for state tracking */
 	page_state_mark_range_unmapped(unreg.start, unreg.len);
 
+	/* Remove these pages from buffer - no point draining them */
+	cow_page_buffer_remove_range(unreg.start, unreg.len);
+
 	/*
 	 * The REMOVE event does not change the VMA, so we need to
 	 * make sure that we won't handle #PFs in the removed
