@@ -92,7 +92,7 @@ static inline unsigned int page_state_hash(unsigned long vaddr)
  * PF_PENDING -> COPIED, DISCARDED, EAGAIN_QUEUED
  * DRAIN_PENDING -> COPIED, DISCARDED, EAGAIN_QUEUED
  * URGENT_PENDING -> COPIED, EAGAIN_QUEUED, DISCARDED
- * EAGAIN_QUEUED -> COPIED, DISCARDED
+ * EAGAIN_QUEUED -> COPIED, DISCARDED, DRAIN_PENDING, PF_PENDING (retry after EAGAIN)
  * COPIED -> (terminal, no further transitions)
  * DISCARDED -> (terminal, no further transitions)
  */
@@ -126,7 +126,9 @@ static bool is_valid_transition(enum page_state from, enum page_state to)
 	case PAGE_STATE_EAGAIN_QUEUED:
 		return to == PAGE_STATE_COPIED ||
 		       to == PAGE_STATE_DISCARDED ||
-		       to == PAGE_STATE_UNMAPPED;
+		       to == PAGE_STATE_UNMAPPED ||
+		       to == PAGE_STATE_DRAIN_PENDING ||
+		       to == PAGE_STATE_PF_PENDING;
 	case PAGE_STATE_COPIED:
 		/* COPIED pages can become DIRTY if source re-sends with newer data */
 		return to == PAGE_STATE_DIRTY;
