@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <unistd.h>
 #include <string.h>
+#include <limits.h>
 #include <sys/ioctl.h>
 #include <linux/userfaultfd.h>
 
