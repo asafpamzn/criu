@@ -381,7 +381,7 @@ void page_state_mark_range_unmapped(unsigned long start, unsigned long len)
 {
 	unsigned long vaddr, end;
 	struct page_state_entry *entry;
-	struct page_state_bucket *bucket;
+	struct page_state_bucket *bucket = NULL;
 	struct timespec now;
 	unsigned int hash, last_hash = UINT_MAX;
 	unsigned long transitions_count = 0;
@@ -440,7 +440,7 @@ void page_state_mark_dirty_ranges(unsigned long *ranges, unsigned int nr_ranges)
 	unsigned int i;
 	unsigned long marked = 0;
 	struct page_state_entry *entry;
-	struct page_state_bucket *bucket;
+	struct page_state_bucket *bucket = NULL;
 	struct timespec now;
 	unsigned int hash, last_hash;
 
