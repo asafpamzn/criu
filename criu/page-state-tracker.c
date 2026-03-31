@@ -93,8 +93,10 @@ static inline unsigned int page_state_hash(unsigned long vaddr)
  * DRAIN_PENDING -> COPIED, DISCARDED, EAGAIN_QUEUED
  * URGENT_PENDING -> COPIED, EAGAIN_QUEUED, DISCARDED
  * EAGAIN_QUEUED -> COPIED, DISCARDED, DRAIN_PENDING, PF_PENDING (retry after EAGAIN)
- * COPIED -> (terminal, no further transitions)
- * DISCARDED -> (terminal, no further transitions)
+ * COPIED -> DIRTY (source re-sends with newer data)
+ * DISCARDED -> DIRTY (source re-sends with newer data)
+ * DIRTY -> IN_BUFFER, COPIED, EAGAIN_QUEUED (re-receive the dirty page)
+ * UNMAPPED -> (terminal, region no longer exists)
  */
 static bool is_valid_transition(enum page_state from, enum page_state to)
 {
@@ -143,8 +145,11 @@ static bool is_valid_transition(enum page_state from, enum page_state to)
 		/* Dirty pages can be:
 		 * - Re-buffered (IN_BUFFER) if arriving pre-convergence
 		 * - Directly copied (COPIED) during convergence phase
+		 * - Queued for retry (EAGAIN_QUEUED) if copy gets EAGAIN
 		 */
-		return to == PAGE_STATE_IN_BUFFER || to == PAGE_STATE_COPIED;
+		return to == PAGE_STATE_IN_BUFFER ||
+		       to == PAGE_STATE_COPIED ||
+		       to == PAGE_STATE_EAGAIN_QUEUED;
 	default:
 		return false;
 	}
