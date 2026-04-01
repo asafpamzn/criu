@@ -43,7 +43,7 @@
 #define CHUNK_ALIGN_MASK (~(CHUNK_ALIGN - 1))
 #define ALLOC_BATCH      64                        /* 64 pages = 256KB per allocation */
 #define PAGES_PER_CHUNK  (CHUNK_SIZE / PAGE_SIZE)  /* 65536 pages */
-#define MAX_THREADS      16
+#define MAX_THREADS      32
 #define MAX_CHUNKS       512  /* 512 * 256MB = 128GB max */
 
 /* Chunk header - stored at start of each 256MB region (uses page 0) */

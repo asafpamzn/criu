@@ -1242,7 +1242,7 @@ int setup_tcp_server(char *type, char *addr, unsigned short *port)
 
 	pr_debug("DEBUG_SOCKET: Bound socket fd=%d to port %u\n", sk, *port);
 
-	if (listen(sk, 1)) {
+	if (listen(sk, 32)) {
 		pr_perror("Can't listen on %s server socket", type);
 		goto out;
 	}
