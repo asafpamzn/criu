@@ -20,6 +20,9 @@ struct ps_info {
 #define PS_IOV_ADD_F  6
 #define PS_IOV_GET    7
 
+#define PS_IOV_CLOSE       0x1023
+#define PS_IOV_FORCE_CLOSE 0x1024
+
 #define PS_CMD_BITS 16
 #define PS_CMD_MASK ((1 << PS_CMD_BITS) - 1)
 

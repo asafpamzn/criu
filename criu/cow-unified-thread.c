@@ -10,6 +10,7 @@
 #include <sys/socket.h>
 #include <sys/mman.h>
 #include <sys/ioctl.h>
+#include <sys/uio.h>
 #include <linux/userfaultfd.h>
 #include <pthread.h>
 #include <unistd.h>

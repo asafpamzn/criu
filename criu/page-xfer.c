@@ -80,12 +80,8 @@ static void psi2iovec(struct page_server_iov *ps, struct iovec *iov)
 	iov->iov_len = ps->nr_pages * PAGE_SIZE;
 }
 
-/* PS_IOV_* protocol commands (1-7) are now in page-xfer.h */
+/* PS_IOV_* protocol commands (1-7), PS_IOV_CLOSE, PS_IOV_FORCE_CLOSE are now in page-xfer.h */
 /* COW-specific PS_IOV_* defines (8-17) are in cow-page-xfer.h */
-
-#define PS_IOV_CLOSE	   0x1023
-#define PS_IOV_FORCE_CLOSE 0x1024
-
 /* PS_CMD_BITS, PS_CMD_MASK, encode_ps_cmd, decode_ps_cmd are now in page-xfer.h */
 
 #define PS_TYPE_BITS 8
