@@ -2099,9 +2099,12 @@ static int retry_uffd_copy(struct uffd_eagain_request *req)
 	/* Check for soft error */
 	if (uffdio_copy.copy < 0) {
 		errno = -uffdio_copy.copy;
-		if (errno == EAGAIN)
+		if (errno == EAGAIN) {
+			pr_err("DEBUG: retry_uffd_copy soft EAGAIN at 0x%llx\n", req->address);
 			return -EAGAIN;
+		}
 
+		pr_err("DEBUG: retry_uffd_copy soft error at 0x%llx errno=%d\n", req->address, errno);
 		lp_err(req->lpi, "EAGAIN copy retry soft error for 0x%llx: %d\n",
 		       req->address, errno);
 		page_state_set(req->address, PAGE_STATE_DISCARDED);
@@ -2130,8 +2133,12 @@ static int retry_uffd_zero(struct uffd_eagain_request *req)
 	uffdio_zeropage.zeropage = 0;
 
 	if (ioctl(req->lpi->lpfd.fd, UFFDIO_ZEROPAGE, &uffdio_zeropage) == -1) {
-		if (errno == EAGAIN)
+		if (errno == EAGAIN) {
+			pr_err("DEBUG: retry_uffd_zero still EAGAIN at 0x%llx\n", req->address);
 			return -EAGAIN;
+		}
+
+		pr_err("DEBUG: retry_uffd_zero error at 0x%llx errno=%d\n", req->address, errno);
 		lp_err(req->lpi, "EAGAIN zero retry failed for 0x%llx: %d\n",
 		       req->address, errno);
 		page_state_set(req->address, PAGE_STATE_DISCARDED);
@@ -2146,6 +2153,7 @@ static int retry_uffd_zero(struct uffd_eagain_request *req)
 			return -EAGAIN;
 		}
 
+		pr_err("DEBUG: retry_uffd_zero soft error at 0x%llx errno=%d\n", req->address, errno);
 		lp_err(req->lpi, "EAGAIN zero retry soft error for 0x%llx: %d\n",
 		       req->address, errno);
 		page_state_set(req->address, PAGE_STATE_DISCARDED);
@@ -2210,7 +2218,7 @@ int process_eagain_requests(void)
 		if (ret == -EAGAIN) {
 			/* Still blocked - keep in queue for next attempt */
 			uffd_stats.eagain_blocked++;
-			pr_err("DEBUG: eagain 0x%llx still blocked (EAGAIN)\n", req->address);
+			//pr_err("DEBUG: eagain 0x%llx still blocked (EAGAIN)\n", req->address); TODO print if blocked for long time
 			continue;
 		} else if (ret < 0) {
 			/* Error - remove from queue */
