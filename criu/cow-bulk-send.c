@@ -25,6 +25,7 @@
 #include "mem.h"
 #include "cow-bulk-send.h"
 #include "page-xfer.h"
+#include "cow-page-xfer.h"
 #include "atomic-bitmap.h"
 #include "cr_options.h"
 #include "tls.h"
@@ -36,8 +37,7 @@
 #define COW_BATCH_PAGES 64
 #define COW_BATCH_SIZE  (COW_BATCH_PAGES * PAGE_SIZE)
 
-/* Protocol constants and structures (from page-xfer.c) */
-#define PS_IOV_ADD_F_COMPRESS 10
+/* Protocol constants - PS_IOV_ADD_F_COMPRESS is in cow-page-xfer.h */
 #define PS_CMD_BITS 16
 
 struct page_server_iov {
@@ -57,9 +57,7 @@ static inline int __send(int sk, const void *buf, size_t sz, int fl)
 	return opts.tls ? tls_send(buf, sz, fl) : send(sk, buf, sz, fl);
 }
 
-/* Global compression stats - shared with page-xfer.c */
-extern unsigned long g_compress_uncompressed_bytes;
-extern unsigned long g_compress_compressed_bytes;
+/* Compression stats are in cow-page-xfer.h */
 
 /* Number of parallel P3 threads */
 #define NUM_P3_THREADS 10

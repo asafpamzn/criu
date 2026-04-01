@@ -47,25 +47,11 @@
 #include "cow-bulk-send.h"
 #include "spsc-queue.h"
 #include "xmalloc.h"
+#include "cow-page-xfer.h"
 
 static int page_server_sk = -1;
-static bool bulk_stream_done = false;
-static bool all_pages_sent_ack_received = false;
 
-bool page_server_bulk_stream_done(void)
-{
-	return bulk_stream_done;
-}
-
-static void set_all_pages_sent_ack_received(void)
-{
-	all_pages_sent_ack_received = true;
-}
-
-static bool is_all_pages_sent_ack_received(void)
-{
-	return all_pages_sent_ack_received;
-}
+/* COW state (bulk_stream_done, all_pages_sent_ack_received) is in cow-page-xfer.c */
 
 int get_page_server_sk(void)
 {
@@ -77,9 +63,7 @@ int get_page_server_sk(void)
 #define BULK_STREAM_COMPLETE 2
 /* No ACK on bulk close: end-of-stream marker is enough. */
 
-/* Global compression statistics for stats printing (used by cow-bulk-send.c too) */
-unsigned long g_compress_uncompressed_bytes = 0;
-unsigned long g_compress_compressed_bytes = 0;
+/* Compression statistics are in cow-page-xfer.c */
 
 struct page_server_iov {
 	u32 cmd;
@@ -101,27 +85,9 @@ static void psi2iovec(struct page_server_iov *ps, struct iovec *iov)
 #define PS_IOV_PARENT 5
 #define PS_IOV_ADD_F  6
 #define PS_IOV_GET    7
-#define PS_IOV_GET_ALL 8
-#define PS_IOV_ADD_F_PF 9
-#define PS_IOV_ADD_F_COMPRESS 10
-#define PS_IOV_DIRTY_BITMAP   11   /* Primary sends dirty bitmap to replica */
-#define PS_IOV_START_RESTORE  12   /* Signal replica to start process */
-#define PS_IOV_BULK_COMPLETE_ACK 13 /* Replica → Primary: all bulk pages received */
-#define PS_IOV_INVENTORY_READY  14  /* Primary → Replica: inventory.img written */
-#define PS_IOV_DIRTY_BITMAP_ACK 15  /* Replica → Primary: dirty bitmap received */
-#define PS_IOV_ALL_PAGES_SENT     16  /* Primary → Replica: all pages sent, zero-fill rest */
-#define PS_IOV_ALL_PAGES_SENT_ACK 17  /* Replica → Primary: ACK, safe to close connection */
+/* COW-specific PS_IOV_* defines (8-17) are in cow-page-xfer.h */
 
 #define PS_IOV_CLOSE	   0x1023
-
-/* Compression state machine states for bulk stream reader */
-enum compress_read_state {
-	COMPRESS_STATE_READING_HEADER = 0,    /* Reading page_server_iov header */
-	COMPRESS_STATE_READING_SIZE,          /* Reading compressed_size (4 bytes) */
-	COMPRESS_STATE_READING_COMPRESSED,    /* Reading compressed data */
-	COMPRESS_STATE_READING_UNCOMPRESSED,  /* Reading uncompressed page data */
-	COMPRESS_STATE_READING_DIRTY_BITMAP,  /* Reading dirty bitmap ranges */
-};
 #define PS_IOV_FORCE_CLOSE 0x1024
 
 #define PS_CMD_BITS 16
@@ -3642,7 +3608,7 @@ static int handle_end_of_transfer(struct ps_async_read *ar, u32 cmd)
 
 	pr_err("Received end-of-transfer marker (cmd=%u dst_id=%lu)\n", cmd,
 		(unsigned long)ar->pi.dst_id);
-	bulk_stream_done = true;
+	set_bulk_stream_done();
 
 	/*
 	 * Send ACK back to primary so it can break out of
@@ -4104,7 +4070,7 @@ static int page_server_async_read_bulk(struct epoll_rfd *f)
 	check_and_print_bulk_stats();
 
 	if (list_empty(&async_reads)) {
-		if (opts.cow_dump && bulk_stream_done)
+		if (opts.cow_dump && page_server_bulk_stream_done())
 			return 0;
 		pr_err("Bulk async read with empty queue\n");
 		return -1;
@@ -4268,13 +4234,13 @@ static int page_server_async_read(struct epoll_rfd *f)
 static int page_server_hangup_event(struct epoll_rfd *rfd)
 {
 	pr_err("DEBUG_CALLBACK: page_server_hangup_event called fd=%d cow_dump=%d dirty_bitmap=%d bulk_done=%d\n",
-	       rfd->fd, opts.cow_dump, is_dirty_bitmap_received(), bulk_stream_done);
+	       rfd->fd, opts.cow_dump, is_dirty_bitmap_received(), page_server_bulk_stream_done());
 
 	if (opts.cow_dump && is_dirty_bitmap_received()) {
 		pr_err("Page server closed connection after dirty bitmap received\n");
 		return 1;
 	}
-	if (opts.cow_dump && bulk_stream_done) {
+	if (opts.cow_dump && page_server_bulk_stream_done()) {
 		/*
 		 * Bulk stream done but dirty bitmap not yet fully received.
 		 * The data might still be in the socket buffer - let the
@@ -4293,7 +4259,7 @@ int connect_to_page_server_to_recv(int epfd)
 {
 	if (connect_to_page_server())
 		return -1;
-	bulk_stream_done = false;
+	reset_bulk_stream_done();
 
 	ps_rfd.fd = page_server_sk;
 	/* Use bulk stream reader in bulk mode, regular reader in on-demand mode */
