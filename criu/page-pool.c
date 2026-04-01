@@ -118,6 +118,7 @@ static void *alloc_chunk(void)
 
 int page_pool_thread_init(int thread_id)
 {
+	BUG_ON(thread_id < 0 || thread_id >= MAX_THREADS);
 	if (thread_id < 0 || thread_id >= MAX_THREADS) {
 		pr_err("Invalid thread_id %d (max %d)\n", thread_id, MAX_THREADS);
 		return -1;
