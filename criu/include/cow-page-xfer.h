@@ -41,6 +41,9 @@ extern void reset_bulk_stream_done(void);
 extern void set_all_pages_sent_ack_received(void);
 extern bool is_all_pages_sent_ack_received(void);
 
+/* Wait for all_pages_sent ACK (called from page-xfer.c) */
+extern int wait_for_all_pages_sent_ack(int sk);
+
 /*
  * COW signaling functions are declared in page-xfer.h:
  * - send_dirty_bitmap_to_replica()

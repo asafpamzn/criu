@@ -89,7 +89,7 @@ int send_dirty_bitmap_to_replica(int sk, u64 dst_id,
  * Note: The ACK is received by page_server_serve() which sets a flag.
  * We poll the flag here to avoid race conditions with socket reads.
  */
-static int wait_for_all_pages_sent_ack(int sk)
+int wait_for_all_pages_sent_ack(int sk)
 {
 	(void)sk;  /* unused - ACK comes via page_server_serve() */
 
