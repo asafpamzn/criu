@@ -2085,13 +2085,9 @@ static int retry_uffd_copy(struct uffd_eagain_request *req)
 	uffdio_copy.mode = 0;
 	uffdio_copy.copy = 0;
 
-	pr_err("DEBUG: retry_uffd_copy attempting 0x%llx\n", req->address);
-
 	if (ioctl(req->lpi->lpfd.fd, UFFDIO_COPY, &uffdio_copy) == -1) {
-		if (errno == EAGAIN) {
-			pr_err("DEBUG: retry_uffd_copy still EAGAIN at 0x%llx\n", req->address);
+		if (errno == EAGAIN)
 			return -EAGAIN;
-		}
 
 		pr_err("DEBUG: retry_uffd_copy error at 0x%llx errno=%d\n", req->address, errno);
 		lp_err(req->lpi, "EAGAIN copy retry failed for 0x%llx: %d\n",
@@ -2103,12 +2099,9 @@ static int retry_uffd_copy(struct uffd_eagain_request *req)
 	/* Check for soft error */
 	if (uffdio_copy.copy < 0) {
 		errno = -uffdio_copy.copy;
-		if (errno == EAGAIN) {
-			pr_err("DEBUG: retry_uffd_copy soft EAGAIN at 0x%llx\n", req->address);
+		if (errno == EAGAIN)
 			return -EAGAIN;
-		}
 
-		pr_err("DEBUG: retry_uffd_copy soft error at 0x%llx errno=%d\n", req->address, errno);
 		lp_err(req->lpi, "EAGAIN copy retry soft error for 0x%llx: %d\n",
 		       req->address, errno);
 		page_state_set(req->address, PAGE_STATE_DISCARDED);
@@ -2116,7 +2109,6 @@ static int retry_uffd_copy(struct uffd_eagain_request *req)
 	}
 
 	/* Success */
-	pr_err("DEBUG: retry_uffd_copy success at 0x%llx\n", req->address);
 	req->lpi->copied_pages += req->nr_pages;
 	pf_tracker_set_state(req->address, PF_STATE_COMPLETED);
 	page_state_set(req->address, PAGE_STATE_COPIED);
@@ -2137,15 +2129,9 @@ static int retry_uffd_zero(struct uffd_eagain_request *req)
 	uffdio_zeropage.mode = 0;
 	uffdio_zeropage.zeropage = 0;
 
-	pr_err("DEBUG: retry_uffd_zero attempting 0x%llx\n", req->address);
-
 	if (ioctl(req->lpi->lpfd.fd, UFFDIO_ZEROPAGE, &uffdio_zeropage) == -1) {
-		if (errno == EAGAIN) {
-			pr_err("DEBUG: retry_uffd_zero still EAGAIN at 0x%llx\n", req->address);
+		if (errno == EAGAIN)
 			return -EAGAIN;
-		}
-
-		pr_err("DEBUG: retry_uffd_zero error at 0x%llx errno=%d\n", req->address, errno);
 		lp_err(req->lpi, "EAGAIN zero retry failed for 0x%llx: %d\n",
 		       req->address, errno);
 		page_state_set(req->address, PAGE_STATE_DISCARDED);
@@ -2160,7 +2146,6 @@ static int retry_uffd_zero(struct uffd_eagain_request *req)
 			return -EAGAIN;
 		}
 
-		pr_err("DEBUG: retry_uffd_zero soft error at 0x%llx errno=%d\n", req->address, errno);
 		lp_err(req->lpi, "EAGAIN zero retry soft error for 0x%llx: %d\n",
 		       req->address, errno);
 		page_state_set(req->address, PAGE_STATE_DISCARDED);
@@ -2168,7 +2153,6 @@ static int retry_uffd_zero(struct uffd_eagain_request *req)
 	}
 
 	/* Success */
-	pr_err("DEBUG: retry_uffd_zero success at 0x%llx\n", req->address);
 	pf_tracker_set_state(req->address, PF_STATE_COMPLETED);
 	page_state_set(req->address, PAGE_STATE_COPIED);
 	lp_debug(req->lpi, "EAGAIN zero retry succeeded for 0x%llx\n", req->address);
@@ -2178,9 +2162,7 @@ static int retry_uffd_zero(struct uffd_eagain_request *req)
 /* Check if EAGAIN requests queue is empty */
 bool is_eagain_queue_empty(void)
 {
-	bool empty = list_empty(&eagain_requests);
-	pr_err("DEBUG: is_eagain_queue_empty() = %d\n", empty);
-	return empty;
+	return list_empty(&eagain_requests);
 }
 
 /*
@@ -2205,9 +2187,6 @@ int process_eagain_requests(void)
 	}
 
 	list_for_each_entry_safe(req, n, &eagain_requests, l) {
-		pr_err("DEBUG: processing eagain request 0x%llx, lpi->exited=%d\n",
-		       req->address, req->lpi->exited);
-
 		/* Skip if process has exited */
 		if (req->lpi->exited) {
 			uffd_stats.eagain_skipped++;
@@ -2246,7 +2225,6 @@ int process_eagain_requests(void)
 
 		/* Success! */
 		uffd_stats.eagain_succeeded++;
-		pr_err("DEBUG: eagain 0x%llx succeeded, removing\n", req->address);
 
 		/* Clean up and remove from queue */
 		list_del(&req->l);

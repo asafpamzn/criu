@@ -3,7 +3,7 @@
 
 #include <stdbool.h>
 #include "int.h"
-#include "list.h"
+#include "common/list.h"
 #include "vma.h"
 
 struct lazy_vma_entry {
