@@ -37,27 +37,14 @@
 #define COW_BATCH_PAGES 64
 #define COW_BATCH_SIZE  (COW_BATCH_PAGES * PAGE_SIZE)
 
-/* Protocol constants - PS_IOV_ADD_F_COMPRESS is in cow-page-xfer.h */
-#define PS_CMD_BITS 16
-
-struct page_server_iov {
-	u32 cmd;
-	u64 nr_pages;
-	u64 vaddr;
-	u64 dst_id;
-};
-
-static inline u32 encode_ps_cmd(u32 cmd, u32 flags)
-{
-	return flags << PS_CMD_BITS | cmd;
-}
-
-static inline int __send(int sk, const void *buf, size_t sz, int fl)
-{
-	return opts.tls ? tls_send(buf, sz, fl) : send(sk, buf, sz, fl);
-}
-
-/* Compression stats are in cow-page-xfer.h */
+/*
+ * Protocol structs, constants, and helpers are now in page-xfer.h:
+ * - struct page_server_iov
+ * - PS_CMD_BITS, encode_ps_cmd()
+ * - page_server_send() (replaces __send)
+ *
+ * COW-specific protocol defines (PS_IOV_ADD_F_COMPRESS, etc.) are in cow-page-xfer.h
+ */
 
 /* Number of parallel P3 threads */
 #define NUM_P3_THREADS 10
@@ -132,7 +119,7 @@ static int send_pages_batch_compressed(int sk, const void *data,
 
 	/* Single send: header + size + compressed data */
 	total_len = sizeof(*pi) + sizeof(int) + *compressed_size;
-	ret = __send(sk, send_buf, total_len, 0);
+	ret = page_server_send(sk, send_buf, total_len, 0);
 
 	xfree(send_buf);
 

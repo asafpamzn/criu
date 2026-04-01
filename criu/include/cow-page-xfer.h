@@ -41,17 +41,15 @@ extern void reset_bulk_stream_done(void);
 extern void set_all_pages_sent_ack_received(void);
 extern bool is_all_pages_sent_ack_received(void);
 
-/* COW signaling functions */
-extern int send_dirty_bitmap_to_replica(int sk, u64 dst_id,
-					unsigned long *ranges,
-					unsigned int nr_ranges);
-extern int send_cow_dirty_bitmap(unsigned long *ranges, unsigned int nr_ranges);
-extern int send_all_pages_sent_signal(int sk);
-extern int send_all_pages_sent_ack(void);
-extern int send_inventory_ready_signal(void);
-
-/* P3 parallel receiver connections (REPLICA side) */
-extern int start_p3_receiver_connections(int num_connections);
-extern void stop_p3_receiver_connections(void);
+/*
+ * COW signaling functions are declared in page-xfer.h:
+ * - send_dirty_bitmap_to_replica()
+ * - send_cow_dirty_bitmap()
+ * - send_all_pages_sent_signal()
+ * - send_all_pages_sent_ack()
+ * - send_inventory_ready_signal()
+ * - start_p3_receiver_connections()
+ * - stop_p3_receiver_connections()
+ */
 
 #endif /* __CR_COW_PAGE_XFER_H__ */

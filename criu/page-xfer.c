@@ -65,12 +65,7 @@ int get_page_server_sk(void)
 
 /* Compression statistics are in cow-page-xfer.c */
 
-struct page_server_iov {
-	u32 cmd;
-	u64 nr_pages;
-	u64 vaddr;
-	u64 dst_id;
-};
+/* struct page_server_iov is now in page-xfer.h */
 
 static void psi2iovec(struct page_server_iov *ps, struct iovec *iov)
 {
@@ -90,8 +85,7 @@ static void psi2iovec(struct page_server_iov *ps, struct iovec *iov)
 #define PS_IOV_CLOSE	   0x1023
 #define PS_IOV_FORCE_CLOSE 0x1024
 
-#define PS_CMD_BITS 16
-#define PS_CMD_MASK ((1 << PS_CMD_BITS) - 1)
+/* PS_CMD_BITS, PS_CMD_MASK, encode_ps_cmd, decode_ps_cmd are now in page-xfer.h */
 
 #define PS_TYPE_BITS 8
 #define PS_TYPE_MASK ((1 << PS_TYPE_BITS) - 1)
@@ -155,15 +149,7 @@ static int decode_pm(u64 dst_id, unsigned long *id)
 	return type;
 }
 
-static inline u32 encode_ps_cmd(u32 cmd, u32 flags)
-{
-	return flags << PS_CMD_BITS | cmd;
-}
-
-static inline u32 decode_ps_cmd(u32 cmd)
-{
-	return cmd & PS_CMD_MASK;
-}
+/* encode_ps_cmd and decode_ps_cmd are now in page-xfer.h */
 
 static inline u32 decode_ps_flags(u32 cmd)
 {
@@ -178,6 +164,23 @@ static inline int __send(int sk, const void *buf, size_t sz, int fl)
 static inline int __recv(int sk, void *buf, size_t sz, int fl)
 {
 	return opts.tls ? tls_recv(buf, sz, fl) : recv(sk, buf, sz, fl);
+}
+
+/* Exported wrappers for cow-page-xfer.c and cow-bulk-send.c */
+int page_server_send(int sk, const void *buf, size_t sz, int fl)
+{
+	return __send(sk, buf, sz, fl);
+}
+
+int page_server_recv(int sk, void *buf, size_t sz, int fl)
+{
+	return __recv(sk, buf, sz, fl);
+}
+
+/* Exported wrapper for encode_pm */
+u64 encode_pm_id(int type, unsigned long id)
+{
+	return encode_pm(type, id);
 }
 
 /*
@@ -617,7 +620,8 @@ static inline int send_psi_flags(int sk, struct page_server_iov *pi, int flags)
 	return 0;
 }
 
-static inline int send_psi(int sk, struct page_server_iov *pi)
+/* Non-static so cow-page-xfer.c can use it */
+int send_psi(int sk, struct page_server_iov *pi)
 {
 	return send_psi_flags(sk, pi, 0);
 }
@@ -699,202 +703,10 @@ static __maybe_unused int send_page_uncompressed(int sk, const void *data,
 }
 
 /*
- * Send dirty bitmap to replica (COW phased migration).
- * Called by primary after Phase 3 dirty scan completes.
- * Format: header with cmd=PS_IOV_DIRTY_BITMAP, nr_pages=nr_ranges,
- * followed by ranges array: [start0, len0, start1, len1, ...]
+ * COW signaling functions (send_dirty_bitmap_to_replica, send_cow_dirty_bitmap,
+ * send_all_pages_sent_signal, send_all_pages_sent_ack, send_inventory_ready_signal)
+ * are now in cow-page-xfer.c
  */
-int send_dirty_bitmap_to_replica(int sk, u64 dst_id,
-				 unsigned long *ranges,
-				 unsigned int nr_ranges)
-{
-	struct page_server_iov pi = {
-		.cmd = encode_ps_cmd(PS_IOV_DIRTY_BITMAP, 0),
-		.nr_pages = nr_ranges,
-		.vaddr = 0,
-		.dst_id = dst_id,
-	};
-	size_t ranges_size = nr_ranges * 2 * sizeof(unsigned long);
-
-	pr_info("Sending dirty bitmap: %u ranges (%zu bytes)\n",
-		nr_ranges, ranges_size);
-
-	if (send_psi(sk, &pi))
-		return -1;
-
-	if (nr_ranges > 0 && __send(sk, ranges, ranges_size, 0) != ranges_size) {
-		pr_perror("Failed to send dirty ranges");
-		return -1;
-	}
-
-	return 0;
-}
-
-/*
- * Wait for all_pages_sent ACK from replica.
- * Called by primary after sending PS_IOV_ALL_PAGES_SENT.
- *
- * Note: The ACK is received by page_server_serve() which sets a flag.
- * We poll the flag here to avoid race conditions with socket reads.
- */
-static int wait_for_all_pages_sent_ack(int sk)
-{
-	(void)sk;  /* unused - ACK comes via page_server_serve() */
-
-	pr_info("Waiting for all_pages_sent ACK from replica...\n");
-	while (!is_all_pages_sent_ack_received()) {
-		usleep(1000);  /* 1ms poll */
-	}
-	pr_info("Received all_pages_sent ACK from replica\n");
-	return 0;
-}
-
-/*
- * Wait for dirty bitmap ACK from replica.
- * Called by primary after sending all dirty bitmaps.
- */
-static int wait_for_dirty_bitmap_ack(void)
-{
-	struct page_server_iov pi;	
-
-	while (true) {
-		pr_info("Waiting for dirty bitmap ACK from replica...\n");
-		if (__recv(page_server_sk, &pi, sizeof(pi), MSG_WAITALL) != sizeof(pi)) {
-			pr_perror("Failed to receive dirty bitmap ACK");
-			return -1;
-		}
-
-		if (decode_ps_cmd(pi.cmd) != PS_IOV_DIRTY_BITMAP_ACK) {
-			pr_err("Expected dirty bitmap ACK, got cmd=%u\n", decode_ps_cmd(pi.cmd));
-			continue;
-		}
-		break;
-	}
-
-	pr_info("Received dirty bitmap ACK from replica\n");
-	return 0;
-}
-
-/*
- * Send dirty bitmap to replica using the current page server connection.
- * Called from cr-dump.c after skeleton dump completes.
- */
-int send_cow_dirty_bitmap(unsigned long *ranges, unsigned int nr_ranges)
-{
-	struct pstree_item *item;
-
-	pr_info("send_cow_dirty_bitmap: page_server_sk=%d, nr_ranges=%u\n",
-		page_server_sk, nr_ranges);
-
-	if (page_server_sk < 0) {
-		pr_err("Page server not connected (page_server_sk=%d), cannot send dirty bitmap\n",
-		       page_server_sk);
-		return -1;
-	}
-
-	/*
-	 * Send dirty bitmap for each task. The replica needs to know
-	 * which pages are dirty so it can apply WP_SYNC for convergence.
-	 */
-	for_each_pstree_item(item) {
-		u64 dst_id;
-
-		if (!task_alive(item))
-			continue;
-
-		dst_id = encode_pm(CR_FD_PAGEMAP, vpid(item));
-
-		pr_info("Sending dirty bitmap for pid=%d (dst_id=%lu)\n",
-			vpid(item), (unsigned long)dst_id);
-
-		if (send_dirty_bitmap_to_replica(page_server_sk, dst_id,
-						 ranges, nr_ranges))
-			return -1;
-	}
-
-	/* Wait for ACK from replica to ensure it processed the dirty bitmap */
-	if (wait_for_dirty_bitmap_ack())
-		return -1;
-
-	return 0;
-}
-
-/*
- * Send "all pages sent" signal to replica (COW phased migration).
- * Called by primary after dirty bitmap transfer completes, so replica
- * knows it can zero-fill any remaining page faults for new VMAs.
- * If sk >= 0, use that socket; otherwise use global page_server_sk.
- */
-int send_all_pages_sent_signal(int sk)
-{
-	struct page_server_iov pi = {
-		.cmd = PS_IOV_ALL_PAGES_SENT,
-		.nr_pages = 0,
-		.vaddr = 0,
-		.dst_id = 0,
-	};
-	int use_sk = (sk >= 0) ? sk : page_server_sk;
-
-	if (use_sk < 0) {
-		pr_err("No page server socket for all_pages_sent signal\n");
-		return -1;
-	}
-
-	pr_info("Sending all_pages_sent signal to replica (sk=%d)\n", use_sk);
-	return send_psi(use_sk, &pi);
-}
-
-/*
- * Send ACK for all_pages_sent signal (COW phased migration).
- * Called by replica after drain thread finishes, so primary knows
- * it's safe to close the connection.
- */
-int send_all_pages_sent_ack(void)
-{
-	struct page_server_iov pi = {
-		.cmd = PS_IOV_ALL_PAGES_SENT_ACK,
-		.nr_pages = 0,
-		.vaddr = 0,
-		.dst_id = 0,
-	};
-
-	if (page_server_sk < 0) {
-		pr_err("No page server socket for all_pages_sent ACK\n");
-		return -1;
-	}
-
-	pr_info("Sending all_pages_sent ACK to primary (sk=%d)\n", page_server_sk);
-	return send_psi(page_server_sk, &pi);
-}
-
-/*
- * Send inventory ready signal to replica (COW phased migration).
- * Called by primary after writing inventory.img, so replica knows
- * it's safe to load the pstree.
- */
-int send_inventory_ready_signal(void)
-{
-	struct page_server_iov pi = {
-		.cmd = PS_IOV_INVENTORY_READY,
-		.nr_pages = 0,
-		.vaddr = 0,
-		.dst_id = 0,
-	};
-
-	pr_info("Sending inventory ready signal to replica\n");
-
-	if (page_server_sk < 0) {
-		pr_err("Page server not connected, cannot send inventory ready signal\n");
-		return -1;
-	}
-
-	if (send_psi(page_server_sk, &pi)) {
-		pr_err("Failed to send inventory ready signal\n");
-		return -1;
-	}
-
-	return 0;
-}
 
 static void tcp_cork(int sk, bool on)
 {

@@ -8,6 +8,39 @@ struct ps_info {
 	unsigned short port;
 };
 
+/*
+ * Wire protocol constants and structures.
+ * Shared by page-xfer.c, cow-page-xfer.c, and cow-bulk-send.c.
+ */
+#define PS_CMD_BITS 16
+#define PS_CMD_MASK ((1 << PS_CMD_BITS) - 1)
+
+struct page_server_iov {
+	u32 cmd;
+	u64 nr_pages;
+	u64 vaddr;
+	u64 dst_id;
+};
+
+/* Protocol helpers - static inline for header inclusion */
+static inline u32 encode_ps_cmd(u32 cmd, u32 flags)
+{
+	return flags << PS_CMD_BITS | cmd;
+}
+
+static inline u32 decode_ps_cmd(u32 cmd)
+{
+	return cmd & PS_CMD_MASK;
+}
+
+/* TLS-aware send/recv wrappers */
+extern int page_server_send(int sk, const void *buf, size_t sz, int fl);
+extern int page_server_recv(int sk, void *buf, size_t sz, int fl);
+extern int send_psi(int sk, struct page_server_iov *pi);
+
+/* Pagemap encoding for dst_id */
+extern u64 encode_pm_id(int type, unsigned long id);
+
 extern int cr_page_server(bool daemon_mode, bool lazy_dump, int cfd);
 
 /* User buffer for read-mode pre-dump*/
