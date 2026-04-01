@@ -1173,6 +1173,8 @@ static int queue_eagain_request(struct lazy_pages_info *lpi, __u64 address,
 	
 	list_add_tail(&req->l, &eagain_requests);
 
+	pr_err("DEBUG: queue_eagain_request added 0x%llx to eagain_requests (op=%s)\n",
+	       address, op_name);
 	return 0;
 }
 
@@ -1502,33 +1504,45 @@ static int uffd_zero(struct lazy_pages_info *lpi, __u64 address, unsigned long n
 	uffdio_zeropage.zeropage = 0;
 
 	lp_err(lpi, "zero page at 0x%llx\n", address);
-	
+
 	if (ioctl(lpi->lpfd.fd, UFFDIO_ZEROPAGE, &uffdio_zeropage) == -1) {
 		/* In COW dump mode, queue EAGAIN requests instead of blocking */
-		if (errno == EAGAIN && opts.cow_dump)
+		if (errno == EAGAIN && opts.cow_dump) {
+			pr_err("DEBUG: uffd_zero EAGAIN at 0x%llx, queueing\n", address);
+			page_state_set(address, PAGE_STATE_EAGAIN_QUEUED);
 			return queue_eagain_request(lpi, address, nr_pages, NULL, "zero");
-		
+		}
+
 		/* Non-COW mode or non-EAGAIN: check for errors */
-		if (uffd_check_op_error(lpi, "zero", &nr_pages, uffdio_zeropage.zeropage))
+		if (uffd_check_op_error(lpi, "zero", &nr_pages, uffdio_zeropage.zeropage)) {
+			pr_err("DEBUG: uffd_zero error at 0x%llx errno=%d\n", address, errno);
 			return -1;
-			
-		return 0;
-	}
-	
-	/* Check for soft error */
-	if (uffdio_zeropage.zeropage < 0) {
-		errno = -uffdio_zeropage.zeropage;
-		
-		/* In COW dump mode, queue EAGAIN requests */
-		if (errno == EAGAIN && opts.cow_dump)
-			return queue_eagain_request(lpi, address, nr_pages, NULL, "zero");
-		
-		if (uffd_check_op_error(lpi, "zero", &nr_pages, uffdio_zeropage.zeropage))
-			return -1;
-			
+		}
+		pr_err("DEBUG: uffd_zero non-fatal error at 0x%llx errno=%d\n", address, errno);
 		return 0;
 	}
 
+	/* Check for soft error */
+	if (uffdio_zeropage.zeropage < 0) {
+		errno = -uffdio_zeropage.zeropage;
+
+		/* In COW dump mode, queue EAGAIN requests */
+		if (errno == EAGAIN && opts.cow_dump) {
+			pr_err("DEBUG: uffd_zero soft EAGAIN at 0x%llx, queueing\n", address);
+			page_state_set(address, PAGE_STATE_EAGAIN_QUEUED);
+			return queue_eagain_request(lpi, address, nr_pages, NULL, "zero");
+		}
+
+		if (uffd_check_op_error(lpi, "zero", &nr_pages, uffdio_zeropage.zeropage)) {
+			pr_err("DEBUG: uffd_zero soft error at 0x%llx errno=%d\n", address, errno);
+			return -1;
+		}
+		pr_err("DEBUG: uffd_zero soft non-fatal at 0x%llx errno=%d\n", address, errno);
+		return 0;
+	}
+
+	pr_err("DEBUG: uffd_zero success at 0x%llx\n", address);
+	page_state_set(address, PAGE_STATE_COPIED);
 	return 0;
 }
 
@@ -2064,36 +2078,48 @@ void lazy_pages_summary(struct lazy_pages_info *lpi)
 static int retry_uffd_copy(struct uffd_eagain_request *req)
 {
 	struct uffdio_copy uffdio_copy;
-	
+
 	uffdio_copy.dst = req->address;
 	uffdio_copy.src = (unsigned long)req->buf;
 	uffdio_copy.len = req->nr_pages * page_size();
 	uffdio_copy.mode = 0;
 	uffdio_copy.copy = 0;
 
+	pr_err("DEBUG: retry_uffd_copy attempting 0x%llx\n", req->address);
+
 	if (ioctl(req->lpi->lpfd.fd, UFFDIO_COPY, &uffdio_copy) == -1) {
-		if (errno == EAGAIN)
+		if (errno == EAGAIN) {
+			pr_err("DEBUG: retry_uffd_copy still EAGAIN at 0x%llx\n", req->address);
 			return -EAGAIN;
-		
-		lp_err(req->lpi, "EAGAIN copy retry failed for 0x%llx: %d\n", 
+		}
+
+		pr_err("DEBUG: retry_uffd_copy error at 0x%llx errno=%d\n", req->address, errno);
+		lp_err(req->lpi, "EAGAIN copy retry failed for 0x%llx: %d\n",
 		       req->address, errno);
+		page_state_set(req->address, PAGE_STATE_DISCARDED);
 		return -1;
 	}
 
 	/* Check for soft error */
 	if (uffdio_copy.copy < 0) {
 		errno = -uffdio_copy.copy;
-		if (errno == EAGAIN)
+		if (errno == EAGAIN) {
+			pr_err("DEBUG: retry_uffd_copy soft EAGAIN at 0x%llx\n", req->address);
 			return -EAGAIN;
-		
+		}
+
+		pr_err("DEBUG: retry_uffd_copy soft error at 0x%llx errno=%d\n", req->address, errno);
 		lp_err(req->lpi, "EAGAIN copy retry soft error for 0x%llx: %d\n",
 		       req->address, errno);
+		page_state_set(req->address, PAGE_STATE_DISCARDED);
 		return -1;
 	}
 
 	/* Success */
+	pr_err("DEBUG: retry_uffd_copy success at 0x%llx\n", req->address);
 	req->lpi->copied_pages += req->nr_pages;
 	pf_tracker_set_state(req->address, PF_STATE_COMPLETED);
+	page_state_set(req->address, PAGE_STATE_COPIED);
 	lp_debug(req->lpi, "EAGAIN copy retry succeeded for 0x%llx\n", req->address);
 	return 0;
 }
@@ -2105,33 +2131,46 @@ static int retry_uffd_copy(struct uffd_eagain_request *req)
 static int retry_uffd_zero(struct uffd_eagain_request *req)
 {
 	struct uffdio_zeropage uffdio_zeropage;
-	
+
 	uffdio_zeropage.range.start = req->address;
 	uffdio_zeropage.range.len = req->nr_pages * page_size();
 	uffdio_zeropage.mode = 0;
 	uffdio_zeropage.zeropage = 0;
 
+	pr_err("DEBUG: retry_uffd_zero attempting 0x%llx\n", req->address);
+
 	if (ioctl(req->lpi->lpfd.fd, UFFDIO_ZEROPAGE, &uffdio_zeropage) == -1) {
-		if (errno == EAGAIN)
+		if (errno == EAGAIN) {
+			pr_err("DEBUG: retry_uffd_zero still EAGAIN at 0x%llx\n", req->address);
 			return -EAGAIN;
-		
-		lp_err(req->lpi, "EAGAIN zero retry failed for 0x%llx: %d\n", 
+		}
+
+		pr_err("DEBUG: retry_uffd_zero error at 0x%llx errno=%d\n", req->address, errno);
+		lp_err(req->lpi, "EAGAIN zero retry failed for 0x%llx: %d\n",
 		       req->address, errno);
+		page_state_set(req->address, PAGE_STATE_DISCARDED);
 		return -1;
 	}
 
 	/* Check for soft error */
 	if (uffdio_zeropage.zeropage < 0) {
 		errno = -uffdio_zeropage.zeropage;
-		if (errno == EAGAIN)
+		if (errno == EAGAIN) {
+			pr_err("DEBUG: retry_uffd_zero soft EAGAIN at 0x%llx\n", req->address);
 			return -EAGAIN;
-		
+		}
+
+		pr_err("DEBUG: retry_uffd_zero soft error at 0x%llx errno=%d\n", req->address, errno);
 		lp_err(req->lpi, "EAGAIN zero retry soft error for 0x%llx: %d\n",
 		       req->address, errno);
+		page_state_set(req->address, PAGE_STATE_DISCARDED);
 		return -1;
 	}
 
 	/* Success */
+	pr_err("DEBUG: retry_uffd_zero success at 0x%llx\n", req->address);
+	pf_tracker_set_state(req->address, PF_STATE_COMPLETED);
+	page_state_set(req->address, PAGE_STATE_COPIED);
 	lp_debug(req->lpi, "EAGAIN zero retry succeeded for 0x%llx\n", req->address);
 	return 0;
 }
@@ -2139,7 +2178,9 @@ static int retry_uffd_zero(struct uffd_eagain_request *req)
 /* Check if EAGAIN requests queue is empty */
 bool is_eagain_queue_empty(void)
 {
-	return list_empty(&eagain_requests);
+	bool empty = list_empty(&eagain_requests);
+	pr_err("DEBUG: is_eagain_queue_empty() = %d\n", empty);
+	return empty;
 }
 
 /*
@@ -2154,10 +2195,18 @@ int process_eagain_requests(void)
 
 	clock_gettime(CLOCK_MONOTONIC, &t_start);
 
+	pr_err("DEBUG: process_eagain_requests starting, queue_empty=%d\n",
+	       list_empty(&eagain_requests));
+
 	list_for_each_entry_safe(req, n, &eagain_requests, l) {
+		pr_err("DEBUG: processing eagain request 0x%llx, lpi->exited=%d\n",
+		       req->address, req->lpi->exited);
+
 		/* Skip if process has exited */
 		if (req->lpi->exited) {
 			uffd_stats.eagain_skipped++;
+			pr_err("DEBUG: eagain 0x%llx skipped (lpi exited)\n", req->address);
+			page_state_set(req->address, PAGE_STATE_DISCARDED);
 			list_del(&req->l);
 			if (req->buf)
 				xfree(req->buf);
@@ -2176,10 +2225,12 @@ int process_eagain_requests(void)
 		if (ret == -EAGAIN) {
 			/* Still blocked - keep in queue for next attempt */
 			uffd_stats.eagain_blocked++;
+			pr_err("DEBUG: eagain 0x%llx still blocked (EAGAIN)\n", req->address);
 			continue;
 		} else if (ret < 0) {
 			/* Error - remove from queue */
 			uffd_stats.eagain_errors++;
+			pr_err("DEBUG: eagain 0x%llx error ret=%d, removing\n", req->address, ret);
 			list_del(&req->l);
 			if (req->buf)
 				xfree(req->buf);
@@ -2189,6 +2240,7 @@ int process_eagain_requests(void)
 
 		/* Success! */
 		uffd_stats.eagain_succeeded++;
+		pr_err("DEBUG: eagain 0x%llx succeeded, removing\n", req->address);
 
 		/* Clean up and remove from queue */
 		list_del(&req->l);
@@ -2201,6 +2253,8 @@ int process_eagain_requests(void)
 	uffd_stats.eagain_total_ns += (t_end.tv_sec - t_start.tv_sec) * 1000000000 + (t_end.tv_nsec - t_start.tv_nsec);
 	uffd_stats.eagain_calls++;
 
+	pr_err("DEBUG: process_eagain_requests done, queue_empty=%d\n",
+	       list_empty(&eagain_requests));
 	return 0;
 }
 
