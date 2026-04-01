@@ -47,8 +47,8 @@
  */
 
 /* Number of parallel P3 threads */
-#define NUM_P3_THREADS 10
-#define NUM_P3_SPLITTER_THREADS 9  /* Threads 1-9 split large VMAs */
+#define NUM_P3_THREADS 20
+#define NUM_P3_SPLITTER_THREADS 19  /* Threads 1-19 split large VMAs */
 #define MIN_VMA_SIZE_FOR_SPLIT (256 * 1024)  /* 256KB threshold */
 
 /* Per-thread state */

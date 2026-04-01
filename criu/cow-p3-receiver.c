@@ -29,7 +29,7 @@
 #undef LOG_PREFIX
 #define LOG_PREFIX "cow-p3-recv: "
 
-#define MAX_P3_RECEIVERS 10
+#define MAX_P3_RECEIVERS 20
 
 /* Max batch size for P3 transfer */
 #define P3_MAX_BATCH_PAGES 64

@@ -7,10 +7,10 @@
 #define COW_BATCH_SIZE  (COW_BATCH_PAGES * PAGE_SIZE)  /* 256KB */
 
 /*
- * Start multiple P3 bulk sender threads (up to 10 threads for parallel transfer).
+ * Start multiple P3 bulk sender threads (up to 20 threads for parallel transfer).
  * Each thread handles 1/N of each VMA's address range and has its own socket.
  * sockets: array of socket file descriptors (one per thread)
- * num_sockets: number of sockets/threads to start (capped at 10)
+ * num_sockets: number of sockets/threads to start (capped at 20)
  * Returns 0 on success, -1 on error.
  */
 int cow_start_p3_threads(int *sockets, int num_sockets, u64 dst_id, pid_t source_pid);
