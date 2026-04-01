@@ -12,6 +12,14 @@ struct ps_info {
  * Wire protocol constants and structures.
  * Shared by page-xfer.c, cow-page-xfer.c, and cow-bulk-send.c.
  */
+#define PS_IOV_ADD    1
+#define PS_IOV_HOLE   2
+#define PS_IOV_OPEN   3
+#define PS_IOV_OPEN2  4
+#define PS_IOV_PARENT 5
+#define PS_IOV_ADD_F  6
+#define PS_IOV_GET    7
+
 #define PS_CMD_BITS 16
 #define PS_CMD_MASK ((1 << PS_CMD_BITS) - 1)
 

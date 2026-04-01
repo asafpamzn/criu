@@ -73,13 +73,7 @@ static void psi2iovec(struct page_server_iov *ps, struct iovec *iov)
 	iov->iov_len = ps->nr_pages * PAGE_SIZE;
 }
 
-#define PS_IOV_ADD    1
-#define PS_IOV_HOLE   2
-#define PS_IOV_OPEN   3
-#define PS_IOV_OPEN2  4
-#define PS_IOV_PARENT 5
-#define PS_IOV_ADD_F  6
-#define PS_IOV_GET    7
+/* PS_IOV_* protocol commands (1-7) are now in page-xfer.h */
 /* COW-specific PS_IOV_* defines (8-17) are in cow-page-xfer.h */
 
 #define PS_IOV_CLOSE	   0x1023
