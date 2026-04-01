@@ -20,6 +20,7 @@
 #include "criu-log.h"
 #include "page-xfer.h"
 #include "cow-page-xfer.h"
+#include "cow-bulk-send.h"
 #include "cr_options.h"
 #include "tls.h"
 #include "page-pool.h"
@@ -29,7 +30,8 @@
 #undef LOG_PREFIX
 #define LOG_PREFIX "cow-p3-recv: "
 
-#define MAX_P3_RECEIVERS 20
+/* Use same thread count as sender (from cow-bulk-send.h) */
+#define MAX_P3_RECEIVERS NUM_P3_THREADS
 
 /* Max batch size for P3 transfer */
 #define P3_MAX_BATCH_PAGES 64

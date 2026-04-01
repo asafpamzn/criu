@@ -46,9 +46,8 @@
  * COW-specific protocol defines (PS_IOV_ADD_F_COMPRESS, etc.) are in cow-page-xfer.h
  */
 
-/* Number of parallel P3 threads */
-#define NUM_P3_THREADS 20
-#define NUM_P3_SPLITTER_THREADS 19  /* Threads 1-19 split large VMAs */
+/* NUM_P3_THREADS is defined in cow-bulk-send.h */
+#define NUM_P3_SPLITTER_THREADS (NUM_P3_THREADS - 1)  /* Threads 1-(N-1) split large VMAs */
 #define MIN_VMA_SIZE_FOR_SPLIT (256 * 1024)  /* 256KB threshold */
 
 /* Per-thread state */

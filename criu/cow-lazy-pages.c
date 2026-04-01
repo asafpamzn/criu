@@ -25,6 +25,7 @@
 #include "servicefd.h"
 #include "uffd.h"
 #include "cow-uffd.h"
+#include "cow-bulk-send.h"
 #include "pstree.h"
 #include "pf-tracker.h"
 #include "unmapped-tracker.h"
@@ -210,7 +211,7 @@ int cr_lazy_pages_cow_phase2(bool daemon)
 	 * 7b. Create P3 parallel connections AFTER sending page requests.
 	 * PRIMARY is now in unified_page_server_thread and ready to accept.
 	 */
-	if (start_p3_receiver_connections(10) > 0) {
+	if (start_p3_receiver_connections(MAX_P3_RECEIVERS) > 0) {
 		pr_info("P3 parallel receiver enabled\n");
 	}
 

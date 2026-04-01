@@ -6,6 +6,9 @@
 #define COW_BATCH_PAGES 64
 #define COW_BATCH_SIZE  (COW_BATCH_PAGES * PAGE_SIZE)  /* 256KB */
 
+/* Number of parallel P3 threads for bulk transfer */
+#define NUM_P3_THREADS 20
+
 /*
  * Start multiple P3 bulk sender threads (up to 20 threads for parallel transfer).
  * Each thread handles 1/N of each VMA's address range and has its own socket.
