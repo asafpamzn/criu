@@ -2192,11 +2192,17 @@ int process_eagain_requests(void)
 	struct uffd_eagain_request *req, *n;
 	int ret;
 	struct timespec t_start, t_end;
+	static int last_queue_empty = -1;
+	int queue_empty;
 
 	clock_gettime(CLOCK_MONOTONIC, &t_start);
 
-	pr_err("DEBUG: process_eagain_requests starting, queue_empty=%d\n",
-	       list_empty(&eagain_requests));
+	queue_empty = list_empty(&eagain_requests);
+	if (queue_empty != last_queue_empty) {
+		pr_err("DEBUG: process_eagain_requests queue_empty changed: %d -> %d\n",
+		       last_queue_empty, queue_empty);
+		last_queue_empty = queue_empty;
+	}
 
 	list_for_each_entry_safe(req, n, &eagain_requests, l) {
 		pr_err("DEBUG: processing eagain request 0x%llx, lpi->exited=%d\n",
@@ -2253,8 +2259,12 @@ int process_eagain_requests(void)
 	uffd_stats.eagain_total_ns += (t_end.tv_sec - t_start.tv_sec) * 1000000000 + (t_end.tv_nsec - t_start.tv_nsec);
 	uffd_stats.eagain_calls++;
 
-	pr_err("DEBUG: process_eagain_requests done, queue_empty=%d\n",
-	       list_empty(&eagain_requests));
+	queue_empty = list_empty(&eagain_requests);
+	if (queue_empty != last_queue_empty) {
+		pr_err("DEBUG: process_eagain_requests done, queue_empty changed: %d -> %d\n",
+		       last_queue_empty, queue_empty);
+		last_queue_empty = queue_empty;
+	}
 	return 0;
 }
 
