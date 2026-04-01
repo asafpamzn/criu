@@ -257,7 +257,7 @@ int accept_p3_connections(int *sockets, int max_connections, int timeout_ms)
 	return num_accepted;
 }
 
-static void stop_p3_acceptor_thread(void)
+void stop_p3_acceptor_thread(void)
 {
 	int i;
 	unsigned long total_pages = 0;

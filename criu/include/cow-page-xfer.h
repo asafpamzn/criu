@@ -58,5 +58,6 @@ extern int wait_for_all_pages_sent_ack(int sk);
 /* P3 parallel receiver functions (cow-p3-receiver.c) */
 extern int accept_p3_connections(int *sockets, int max_connections, int timeout_ms);
 extern void close_p3_sockets(int *sockets, int num_sockets);
+extern void stop_p3_acceptor_thread(void);
 
 #endif /* __CR_COW_PAGE_XFER_H__ */
