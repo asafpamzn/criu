@@ -26,7 +26,6 @@
 #include "cow-uffd.h"
 #include "cow-dump.h"
 #include "cow-bulk-send.h"
-#include "cow-p3-receiver.h"
 #include "spsc-queue.h"
 #include "xmalloc.h"
 #include "atomic-bitmap.h"
