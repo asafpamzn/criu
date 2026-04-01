@@ -29,7 +29,7 @@
 #include "spsc-queue.h"
 #include "xmalloc.h"
 #include "atomic-bitmap.h"
-#include "list.h"
+#include "cr_options.h"
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "cow-thread: "
