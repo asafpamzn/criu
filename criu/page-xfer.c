@@ -203,85 +203,9 @@ int send_psi(int sk, struct page_server_iov *pi)
 }
 
 /*
- * Send a page with LZ4 compression.
- * Protocol: header (PS_IOV_ADD_F_COMPRESS) + compressed_size (4 bytes) + compressed_data
- * Optimized: single buffer, single send() syscall
- */
-static __maybe_unused int send_page_compressed(int sk, const void *data, u64 dst_id,
-					      unsigned long vaddr)
-{
-	/* Buffer layout: [header][compressed_size][compressed_data] */
-	char send_buf[sizeof(struct page_server_iov) + sizeof(int) + LZ4_compressBound(PAGE_SIZE)];
-	struct page_server_iov *pi = (struct page_server_iov *)send_buf;
-	int *compressed_size = (int *)(send_buf + sizeof(*pi));
-	char *compressed_data = send_buf + sizeof(*pi) + sizeof(int);
-	int total_len;
-	int ret;
-
-	/* 1. Compress directly into send buffer (no memcpy!) */
-	*compressed_size = LZ4_compress_default(data, compressed_data, PAGE_SIZE, 
-						LZ4_compressBound(PAGE_SIZE));
-	if (*compressed_size <= 0) {
-		pr_err("LZ4 compression failed for page at %lx\n", vaddr);
-		return -1;
-	}
-
-	/* Track compression statistics */
-	g_compress_uncompressed_bytes += PAGE_SIZE;
-	g_compress_compressed_bytes += *compressed_size;
-
-	pr_debug("Compressed page at %lx: %lu -> %d bytes (%.1f%%)\n", 
-		 vaddr, PAGE_SIZE, *compressed_size, 
-		 (float)(*compressed_size) * 100 / PAGE_SIZE);
-
-	/* 2. Fill in header (after compression so we know it succeeded) */
-	pi->cmd = encode_ps_cmd(PS_IOV_ADD_F_COMPRESS, PE_PRESENT);
-	pi->nr_pages = 1;
-	pi->vaddr = vaddr;
-	pi->dst_id = dst_id;
-
-	/* 3. Single send: header + size + compressed data */
-	total_len = sizeof(*pi) + sizeof(int) + *compressed_size;
-	ret = __send(sk, send_buf, total_len, 0);
-	if (ret != total_len) {
-		pr_perror("Failed to send compressed page (sent %d/%d)", ret, total_len);
-		return -1;
-	}
-
-	return 0;
-}
-
-static __maybe_unused int send_page_uncompressed(int sk, const void *data,
-						 u64 dst_id,
-						 unsigned long vaddr)
-{
-	char send_buf[sizeof(struct page_server_iov) + PAGE_SIZE];
-	struct page_server_iov *pi = (struct page_server_iov *)send_buf;
-	void *payload = send_buf + sizeof(*pi);
-	int total_len;
-	int ret;
-
-	memcpy(payload, data, PAGE_SIZE);
-
-	pi->cmd = encode_ps_cmd(PS_IOV_ADD_F, PE_PRESENT);
-	pi->nr_pages = 1;
-	pi->vaddr = vaddr;
-	pi->dst_id = dst_id;
-
-	total_len = sizeof(*pi) + PAGE_SIZE;
-	ret = __send(sk, send_buf, total_len, 0);
-	if (ret != total_len) {
-		pr_perror("Failed to send page (sent %d/%d)", ret, total_len);
-		return -1;
-	}
-
-	return 0;
-}
-
-/*
- * COW signaling functions (send_dirty_bitmap_to_replica, send_cow_dirty_bitmap,
- * send_all_pages_sent_signal, send_all_pages_sent_ack, send_inventory_ready_signal)
- * are now in cow-page-xfer.c
+ * COW page functions (send_page_compressed, send_page_uncompressed,
+ * send_dirty_bitmap_to_replica, send_cow_dirty_bitmap, send_all_pages_sent_signal,
+ * send_all_pages_sent_ack, send_inventory_ready_signal) are now in cow-page-xfer.c
  */
 
 static void tcp_cork(int sk, bool on)
@@ -2922,22 +2846,7 @@ static int page_server_start_async_read(void *buf, unsigned long nr_pages, ps_as
 	return 0;
 }
 
-/*
- * Send dirty bitmap ACK to primary.
- * Called by replica after fully receiving the dirty bitmap.
- */
-static int send_dirty_bitmap_ack(void)
-{
-	struct page_server_iov pi = {
-		.cmd = encode_ps_cmd(PS_IOV_DIRTY_BITMAP_ACK, 0),
-		.nr_pages = 0,
-		.vaddr = 0,
-		.dst_id = 0,
-	};
-
-	pr_info("Sending dirty bitmap ACK to primary\n");
-	return send_psi(page_server_sk, &pi);
-}
+/* send_dirty_bitmap_ack is now in cow-page-xfer.c */
 
 static struct {
 	unsigned long recv_calls;

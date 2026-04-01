@@ -9,13 +9,17 @@
 #include <stdbool.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <string.h>
+#include <lz4.h>
 
 #include "cow-page-xfer.h"
 #include "page-xfer.h"
+#include "page.h"
 #include "pstree.h"
 #include "cr_options.h"
 #include "criu-log.h"
 #include "image.h"
+#include "pagemap.h"
 
 /* Global compression statistics for stats printing (used by cow-bulk-send.c too) */
 unsigned long g_compress_uncompressed_bytes = 0;
@@ -245,6 +249,97 @@ int send_inventory_ready_signal(void)
 
 	if (send_psi(sk, &pi)) {
 		pr_err("Failed to send inventory ready signal\n");
+		return -1;
+	}
+
+	return 0;
+}
+
+/*
+ * Send dirty bitmap ACK to primary.
+ * Called by replica after fully receiving the dirty bitmap.
+ */
+int send_dirty_bitmap_ack(void)
+{
+	struct page_server_iov pi = {
+		.cmd = encode_ps_cmd(PS_IOV_DIRTY_BITMAP_ACK, 0),
+		.nr_pages = 0,
+		.vaddr = 0,
+		.dst_id = 0,
+	};
+	int sk = get_page_server_sk();
+
+	pr_info("Sending dirty bitmap ACK to primary\n");
+	return send_psi(sk, &pi);
+}
+
+/*
+ * Send a page with LZ4 compression.
+ * Protocol: header (PS_IOV_ADD_F_COMPRESS) + compressed_size (4 bytes) + compressed_data
+ * Optimized: single buffer, single send() syscall
+ */
+int send_page_compressed(int sk, const void *data, u64 dst_id, unsigned long vaddr)
+{
+	/* Buffer layout: [header][compressed_size][compressed_data] */
+	char send_buf[sizeof(struct page_server_iov) + sizeof(int) + LZ4_compressBound(PAGE_SIZE)];
+	struct page_server_iov *pi = (struct page_server_iov *)send_buf;
+	int *compressed_size = (int *)(send_buf + sizeof(*pi));
+	char *compressed_data = send_buf + sizeof(*pi) + sizeof(int);
+	int total_len;
+	int ret;
+
+	/* 1. Compress directly into send buffer (no memcpy!) */
+	*compressed_size = LZ4_compress_default(data, compressed_data, PAGE_SIZE,
+						LZ4_compressBound(PAGE_SIZE));
+	if (*compressed_size <= 0) {
+		pr_err("LZ4 compression failed for page at %lx\n", vaddr);
+		return -1;
+	}
+
+	/* Track compression statistics */
+	g_compress_uncompressed_bytes += PAGE_SIZE;
+	g_compress_compressed_bytes += *compressed_size;
+
+	pr_debug("Compressed page at %lx: %lu -> %d bytes (%.1f%%)\n",
+		 vaddr, PAGE_SIZE, *compressed_size,
+		 (float)(*compressed_size) * 100 / PAGE_SIZE);
+
+	/* 2. Fill in header (after compression so we know it succeeded) */
+	pi->cmd = encode_ps_cmd(PS_IOV_ADD_F_COMPRESS, PE_PRESENT);
+	pi->nr_pages = 1;
+	pi->vaddr = vaddr;
+	pi->dst_id = dst_id;
+
+	/* 3. Single send: header + size + compressed data */
+	total_len = sizeof(*pi) + sizeof(int) + *compressed_size;
+	ret = page_server_send(sk, send_buf, total_len, 0);
+	if (ret != total_len) {
+		pr_perror("Failed to send compressed page (sent %d/%d)", ret, total_len);
+		return -1;
+	}
+
+	return 0;
+}
+
+int send_page_uncompressed(int sk, const void *data, u64 dst_id, unsigned long vaddr)
+{
+	char send_buf[sizeof(struct page_server_iov) + PAGE_SIZE];
+	struct page_server_iov *pi = (struct page_server_iov *)send_buf;
+	void *payload = send_buf + sizeof(*pi);
+	int total_len;
+	int ret;
+
+	memcpy(payload, data, PAGE_SIZE);
+
+	pi->cmd = encode_ps_cmd(PS_IOV_ADD_F, PE_PRESENT);
+	pi->nr_pages = 1;
+	pi->vaddr = vaddr;
+	pi->dst_id = dst_id;
+
+	total_len = sizeof(*pi) + PAGE_SIZE;
+	ret = page_server_send(sk, send_buf, total_len, 0);
+	if (ret != total_len) {
+		pr_perror("Failed to send page (sent %d/%d)", ret, total_len);
 		return -1;
 	}
 
