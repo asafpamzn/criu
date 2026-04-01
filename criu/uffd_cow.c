@@ -65,6 +65,12 @@ int cow_handle_exit(struct list_head *lpis)
 		return 0;
 	}
 
+	/* Condition 4: Wait for EAGAIN requests to be processed */
+	if (!is_eagain_queue_empty()) {
+		pr_err("cow_handle_exit: waiting for EAGAIN requests to be processed\n");
+		return 0;
+	}
+
 	/* All conditions met - send ACK to primary */
 	pr_err("All pages received and drained, sending ACK to primary\n");
 	if (send_all_pages_sent_ack() < 0)

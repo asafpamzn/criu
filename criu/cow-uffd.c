@@ -554,9 +554,10 @@ static void *background_drain_thread(void *arg)
 								unmapped_tracker_mark_range(vaddr, PAGE_SIZE);
 							} else if (errno == EAGAIN) {
 								__sync_fetch_and_add(&cow_buffer.nr_eagain, 1);
-								cow_page_buffer_readd(vaddr, data);
-								free_data = false;
-								pr_debug("COW_TRACE DRAIN_COPY: 0x%lx EAGAIN, re-buffered\n", vaddr);
+								if (queue_drain_eagain_request(vaddr, data) == 0) {
+									free_data = false;  /* ownership transferred */
+								}
+								pr_debug("COW_TRACE DRAIN_COPY: 0x%lx EAGAIN, queued for retry\n", vaddr);
 							} else {
 								pr_err("COW_TRACE DRAIN_COPY: 0x%lx FAILED errno=%d\n", vaddr, errno);
 								page_state_print_history(vaddr);

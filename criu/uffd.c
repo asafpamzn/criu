@@ -1172,8 +1172,35 @@ static int queue_eagain_request(struct lazy_pages_info *lpi, __u64 address,
 	INIT_LIST_HEAD(&req->l);
 	
 	list_add_tail(&req->l, &eagain_requests);
-	
+
 	return 0;
+}
+
+/*
+ * Queue an EAGAIN request from drain thread context.
+ * Finds the appropriate lpi for the vaddr and queues for retry.
+ * Returns 0 on success (ownership of data transferred), -1 on error.
+ */
+int queue_drain_eagain_request(unsigned long vaddr, void *data)
+{
+	struct lazy_pages_info *lpi;
+
+	list_for_each_entry(lpi, &lpis, l) {
+		if (lpi->exited || lpi->lpfd.fd < 0)
+			continue;
+		if (!find_iov(lpi, vaddr))
+			continue;
+
+		/* Found the lpi - queue the request */
+		page_state_set(vaddr, PAGE_STATE_EAGAIN_QUEUED);
+		return queue_eagain_request(lpi, vaddr, 1, data, "drain");
+	}
+
+	/* No matching lpi - this is a bug */
+	pr_err("BUG: No lpi found for drain EAGAIN at 0x%lx\n", vaddr);
+	page_state_print_history(vaddr);
+	BUG();
+	return -1;
 }
 
 static int uffd_copy(struct lazy_pages_info *lpi, __u64 address, unsigned long *nr_pages)
@@ -2107,6 +2134,12 @@ static int retry_uffd_zero(struct uffd_eagain_request *req)
 	/* Success */
 	lp_debug(req->lpi, "EAGAIN zero retry succeeded for 0x%llx\n", req->address);
 	return 0;
+}
+
+/* Check if EAGAIN requests queue is empty */
+bool is_eagain_queue_empty(void)
+{
+	return list_empty(&eagain_requests);
 }
 
 /*

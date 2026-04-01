@@ -21,6 +21,12 @@ extern int get_first_lpi_uffd(void);
 /* Return uffd for a given vaddr (for background drain thread). */
 extern int get_uffd_for_vaddr(unsigned long vaddr);
 
+/* Queue EAGAIN request from drain thread (finds lpi and queues for retry) */
+extern int queue_drain_eagain_request(unsigned long vaddr, void *data);
+
+/* Check if EAGAIN requests queue is empty */
+extern bool is_eagain_queue_empty(void);
+
 /* Check if restore has connected (uffd available) */
 extern bool is_restore_connected(void);
 
