@@ -48,6 +48,7 @@ static inline u32 decode_ps_cmd(u32 cmd)
 extern int page_server_send(int sk, const void *buf, size_t sz, int fl);
 extern int page_server_recv(int sk, void *buf, size_t sz, int fl);
 extern int send_psi(int sk, struct page_server_iov *pi);
+extern void page_server_tcp_nodelay(int sk, bool on);
 
 /* Pagemap encoding for dst_id */
 extern u64 encode_pm_id(int type, unsigned long id);
