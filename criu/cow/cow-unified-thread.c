@@ -28,7 +28,7 @@
 #include "cow/cow-dump.h"
 #include "cow/cow-bulk-send.h"
 #include "cow/cow-mem.h"
-#include "spsc-queue.h"
+#include "cow/spsc-queue.h"
 #include "xmalloc.h"
 #include "atomic-bitmap.h"
 #include "cr_options.h"

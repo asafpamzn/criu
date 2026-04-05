@@ -33,7 +33,7 @@
 #include "parasite.h"
 #include "atomic-bitmap.h"
 #include "cow/cow-bitmap.h"
-#include "mpsc-queue.h"
+#include "cow/mpsc-queue.h"
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "cow-dump: "

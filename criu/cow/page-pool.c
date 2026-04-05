@@ -31,7 +31,7 @@
 #include <stdlib.h>
 
 #include "page.h"
-#include "page-pool.h"
+#include "cow/page-pool.h"
 #include "criu-log.h"
 #include "common/bug.h"
 

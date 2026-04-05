@@ -27,8 +27,8 @@
 #include "cow/cow-uffd.h"
 #include "cow/cow-bulk-send.h"
 #include "pstree.h"
-#include "pf-tracker.h"
-#include "unmapped-tracker.h"
+#include "cow/pf-tracker.h"
+#include "cow/unmapped-tracker.h"
 #include "rst_info.h"
 #include "cow/cow-lazy-pages.h"
 

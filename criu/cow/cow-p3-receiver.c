@@ -23,7 +23,7 @@
 #include "cow/cow-bulk-send.h"
 #include "cr_options.h"
 #include "tls.h"
-#include "page-pool.h"
+#include "cow/page-pool.h"
 #include "cow/cow-uffd.h"
 #include "util.h"
 

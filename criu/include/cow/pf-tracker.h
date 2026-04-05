@@ -8,7 +8,7 @@
  *   - hung-page-tracker.h for hung page fault tracking
  */
 
-#include "page-state-tracker.h"
-#include "hung-page-tracker.h"
+#include "cow/page-state-tracker.h"
+#include "cow/hung-page-tracker.h"
 
 #endif /* __CR_PF_TRACKER_H__ */

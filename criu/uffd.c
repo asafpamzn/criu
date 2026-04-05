@@ -44,12 +44,12 @@
 #include "util.h"
 #include "namespaces.h"
 #include "pagemap.h"
-#include "pf-tracker.h"
+#include "cow/pf-tracker.h"
 #include "cow/cow-lazy-pages.h"
 #include "cow/cow-uffd.h"
 #include "uffd-internal.h"
-#include "unmapped-tracker.h"
-#include "page-pool.h"
+#include "cow/unmapped-tracker.h"
+#include "cow/page-pool.h"
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "uffd: "
