@@ -500,8 +500,10 @@ static int page_xfer_dump_hole(struct page_xfer *xfer, struct iovec *hole, u32 f
 	hole->iov_base -= xfer->offset;
 	pr_debug("\th %p [%u]\n", hole->iov_base, (unsigned int)(hole->iov_len / PAGE_SIZE));
 
-		pr_info("  Writing hole pagemap asaf: 0x%lx-0x%lx (%lu pages)\n",
-						(unsigned long)hole->iov_base, (unsigned long)(hole->iov_base+hole->iov_len), (unsigned long)(hole->iov_len/PAGE_SIZE));
+	pr_info("  Writing hole pagemap: 0x%lx-0x%lx (%lu pages)\n",
+		(unsigned long)hole->iov_base,
+		(unsigned long)(hole->iov_base + hole->iov_len),
+		(unsigned long)(hole->iov_len / PAGE_SIZE));
 	if (xfer->write_pagemap(xfer, hole, flags))
 		return -1;
 
@@ -997,7 +999,6 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 	int ret;
 
 	pr_debug("Transferring pages:\n");
-	
 
 	/* In COW dump mode, we need to interleave lazy VMA entries with pipe entries */
 	if (opts.cow_dump) {
@@ -1014,7 +1015,6 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 			struct iovec iov = ppb->iov[i];
 			u32 flags;
 			unsigned long seg_vaddr = (unsigned long)iov.iov_base + xfer->offset;
-			
 
 			ret = dump_holes(xfer, pp, &cur_hole, iov.iov_base);
 			if (ret)
@@ -1032,7 +1032,6 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 			pr_debug("\tp %p - %p\n", iov.iov_base, iov.iov_base + iov.iov_len);
 
 			flags = ppb_xfer_flags(xfer, ppb);
-			
 
 			pr_debug("Writing pagemap segment: 0x%lx-0x%lx (%lu pages)\n",
 				 (unsigned long)iov.iov_base, (unsigned long)(iov.iov_base + iov.iov_len),
@@ -1042,11 +1041,8 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 				return -1;
 			if ((flags & PE_PRESENT) && xfer->write_pages(xfer, ppb->p[0], iov.iov_len))
 				return -1;
-			
-
 		}
 	}
-	
 
 	ret = dump_holes(xfer, pp, &cur_hole, NULL);
 	if (ret)
@@ -1386,16 +1382,62 @@ static int page_server_add(int sk, struct page_server_iov *pi, u32 flags, bool c
 
 static int page_server_get_pages(int sk, struct page_server_iov *pi)
 {
-	/* Enqueue page requests for background processing (COW unified thread) */
-	cow_enqueue_page_requests(pi->vaddr, pi->nr_pages, sk, pi->dst_id);
+	struct pstree_item *item;
+	struct page_pipe *pp;
+	unsigned long len, nr_pages;
+	int ret;
 
-	pr_debug("Enqueued %lu page requests starting at vaddr=%lx\n",
-		 (unsigned long)pi->nr_pages, (unsigned long)pi->vaddr);
+	/* COW mode: enqueue for background processing */
+	if (opts.cow_dump) {
+		cow_enqueue_page_requests(pi->vaddr, pi->nr_pages, sk, pi->dst_id);
+		pr_debug("Enqueued %lu page requests starting at vaddr=%lx\n",
+			 (unsigned long)pi->nr_pages, (unsigned long)pi->vaddr);
+		return 0;
+	}
 
-	/* Return immediately - background thread will send the response */
+	/* Non-COW mode: original synchronous page serving */
+	item = pstree_item_by_virt(pi->dst_id);
+	pp = dmpi(item)->mem_pp;
+
+	/* page_pipe_read() uses 'unsigned long *' but pi->nr_pages is u64.
+	 * Use a temporary variable to fix the incompatible pointer type
+	 * on 32-bit platforms (e.g. armv7). */
+	nr_pages = pi->nr_pages;
+	ret = page_pipe_read(pp, &pipe_read_dest, pi->vaddr, &nr_pages, PPB_LAZY);
+	if (ret)
+		return ret;
+
+	/*
+	 * The pi is reused for send_psi here, so .nr_pages, .vaddr and
+	 * .dst_id all remain intact.
+	 */
+
+	pi->nr_pages = nr_pages;
+	if (pi->nr_pages == 0) {
+		pr_debug("no iovs found, zero pages\n");
+		return -1;
+	}
+
+	pi->cmd = encode_ps_cmd(PS_IOV_ADD_F, PE_PRESENT);
+	if (send_psi(sk, pi))
+		return -1;
+
+	len = pi->nr_pages * PAGE_SIZE;
+
+	if (opts.tls) {
+		if (tls_send_data_from_fd(pipe_read_dest.p[0], len))
+			return -1;
+	} else {
+		ret = splice(pipe_read_dest.p[0], NULL, sk, NULL, len, SPLICE_F_MOVE);
+		if (ret != len)
+			return -1;
+	}
+
+	tcp_nodelay(sk, true);
+
 	return 0;
 }
-extern void pstree_switch_state(struct pstree_item *root_item, int st);
+
 static int page_server_serve(int sk)
 {
 	int ret = -1;
@@ -1424,14 +1466,15 @@ static int page_server_serve(int sk)
 		tcp_cork(sk, true);
 	}
 
-
 	/* Initialize page request queue on first use (COW unified thread) */
-	cow_init_page_request_queue();
+	if (opts.cow_dump)
+		cow_init_page_request_queue();
 
 	while (1) {
 		struct page_server_iov pi;
-		u32 cmd;		
-		ret = __recv(sk, &pi, sizeof(pi), MSG_WAITALL);		
+		u32 cmd;
+
+		ret = __recv(sk, &pi, sizeof(pi), MSG_WAITALL);
 		if (!ret)
 			break;
 
@@ -1444,8 +1487,9 @@ static int page_server_serve(int sk)
 		flushed = false;
 		cmd = decode_ps_cmd(pi.cmd);
 
-		/* Check and print stats on each iteration */
-		check_and_print_stats();
+		/* Check and print stats on each iteration (COW mode only) */
+		if (opts.cow_dump)
+			check_and_print_stats();
 
 		switch (cmd) {
 		case PS_IOV_OPEN:
@@ -1518,11 +1562,21 @@ static int page_server_serve(int sk)
 			ret = page_server_get_pages(sk, &pi);
 			break;
 		case PS_IOV_GET_ALL:
+			if (!opts.cow_dump) {
+				pr_err("PS_IOV_GET_ALL requires COW mode\n");
+				ret = -1;
+				break;
+			}
 			ps_stats.serve_get++;
 			ret = cow_page_server_get_all_pages(sk, pi.dst_id);
 			break;
 		case PS_IOV_START_RESTORE:
-			/* Signal to start the restore process */
+			/* Signal to start the restore process (COW mode) */
+			if (!opts.cow_dump) {
+				pr_err("PS_IOV_START_RESTORE requires COW mode\n");
+				ret = -1;
+				break;
+			}
 			pr_info("Received start restore signal\n");
 			ret = 0;
 			break;
@@ -1532,6 +1586,11 @@ static int page_server_serve(int sk)
 			 * Break out of the serve loop so the primary can
 			 * proceed to Phase 3 (skeleton dump + dirty scan).
 			 */
+			if (!opts.cow_dump) {
+				pr_err("PS_IOV_BULK_COMPLETE_ACK requires COW mode\n");
+				ret = -1;
+				break;
+			}
 			pr_info("Received bulk complete ACK from replica\n");
 			ret = 0;
 			flushed = true;
@@ -1542,6 +1601,11 @@ static int page_server_serve(int sk)
 			 * Replica acknowledges all_pages_sent signal received.
 			 * Set flag so unified_page_server_thread can continue.
 			 */
+			if (!opts.cow_dump) {
+				pr_err("PS_IOV_ALL_PAGES_SENT_ACK requires COW mode\n");
+				ret = -1;
+				break;
+			}
 			pr_info("Received all_pages_sent ACK from replica\n");
 			set_all_pages_sent_ack_received();
 			ret = 0;
@@ -1554,13 +1618,11 @@ static int page_server_serve(int sk)
 			break;
 		}
 
-		if (ret){
+		if (ret)
 			break;
-		}
 		if (pi.cmd == PS_IOV_CLOSE || pi.cmd == PS_IOV_FORCE_CLOSE ||
-		    decode_ps_cmd(pi.cmd) == PS_IOV_BULK_COMPLETE_ACK) {
+		    decode_ps_cmd(pi.cmd) == PS_IOV_BULK_COMPLETE_ACK)
 			break;
-		}
 	}
 
 	if (receiving_pages && !ret && !flushed) {
@@ -1573,7 +1635,7 @@ static int page_server_serve(int sk)
 	 * keep the socket open for Phase 4 dirty bitmap transfer.
 	 * Store the socket globally so send_cow_dirty_bitmap() can use it.
 	 */
-	if (bulk_ack_received) {
+	if (opts.cow_dump && bulk_ack_received) {
 		pr_info("Bulk ACK received, storing socket (sk=%d) for dirty bitmap\n", sk);
 		page_server_sk = sk;
 		pr_info("page_server_sk now set to %d\n", page_server_sk);
@@ -2036,7 +2098,9 @@ int connect_to_page_server_to_recv(int epfd)
 {
 	if (connect_to_page_server())
 		return -1;
-	reset_bulk_stream_done();
+
+	if (opts.cow_dump)
+		reset_bulk_stream_done();
 
 	ps_rfd.fd = page_server_sk;
 	/* Use bulk stream reader in bulk mode, regular reader in on-demand mode */
