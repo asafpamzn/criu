@@ -1544,7 +1544,7 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 			cow_uffd_stats_inc_pf(1);
 		pf_tracker_add(address, 1, lpi->pid, true);
 
-		if (phase3_active) {
+		if (cow_is_phase3_active()) {
 			/* In Phase 3, pages arrive via convergence stream */
 			if (request_remote_pages(lpi->pr.img_id, address, 1) < 0) {
 				lp_err(lpi, "Error requesting page 0x%llx in Phase 3\n", address);
