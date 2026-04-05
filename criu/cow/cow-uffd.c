@@ -702,13 +702,6 @@ int cow_handle_exit(struct list_head *lpis)
 	if (send_all_pages_sent_ack() < 0)
 		pr_warn("Failed to send all_pages_sent ACK\n");
 
-	/*
-	 * Discard any remaining EAGAIN requests before freeing lpis.
-	 * This shouldn't happen normally (queue should be empty), but
-	 * ensures proper cleanup if there's a race condition.
-	 */
-	cow_discard_all_eagain_requests();
-
 	/* Cleanup all lpis */
 	list_for_each_entry_safe(lpi, n, lpis, l) {
 		lazy_pages_summary(lpi);
