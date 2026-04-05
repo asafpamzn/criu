@@ -848,6 +848,7 @@ static int uffd_copy(struct lazy_pages_info *lpi, __u64 address, unsigned long *
 {
 	struct uffdio_copy uffdio_copy;
 	unsigned long len = *nr_pages * page_size();
+	int ret;
 
 	uffdio_copy.dst = address;
 	uffdio_copy.src = (unsigned long)lpi->buf;
@@ -858,75 +859,37 @@ static int uffd_copy(struct lazy_pages_info *lpi, __u64 address, unsigned long *
 	lp_debug(lpi, "uffd_copy: 0x%llx/%ld\n", uffdio_copy.dst, len);
 
 	if (ioctl(lpi->lpfd.fd, UFFDIO_COPY, &uffdio_copy) == -1) {
-		/* In COW dump mode, queue EAGAIN requests instead of blocking */
-		if (errno == EAGAIN && opts.cow_dump) {
-			pf_tracker_set_state(address, PF_STATE_PENDING_EAGAIN);
-			/* page_state set to EAGAIN_QUEUED inside cow_queue_eagain_request on success */
-			return cow_queue_eagain_request(lpi, address, *nr_pages, lpi->buf, "copy");
+		int err = errno;
+
+		/* COW mode: use helper for EAGAIN/EEXIST handling */
+		if (opts.cow_dump) {
+			ret = cow_uffd_handle_copy_error(lpi, address, *nr_pages,
+							lpi->buf, err, uffdio_copy.copy);
+			if (ret != 0)
+				return ret < 0 ? -1 : 0;
 		}
 
-		/* Non-COW mode or non-EAGAIN: check for other errors */
-		if (uffd_check_op_error(lpi, "copy", nr_pages, uffdio_copy.copy)) {
-			lp_err(lpi, "UFFDIO_COPY got error\n");
-			page_state_print_history(address);
-			/*
-			 * Don't set DISCARDED if page is DIRTY/UNMAPPED.
-			 * These are terminal states or will be re-sent.
-			 */
-			if (!unmapped_tracker_is_unmapped(address) &&
-			    page_state_get(address) != PAGE_STATE_DIRTY)
-				page_state_set(address, PAGE_STATE_DISCARDED);
+		/* Non-COW mode or unhandled error */
+		if (uffd_check_op_error(lpi, "copy", nr_pages, uffdio_copy.copy))
 			return -1;
-		}
-
-		/*
-		 * EEXIST means duplicate copy attempt - this is a bug!
-		 * Report and fail to catch coordination issues.
-		 */
-		if (errno == EEXIST) {
-			lp_err(lpi, "BUG: UFFDIO_COPY EEXIST at 0x%llx - duplicate copy!\n", address);
-			page_state_print_history(address);
-			return -1;
-		}
-		/* Don't set DISCARDED if page is DIRTY/UNMAPPED */
-		if (!unmapped_tracker_is_unmapped(address) &&
-		    page_state_get(address) != PAGE_STATE_DIRTY)
-			page_state_set(address, PAGE_STATE_DISCARDED);
 		return 0;
 	}
 
 	if (uffdio_copy.copy < 0) {
-		/* Soft userfaultfd error: encoded as -errno in copy */
-		errno = -uffdio_copy.copy;
+		int err = -uffdio_copy.copy;
+		errno = err;
 
-		/* In COW dump mode, queue EAGAIN requests */
-		if (errno == EAGAIN && opts.cow_dump) {
-			pf_tracker_set_state(address, PF_STATE_PENDING_EAGAIN);
-			/* page_state set to EAGAIN_QUEUED inside cow_queue_eagain_request on success */
-			return cow_queue_eagain_request(lpi, address, *nr_pages, lpi->buf, "copy");
+		/* COW mode: use helper for EAGAIN/EEXIST handling */
+		if (opts.cow_dump) {
+			ret = cow_uffd_handle_copy_error(lpi, address, *nr_pages,
+							lpi->buf, err, uffdio_copy.copy);
+			if (ret != 0)
+				return ret < 0 ? -1 : 0;
 		}
 
-		if (uffd_check_op_error(lpi, "copy", nr_pages, uffdio_copy.copy)) {
-			lp_err(lpi, "UFFDIO_COPY err \n");
-			page_state_print_history(address);
-			/* Don't set DISCARDED if page is DIRTY/UNMAPPED */
-			if (!unmapped_tracker_is_unmapped(address) &&
-			    page_state_get(address) != PAGE_STATE_DIRTY)
-				page_state_set(address, PAGE_STATE_DISCARDED);
+		/* Non-COW mode or unhandled error */
+		if (uffd_check_op_error(lpi, "copy", nr_pages, uffdio_copy.copy))
 			return -1;
-		}
-		/*
-		 * EEXIST means duplicate copy attempt - this is a bug!
-		 */
-		if (errno == EEXIST) {
-			lp_err(lpi, "BUG: UFFDIO_COPY soft EEXIST at 0x%llx - duplicate copy!\n", address);
-			page_state_print_history(address);
-			return -1;
-		}
-		/* Don't set DISCARDED if page is DIRTY/UNMAPPED */
-		if (!unmapped_tracker_is_unmapped(address) &&
-		    page_state_get(address) != PAGE_STATE_DIRTY)
-			page_state_set(address, PAGE_STATE_DISCARDED);
 		return 0;
 	}
 
@@ -938,9 +901,9 @@ static int uffd_copy(struct lazy_pages_info *lpi, __u64 address, unsigned long *
 
 	lpi->copied_pages += *nr_pages;
 
-	/* Mark as completed in the tracker */
-	pf_tracker_set_state(address, PF_STATE_COMPLETED);
-	page_state_set(address, PAGE_STATE_COPIED);
+	/* COW mode: track success */
+	if (opts.cow_dump)
+		cow_uffd_copy_success(address);
 
 	return 0;
 }
@@ -1019,98 +982,22 @@ static int uffd_io_complete(struct page_read *pr, unsigned long img_addr, unsign
 	return ret;
 }
 
+/*
+ * COW bulk mode io_complete callback.
+ * Used when opts.cow_dump is true but NOT using Phase 2/3 mode.
+ * In Phase 2/3 mode, pages flow through convergence_io_complete() or prebuffer_io_complete().
+ */
 static int uffd_io_complete_bulk(struct page_read *pr, unsigned long vaddr, unsigned long nr)
 {
-	struct lazy_pages_info *lpi;
-	unsigned long pages = nr;
-	unsigned long tracked_pages;
-	struct lazy_iov *iov;
-	int ret;
-	struct timespec t_start, t_copy, t_drop, t_end;
-
-	if (opts.cow_dump)
-		cow_uffd_stats_inc_io_bulk_start();
-
-	clock_gettime(CLOCK_MONOTONIC, &t_start);
-
-	lpi = container_of(pr, struct lazy_pages_info, pr);
-
-	/* Process may exit while pages are in flight */
-	if (lpi->exited) {
-		lp_debug(lpi, "Page at 0x%lx no longer needed existed\n", vaddr);
-		return 0;
-	}
-
-	/* Check if this address is still tracked (not removed/unmapped) */
-	/* First check main IOVs list */
-	iov = find_iov(lpi, vaddr);
-
-	/* If not found in main list, check requests list (may have been queued by page fault) */
-	if (!iov) {
-		list_for_each_entry(iov, &lpi->reqs, l) {
-			if (vaddr >= iov->start && vaddr < iov->end) {
-				lp_debug(lpi, "Page at 0x%lx found in requests list\n", vaddr);
-				goto found_iov;
-			}
-		}
-		iov = NULL; /* Reset if not found in reqs either */
-	}
-
-	if (!iov) {
-		lp_debug(lpi, "Page at 0x%lx no longer needed (unmapped), dropping\n", vaddr);
-		return 0;
-	}
-
-found_iov:
-	tracked_pages = (iov->end - vaddr) / PAGE_SIZE;
-	pages = min(pages, tracked_pages);
-	if (!pages)
-		return 0;
-
-	/*
-	 * NOTE: In COW mode, this callback is NOT called - pages flow through
-	 * convergence_io_complete() or prebuffer_io_complete() instead.
-	 * This code path is only for non-COW lazy pages.
-	 */
-
-	/* Copy pages to userspace */
-	ret = uffd_copy(lpi, vaddr, &pages);
-	clock_gettime(CLOCK_MONOTONIC, &t_copy);
-	if (opts.cow_dump)
-		cow_uffd_stats_add_copy((t_copy.tv_sec - t_start.tv_sec) * 1000000000 +
-					(t_copy.tv_nsec - t_start.tv_nsec));
-
-	if (ret < 0)
-		return ret;
-
-	/* Recheck if process exited (may be detected in uffd_copy) */
-	if (lpi->exited)
-		return 0;
-
-	/* CRITICAL: Remove copied pages from IOV tracking to prevent duplicate faults */
-#if 0 //TODO
-	ret = drop_iovs(lpi, vaddr, pages * PAGE_SIZE);
-		if (ret < 0)
-		return ret;
-
-#endif
-	clock_gettime(CLOCK_MONOTONIC, &t_drop);
-	if (opts.cow_dump)
-		cow_uffd_stats_add_drop((t_drop.tv_sec - t_copy.tv_sec) * 1000000000 +
-					(t_drop.tv_nsec - t_copy.tv_nsec));
-
-	clock_gettime(CLOCK_MONOTONIC, &t_end);
-	if (opts.cow_dump)
-		cow_uffd_stats_add_io_bulk((t_end.tv_sec - t_start.tv_sec) * 1000000000 +
-					   (t_end.tv_nsec - t_start.tv_nsec));
-
-	return ret;
+	struct lazy_pages_info *lpi = container_of(pr, struct lazy_pages_info, pr);
+	return cow_uffd_io_complete_bulk(lpi, vaddr, nr);
 }
 
 static int uffd_zero(struct lazy_pages_info *lpi, __u64 address, unsigned long nr_pages)
 {
 	struct uffdio_zeropage uffdio_zeropage;
 	unsigned long len = page_size() * nr_pages;
+	int ret;
 
 	uffdio_zeropage.range.start = address;
 	uffdio_zeropage.range.len = len;
@@ -1120,13 +1007,16 @@ static int uffd_zero(struct lazy_pages_info *lpi, __u64 address, unsigned long n
 	lp_debug(lpi, "zero page at 0x%llx\n", address);
 
 	if (ioctl(lpi->lpfd.fd, UFFDIO_ZEROPAGE, &uffdio_zeropage) == -1) {
-		/* In COW dump mode, queue EAGAIN requests instead of blocking */
-		if (errno == EAGAIN && opts.cow_dump) {
-			/* page_state set to EAGAIN_QUEUED inside cow_queue_eagain_request on success */
-			return cow_queue_eagain_request(lpi, address, nr_pages, NULL, "zero");
+		int err = errno;
+
+		/* COW mode: use helper for EAGAIN handling */
+		if (opts.cow_dump) {
+			ret = cow_uffd_handle_zero_error(lpi, address, nr_pages, err);
+			if (ret != 0)
+				return ret < 0 ? -1 : 0;
 		}
 
-		/* Non-COW mode or non-EAGAIN: check for errors */
+		/* Non-COW mode or unhandled error */
 		if (uffd_check_op_error(lpi, "zero", &nr_pages, uffdio_zeropage.zeropage))
 			return -1;
 		return 0;
@@ -1134,12 +1024,14 @@ static int uffd_zero(struct lazy_pages_info *lpi, __u64 address, unsigned long n
 
 	/* Check for soft error */
 	if (uffdio_zeropage.zeropage < 0) {
-		errno = -uffdio_zeropage.zeropage;
+		int err = -uffdio_zeropage.zeropage;
+		errno = err;
 
-		/* In COW dump mode, queue EAGAIN requests */
-		if (errno == EAGAIN && opts.cow_dump) {
-			/* page_state set to EAGAIN_QUEUED inside cow_queue_eagain_request on success */
-			return cow_queue_eagain_request(lpi, address, nr_pages, NULL, "zero");
+		/* COW mode: use helper for EAGAIN handling */
+		if (opts.cow_dump) {
+			ret = cow_uffd_handle_zero_error(lpi, address, nr_pages, err);
+			if (ret != 0)
+				return ret < 0 ? -1 : 0;
 		}
 
 		if (uffd_check_op_error(lpi, "zero", &nr_pages, uffdio_zeropage.zeropage))
@@ -1147,7 +1039,10 @@ static int uffd_zero(struct lazy_pages_info *lpi, __u64 address, unsigned long n
 		return 0;
 	}
 
-	page_state_set(address, PAGE_STATE_COPIED);
+	/* COW mode: track success */
+	if (opts.cow_dump)
+		page_state_set(address, PAGE_STATE_COPIED);
+
 	return 0;
 }
 
@@ -1793,38 +1688,11 @@ close_uffd:
 /* Pre-buffer and convergence infrastructure is in cow-uffd.c */
 static struct epoll_rfd lazy_listen_rfd;
 
-/* Convergence callback wrapper - calls into cow-uffd.c logic */
+/* Convergence callback wrapper - delegates to cow-uffd.c */
 static int convergence_io_complete(unsigned long dst_id, unsigned long vaddr,
 				   unsigned long nr_pages, void *priv)
 {
-	void *buf = priv;
-	struct lazy_pages_info *lpi;
-	int ret;
-
-	/* Find lpi for this vaddr and do UFFDIO_COPY */
-	list_for_each_entry(lpi, &lpis, l) {
-		unsigned long pages;
-
-		if (lpi->exited || lpi->lpfd.fd < 0)
-			continue;
-		if (!find_iov(lpi, vaddr))
-			continue;
-
-		/* Copy buffer to lpi->buf and call uffd_copy */
-		memcpy(lpi->buf, buf, nr_pages * PAGE_SIZE);
-		pages = nr_pages;
-		ret = uffd_copy(lpi, vaddr, &pages);
-		if (ret < 0) {
-			lp_err(lpi, "Direct convergence copy failed at 0x%lx\n", vaddr);
-			return ret;
-		}
-		lp_debug(lpi, "Direct copy %lu pages at 0x%lx (convergence)\n", pages, vaddr);
-		return 0;
-	}
-
-	pr_err("BUG: Convergence callback with no lpi for vaddr 0x%lx\n", vaddr);
-	BUG();
-	return -1;
+	return cow_convergence_copy_page(&lpis, vaddr, nr_pages, priv);
 }
 
 /* Switch to convergence mode - wrapper that sets up callback */

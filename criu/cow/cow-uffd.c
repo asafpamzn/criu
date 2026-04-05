@@ -1614,3 +1614,283 @@ int cow_handle_page_fault_buffer(struct lazy_pages_info *lpi,
 
 	return 1;
 }
+
+/*
+ * Handle UFFDIO_COPY errors in COW mode.
+ * Returns:
+ *   1 - error handled (EAGAIN queued, EEXIST ignored)
+ *   0 - continue with normal error handling
+ *  -1 - fatal error
+ */
+int cow_uffd_handle_copy_error(struct lazy_pages_info *lpi,
+			       __u64 address, unsigned long nr_pages,
+			       void *buf, int saved_errno, long copy_result)
+{
+	/* EAGAIN: queue for retry instead of blocking */
+	if (saved_errno == EAGAIN) {
+		pf_tracker_set_state(address, PF_STATE_PENDING_EAGAIN);
+		return cow_queue_eagain_request(lpi, address, nr_pages, buf, "copy");
+	}
+
+	/* EEXIST: duplicate copy - this is a coordination bug */
+	if (saved_errno == EEXIST) {
+		lp_err(lpi, "BUG: UFFDIO_COPY EEXIST at 0x%llx - duplicate copy!\n",
+		       (unsigned long long)address);
+		page_state_print_history(address);
+		return -1;
+	}
+
+	/* Log errors for debugging */
+	lp_err(lpi, "UFFDIO_COPY error at 0x%llx: errno=%d copy=%ld\n",
+	       (unsigned long long)address, saved_errno, copy_result);
+	page_state_print_history(address);
+
+	/* Mark as discarded unless it's unmapped or dirty */
+	if (!unmapped_tracker_is_unmapped(address) &&
+	    page_state_get(address) != PAGE_STATE_DIRTY)
+		page_state_set(address, PAGE_STATE_DISCARDED);
+
+	return 0;  /* Let caller continue with normal error handling */
+}
+
+/*
+ * Handle UFFDIO_ZEROPAGE errors in COW mode.
+ * Returns:
+ *   1 - error handled (EAGAIN queued)
+ *   0 - continue with normal error handling
+ *  -1 - fatal error
+ */
+int cow_uffd_handle_zero_error(struct lazy_pages_info *lpi,
+			       __u64 address, unsigned long nr_pages,
+			       int saved_errno)
+{
+	/* EAGAIN: queue for retry */
+	if (saved_errno == EAGAIN)
+		return cow_queue_eagain_request(lpi, address, nr_pages, NULL, "zero");
+
+	return 0;  /* Let caller continue with normal error handling */
+}
+
+/*
+ * Track successful UFFDIO_COPY in COW mode.
+ */
+void cow_uffd_copy_success(unsigned long address)
+{
+	pf_tracker_set_state(address, PF_STATE_COMPLETED);
+	page_state_set(address, PAGE_STATE_COPIED);
+}
+
+/*
+ * Handle page fault in COW mode (called when opts.cow_dump is true).
+ * This handles the COW-specific logic:
+ *   - Check if all pages sent -> zero-fill
+ *   - Check server availability
+ *   - Handle new VMAs
+ *   - Request from page server (Phase 3 vs non-Phase 3)
+ *
+ * Returns:
+ *   0 - success (page requested or waiting for drain)
+ *  -1 - error
+ *   COW_PF_NOT_HANDLED - caller should continue with normal path
+ */
+#define COW_PF_NOT_HANDLED 2
+
+int cow_handle_page_fault(struct lazy_pages_info *lpi,
+			  unsigned long long address)
+{
+	struct lazy_iov *iov;
+	unsigned long long img_addr;
+
+	/* Check if all pages have been sent */
+	if (cow_is_all_pages_sent_received()) {
+		lp_debug(lpi, "Page 0x%llx not in buffer, all pages sent - zero-filling\n", address);
+		page_state_set(address, PAGE_STATE_PF_PENDING);
+		return COW_PF_NOT_HANDLED;  /* Caller will call uffd_zero */
+	}
+
+	/* Check if server is available */
+	if (get_page_server_sk() < 0) {
+		lp_debug(lpi, "Page 0x%llx server unavailable - waiting for drain\n", address);
+		return 0;
+	}
+
+	iov = cow_find_iov(lpi, address);
+
+	if (!iov) {
+		if (cow_is_dirty_bitmap_received()) {
+			lp_debug(lpi, "Page 0x%llx IOV not found - zero fill\n", address);
+			return COW_PF_NOT_HANDLED;  /* Caller will call uffd_zero */
+		}
+		lp_debug(lpi, "Page 0x%llx IOV not found - waiting for drain\n", address);
+		return 0;
+	}
+
+	/* New VMAs from Phase 3 - request directly from server */
+	if (iov->is_new_vma) {
+		lp_debug(lpi, "Page 0x%llx in new VMA - requesting from server\n", address);
+		cow_uffd_stats_inc_pf(1);
+		pf_tracker_add(address, 1, lpi->pid, true);
+		if (request_remote_pages(lpi->pr.img_id, address, 1) < 0) {
+			lp_err(lpi, "Error requesting new VMA page 0x%llx\n", address);
+			return -1;
+		}
+		return 0;
+	}
+
+	img_addr = iov->img_start + (address - iov->start);
+
+	cow_uffd_stats_inc_pf(1);
+	pf_tracker_add(address, 1, lpi->pid, true);
+
+	if (cow_is_phase3_active()) {
+		/* In Phase 3, pages arrive via convergence stream */
+		if (request_remote_pages(lpi->pr.img_id, address, 1) < 0) {
+			lp_err(lpi, "Error requesting page 0x%llx in Phase 3\n", address);
+			return -1;
+		}
+	} else {
+		/* Pre-Phase 3: request via page reader */
+		return COW_PF_NOT_HANDLED;  /* Caller will use uffd_handle_pages */
+	}
+
+	return 0;
+}
+
+/*
+ * Copy page data for convergence callback.
+ * Finds the lpi that owns the vaddr and does UFFDIO_COPY.
+ *
+ * Returns: 0 on success, -1 on error
+ */
+int cow_convergence_copy_page(struct list_head *lpis,
+			      unsigned long vaddr,
+			      unsigned long nr_pages, void *buf)
+{
+	struct lazy_pages_info *lpi;
+
+	list_for_each_entry(lpi, lpis, l) {
+		struct uffdio_copy uffd_copy;
+		unsigned long pages;
+		int ret;
+
+		if (lpi->exited || lpi->lpfd.fd < 0)
+			continue;
+		if (!cow_find_iov(lpi, vaddr))
+			continue;
+
+		/* Found the lpi - copy buffer to lpi->buf and call UFFDIO_COPY */
+		memcpy(lpi->buf, buf, nr_pages * PAGE_SIZE);
+
+		uffd_copy.dst = vaddr;
+		uffd_copy.src = (unsigned long)lpi->buf;
+		uffd_copy.len = nr_pages * PAGE_SIZE;
+		uffd_copy.mode = 0;
+		uffd_copy.copy = 0;
+
+		ret = ioctl(lpi->lpfd.fd, UFFDIO_COPY, &uffd_copy);
+		if (ret < 0) {
+			if (errno == EEXIST) {
+				/* Already copied - not an error */
+				lp_debug(lpi, "Convergence EEXIST at 0x%lx (already copied)\n", vaddr);
+				return 0;
+			}
+			if (errno == EAGAIN) {
+				/* Queue for retry */
+				pf_tracker_set_state(vaddr, PF_STATE_PENDING_EAGAIN);
+				return cow_queue_eagain_request(lpi, vaddr, nr_pages, lpi->buf, "convergence");
+			}
+			lp_err(lpi, "Direct convergence copy failed at 0x%lx errno=%d\n", vaddr, errno);
+			return -1;
+		}
+
+		pages = uffd_copy.copy / PAGE_SIZE;
+		lpi->copied_pages += pages;
+		lp_debug(lpi, "Direct copy %lu pages at 0x%lx (convergence)\n", pages, vaddr);
+		return 0;
+	}
+
+	pr_err("BUG: Convergence callback with no lpi for vaddr 0x%lx\n", vaddr);
+	BUG();
+	return -1;
+}
+
+/*
+ * COW bulk IO complete callback.
+ * Called when a bulk page read completes in COW mode (without page server Phase 2/3).
+ *
+ * NOTE: In COW Phase 2/3 mode (opts.cow_dump && opts.use_page_server),
+ * pages flow through prebuffer_io_complete() or convergence_io_complete() instead.
+ * This callback is for COW mode without the page server phased approach.
+ */
+int cow_uffd_io_complete_bulk(struct lazy_pages_info *lpi,
+			      unsigned long vaddr, unsigned long nr_pages)
+{
+	struct lazy_iov *iov;
+	unsigned long pages = nr_pages;
+	unsigned long tracked_pages;
+	struct uffdio_copy uffd_copy;
+	int ret;
+	struct timespec t_start, t_end;
+
+	cow_uffd_stats_inc_io_bulk_start();
+	clock_gettime(CLOCK_MONOTONIC, &t_start);
+
+	/* Process may exit while pages are in flight */
+	if (lpi->exited) {
+		lp_debug(lpi, "Page at 0x%lx no longer needed (exited)\n", vaddr);
+		return 0;
+	}
+
+	/* Check if address is still tracked */
+	iov = cow_find_iov(lpi, vaddr);
+
+	/* Also check requests list */
+	if (!iov) {
+		struct lazy_iov *req;
+		list_for_each_entry(req, &lpi->reqs, l) {
+			if (vaddr >= req->start && vaddr < req->end) {
+				lp_debug(lpi, "Page at 0x%lx found in requests list\n", vaddr);
+				iov = req;
+				break;
+			}
+		}
+	}
+
+	if (!iov) {
+		lp_debug(lpi, "Page at 0x%lx no longer needed (unmapped), dropping\n", vaddr);
+		return 0;
+	}
+
+	tracked_pages = (iov->end - vaddr) / PAGE_SIZE;
+	pages = min(pages, tracked_pages);
+	if (!pages)
+		return 0;
+
+	/* Copy pages to userspace */
+	uffd_copy.dst = vaddr;
+	uffd_copy.src = (unsigned long)lpi->buf;
+	uffd_copy.len = pages * PAGE_SIZE;
+	uffd_copy.mode = 0;
+	uffd_copy.copy = 0;
+
+	ret = ioctl(lpi->lpfd.fd, UFFDIO_COPY, &uffd_copy);
+	if (ret < 0) {
+		int err = errno;
+		ret = cow_uffd_handle_copy_error(lpi, vaddr, pages, lpi->buf, err, uffd_copy.copy);
+		if (ret != 0)
+			return ret < 0 ? ret : 0;
+		/* Normal error - check if process exited */
+		if (lpi->exited)
+			return 0;
+		return -1;
+	}
+
+	lpi->copied_pages += pages;
+	cow_uffd_copy_success(vaddr);
+
+	clock_gettime(CLOCK_MONOTONIC, &t_end);
+	cow_uffd_stats_add_io_bulk((t_end.tv_sec - t_start.tv_sec) * 1000000000 +
+				   (t_end.tv_nsec - t_start.tv_nsec));
+
+	return 0;
+}

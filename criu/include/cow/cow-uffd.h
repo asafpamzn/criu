@@ -171,4 +171,39 @@ extern bool cow_is_phase3_active(void);
 extern int cow_handle_page_fault_buffer(struct lazy_pages_info *lpi,
 					unsigned long long address);
 
+/*
+ * COW-specific uffd_copy/uffd_zero error handling
+ * Returns: 0 = continue/success, -1 = fatal error, 1 = handled (queued EAGAIN)
+ */
+extern int cow_uffd_handle_copy_error(struct lazy_pages_info *lpi,
+				      __u64 address, unsigned long nr_pages,
+				      void *buf, int saved_errno, long copy_result);
+extern int cow_uffd_handle_zero_error(struct lazy_pages_info *lpi,
+				      __u64 address, unsigned long nr_pages,
+				      int saved_errno);
+extern void cow_uffd_copy_success(unsigned long address);
+
+/*
+ * COW page fault handling (called from handle_page_fault when opts.cow_dump)
+ * Returns: 0 = success, -1 = error
+ */
+extern int cow_handle_page_fault(struct lazy_pages_info *lpi,
+				 unsigned long long address);
+
+/*
+ * COW convergence IO complete - called when page arrives from convergence stream
+ * Finds lpi for vaddr and copies page data.
+ * Returns: 0 = success, -1 = error
+ */
+extern int cow_convergence_copy_page(struct list_head *lpis,
+				     unsigned long vaddr,
+				     unsigned long nr_pages, void *buf);
+
+/*
+ * COW bulk IO complete callback
+ * This is the io_complete callback for COW mode page reads.
+ */
+extern int cow_uffd_io_complete_bulk(struct lazy_pages_info *lpi,
+				     unsigned long vaddr, unsigned long nr_pages);
+
 #endif /* __CR_COW_UFFD_H__ */
