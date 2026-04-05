@@ -534,7 +534,7 @@ static void *background_drain_thread(void *arg)
 					__sync_fetch_and_sub(&cow_buffer.nr_pages, 1);
 
 					/* Find uffd for this address and UFFDIO_COPY */
-					uffd = get_uffd_for_vaddr(vaddr);
+					uffd = cow_get_uffd_for_vaddr(drain_lpis, vaddr);
 					if (uffd >= 0) {
 						struct uffdio_copy uffd_copy = {
 							.dst = vaddr,
@@ -1085,8 +1085,6 @@ int cow_process_eagain_requests(void)
 	struct uffd_eagain_request *req, *n;
 	int ret;
 	struct timespec t_start, t_end;
-	static int last_queue_empty = -1;
-	int queue_empty;
 
 	clock_gettime(CLOCK_MONOTONIC, &t_start);
 
