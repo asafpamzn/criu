@@ -1699,7 +1699,6 @@ int cow_handle_page_fault(struct lazy_pages_info *lpi,
 			  unsigned long long address)
 {
 	struct lazy_iov *iov;
-	unsigned long long img_addr;
 
 	/* Check if all pages have been sent */
 	if (cow_is_all_pages_sent_received()) {
@@ -1736,8 +1735,6 @@ int cow_handle_page_fault(struct lazy_pages_info *lpi,
 		}
 		return 0;
 	}
-
-	img_addr = iov->img_start + (address - iov->start);
 
 	cow_uffd_stats_inc_pf(1);
 	pf_tracker_add(address, 1, lpi->pid, true);
