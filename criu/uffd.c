@@ -861,7 +861,7 @@ static int uffd_copy(struct lazy_pages_info *lpi, __u64 address, unsigned long *
 		/* In COW dump mode, queue EAGAIN requests instead of blocking */
 		if (errno == EAGAIN && opts.cow_dump) {
 			pf_tracker_set_state(address, PF_STATE_PENDING_EAGAIN);
-			page_state_set(address, PAGE_STATE_EAGAIN_QUEUED);
+			/* page_state set to EAGAIN_QUEUED inside cow_queue_eagain_request on success */
 			return cow_queue_eagain_request(lpi, address, *nr_pages, lpi->buf, "copy");
 		}
 
@@ -902,7 +902,7 @@ static int uffd_copy(struct lazy_pages_info *lpi, __u64 address, unsigned long *
 		/* In COW dump mode, queue EAGAIN requests */
 		if (errno == EAGAIN && opts.cow_dump) {
 			pf_tracker_set_state(address, PF_STATE_PENDING_EAGAIN);
-			page_state_set(address, PAGE_STATE_EAGAIN_QUEUED);
+			/* page_state set to EAGAIN_QUEUED inside cow_queue_eagain_request on success */
 			return cow_queue_eagain_request(lpi, address, *nr_pages, lpi->buf, "copy");
 		}
 
@@ -1123,7 +1123,7 @@ static int uffd_zero(struct lazy_pages_info *lpi, __u64 address, unsigned long n
 	if (ioctl(lpi->lpfd.fd, UFFDIO_ZEROPAGE, &uffdio_zeropage) == -1) {
 		/* In COW dump mode, queue EAGAIN requests instead of blocking */
 		if (errno == EAGAIN && opts.cow_dump) {
-			page_state_set(address, PAGE_STATE_EAGAIN_QUEUED);
+			/* page_state set to EAGAIN_QUEUED inside cow_queue_eagain_request on success */
 			return cow_queue_eagain_request(lpi, address, nr_pages, NULL, "zero");
 		}
 
@@ -1139,7 +1139,7 @@ static int uffd_zero(struct lazy_pages_info *lpi, __u64 address, unsigned long n
 
 		/* In COW dump mode, queue EAGAIN requests */
 		if (errno == EAGAIN && opts.cow_dump) {
-			page_state_set(address, PAGE_STATE_EAGAIN_QUEUED);
+			/* page_state set to EAGAIN_QUEUED inside cow_queue_eagain_request on success */
 			return cow_queue_eagain_request(lpi, address, nr_pages, NULL, "zero");
 		}
 
@@ -1438,7 +1438,7 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 				if (errno == EAGAIN) {
 					/* Queue for later retry instead of blocking */
 					pf_tracker_set_state(address, PF_STATE_PENDING_EAGAIN);
-					page_state_set(address, PAGE_STATE_EAGAIN_QUEUED);
+					/* page_state set to EAGAIN_QUEUED inside cow_queue_eagain_request on success */
 					if (cow_queue_eagain_request(lpi, address, 1, data, "pf_buffer") < 0) {
 						page_pool_put(data);
 						return -1;

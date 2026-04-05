@@ -953,6 +953,9 @@ int cow_queue_eagain_request(struct lazy_pages_info *lpi, __u64 address,
 
 	list_add_tail(&req->l, &eagain_requests);
 
+	/* Only set page state after successfully queueing */
+	page_state_set(address, PAGE_STATE_EAGAIN_QUEUED);
+
 	pr_debug("Queued EAGAIN request 0x%llx (op=%s)\n", address, op_name);
 	return 0;
 }
@@ -972,8 +975,7 @@ int cow_queue_drain_eagain_request(struct list_head *lpis, unsigned long vaddr, 
 		if (!cow_find_iov(lpi, vaddr))
 			continue;
 
-		/* Found the lpi - queue the request */
-		page_state_set(vaddr, PAGE_STATE_EAGAIN_QUEUED);
+		/* Found the lpi - queue the request (page_state set inside on success) */
 		return cow_queue_eagain_request(lpi, vaddr, 1, data, "drain");
 	}
 
