@@ -2094,42 +2094,15 @@ int cr_lazy_pages(bool daemon)
 	}
 
 	if (opts.use_page_server) {
-		struct lazy_pages_info *lpi;
-
 		if (connect_to_page_server_to_recv(epollfd)) {
 			xfree(events);
 			return -1;
-		}
-
-		/* Request all pages for bulk mode */
-		if (opts.cow_dump) {
-			/* Initialize COW infrastructure */
-			if (cow_lazy_pages_init() < 0) {
-				pr_err("Failed to initialize COW infrastructure\n");
-				xfree(events);
-				return -1;
-			}
-
-			list_for_each_entry(lpi, &lpis, l) {
-				pr_info("Requesting all remote pages for pid=%d\n",
-					lpi->pid);
-				if (request_all_remote_pages(lpi->pr.img_id) < 0) {
-					pr_err("Failed to request pages for pid=%d\n",
-					       lpi->pid);
-					xfree(events);
-					return -1;
-				}
-			}
 		}
 	}
 
 	ret = handle_requests(epollfd, &events, nr_fds);
 
 	disconnect_from_page_server();
-
-	/* Clean up COW infrastructure if it was initialized */
-	if (opts.cow_dump)
-		cow_lazy_pages_cleanup();
 
 	xfree(events);
 	return ret;
