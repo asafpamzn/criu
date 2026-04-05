@@ -8,7 +8,7 @@
 #include "proc_parse.h"
 #include "inventory.pb-c.h"
 #include "pagemap-cache.h"
-#include "cow-mem.h"
+#include "cow/cow-mem.h"
 
 struct parasite_ctl;
 struct vm_area_list;

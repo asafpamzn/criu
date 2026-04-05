@@ -13,7 +13,7 @@
 #include <time.h>
 #include <lz4.h>
 
-#include "cow-page-xfer.h"
+#include "cow/cow-page-xfer.h"
 #include "page-xfer.h"
 #include "page.h"
 #include "pstree.h"
@@ -22,7 +22,7 @@
 #include "image.h"
 #include "pagemap.h"
 #include "mem.h"
-#include "cow-unified-thread.h"
+#include "cow/cow-unified-thread.h"
 #include "common/list.h"
 #include "common/bug.h"
 #include "util.h"

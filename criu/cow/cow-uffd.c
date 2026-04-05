@@ -9,7 +9,7 @@
 
 #include "int.h"
 #include "page.h"
-#include "cow-uffd.h"
+#include "cow/cow-uffd.h"
 #include "uffd.h"
 #include "criu-log.h"
 #include "xmalloc.h"

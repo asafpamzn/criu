@@ -19,12 +19,12 @@
 #include "page.h"
 #include "criu-log.h"
 #include "page-xfer.h"
-#include "cow-page-xfer.h"
-#include "cow-bulk-send.h"
+#include "cow/cow-page-xfer.h"
+#include "cow/cow-bulk-send.h"
 #include "cr_options.h"
 #include "tls.h"
 #include "page-pool.h"
-#include "cow-uffd.h"
+#include "cow/cow-uffd.h"
 #include "util.h"
 
 #undef LOG_PREFIX

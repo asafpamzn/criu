@@ -11,7 +11,7 @@
 #include "common/list.h"
 #include "uffd-internal.h"
 #include "uffd.h"
-#include "cow-uffd.h"
+#include "cow/cow-uffd.h"
 #include "page-xfer.h"
 
 #undef LOG_PREFIX

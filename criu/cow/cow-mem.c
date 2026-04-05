@@ -9,7 +9,7 @@
 
 #include "types.h"
 #include "cr_options.h"
-#include "cow-mem.h"
+#include "cow/cow-mem.h"
 #include "log.h"
 #include "xmalloc.h"
 #include "atomic-bitmap.h"

@@ -24,13 +24,13 @@
 #include "common/list.h"
 #include "servicefd.h"
 #include "uffd.h"
-#include "cow-uffd.h"
-#include "cow-bulk-send.h"
+#include "cow/cow-uffd.h"
+#include "cow/cow-bulk-send.h"
 #include "pstree.h"
 #include "pf-tracker.h"
 #include "unmapped-tracker.h"
 #include "rst_info.h"
-#include "cow-lazy-pages.h"
+#include "cow/cow-lazy-pages.h"
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "cow-lazy: "

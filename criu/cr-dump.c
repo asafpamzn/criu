@@ -65,7 +65,7 @@
 #include "stats.h"
 #include "mem.h"
 #include "page-pipe.h"
-#include "cow-dump.h"
+#include "cow/cow-dump.h"
 #include "posix-timer.h"
 #include "vdso.h"
 #include "vma.h"

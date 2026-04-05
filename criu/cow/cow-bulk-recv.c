@@ -19,10 +19,10 @@
 #include "cr_options.h"
 #include "xmalloc.h"
 #include "page-xfer.h"
-#include "cow-page-xfer.h"
-#include "cow-bulk-send.h"
-#include "cow-bulk-recv.h"
-#include "cow-uffd.h"
+#include "cow/cow-page-xfer.h"
+#include "cow/cow-bulk-send.h"
+#include "cow/cow-bulk-recv.h"
+#include "cow/cow-uffd.h"
 #include "uffd.h"
 
 #undef LOG_PREFIX

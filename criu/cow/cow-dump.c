@@ -17,7 +17,7 @@
 #include "types.h"
 #include "cr_options.h"
 #include "pstree.h"
-#include "cow-dump.h"
+#include "cow/cow-dump.h"
 #include "mman.h"
 #include "uffd.h"
 #include "pagemap_scan.h"
@@ -32,7 +32,7 @@
 #include "criu-log.h"
 #include "parasite.h"
 #include "atomic-bitmap.h"
-#include "cow-bitmap.h"
+#include "cow/cow-bitmap.h"
 #include "mpsc-queue.h"
 
 #undef LOG_PREFIX
