@@ -1488,7 +1488,7 @@ static void check_and_print_epoll_stats(void)
 }
 
 extern void check_and_print_uffd_stats(void);
-extern int process_eagain_requests(void);
+extern int cow_process_eagain_requests(void);
 
 int epoll_run_rfds(int epollfd, struct epoll_event *evs, int nr_fds, int timeout)
 {
@@ -1506,9 +1506,9 @@ int epoll_run_rfds(int epollfd, struct epoll_event *evs, int nr_fds, int timeout
 
 		/* In COW dump mode, process pending EAGAIN requests */
 		if (opts.cow_dump) {
-			ret = process_eagain_requests();
+			ret = cow_process_eagain_requests();
 			if (ret < 0) {
-				pr_err("DEBUG_EPOLL: process_eagain_requests returned %d\n", ret);
+				pr_err("DEBUG_EPOLL: cow_process_eagain_requests returned %d\n", ret);
 				goto out;
 			}
 		}

@@ -62,11 +62,9 @@ struct uffd_eagain_request {
 #define lp_err(lpi, fmt, arg...)    pr_err("%d-%d: " fmt, lpi->pid, lpi->lpfd.fd, ##arg)
 #define lp_perror(lpi, fmt, arg...) pr_perror("%d-%d: " fmt, lpi->pid, lpi->lpfd.fd, ##arg)
 
-/* Helper functions from uffd.c needed by uffd_cow.c */
+/* Helper functions from uffd.c needed by cow-uffd.c */
 extern void lpi_put(struct lazy_pages_info *lpi);
 extern void lazy_pages_summary(struct lazy_pages_info *lpi);
-extern void dump_lazy_iov_list(struct lazy_pages_info *lpi, const char *name,
-			       struct list_head *head, unsigned int max);
 
 /*
  * COW-specific functions from uffd_cow.c

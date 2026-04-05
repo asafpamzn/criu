@@ -2,6 +2,10 @@
 #define __CR_COW_UFFD_H__
 
 #include <stdbool.h>
+#include "int.h"
+
+/* Forward declarations */
+struct list_head;
 
 /* Initialize COW page buffer (hash table, locks) */
 int cow_page_buffer_init(void);
@@ -30,8 +34,8 @@ void cow_page_buffer_destroy(void);
 /* Discard dirty pages from buffer (called when dirty bitmap received) */
 void cow_page_buffer_discard_dirty(unsigned long *dirty_ranges, unsigned int nr_dirty_ranges);
 
-/* Start background drain thread */
-int cow_start_drain_thread(void);
+/* Start background drain thread (lpis needed for EAGAIN handling) */
+int cow_start_drain_thread(struct list_head *lpis);
 
 /* Stop background drain thread */
 void cow_stop_drain_thread(void);
@@ -44,5 +48,37 @@ void cow_page_buffer_remove_range(unsigned long start, unsigned long len);
 
 /* Re-add page to buffer for EAGAIN retry (takes ownership of data) */
 void cow_page_buffer_readd(unsigned long vaddr, void *data);
+
+/*
+ * UFFD Statistics (COW mode)
+ */
+extern void check_and_print_uffd_stats(void);
+extern int cow_get_histogram_bucket(unsigned long nr_pages);
+extern void cow_uffd_stats_inc_pf(unsigned long nr_pages);
+extern void cow_uffd_stats_inc_bg(unsigned long nr_pages);
+extern void cow_uffd_stats_add_io_bulk(unsigned long ns);
+extern void cow_uffd_stats_inc_io_bulk_start(void);
+extern void cow_uffd_stats_add_copy(unsigned long ns);
+extern void cow_uffd_stats_add_drop(unsigned long ns);
+
+/*
+ * EAGAIN Request Handling (COW mode)
+ */
+struct lazy_pages_info;
+extern int cow_queue_eagain_request(struct lazy_pages_info *lpi, __u64 address,
+				    unsigned long nr_pages, void *buf, const char *op_name);
+extern int cow_queue_drain_eagain_request(struct list_head *lpis, unsigned long vaddr, void *data);
+extern bool cow_is_eagain_queue_empty(void);
+extern int cow_process_eagain_requests(void);
+
+/*
+ * IOV Debugging (COW mode)
+ */
+extern void cow_dump_lazy_iov_list(struct lazy_pages_info *lpi, const char *name,
+				   struct list_head *iovs, unsigned int max_dump);
+
+/* Find IOV for address (wrapper for uffd.c find_iov) */
+struct lazy_iov;
+extern struct lazy_iov *cow_find_iov(struct lazy_pages_info *lpi, unsigned long addr);
 
 #endif /* __CR_COW_UFFD_H__ */

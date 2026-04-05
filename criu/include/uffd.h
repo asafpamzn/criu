@@ -21,11 +21,11 @@ extern int get_first_lpi_uffd(void);
 /* Return uffd for a given vaddr (for background drain thread). */
 extern int get_uffd_for_vaddr(unsigned long vaddr);
 
-/* Queue EAGAIN request from drain thread (finds lpi and queues for retry) */
-extern int queue_drain_eagain_request(unsigned long vaddr, void *data);
-
-/* Check if EAGAIN requests queue is empty */
-extern bool is_eagain_queue_empty(void);
+/*
+ * EAGAIN handling functions are in cow-uffd.c:
+ * - cow_queue_drain_eagain_request()
+ * - cow_is_eagain_queue_empty()
+ */
 
 /* Check if restore has connected (uffd available) */
 extern bool is_restore_connected(void);

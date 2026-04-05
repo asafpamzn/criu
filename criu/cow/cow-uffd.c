@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <string.h>
 #include <limits.h>
+#include <time.h>
 #include <sys/ioctl.h>
 #include <linux/userfaultfd.h>
 
@@ -20,6 +21,7 @@
 #include "cow/pf-tracker.h"
 #include "cow/page-pool.h"
 #include "cow/unmapped-tracker.h"
+#include "cow/page-state-tracker.h"
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "cow-uffd: "
@@ -73,6 +75,7 @@ static inline int lock_index(unsigned int hash)
 static pthread_t drain_thread;
 static volatile bool drain_thread_stop = false;
 static volatile bool drain_thread_active = false;
+static struct list_head *drain_lpis = NULL;  /* lpis list for EAGAIN handling */
 
 static inline unsigned int page_buffer_hash(unsigned long vaddr)
 {
@@ -556,7 +559,7 @@ static void *background_drain_thread(void *arg)
 								unmapped_tracker_mark_range(vaddr, PAGE_SIZE);
 							} else if (errno == EAGAIN) {
 								__sync_fetch_and_add(&cow_buffer.nr_eagain, 1);
-								if (queue_drain_eagain_request(vaddr, data) == 0) {
+								if (drain_lpis && cow_queue_drain_eagain_request(drain_lpis, vaddr, data) == 0) {
 									free_data = false;  /* ownership transferred */
 								}
 								pr_debug("COW_TRACE DRAIN_COPY: 0x%lx EAGAIN, queued for retry\n", vaddr);
@@ -604,7 +607,7 @@ static void *background_drain_thread(void *arg)
 	return NULL;
 }
 
-int cow_start_drain_thread(void)
+int cow_start_drain_thread(struct list_head *lpis)
 {
 	if (drain_thread_active)
 		return 0;
@@ -612,6 +615,7 @@ int cow_start_drain_thread(void)
 	if (cow_buffer.nr_pages == 0)
 		return 0;
 
+	drain_lpis = lpis;  /* Store for EAGAIN handling */
 	drain_thread_stop = false;
 	drain_thread_active = true;
 
@@ -688,7 +692,7 @@ int cow_handle_exit(struct list_head *lpis)
 	}
 
 	/* Condition 4: Wait for EAGAIN requests to be processed */
-	if (!is_eagain_queue_empty()) {
+	if (!cow_is_eagain_queue_empty()) {
 		pr_err("cow_handle_exit: waiting for EAGAIN requests to be processed\n");
 		return 0;
 	}
@@ -706,4 +710,497 @@ int cow_handle_exit(struct list_head *lpis)
 	}
 
 	return 1;  /* Exit main loop */
+}
+
+/*
+ * ============================================================================
+ * UFFD Statistics and Histogram (COW mode)
+ * ============================================================================
+ */
+
+/* Histogram statistics structure */
+static struct {
+	/* Histogram buckets by page count: 1, 16, 32, 64, 128, 256, 512, 1024, >1024 */
+	unsigned long pf_hist[9]; /* Page fault histogram */
+	unsigned long bg_hist[9]; /* Background transfer histogram */
+
+	unsigned long total_pf_reqs;
+	unsigned long total_bg_reqs;
+	unsigned long total_pages;
+
+	/* Timing statistics (nanoseconds) */
+	unsigned long io_complete_bulk_total_ns;
+	unsigned long io_complete_bulk_count;
+	unsigned long io_complete_bulk_count_start;
+	unsigned long uffd_copy_total_ns;
+	unsigned long uffd_copy_count;
+	unsigned long drop_iovs_total_ns;
+	unsigned long drop_iovs_count;
+
+	/* EAGAIN retry statistics */
+	unsigned long eagain_processed;
+	unsigned long eagain_succeeded;
+	unsigned long eagain_blocked;
+	unsigned long eagain_errors;
+	unsigned long eagain_skipped;
+	unsigned long eagain_total_ns;
+	unsigned long eagain_calls;
+
+	time_t last_print_time;
+} uffd_stats = {0};
+
+int cow_get_histogram_bucket(unsigned long nr_pages)
+{
+	if (nr_pages == 1)
+		return 0; /* 4KB */
+	if (nr_pages <= 16)
+		return 1; /* 64KB */
+	if (nr_pages <= 32)
+		return 2; /* 128KB */
+	if (nr_pages <= 64)
+		return 3; /* 256KB */
+	if (nr_pages <= 128)
+		return 4; /* 512KB */
+	if (nr_pages <= 256)
+		return 5; /* 1MB */
+	if (nr_pages <= 512)
+		return 6; /* 2MB */
+	if (nr_pages <= 1024)
+		return 7; /* 4MB */
+	return 8;	  /* >4MB */
+}
+
+static const char *get_bucket_label(int bucket)
+{
+	switch (bucket) {
+	case 0:
+		return "4K";
+	case 1:
+		return "64K";
+	case 2:
+		return "128K";
+	case 3:
+		return "256K";
+	case 4:
+		return "512K";
+	case 5:
+		return "1M";
+	case 6:
+		return "2M";
+	case 7:
+		return "4M";
+	case 8:
+		return ">4M";
+	default:
+		return "?";
+	}
+}
+
+void cow_uffd_stats_inc_pf(unsigned long nr_pages)
+{
+	int bucket = cow_get_histogram_bucket(nr_pages);
+	uffd_stats.total_pf_reqs++;
+	uffd_stats.total_pages += nr_pages;
+	uffd_stats.pf_hist[bucket]++;
+}
+
+void cow_uffd_stats_inc_bg(unsigned long nr_pages)
+{
+	int bucket = cow_get_histogram_bucket(nr_pages);
+	uffd_stats.total_bg_reqs++;
+	uffd_stats.total_pages += nr_pages;
+	uffd_stats.bg_hist[bucket]++;
+}
+
+void cow_uffd_stats_add_io_bulk(unsigned long ns)
+{
+	uffd_stats.io_complete_bulk_total_ns += ns;
+	uffd_stats.io_complete_bulk_count++;
+}
+
+void cow_uffd_stats_inc_io_bulk_start(void)
+{
+	uffd_stats.io_complete_bulk_count_start++;
+}
+
+void cow_uffd_stats_add_copy(unsigned long ns)
+{
+	uffd_stats.uffd_copy_total_ns += ns;
+	uffd_stats.uffd_copy_count++;
+}
+
+void cow_uffd_stats_add_drop(unsigned long ns)
+{
+	uffd_stats.drop_iovs_total_ns += ns;
+	uffd_stats.drop_iovs_count++;
+}
+
+void check_and_print_uffd_stats(void)
+{
+	time_t now = time(NULL);
+	int i;
+
+	if (now - uffd_stats.last_print_time >= 30) {
+		{
+			struct timespec ts;
+			struct tm *tm;
+			clock_gettime(CLOCK_REALTIME, &ts);
+			tm = localtime(&ts.tv_sec);
+			pr_err("[UFFD_STATS] [%02d:%02d:%02d.%03ld] reqs=%lu(pf:%lu,bg:%lu) pages=%lu\n",
+				tm->tm_hour, tm->tm_min, tm->tm_sec, ts.tv_nsec / 1000000,
+				uffd_stats.total_pf_reqs + uffd_stats.total_bg_reqs,
+				uffd_stats.total_pf_reqs,
+				uffd_stats.total_bg_reqs,
+				uffd_stats.total_pages);
+		}
+
+		/* Print page fault histogram */
+		pr_debug("  PF: ");
+		for (i = 0; i < 9; i++) {
+			if (uffd_stats.pf_hist[i] > 0)
+				pr_debug(" %s=%lu", get_bucket_label(i), uffd_stats.pf_hist[i]);
+		}
+		pr_debug("\n");
+
+		/* Print background transfer histogram */
+		pr_debug("  BG: ");
+		for (i = 0; i < 9; i++) {
+			if (uffd_stats.bg_hist[i] > 0)
+				pr_debug(" %s=%lu", get_bucket_label(i), uffd_stats.bg_hist[i]);
+		}
+		pr_debug("\n");
+
+		/* Print timing stats */
+		if (uffd_stats.io_complete_bulk_count_start > 0) {
+			pr_err("  TIMING: io_bulk=%lu ns (%lu, %lu ops) copy=%lu ns (%lu ops) drop=%lu ns (%lu ops)\n",
+				uffd_stats.io_complete_bulk_total_ns / uffd_stats.io_complete_bulk_count,
+				uffd_stats.io_complete_bulk_count,
+				uffd_stats.io_complete_bulk_count_start,
+				uffd_stats.uffd_copy_count > 0 ? uffd_stats.uffd_copy_total_ns / uffd_stats.uffd_copy_count : 0,
+				uffd_stats.uffd_copy_count,
+				uffd_stats.drop_iovs_count > 0 ? uffd_stats.drop_iovs_total_ns / uffd_stats.drop_iovs_count : 0,
+				uffd_stats.drop_iovs_count);
+		}
+
+		/* Print EAGAIN stats */
+		if (uffd_stats.eagain_processed > 0 || uffd_stats.eagain_skipped > 0 || uffd_stats.eagain_calls > 0) {
+			pr_info("  EAGAIN: processed=%lu succeeded=%lu blocked=%lu errors=%lu skipped=%lu | time=%lu ns (%lu calls)\n",
+				uffd_stats.eagain_processed,
+				uffd_stats.eagain_succeeded,
+				uffd_stats.eagain_blocked,
+				uffd_stats.eagain_errors,
+				uffd_stats.eagain_skipped,
+				uffd_stats.eagain_calls > 0 ? uffd_stats.eagain_total_ns / uffd_stats.eagain_calls : 0,
+				uffd_stats.eagain_calls);
+		}
+
+		/* Print page fault tracker stats and clean up completed entries */
+		pf_tracker_print_stats();
+
+		/* Reset all counters */
+		memset(&uffd_stats, 0, sizeof(uffd_stats));
+		uffd_stats.last_print_time = now;
+	}
+}
+
+/*
+ * ============================================================================
+ * EAGAIN Request Handling (COW mode)
+ * ============================================================================
+ */
+
+/* Pending EAGAIN requests list */
+static LIST_HEAD(eagain_requests);
+
+/*
+ * Queue an EAGAIN request for later retry in COW dump mode.
+ * For copy operations, buf should point to the data to copy.
+ * For zero operations, buf should be NULL.
+ */
+int cow_queue_eagain_request(struct lazy_pages_info *lpi, __u64 address,
+			     unsigned long nr_pages, void *buf, const char *op_name)
+{
+	struct uffd_eagain_request *req;
+	void *buf_copy = NULL;
+	unsigned long len = nr_pages * page_size();
+
+	lp_debug(lpi, "uffd_%s EAGAIN in COW mode: queueing 0x%llx/%ld for later\n",
+		 op_name, address, len);
+
+	/* Copy buffer if provided (copy operation) */
+	if (buf) {
+		buf_copy = xmalloc(len);
+		if (!buf_copy) {
+			lp_err(lpi, "Failed to allocate buffer for EAGAIN request\n");
+			return -1;
+		}
+		memcpy(buf_copy, buf, len);
+	}
+
+	/* Create request entry */
+	req = xmalloc(sizeof(*req));
+	if (!req) {
+		if (buf_copy)
+			xfree(buf_copy);
+		return -1;
+	}
+
+	req->lpi = lpi;
+	req->address = address;
+	req->nr_pages = nr_pages;
+	req->buf = buf_copy;  /* NULL for zero operations */
+	INIT_LIST_HEAD(&req->l);
+
+	list_add_tail(&req->l, &eagain_requests);
+
+	pr_err("DEBUG: queue_eagain_request added 0x%llx to eagain_requests (op=%s)\n",
+	       address, op_name);
+	return 0;
+}
+
+/*
+ * Queue an EAGAIN request from drain thread context.
+ * Finds the appropriate lpi for the vaddr and queues for retry.
+ * Returns 0 on success (ownership of data transferred), -1 on error.
+ */
+int cow_queue_drain_eagain_request(struct list_head *lpis, unsigned long vaddr, void *data)
+{
+	struct lazy_pages_info *lpi;
+
+	list_for_each_entry(lpi, lpis, l) {
+		if (lpi->exited || lpi->lpfd.fd < 0)
+			continue;
+		if (!cow_find_iov(lpi, vaddr))
+			continue;
+
+		/* Found the lpi - queue the request */
+		page_state_set(vaddr, PAGE_STATE_EAGAIN_QUEUED);
+		return cow_queue_eagain_request(lpi, vaddr, 1, data, "drain");
+	}
+
+	/* No matching lpi - this is a bug */
+	pr_err("BUG: No lpi found for drain EAGAIN at 0x%lx\n", vaddr);
+	page_state_print_history(vaddr);
+	BUG();
+	return -1;
+}
+
+/* Check if EAGAIN requests queue is empty */
+bool cow_is_eagain_queue_empty(void)
+{
+	return list_empty(&eagain_requests);
+}
+
+/*
+ * Retry a copy operation that previously failed with EAGAIN.
+ * Returns: 0 on success, -EAGAIN if still blocked, -1 on error
+ */
+static int retry_uffd_copy(struct uffd_eagain_request *req)
+{
+	struct uffdio_copy uffdio_copy;
+
+	uffdio_copy.dst = req->address;
+	uffdio_copy.src = (unsigned long)req->buf;
+	uffdio_copy.len = req->nr_pages * page_size();
+	uffdio_copy.mode = 0;
+	uffdio_copy.copy = 0;
+
+	if (ioctl(req->lpi->lpfd.fd, UFFDIO_COPY, &uffdio_copy) == -1) {
+		if (errno == EAGAIN)
+			return -EAGAIN;
+
+		pr_err("DEBUG: retry_uffd_copy error at 0x%llx errno=%d\n", req->address, errno);
+		lp_err(req->lpi, "EAGAIN copy retry failed for 0x%llx: %d\n",
+		       req->address, errno);
+		page_state_set(req->address, PAGE_STATE_DISCARDED);
+		return -1;
+	}
+
+	/* Check for soft error */
+	if (uffdio_copy.copy < 0) {
+		errno = -uffdio_copy.copy;
+		if (errno == EAGAIN) {
+			pr_err("DEBUG: retry_uffd_copy soft EAGAIN at 0x%llx\n", req->address);
+			return -EAGAIN;
+		}
+
+		pr_err("DEBUG: retry_uffd_copy soft error at 0x%llx errno=%d\n", req->address, errno);
+		lp_err(req->lpi, "EAGAIN copy retry soft error for 0x%llx: %d\n",
+		       req->address, errno);
+		page_state_set(req->address, PAGE_STATE_DISCARDED);
+		return -1;
+	}
+
+	/* Success */
+	req->lpi->copied_pages += req->nr_pages;
+	pf_tracker_set_state(req->address, PF_STATE_COMPLETED);
+	page_state_set(req->address, PAGE_STATE_COPIED);
+	lp_debug(req->lpi, "EAGAIN copy retry succeeded for 0x%llx\n", req->address);
+	return 0;
+}
+
+/*
+ * Retry a zero operation that previously failed with EAGAIN.
+ * Returns: 0 on success, -EAGAIN if still blocked, -1 on error
+ */
+static int retry_uffd_zero(struct uffd_eagain_request *req)
+{
+	struct uffdio_zeropage uffdio_zeropage;
+
+	uffdio_zeropage.range.start = req->address;
+	uffdio_zeropage.range.len = req->nr_pages * page_size();
+	uffdio_zeropage.mode = 0;
+	uffdio_zeropage.zeropage = 0;
+
+	if (ioctl(req->lpi->lpfd.fd, UFFDIO_ZEROPAGE, &uffdio_zeropage) == -1) {
+		if (errno == EAGAIN) {
+			pr_err("DEBUG: retry_uffd_zero still EAGAIN at 0x%llx\n", req->address);
+			return -EAGAIN;
+		}
+
+		pr_err("DEBUG: retry_uffd_zero error at 0x%llx errno=%d\n", req->address, errno);
+		lp_err(req->lpi, "EAGAIN zero retry failed for 0x%llx: %d\n",
+		       req->address, errno);
+		page_state_set(req->address, PAGE_STATE_DISCARDED);
+		return -1;
+	}
+
+	/* Check for soft error */
+	if (uffdio_zeropage.zeropage < 0) {
+		errno = -uffdio_zeropage.zeropage;
+		if (errno == EAGAIN) {
+			pr_err("DEBUG: retry_uffd_zero soft EAGAIN at 0x%llx\n", req->address);
+			return -EAGAIN;
+		}
+
+		pr_err("DEBUG: retry_uffd_zero soft error at 0x%llx errno=%d\n", req->address, errno);
+		lp_err(req->lpi, "EAGAIN zero retry soft error for 0x%llx: %d\n",
+		       req->address, errno);
+		page_state_set(req->address, PAGE_STATE_DISCARDED);
+		return -1;
+	}
+
+	/* Success */
+	pf_tracker_set_state(req->address, PF_STATE_COMPLETED);
+	page_state_set(req->address, PAGE_STATE_COPIED);
+	lp_debug(req->lpi, "EAGAIN zero retry succeeded for 0x%llx\n", req->address);
+	return 0;
+}
+
+/*
+ * Process pending EAGAIN requests.
+ * Attempts to retry UFFDIO_COPY or UFFDIO_ZEROPAGE for requests that previously failed with EAGAIN.
+ */
+int cow_process_eagain_requests(void)
+{
+	struct uffd_eagain_request *req, *n;
+	int ret;
+	struct timespec t_start, t_end;
+	static int last_queue_empty = -1;
+	int queue_empty;
+
+	clock_gettime(CLOCK_MONOTONIC, &t_start);
+
+	queue_empty = list_empty(&eagain_requests);
+	if (queue_empty != last_queue_empty) {
+		pr_err("DEBUG: process_eagain_requests queue_empty changed: %d -> %d\n",
+		       last_queue_empty, queue_empty);
+		last_queue_empty = queue_empty;
+	}
+
+	list_for_each_entry_safe(req, n, &eagain_requests, l) {
+		/* Skip if process has exited */
+		if (req->lpi->exited) {
+			uffd_stats.eagain_skipped++;
+			pr_err("DEBUG: eagain 0x%llx skipped (lpi exited)\n", req->address);
+			page_state_set(req->address, PAGE_STATE_DISCARDED);
+			list_del(&req->l);
+			if (req->buf)
+				xfree(req->buf);
+			xfree(req);
+			continue;
+		}
+
+		uffd_stats.eagain_processed++;
+
+		/* Call appropriate retry function based on operation type */
+		if (req->buf)
+			ret = retry_uffd_copy(req);
+		else
+			ret = retry_uffd_zero(req);
+
+		if (ret == -EAGAIN) {
+			/* Still blocked - keep in queue for next attempt */
+			uffd_stats.eagain_blocked++;
+			continue;
+		} else if (ret < 0) {
+			/* Error - remove from queue */
+			uffd_stats.eagain_errors++;
+			pr_err("DEBUG: eagain 0x%llx error ret=%d, removing\n", req->address, ret);
+			list_del(&req->l);
+			if (req->buf)
+				xfree(req->buf);
+			xfree(req);
+			continue;
+		}
+
+		/* Success! */
+		uffd_stats.eagain_succeeded++;
+
+		/* Clean up and remove from queue */
+		list_del(&req->l);
+		if (req->buf)
+			xfree(req->buf);
+		xfree(req);
+	}
+
+	clock_gettime(CLOCK_MONOTONIC, &t_end);
+	uffd_stats.eagain_total_ns += (t_end.tv_sec - t_start.tv_sec) * 1000000000 + (t_end.tv_nsec - t_start.tv_nsec);
+	uffd_stats.eagain_calls++;
+
+	queue_empty = list_empty(&eagain_requests);
+	if (queue_empty != last_queue_empty) {
+		pr_err("DEBUG: process_eagain_requests done, queue_empty changed: %d -> %d\n",
+		       last_queue_empty, queue_empty);
+		last_queue_empty = queue_empty;
+	}
+	return 0;
+}
+
+/*
+ * ============================================================================
+ * IOV Debugging (COW mode)
+ * ============================================================================
+ */
+
+void cow_dump_lazy_iov_list(struct lazy_pages_info *lpi, const char *name,
+			    struct list_head *iovs, unsigned int max_dump)
+{
+	struct lazy_iov *iov;
+	unsigned long count = 0;
+	unsigned long pages = 0;
+	unsigned long prev_start = 0;
+	bool sorted = true;
+	bool first = true;
+
+	list_for_each_entry(iov, iovs, l) {
+		unsigned long iov_pages;
+
+		iov_pages = (iov->end - iov->start) / page_size();
+		pages += iov_pages;
+
+		if (!first && iov->start < prev_start)
+			sorted = false;
+		first = false;
+		prev_start = iov->start;
+
+		if (count < max_dump)
+			lp_err(lpi, "%s[%lu]: 0x%lx-0x%lx img_start=0x%lx pages=%lu\n",
+			       name, count, iov->start, iov->end, iov->img_start,
+			       iov_pages);
+		count++;
+	}
+
+	lp_err(lpi, "%s: count=%lu pages=%lu sorted=%s\n", name, count, pages,
+	       sorted ? "yes" : "no");
 }
