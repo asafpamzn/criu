@@ -6,6 +6,7 @@
 
 /* Forward declarations */
 struct list_head;
+struct epoll_event;
 
 /* Initialize COW page buffer (hash table, locks) */
 int cow_page_buffer_init(void);
