@@ -142,7 +142,7 @@ static int handle_end_of_transfer(struct ps_async_read_bulk *ar, u32 cmd)
 	 * The dirty bitmap will arrive later (Phase 4).
 	 * Reset to read next header and continue.
 	 */
-	if (opts.cow_dump && !is_dirty_bitmap_received()) {
+	if (opts.cow_dump && !cow_is_dirty_bitmap_received()) {
 		pr_err("COW mode Phase 2: waiting for dirty bitmap...\n");
 		ar->rb = 0;
 		ar->compress_state = COMPRESS_STATE_READING_HEADER;
@@ -598,7 +598,7 @@ int page_server_async_read_bulk(struct epoll_rfd *f)
 		list_del(&ar->l);
 		xfree(ar);
 		/* Only break epoll loop for all_pages_sent - other COMPLETE cases continue */
-		if (is_all_pages_sent_received()) {
+		if (cow_is_all_pages_sent_received()) {
 			pr_info("page_server_async_read_bulk: BULK_STREAM_COMPLETE + all_pages_sent, returning 1 to break epoll\n");
 			return 1;
 		}
