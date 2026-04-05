@@ -660,8 +660,10 @@ static int collect_iovs(struct lazy_pages_info *lpi)
 	MmEntry *mm;
 
 	mm = init_mm_entry(lpi);
-	if (!mm)
+	if (!mm) {
+		pr_err("collect_iovs: init_mm_entry failed for pid=%d\n", lpi->pid);
 		return -1;
+	}
 
 	while (pr->advance(pr)) {
 		if (!pagemap_lazy(pr->pe))
@@ -678,8 +680,10 @@ static int collect_iovs(struct lazy_pages_info *lpi)
 				continue;
 
 			iov = xzalloc(sizeof(*iov));
-			if (!iov)
+			if (!iov) {
+				pr_err("collect_iovs: xzalloc failed for pid=%d\n", lpi->pid);
 				goto free_iovs;
+			}
 
 			len = min_t(uint64_t, end, vma->end) - start;
 			iov->start = start;
@@ -698,8 +702,11 @@ static int collect_iovs(struct lazy_pages_info *lpi)
 	}
 
 	lpi->buf_size = max_iov_len;
-	if (posix_memalign(&lpi->buf, PAGE_SIZE, lpi->buf_size))
+	if (posix_memalign(&lpi->buf, PAGE_SIZE, lpi->buf_size)) {
+		pr_err("collect_iovs: posix_memalign failed for pid=%d (size=%d)\n",
+		       lpi->pid, max_iov_len);
 		goto free_iovs;
+	}
 
 	ret = nr_pages;
 	goto free_mm;
@@ -722,8 +729,10 @@ static int ud_open(int client, struct lazy_pages_info **_lpi)
 	int pr_flags = PR_TASK;
 
 	lpi = lpi_init();
-	if (!lpi)
+	if (!lpi) {
+		pr_err("ud_open: lpi_init failed (malloc?)\n");
 		goto out;
+	}
 
 	/* The "transfer protocol" is first the pid as int and then
 	 * the FD for UFFD */
@@ -732,9 +741,11 @@ static int ud_open(int client, struct lazy_pages_info **_lpi)
 		if (ret < 0)
 			pr_perror("PID recv error");
 		else
-			pr_err("PID recv: short read\n");
+			pr_err("PID recv: short read (got %d, expected %zu)\n",
+			       ret, sizeof(lpi->pid));
 		goto out;
 	}
+	pr_info("ud_open: received pid=%d\n", lpi->pid);
 
 	if (lpi->pid < 0) {
 		pr_debug("Zombie PID: %d\n", lpi->pid);
@@ -744,10 +755,10 @@ static int ud_open(int client, struct lazy_pages_info **_lpi)
 
 	lpi->lpfd.fd = recv_fd(client);
 	if (lpi->lpfd.fd < 0) {
-		pr_err("recv_fd error\n");
+		pr_err("recv_fd error for pid=%d\n", lpi->pid);
 		goto out;
 	}
-	pr_debug("Received PID: %d, uffd: %d\n", lpi->pid, lpi->lpfd.fd);
+	pr_info("ud_open: received uffd fd=%d for pid=%d\n", lpi->lpfd.fd, lpi->pid);
 
 	if (opts.use_page_server)
 		pr_flags |= PR_REMOTE;
@@ -756,6 +767,7 @@ static int ud_open(int client, struct lazy_pages_info **_lpi)
 		lp_err(lpi, "Failed to open pagemap\n");
 		goto out;
 	}
+	pr_info("ud_open: open_page_read returned %d for pid=%d\n", ret, lpi->pid);
 
 	if (opts.cow_dump) {
 		/* Bulk mode: pages arrive automatically from background thread */
@@ -770,8 +782,10 @@ static int ud_open(int client, struct lazy_pages_info **_lpi)
 	 * so that it is trackable when all pages have been transferred.
 	 */
 	ret = collect_iovs(lpi);
-	if (ret < 0)
+	if (ret < 0) {
+		pr_err("ud_open: collect_iovs failed for pid=%d\n", lpi->pid);
 		goto out;
+	}
 	lpi->total_pages = ret;
 
 	lp_debug(lpi, "Found %ld pages to be handled by UFFD\n", lpi->total_pages);
@@ -1719,6 +1733,9 @@ static int handle_lazy_accept(struct epoll_rfd *rfd)
 	struct sockaddr_un saddr;
 	socklen_t len = sizeof(saddr);
 
+	pr_info("handle_lazy_accept: starting, nr_tasks=%d\n",
+		task_entries ? task_entries->nr_tasks : -1);
+
 	client = accept(rfd->fd, (struct sockaddr *)&saddr, &len);
 	if (client < 0) {
 		if (errno == EAGAIN || errno == EWOULDBLOCK)
@@ -1726,17 +1743,24 @@ static int handle_lazy_accept(struct epoll_rfd *rfd)
 		pr_perror("accept failed");
 		return -1;
 	}
+	pr_info("handle_lazy_accept: accepted client fd=%d\n", client);
 
 	/* Set up lpi for each task (reads uffd from restore) */
 	for (i = 0; i < task_entries->nr_tasks; i++) {
 		struct lazy_pages_info *lpi = NULL;
 
-		if (ud_open(client, &lpi))
+		pr_info("handle_lazy_accept: calling ud_open for task %d/%d\n",
+			i + 1, task_entries->nr_tasks);
+		if (ud_open(client, &lpi)) {
+			pr_err("handle_lazy_accept: ud_open failed for task %d\n", i + 1);
 			goto err;
+		}
 		if (lpi == NULL)
 			continue;
-		if (epoll_add_rfd(epollfd, &lpi->lpfd))
+		if (epoll_add_rfd(epollfd, &lpi->lpfd)) {
+			pr_err("handle_lazy_accept: epoll_add_rfd failed for task %d\n", i + 1);
 			goto err;
+		}
 	}
 
 	/* Set up restore-finished notification socket */
