@@ -23,7 +23,7 @@
 #include "pagemap.h"
 #include "mem.h"
 #include "cow-unified-thread.h"
-#include "list.h"
+#include "common/list.h"
 #include "bug.h"
 
 /* Global compression statistics for stats printing (used by cow-bulk-send.c too) */

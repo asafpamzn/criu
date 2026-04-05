@@ -87,6 +87,7 @@ extern void cow_close_page_server_socket(void);
 /* COW lazy VMA pagemap writing */
 struct page_xfer;
 struct lazy_vma_entry;
+struct page_server_iov;
 extern int cow_write_lazy_vmas_before(struct page_xfer *xfer, unsigned long before_vaddr,
 				      struct lazy_vma_entry **cur_lve);
 
