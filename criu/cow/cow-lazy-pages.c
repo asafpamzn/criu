@@ -250,7 +250,7 @@ int cr_lazy_pages_cow_phase2(bool daemon)
 	 * The PS_IOV_INVENTORY_READY signal ensures we don't race
 	 * with the primary writing inventory.img.
 	 */
-	if (!is_inventory_ready_received()) {
+	if (!cow_is_inventory_ready_received()) {
 		pr_err("Inventory ready signal not received!\n");
 		goto err_disconnect;
 	}
@@ -316,13 +316,13 @@ int cow_phase2_handle_pages(int epollfd, struct epoll_event *events, int nr_fds)
 		}
 
 		/* Track inventory ready signal */
-		if (!inventory_ready && is_inventory_ready_received()) {
+		if (!inventory_ready && cow_is_inventory_ready_received()) {
 			pr_err("Inventory ready signal received\n");
 			inventory_ready = true;
 		}
 
 		/* Dirty bitmap signals Phase 3 is ready */
-		if (is_dirty_bitmap_received()) {
+		if (cow_is_dirty_bitmap_received()) {
 			pr_err("Dirty bitmap received - Phase 3 ready\n");
 			return 0;
 		}

@@ -663,7 +663,7 @@ int cow_handle_exit(struct list_head *lpis)
 	/* Only log when state changes to avoid log spam */
 	static int last_signal = -1, last_drain = -1;
 	static unsigned long call_count = 0;
-	int cur_signal = is_all_pages_sent_received();
+	int cur_signal = cow_is_all_pages_sent_received();
 	int cur_drain = cow_drain_thread_running();
 
 	call_count++;
