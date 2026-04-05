@@ -1029,7 +1029,8 @@ static int uffd_io_complete_bulk(struct page_read *pr, unsigned long vaddr, unsi
 	int ret;
 	struct timespec t_start, t_copy, t_drop, t_end;
 
-	uffd_stats.io_complete_bulk_count_start++;
+	if (opts.cow_dump)
+		cow_uffd_stats_inc_io_bulk_start();
 
 	clock_gettime(CLOCK_MONOTONIC, &t_start);
 
@@ -1076,8 +1077,9 @@ found_iov:
 	/* Copy pages to userspace */
 	ret = uffd_copy(lpi, vaddr, &pages);
 	clock_gettime(CLOCK_MONOTONIC, &t_copy);
-	uffd_stats.uffd_copy_total_ns += (t_copy.tv_sec - t_start.tv_sec) * 1000000000 + (t_copy.tv_nsec - t_start.tv_nsec);
-	uffd_stats.uffd_copy_count++;
+	if (opts.cow_dump)
+		cow_uffd_stats_add_copy((t_copy.tv_sec - t_start.tv_sec) * 1000000000 +
+					(t_copy.tv_nsec - t_start.tv_nsec));
 
 	if (ret < 0)
 		return ret;
@@ -1094,12 +1096,14 @@ found_iov:
 
 #endif
 	clock_gettime(CLOCK_MONOTONIC, &t_drop);
-	uffd_stats.drop_iovs_total_ns += (t_drop.tv_sec - t_copy.tv_sec) * 1000000000 + (t_drop.tv_nsec - t_copy.tv_nsec);
-	uffd_stats.drop_iovs_count++;
+	if (opts.cow_dump)
+		cow_uffd_stats_add_drop((t_drop.tv_sec - t_copy.tv_sec) * 1000000000 +
+					(t_drop.tv_nsec - t_copy.tv_nsec));
 
 	clock_gettime(CLOCK_MONOTONIC, &t_end);
-	uffd_stats.io_complete_bulk_total_ns += (t_end.tv_sec - t_start.tv_sec) * 1000000000 + (t_end.tv_nsec - t_start.tv_nsec);
-	uffd_stats.io_complete_bulk_count++;
+	if (opts.cow_dump)
+		cow_uffd_stats_add_io_bulk((t_end.tv_sec - t_start.tv_sec) * 1000000000 +
+					   (t_end.tv_nsec - t_start.tv_nsec));
 
 	return ret;
 }
@@ -1220,7 +1224,6 @@ static int xfer_pages(struct lazy_pages_info *lpi)
 	unsigned long nr_pages;
 	unsigned long len;
 	int err;
-	int bucket;
 
 	iov = pick_next_range(lpi);
 	if (!iov)
@@ -1235,11 +1238,9 @@ static int xfer_pages(struct lazy_pages_info *lpi)
 
 	nr_pages = (iov->end - iov->start) / PAGE_SIZE;
 
-	/* Update statistics */
-	uffd_stats.total_bg_reqs++;
-	uffd_stats.total_pages += nr_pages;
-	bucket = get_histogram_bucket(nr_pages);
-	uffd_stats.bg_hist[bucket]++;
+	/* Update COW statistics */
+	if (opts.cow_dump)
+		cow_uffd_stats_inc_bg(nr_pages);
 
 	update_xfer_len(lpi, false);
 
@@ -1391,7 +1392,6 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 	unsigned long long address;
 	int ret;
 	unsigned long nr_pages;
-	int bucket;
 	static unsigned long pf_count = 0;
 
 	/* Align requested address to the next page boundary */
@@ -1528,7 +1528,8 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 		 */
 		if (iov->is_new_vma) {
 			lp_debug(lpi, "Page 0x%llx in new VMA - requesting from server\n", address);
-			uffd_stats.total_pf_reqs++;
+			if (opts.cow_dump)
+				cow_uffd_stats_inc_pf(1);
 			pf_tracker_add(address, 1, lpi->pid, true);
 			if (request_remote_pages(lpi->pr.img_id, address, 1) < 0) {
 				lp_err(lpi, "Error requesting new VMA page 0x%llx\n", address);
@@ -1539,7 +1540,8 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 
 		img_addr = iov->img_start + (address - iov->start);
 
-		uffd_stats.total_pf_reqs++;
+		if (opts.cow_dump)
+			cow_uffd_stats_inc_pf(1);
 		pf_tracker_add(address, 1, lpi->pid, true);
 
 		if (phase3_active) {
@@ -1581,11 +1583,9 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 
 	nr_pages = (iov->end - iov->start) / PAGE_SIZE;
 
-	/* Update statistics */
-	uffd_stats.total_pf_reqs++;
-	uffd_stats.total_pages += nr_pages;
-	bucket = get_histogram_bucket(nr_pages);
-	uffd_stats.pf_hist[bucket]++;
+	/* Update COW statistics */
+	if (opts.cow_dump)
+		cow_uffd_stats_inc_pf(nr_pages);
 
 	update_xfer_len(lpi, true);
 
