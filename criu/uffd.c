@@ -1790,12 +1790,7 @@ close_uffd:
 	return -1;
 }
 
-/*
- * Pre-buffer infrastructure is now in cow-uffd.c:
- * - cow_setup_prebuffer_reader()
- * - cow_cleanup_prebuffer()
- * - cow_switch_to_convergence_callback()
- */
+/* Pre-buffer and convergence infrastructure is in cow-uffd.c */
 static struct epoll_rfd lazy_listen_rfd;
 
 /* Convergence callback wrapper - calls into cow-uffd.c logic */
@@ -1845,10 +1840,6 @@ static void switch_to_convergence_callback(void)
 		pr_warn("Failed to switch to convergence callback\n");
 }
 
-int setup_prebuffer_reader(void)
-{
-	return cow_setup_prebuffer_reader();
-}
 /*
  * Non-blocking accept handler for when criu restore connects.
  * Called from epoll loop when restore connects on the Unix socket.
@@ -2025,7 +2016,7 @@ int cow_phase3_restore_loop(int ep_fd, struct epoll_event **events, int nr_fds)
 	pr_info("COW Phase 3: Waiting for restore to connect\n");
 
 	/* Initialize buffer and switch directly to convergence callback for Phase 3 */
-	if (setup_prebuffer_reader()) {
+	if (cow_setup_prebuffer_reader()) {
 		pr_err("Failed to setup prebuffer reader for Phase 3\n");
 		close(lazy_sk);
 		return -1;
@@ -2046,7 +2037,6 @@ int cr_lazy_pages(bool daemon)
 	int nr_fds;
 	int lazy_sk;
 	int ret;
-	int flags;
 
 	if (!kdat.has_uffd)
 		return -1;
@@ -2098,102 +2088,42 @@ int cr_lazy_pages(bool daemon)
 	if (epollfd < 0)
 		return -1;
 
-	if (opts.cow_dump && opts.use_page_server) {
-		/*
-		 * COW PHASED MODE: Connect to page server FIRST to buffer
-		 * pages during Phase 2, before criu restore runs.
-		 */
-		struct pstree_item *pi;
+	if (prepare_uffds(lazy_sk, epollfd)) {
+		xfree(events);
+		return -1;
+	}
 
-		/* 1. Initialize COW page buffer and trackers */
-		if (cow_lazy_pages_init() < 0) {
-			pr_err("Failed to initialize COW infrastructure\n");
-			xfree(events);
-			return -1;
-		}
+	if (opts.use_page_server) {
+		struct lazy_pages_info *lpi;
 
-		/* 2. Connect to page server and add socket to epoll */
 		if (connect_to_page_server_to_recv(epollfd)) {
 			xfree(events);
 			return -1;
 		}
 
-		/* 3. Set up pre-buffer bulk reader */
-		if (setup_prebuffer_reader()) {
-			pr_err("Failed to setup prebuffer reader\n");
-			xfree(events);
-			return -1;
-		}
-
-		/* 4. Make listen socket non-blocking and add to epoll */
-		flags = fcntl(lazy_sk, F_GETFL, 0);
-		fcntl(lazy_sk, F_SETFL, flags | O_NONBLOCK);
-
-		lazy_listen_rfd.fd = lazy_sk;
-		lazy_listen_rfd.read_event = handle_lazy_accept;
-		if (epoll_add_rfd(epollfd, &lazy_listen_rfd)) {
-			xfree(events);
-			return -1;
-		}
-
-		/* 5. Request all pages from primary for each task */
-		for_each_pstree_item(pi) {
-			if (task_alive(pi)) {
-				pr_info("Requesting all remote pages for pid=%d\n",
-					vpid(pi));
-				if (request_all_remote_pages(vpid(pi)) < 0) {
-					pr_err("Failed to request pages for pid=%d\n",
-					       vpid(pi));
-					xfree(events);
-					return -1;
-				}
-			}
-		}
-
-		pr_info("COW pre-buffer mode: waiting for pages and restore\n");
-
-		/* 6. Enter event loop */
-		ret = handle_requests(epollfd, &events, nr_fds);
-
-	} else {
-		/* EXISTING PATH: wait for restore first, then page server */
-		if (prepare_uffds(lazy_sk, epollfd)) {
-			xfree(events);
-			return -1;
-		}
-
-		if (opts.use_page_server) {
-			struct lazy_pages_info *lpi;
-
-			if (connect_to_page_server_to_recv(epollfd)) {
+		/* Request all pages for bulk mode */
+		if (opts.cow_dump) {
+			/* Initialize COW infrastructure */
+			if (cow_lazy_pages_init() < 0) {
+				pr_err("Failed to initialize COW infrastructure\n");
 				xfree(events);
 				return -1;
 			}
 
-			/* Request all pages for bulk mode */
-			if (opts.cow_dump) {
-				/* Initialize COW infrastructure */
-				if (cow_lazy_pages_init() < 0) {
-					pr_err("Failed to initialize COW infrastructure\n");
+			list_for_each_entry(lpi, &lpis, l) {
+				pr_info("Requesting all remote pages for pid=%d\n",
+					lpi->pid);
+				if (request_all_remote_pages(lpi->pr.img_id) < 0) {
+					pr_err("Failed to request pages for pid=%d\n",
+					       lpi->pid);
 					xfree(events);
 					return -1;
 				}
-
-				list_for_each_entry(lpi, &lpis, l) {
-					pr_info("Requesting all remote pages for pid=%d\n",
-						lpi->pid);
-					if (request_all_remote_pages(lpi->pr.img_id) < 0) {
-						pr_err("Failed to request pages for pid=%d\n",
-						       lpi->pid);
-						xfree(events);
-						return -1;
-					}
-				}
 			}
 		}
-
-		ret = handle_requests(epollfd, &events, nr_fds);
 	}
+
+	ret = handle_requests(epollfd, &events, nr_fds);
 
 	disconnect_from_page_server();
 
