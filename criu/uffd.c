@@ -2025,22 +2025,6 @@ err:
 	return -1;
 }
 
-
-/* Return uffd for a given vaddr (for background drain thread). */
-int get_uffd_for_vaddr(unsigned long vaddr)
-{
-	struct lazy_pages_info *lpi;
-
-	list_for_each_entry(lpi, &lpis, l) {
-		if (lpi->exited || lpi->lpfd.fd < 0)
-			continue;
-		if (find_iov(lpi, vaddr))
-			return lpi->lpfd.fd;
-	}
-	return -1;
-}
-
-
 /*
  * Simple COW state accessors are in cow-uffd.c:
  * - cow_is_dirty_bitmap_received(), cow_set_dirty_bitmap_received()
