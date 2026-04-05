@@ -24,7 +24,7 @@
 #include "mem.h"
 #include "cow-unified-thread.h"
 #include "common/list.h"
-#include "bug.h"
+#include "common/bug.h"
 
 /* Global compression statistics for stats printing (used by cow-bulk-send.c too) */
 unsigned long g_compress_uncompressed_bytes = 0;
