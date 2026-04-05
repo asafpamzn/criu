@@ -84,4 +84,19 @@ extern int cow_request_all_remote_pages(unsigned long img_id);
 /* COW server-side socket close */
 extern void cow_close_page_server_socket(void);
 
+/* COW lazy VMA pagemap writing */
+struct page_xfer;
+struct lazy_vma_entry;
+extern int cow_write_lazy_vmas_before(struct page_xfer *xfer, unsigned long before_vaddr,
+				      struct lazy_vma_entry **cur_lve);
+
+/* COW protocol command handler (returns 0=handled, 1=not COW cmd, -1=error) */
+extern int cow_handle_protocol_cmd(u32 cmd, struct page_server_iov *pi, int sk,
+				   int *ret_val, bool *flushed, bool *bulk_ack);
+
+/* COW compressed page receiver (server-side) */
+extern int cow_receive_compressed_pages(int sk, struct page_server_iov *pi,
+					int write_fd, int read_fd,
+					struct page_xfer *lxfer);
+
 #endif /* __CR_COW_PAGE_XFER_H__ */

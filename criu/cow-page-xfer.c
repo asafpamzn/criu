@@ -21,6 +21,10 @@
 #include "criu-log.h"
 #include "image.h"
 #include "pagemap.h"
+#include "mem.h"
+#include "cow-unified-thread.h"
+#include "list.h"
+#include "bug.h"
 
 /* Global compression statistics for stats printing (used by cow-bulk-send.c too) */
 unsigned long g_compress_uncompressed_bytes = 0;
@@ -432,4 +436,175 @@ void cow_close_page_server_socket(void)
 		pr_info("Closing page server socket (server-side)\n");
 	/* Also close the listen socket to release the port */
 	close_listen_socket();
+}
+
+/*
+ * Helper to write lazy VMA pagemap entries that come before a given vaddr.
+ * COW-specific: used to interleave lazy VMA entries with pipe entries.
+ */
+int cow_write_lazy_vmas_before(struct page_xfer *xfer, unsigned long before_vaddr,
+			       struct lazy_vma_entry **cur_lve)
+{
+	struct list_head *global_list = get_global_lazy_vmas();
+	struct lazy_vma_entry *lve = *cur_lve;
+
+	/* Start from beginning if not set */
+	if (!lve && !list_empty(global_list))
+		lve = list_first_entry(global_list, struct lazy_vma_entry, list);
+
+	/* Write all lazy VMAs that start before before_vaddr.
+	 * Use lve->start/end (not lve->vma->e) since vma structs
+	 * may be freed after the dump completes.
+	 */
+	while (lve && &lve->list != global_list) {
+		struct iovec iov;
+		u32 flags = PE_LAZY;
+		unsigned long vma_start = lve->start;
+
+		/*
+		 * In server mode, filter VMAs by dst_id (for multi-process dumps).
+		 * In local mode, xfer->dst_id is unreliable (union with pmi/pi),
+		 * so skip the check. COW local mode dumps single process anyway.
+		 */
+		if (opts.use_page_server && lve->dst_id != xfer->dst_id) {
+			lve = list_entry(lve->list.next, struct lazy_vma_entry, list);
+			continue;
+		}
+
+		/* Stop if this VMA starts at or after our limit */
+		if (vma_start >= before_vaddr)
+			break;
+
+		iov.iov_base = (void *)(unsigned long)lve->start;
+		iov.iov_len = lve->end - lve->start;
+
+		BUG_ON(iov.iov_base < (void *)xfer->offset);
+		iov.iov_base -= xfer->offset;
+
+		pr_debug("Writing lazy VMA pagemap: 0x%lx-0x%lx (%lu pages)\n",
+			(unsigned long)lve->start, (unsigned long)lve->end,
+			(unsigned long)(iov.iov_len / PAGE_SIZE));
+
+		if (xfer->write_pagemap(xfer, &iov, flags)) {
+			pr_err("Failed to write pagemap for lazy VMA\n");
+			return -1;
+		}
+
+		lve = list_entry(lve->list.next, struct lazy_vma_entry, list);
+	}
+
+	*cur_lve = lve;
+	return 0;
+}
+
+/*
+ * Handle COW-specific protocol commands in page_server_serve().
+ * Returns: 0 = handled, 1 = not a COW command, -1 = error
+ * Sets *ret_val, *flushed, *bulk_ack on success.
+ */
+int cow_handle_protocol_cmd(u32 cmd, struct page_server_iov *pi, int sk,
+			    int *ret_val, bool *flushed, bool *bulk_ack)
+{
+	switch (cmd) {
+	case PS_IOV_GET_ALL:
+		cow_ps_stats_inc_get();
+		*ret_val = cow_page_server_get_all_pages(sk, pi->dst_id);
+		return 0;
+
+	case PS_IOV_START_RESTORE:
+		pr_info("Received start restore signal\n");
+		*ret_val = 0;
+		return 0;
+
+	case PS_IOV_BULK_COMPLETE_ACK:
+		/*
+		 * Replica acknowledges all bulk pages received.
+		 * Break out of the serve loop so the primary can
+		 * proceed to Phase 3 (skeleton dump + dirty scan).
+		 */
+		pr_info("Received bulk complete ACK from replica\n");
+		*ret_val = 0;
+		*flushed = true;
+		*bulk_ack = true;
+		return 0;
+
+	case PS_IOV_ALL_PAGES_SENT_ACK:
+		/*
+		 * Replica acknowledges all_pages_sent signal received.
+		 * Set flag so unified_page_server_thread can continue.
+		 */
+		pr_info("Received all_pages_sent ACK from replica\n");
+		set_all_pages_sent_ack_received();
+		*ret_val = 0;
+		*flushed = true;
+		return 0;
+
+	default:
+		return 1;  /* Not a COW command */
+	}
+}
+
+/*
+ * Receive and decompress compressed pages from dump client.
+ * Called by page_server_add() when PS_IOV_ADD_F_COMPRESS is received.
+ *
+ * Protocol: For each page, receive [compressed_size (4 bytes)][compressed_data]
+ * Decompress and write to pipe, then call write_pages to store in image.
+ */
+int cow_receive_compressed_pages(int sk, struct page_server_iov *pi,
+				 int write_fd, int read_fd,
+				 struct page_xfer *lxfer)
+{
+	unsigned long pages_left = pi->nr_pages;
+
+	while (pages_left > 0) {
+		int compressed_size;
+		char compressed_buf[LZ4_compressBound(PAGE_SIZE)];
+		char decompressed[PAGE_SIZE];
+		int decomp_ret;
+
+		/* Receive compressed size */
+		if (page_server_recv(sk, &compressed_size, sizeof(compressed_size),
+				     MSG_WAITALL) != sizeof(compressed_size)) {
+			pr_perror("Failed to receive compressed size");
+			return -1;
+		}
+
+		if (compressed_size <= 0 || compressed_size > LZ4_compressBound(PAGE_SIZE)) {
+			pr_err("Invalid compressed size: %d\n", compressed_size);
+			return -1;
+		}
+
+		/* Receive compressed data */
+		if (page_server_recv(sk, compressed_buf, compressed_size,
+				     MSG_WAITALL) != compressed_size) {
+			pr_perror("Failed to receive compressed data");
+			return -1;
+		}
+
+		/* Decompress */
+		decomp_ret = LZ4_decompress_safe(compressed_buf, decompressed,
+						 compressed_size, PAGE_SIZE);
+		if (decomp_ret != PAGE_SIZE) {
+			pr_err("LZ4 decompression failed: expected %lu, got %d\n",
+			       PAGE_SIZE, decomp_ret);
+			return -1;
+		}
+
+		pr_debug("Decompressed page: %d -> %lu bytes\n",
+			 compressed_size, PAGE_SIZE);
+
+		/* Write decompressed page data to pipe and then to image */
+		if (write(write_fd, decompressed, PAGE_SIZE) != PAGE_SIZE) {
+			pr_perror("Failed to write decompressed page to pipe");
+			return -1;
+		}
+
+		if (lxfer->write_pages(lxfer, read_fd, PAGE_SIZE))
+			return -1;
+
+		pages_left--;
+	}
+
+	return 0;
 }

@@ -934,61 +934,7 @@ err:
 	return -1;
 }
 
-/* Helper to write lazy VMA pagemap entries that come before a given vaddr */
-static int write_lazy_vmas_before(struct page_xfer *xfer, unsigned long before_vaddr,
-				   struct lazy_vma_entry **cur_lve)
-{
-	struct list_head *global_list = get_global_lazy_vmas();
-	struct lazy_vma_entry *lve = *cur_lve;
-
-	/* Start from beginning if not set */
-	if (!lve && !list_empty(global_list))
-		lve = list_first_entry(global_list, struct lazy_vma_entry, list);
-
-	/* Write all lazy VMAs that start before before_vaddr.
-	 * Use lve->start/end (not lve->vma->e) since vma structs
-	 * may be freed after the dump completes.
-	 */
-	while (lve && &lve->list != global_list) {
-		struct iovec iov;
-		u32 flags = PE_LAZY;
-		unsigned long vma_start = lve->start;
-
-		/*
-		 * In server mode, filter VMAs by dst_id (for multi-process dumps).
-		 * In local mode, xfer->dst_id is unreliable (union with pmi/pi),
-		 * so skip the check. COW local mode dumps single process anyway.
-		 */
-		if (opts.use_page_server && lve->dst_id != xfer->dst_id) {
-			lve = list_entry(lve->list.next, struct lazy_vma_entry, list);
-			continue;
-		}
-
-		/* Stop if this VMA starts at or after our limit */
-		if (vma_start >= before_vaddr)
-			break;
-
-		iov.iov_base = (void *)(unsigned long)lve->start;
-		iov.iov_len = lve->end - lve->start;
-
-		BUG_ON(iov.iov_base < (void *)xfer->offset);
-		iov.iov_base -= xfer->offset;
-
-		pr_debug("Writing lazy VMA pagemap: 0x%lx-0x%lx (%lu pages)\n",
-			(unsigned long)lve->start, (unsigned long)lve->end,
-			(unsigned long)(iov.iov_len / PAGE_SIZE));
-
-		if (xfer->write_pagemap(xfer, &iov, flags)) {
-			pr_err("Failed to write pagemap for lazy VMA\n");
-			return -1;
-		}
-
-		lve = list_entry(lve->list.next, struct lazy_vma_entry, list);
-	}
-
-	*cur_lve = lve;
-	return 0;
-}
+/* write_lazy_vmas_before is now in cow-page-xfer.c (cow_write_lazy_vmas_before) */
 
 int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 {
@@ -1021,7 +967,7 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 
 			/* Write any lazy VMAs that should come before this segment */
 			if (opts.cow_dump) {
-				ret = write_lazy_vmas_before(xfer, seg_vaddr, &cur_lve);
+				ret = cow_write_lazy_vmas_before(xfer, seg_vaddr, &cur_lve);
 				if (ret)
 					return ret;
 			}
@@ -1049,7 +995,7 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 
 	/* Write any remaining lazy VMAs after all pipe entries */
 	if (opts.cow_dump) {
-		ret = write_lazy_vmas_before(xfer, ULONG_MAX, &cur_lve);
+		ret = cow_write_lazy_vmas_before(xfer, ULONG_MAX, &cur_lve);
 		if (ret)
 			return ret;
 	}
@@ -1231,55 +1177,9 @@ static int page_server_add(int sk, struct page_server_iov *pi, u32 flags, bool c
 	if (!(flags & PE_PRESENT))
 		return 0;
 
-	/* Handle compressed data - receive, decompress, write page by page */
-	if (compressed) {
-		unsigned long pages_left = pi->nr_pages;
-		
-		while (pages_left > 0) {
-			int compressed_size;
-			char compressed_buf[LZ4_compressBound(PAGE_SIZE)];
-			char decompressed[PAGE_SIZE];
-			int decomp_ret;
-
-			/* Receive compressed size */
-			if (__recv(sk, &compressed_size, sizeof(compressed_size), MSG_WAITALL) != sizeof(compressed_size)) {
-				pr_perror("Failed to receive compressed size");
-				return -1;
-			}
-
-			if (compressed_size <= 0 || compressed_size > LZ4_compressBound(PAGE_SIZE)) {
-				pr_err("Invalid compressed size: %d\n", compressed_size);
-				return -1;
-			}
-
-			/* Receive compressed data */
-			if (__recv(sk, compressed_buf, compressed_size, MSG_WAITALL) != compressed_size) {
-				pr_perror("Failed to receive compressed data");
-				return -1;
-			}
-
-			/* Decompress */
-			decomp_ret = LZ4_decompress_safe(compressed_buf, decompressed, compressed_size, PAGE_SIZE);
-			if (decomp_ret != PAGE_SIZE) {
-				pr_err("LZ4 decompression failed: expected %lu, got %d\n", PAGE_SIZE, decomp_ret);
-				return -1;
-			}
-
-			pr_debug("Decompressed page: %d -> %lu bytes\n", compressed_size, PAGE_SIZE);
-
-			/* Write decompressed page data to pipe and then to image */
-			if (write(cxfer.p[1], decompressed, PAGE_SIZE) != PAGE_SIZE) {
-				pr_perror("Failed to write decompressed page to pipe");
-				return -1;
-			}
-
-			if (lxfer->write_pages(lxfer, cxfer.p[0], PAGE_SIZE))
-				return -1;
-
-			pages_left--;
-		}
-		return 0;
-	}
+	/* COW mode: handle compressed pages */
+	if (compressed)
+		return cow_receive_compressed_pages(sk, pi, cxfer.p[1], cxfer.p[0], lxfer);
 
 	/* Handle uncompressed data - original splice-based path */
 	len = iov.iov_len;
@@ -1520,54 +1420,20 @@ static int page_server_serve(int sk)
 			ret = page_server_get_pages(sk, &pi);
 			break;
 		case PS_IOV_GET_ALL:
-			if (!opts.cow_dump) {
-				pr_err("PS_IOV_GET_ALL requires COW mode\n");
-				ret = -1;
-				break;
-			}
-			cow_ps_stats_inc_get();
-			ret = cow_page_server_get_all_pages(sk, pi.dst_id);
-			break;
 		case PS_IOV_START_RESTORE:
-			/* Signal to start the restore process (COW mode) */
-			if (!opts.cow_dump) {
-				pr_err("PS_IOV_START_RESTORE requires COW mode\n");
-				ret = -1;
-				break;
-			}
-			pr_info("Received start restore signal\n");
-			ret = 0;
-			break;
 		case PS_IOV_BULK_COMPLETE_ACK:
-			/*
-			 * Replica acknowledges all bulk pages received.
-			 * Break out of the serve loop so the primary can
-			 * proceed to Phase 3 (skeleton dump + dirty scan).
-			 */
-			if (!opts.cow_dump) {
-				pr_err("PS_IOV_BULK_COMPLETE_ACK requires COW mode\n");
-				ret = -1;
-				break;
-			}
-			pr_info("Received bulk complete ACK from replica\n");
-			ret = 0;
-			flushed = true;
-			bulk_ack_received = true;
-			break;
 		case PS_IOV_ALL_PAGES_SENT_ACK:
-			/*
-			 * Replica acknowledges all_pages_sent signal received.
-			 * Set flag so unified_page_server_thread can continue.
-			 */
+			/* COW-specific commands handled in cow-page-xfer.c */
 			if (!opts.cow_dump) {
-				pr_err("PS_IOV_ALL_PAGES_SENT_ACK requires COW mode\n");
+				pr_err("COW command %u requires COW mode\n", cmd);
 				ret = -1;
 				break;
 			}
-			pr_info("Received all_pages_sent ACK from replica\n");
-			set_all_pages_sent_ack_received();
-			ret = 0;
-			flushed = true;
+			ret = cow_handle_protocol_cmd(cmd, &pi, sk, &ret, &flushed, &bulk_ack_received);
+			if (ret == 1) {
+				pr_err("Unknown COW command %u\n", cmd);
+				ret = -1;
+			}
 			break;
 		default:
 			pr_err("Unknown command %u\n", pi.cmd);
@@ -1905,18 +1771,7 @@ struct ps_async_read {
 	void *priv;
 
 	struct list_head l;
-
-	/* Compression support */
-	int compressed_size;     /* Size of compressed data (0 = uncompressed) */
-	int compressed_rb;       /* Bytes read of compressed data */
-	char *compressed_buf;    /* Buffer for compressed data */
-	int compress_state;      /* 0=reading header, 1=reading size, 2=reading data */
-
-	/* Dirty bitmap support (COW phased migration) */
-	unsigned int nr_dirty_ranges;
-	unsigned long dirty_ranges_size;
-	unsigned long *dirty_ranges;
-	unsigned long dirty_rb;
+	/* COW compression/dirty bitmap fields are in cow-bulk-recv.c (ps_async_read_bulk) */
 };
 
 static LIST_HEAD(async_reads);
