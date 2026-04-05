@@ -146,11 +146,6 @@ extern int cow_phase3_restore_loop_impl(struct list_head *lpis, int epollfd,
 					struct epoll_event **events, int nr_fds,
 					int (*handle_requests)(int, struct epoll_event **, int));
 
-/* Bulk IO completion callback for COW mode */
-extern int cow_uffd_io_complete_bulk(struct list_head *lpis,
-				     unsigned long vaddr,
-				     unsigned long nr_pages, void *buf);
-
 /* COW mode initialization for cr_lazy_pages */
 extern int cow_lazy_pages_init(void);
 
