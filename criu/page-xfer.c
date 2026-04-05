@@ -10,7 +10,6 @@
 #include <sys/mman.h>
 #include <sys/ioctl.h>
 #include <linux/userfaultfd.h>
-#include <time.h>
 #include <string.h>
 #include <pthread.h>
 #include <poll.h>
@@ -1211,54 +1210,7 @@ static int prep_loc_xfer(struct page_server_iov *pi)
 		return 0;
 }
 
-/* Statistics tracking structure */
-static struct {
-	/* page_server_get_pages counters */
-	unsigned long get_total_requests;
-	unsigned long get_with_cow;
-	unsigned long get_no_cow;
-	unsigned long get_total_pages;
-	unsigned long get_cow_pages;
-	unsigned long get_errors;
-	
-	/* page_server_serve counters */
-	unsigned long serve_open;
-	unsigned long serve_open2;
-	unsigned long serve_parent;
-	unsigned long serve_add_f;
-	unsigned long serve_add;
-	unsigned long serve_hole;
-	unsigned long serve_close;
-	unsigned long serve_force_close;
-	unsigned long serve_get;
-	unsigned long serve_unknown;
-	
-	time_t last_print_time;
-} ps_stats = {0};
-
-static void check_and_print_stats(void)
-{
-	time_t now = time(NULL);
-
-	if (now - ps_stats.last_print_time >= 60) {
-		pr_err("[PAGE_SERVER_STATS] get_pages: reqs=%lu with_cow=%lu no_cow=%lu pages=%lu cow=%lu errs=%lu | serve: open2=%lu parent=%lu add_f=%lu get=%lu close=%lu\n",
-			ps_stats.get_total_requests,
-			ps_stats.get_with_cow,
-			ps_stats.get_no_cow,
-			ps_stats.get_total_pages,
-			ps_stats.get_cow_pages,
-			ps_stats.get_errors,
-			ps_stats.serve_open2,
-			ps_stats.serve_parent,
-			ps_stats.serve_add_f,
-			ps_stats.serve_get,
-			ps_stats.serve_close + ps_stats.serve_force_close);
-		
-		/* Reset all counters */
-		memset(&ps_stats, 0, sizeof(ps_stats));
-		ps_stats.last_print_time = now;
-	}
-}
+/* Statistics tracking is in cow-page-xfer.c (cow_check_and_print_stats) */
 
 static int page_server_add(int sk, struct page_server_iov *pi, u32 flags, bool compressed)
 {
@@ -1489,19 +1441,22 @@ static int page_server_serve(int sk)
 
 		/* Check and print stats on each iteration (COW mode only) */
 		if (opts.cow_dump)
-			check_and_print_stats();
+			cow_check_and_print_stats();
 
 		switch (cmd) {
 		case PS_IOV_OPEN:
-			ps_stats.serve_open++;
+			if (opts.cow_dump)
+				cow_ps_stats_inc_open();
 			ret = page_server_open(-1, &pi);
 			break;
 		case PS_IOV_OPEN2:
-			ps_stats.serve_open2++;
+			if (opts.cow_dump)
+				cow_ps_stats_inc_open2();
 			ret = page_server_open(sk, &pi);
 			break;
 		case PS_IOV_PARENT:
-			ps_stats.serve_parent++;
+			if (opts.cow_dump)
+				cow_ps_stats_inc_parent();
 			ret = page_server_check_parent(sk, &pi);
 			break;
 		case PS_IOV_ADD_F_COMPRESS:
@@ -1518,16 +1473,16 @@ static int page_server_serve(int sk)
 			}
 			if (likely(cmd == PS_IOV_ADD_F || cmd == PS_IOV_ADD_F_COMPRESS)) {
 				flags = decode_ps_flags(pi.cmd);
-				ps_stats.serve_add_f++;
-			}
-			else if (cmd == PS_IOV_ADD){
+				if (opts.cow_dump)
+					cow_ps_stats_inc_add_f();
+			} else if (cmd == PS_IOV_ADD) {
 				flags = PE_PRESENT;
-				ps_stats.serve_add++;
-			}
-			else /* PS_IOV_HOLE */
-			{
+				if (opts.cow_dump)
+					cow_ps_stats_inc_add();
+			} else /* PS_IOV_HOLE */ {
 				flags = PE_PARENT;
-				ps_stats.serve_hole++;
+				if (opts.cow_dump)
+					cow_ps_stats_inc_hole();
 			}
 
 			ret = page_server_add(sk, &pi, flags, cmd == PS_IOV_ADD_F_COMPRESS);
@@ -1538,11 +1493,13 @@ static int page_server_serve(int sk)
 			int32_t status = 0;
 
 			ret = 0;
-			
-			if (cmd == PS_IOV_CLOSE)
-				ps_stats.serve_close++;
-			else
-				ps_stats.serve_force_close++;
+
+			if (opts.cow_dump) {
+				if (cmd == PS_IOV_CLOSE)
+					cow_ps_stats_inc_close();
+				else
+					cow_ps_stats_inc_force_close();
+			}
 
 			/*
 			 * An answer must be sent back to inform another side,
@@ -1558,7 +1515,8 @@ static int page_server_serve(int sk)
 			break;
 		}
 		case PS_IOV_GET:
-			ps_stats.serve_get++;
+			if (opts.cow_dump)
+				cow_ps_stats_inc_get();
 			ret = page_server_get_pages(sk, &pi);
 			break;
 		case PS_IOV_GET_ALL:
@@ -1567,7 +1525,7 @@ static int page_server_serve(int sk)
 				ret = -1;
 				break;
 			}
-			ps_stats.serve_get++;
+			cow_ps_stats_inc_get();
 			ret = cow_page_server_get_all_pages(sk, pi.dst_id);
 			break;
 		case PS_IOV_START_RESTORE:
@@ -1613,7 +1571,8 @@ static int page_server_serve(int sk)
 			break;
 		default:
 			pr_err("Unknown command %u\n", pi.cmd);
-			ps_stats.serve_unknown++;
+			if (opts.cow_dump)
+				cow_ps_stats_inc_unknown();
 			ret = -1;
 			break;
 		}
@@ -1887,18 +1846,11 @@ int connect_to_page_server_to_send(void)
 /*
  * Close the page server socket (server-side).
  * Used after sending dirty bitmap in COW phased migration.
- * Unlike disconnect_from_page_server(), this doesn't send PS_IOV_CLOSE
- * since we ARE the server, not the client.
+ * Wrapper for cow_close_page_server_socket().
  */
 void close_page_server_socket(void)
 {
-	pr_debug("DEBUG_SOCKET: close_page_server_socket called fd=%d\n", page_server_sk);
-	if (page_server_sk >= 0) {
-		pr_info("Closing page server socket (server-side)\n");
-		close_safe(&page_server_sk);
-	}
-	/* Also close the listen socket to release the port */
-	close_listen_socket();
+	cow_close_page_server_socket();
 }
 
 int disconnect_from_page_server(void)
@@ -2133,22 +2085,10 @@ int request_remote_pages(unsigned long img_id, unsigned long addr, unsigned long
 	return 0;
 }
 
+/* COW batch mode request - wrapper for cow_request_all_remote_pages */
 int request_all_remote_pages(unsigned long img_id)
 {
-	struct page_server_iov pi = {
-		.cmd = PS_IOV_GET_ALL,
-		.nr_pages = 0,  /* Not used in batch mode */
-		.vaddr = 0,     /* Not used in batch mode */
-		.dst_id = img_id,
-	};
-
-	pr_info("Requesting all pages for img_id=%lu in batch mode\n", img_id);
-
-	if (send_psi_flags(page_server_sk, &pi, MSG_DONTWAIT))
-		return -1;
-
-	tcp_nodelay(page_server_sk, true);
-	return 0;
+	return cow_request_all_remote_pages(img_id);
 }
 
 static int page_server_start_sync_read(void *buf, unsigned long nr, ps_async_read_complete complete, void *priv)

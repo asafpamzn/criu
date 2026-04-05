@@ -65,4 +65,23 @@ extern int accept_p3_connections(int *sockets, int max_connections, int timeout_
 extern void close_p3_sockets(int *sockets, int num_sockets);
 extern void stop_p3_acceptor_thread(void);
 
+/* COW page server statistics (cow-page-xfer.c) */
+extern void cow_check_and_print_stats(void);
+extern void cow_ps_stats_inc_open(void);
+extern void cow_ps_stats_inc_open2(void);
+extern void cow_ps_stats_inc_parent(void);
+extern void cow_ps_stats_inc_add_f(void);
+extern void cow_ps_stats_inc_add(void);
+extern void cow_ps_stats_inc_hole(void);
+extern void cow_ps_stats_inc_close(void);
+extern void cow_ps_stats_inc_force_close(void);
+extern void cow_ps_stats_inc_get(void);
+extern void cow_ps_stats_inc_unknown(void);
+
+/* COW request all pages (batch mode) */
+extern int cow_request_all_remote_pages(unsigned long img_id);
+
+/* COW server-side socket close */
+extern void cow_close_page_server_socket(void);
+
 #endif /* __CR_COW_PAGE_XFER_H__ */

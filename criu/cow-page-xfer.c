@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <string.h>
+#include <time.h>
 #include <lz4.h>
 
 #include "cow-page-xfer.h"
@@ -344,4 +345,91 @@ int send_page_uncompressed(int sk, const void *data, u64 dst_id, unsigned long v
 	}
 
 	return 0;
+}
+
+/*
+ * Statistics tracking for COW page server (debug/monitoring).
+ */
+static struct {
+	unsigned long serve_open;
+	unsigned long serve_open2;
+	unsigned long serve_parent;
+	unsigned long serve_add_f;
+	unsigned long serve_add;
+	unsigned long serve_hole;
+	unsigned long serve_close;
+	unsigned long serve_force_close;
+	unsigned long serve_get;
+	unsigned long serve_unknown;
+	time_t last_print_time;
+} cow_ps_stats = {0};
+
+void cow_ps_stats_inc_open(void) { cow_ps_stats.serve_open++; }
+void cow_ps_stats_inc_open2(void) { cow_ps_stats.serve_open2++; }
+void cow_ps_stats_inc_parent(void) { cow_ps_stats.serve_parent++; }
+void cow_ps_stats_inc_add_f(void) { cow_ps_stats.serve_add_f++; }
+void cow_ps_stats_inc_add(void) { cow_ps_stats.serve_add++; }
+void cow_ps_stats_inc_hole(void) { cow_ps_stats.serve_hole++; }
+void cow_ps_stats_inc_close(void) { cow_ps_stats.serve_close++; }
+void cow_ps_stats_inc_force_close(void) { cow_ps_stats.serve_force_close++; }
+void cow_ps_stats_inc_get(void) { cow_ps_stats.serve_get++; }
+void cow_ps_stats_inc_unknown(void) { cow_ps_stats.serve_unknown++; }
+
+void cow_check_and_print_stats(void)
+{
+	time_t now = time(NULL);
+
+	if (now - cow_ps_stats.last_print_time >= 60) {
+		pr_err("[PAGE_SERVER_STATS] serve: open=%lu open2=%lu parent=%lu add_f=%lu add=%lu hole=%lu get=%lu close=%lu unknown=%lu\n",
+			cow_ps_stats.serve_open,
+			cow_ps_stats.serve_open2,
+			cow_ps_stats.serve_parent,
+			cow_ps_stats.serve_add_f,
+			cow_ps_stats.serve_add,
+			cow_ps_stats.serve_hole,
+			cow_ps_stats.serve_get,
+			cow_ps_stats.serve_close + cow_ps_stats.serve_force_close,
+			cow_ps_stats.serve_unknown);
+
+		/* Reset all counters */
+		memset(&cow_ps_stats, 0, sizeof(cow_ps_stats));
+		cow_ps_stats.last_print_time = now;
+	}
+}
+
+/*
+ * Request all pages from primary in batch mode.
+ * COW-specific: used for bulk page transfer.
+ */
+int cow_request_all_remote_pages(unsigned long img_id)
+{
+	struct page_server_iov pi = {
+		.cmd = PS_IOV_GET_ALL,
+		.nr_pages = 0,  /* Not used in batch mode */
+		.vaddr = 0,     /* Not used in batch mode */
+		.dst_id = img_id,
+	};
+
+	pr_info("Requesting all pages for img_id=%lu in batch mode\n", img_id);
+
+	if (send_psi(get_page_server_sk(), &pi))
+		return -1;
+
+	page_server_tcp_nodelay(get_page_server_sk(), true);
+	return 0;
+}
+
+/*
+ * Close the page server socket (server-side).
+ * Used after sending dirty bitmap in COW phased migration.
+ */
+void cow_close_page_server_socket(void)
+{
+	int sk = get_page_server_sk();
+
+	pr_debug("DEBUG_SOCKET: cow_close_page_server_socket called fd=%d\n", sk);
+	if (sk >= 0)
+		pr_info("Closing page server socket (server-side)\n");
+	/* Also close the listen socket to release the port */
+	close_listen_socket();
 }
