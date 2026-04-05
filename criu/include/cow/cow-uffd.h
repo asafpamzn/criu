@@ -81,4 +81,27 @@ extern void cow_dump_lazy_iov_list(struct lazy_pages_info *lpi, const char *name
 struct lazy_iov;
 extern struct lazy_iov *cow_find_iov(struct lazy_pages_info *lpi, unsigned long addr);
 
+/*
+ * COW Restore State Management
+ */
+
+/* Check/set if restore has connected (uffd available) */
+extern bool cow_is_restore_connected(void);
+extern void cow_set_restore_connected(bool connected);
+
+/* Check/set if dirty bitmap has been received from primary */
+extern bool cow_is_dirty_bitmap_received(void);
+extern void cow_set_dirty_bitmap_received(bool received);
+
+/* Check/set if inventory.img is ready on disk */
+extern bool cow_is_inventory_ready_received(void);
+extern void cow_set_inventory_ready_received(void);
+
+/* Check/set if all pages have been sent by primary */
+extern bool cow_is_all_pages_sent_received(void);
+extern void cow_set_all_pages_sent_received(void);
+
+/* Return uffd for a given vaddr (for background drain thread) */
+extern int cow_get_uffd_for_vaddr(struct list_head *lpis, unsigned long vaddr);
+
 #endif /* __CR_COW_UFFD_H__ */

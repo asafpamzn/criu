@@ -232,7 +232,7 @@ static int read_bulk_header(struct ps_async_read_bulk *ar, int flags)
 	switch (cmd) {
 	case PS_IOV_INVENTORY_READY:
 		/* Primary signals inventory.img is ready */
-		set_inventory_ready_received();
+		cow_set_inventory_ready_received();
 		ar->rb = 0;
 		ar->compress_state = COMPRESS_STATE_READING_HEADER;
 		return BULK_STREAM_PROGRESS;
@@ -240,7 +240,7 @@ static int read_bulk_header(struct ps_async_read_bulk *ar, int flags)
 	case PS_IOV_ALL_PAGES_SENT:
 		/* Primary signals all pages sent - replica can zero-fill rest */
 		pr_info("Received all_pages_sent signal from primary\n");
-		set_all_pages_sent_received();
+		cow_set_all_pages_sent_received();
 		ar->rb = 0;
 		ar->compress_state = COMPRESS_STATE_READING_HEADER;
 		/*
@@ -605,10 +605,8 @@ int page_server_async_read_bulk(struct epoll_rfd *f)
 		pr_info("page_server_async_read_bulk: BULK_STREAM_COMPLETE, returning 0\n");
 		return 0;
 	}
-	if (ret < 0) {
-		pr_err("DEBUG_BULK: page_server_read_bulk_stream returned %d (ERROR)\n", ret);
+	if (ret < 0)
 		return -1;
-	}
 
 	/* ret == BULK_STREAM_WOULD_BLOCK or BULK_STREAM_PROGRESS - keep going */
 	return 0;
@@ -619,14 +617,9 @@ int page_server_start_async_read_bulk(void *buf, unsigned long nr_pages,
 {
 	struct ps_async_read_bulk *ar;
 
-	pr_err("DEBUG_CALLBACK: page_server_start_async_read_bulk called complete=%p\n", complete);
-
 	/* In bulk mode, only create reader once - it processes continuous stream */
-	if (!list_empty(&bulk_async_reads)) {
-		/* Already have a stream reader */
-		pr_err("DEBUG_CALLBACK: stream reader already exists, skipping\n");
+	if (!list_empty(&bulk_async_reads))
 		return 0;
-	}
 
 	ar = xmalloc(sizeof(*ar));
 	if (ar == NULL)
@@ -663,17 +656,13 @@ int page_server_update_async_callback(ps_async_read_complete complete, void *pri
 {
 	struct ps_async_read_bulk *ar;
 
-	pr_err("DEBUG_CALLBACK: page_server_update_async_callback called complete=%p\n", complete);
-
 	if (list_empty(&bulk_async_reads)) {
-		pr_err("DEBUG_CALLBACK: bulk_async_reads is empty, cannot update callback\n");
+		pr_err("bulk_async_reads is empty, cannot update callback\n");
 		return -1;
 	}
 
 	ar = list_first_entry(&bulk_async_reads, struct ps_async_read_bulk, l);
-	pr_err("DEBUG_CALLBACK: old callback=%p, new callback=%p\n", ar->complete, complete);
 	ar->complete = complete;
 	ar->priv = priv;
-	pr_info("Updated async bulk reader callback for convergence\n");
 	return 0;
 }

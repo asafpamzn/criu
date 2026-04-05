@@ -180,7 +180,7 @@ int cow_page_buffer_add(unsigned long vaddr, void *data, int thread_id, bool noc
 		for (i = 0; i < node->count; i++) {
 			if (node->entries[i].vaddr == vaddr) {
 				/* Update existing entry with newer data */
-				pr_err("DEBUG: cow_page_buffer_add REPLACING existing entry vaddr=0x%lx nocopy=%d\n", vaddr, nocopy);
+				pr_debug("cow_page_buffer_add replacing existing entry vaddr=0x%lx\n", vaddr);
 				page_pool_put(node->entries[i].data);
 				node->entries[i].data = page_data;
 				pthread_spin_unlock(&hash_locks[lock_idx]);
@@ -953,8 +953,7 @@ int cow_queue_eagain_request(struct lazy_pages_info *lpi, __u64 address,
 
 	list_add_tail(&req->l, &eagain_requests);
 
-	pr_err("DEBUG: queue_eagain_request added 0x%llx to eagain_requests (op=%s)\n",
-	       address, op_name);
+	pr_debug("Queued EAGAIN request 0x%llx (op=%s)\n", address, op_name);
 	return 0;
 }
 
@@ -1009,7 +1008,6 @@ static int retry_uffd_copy(struct uffd_eagain_request *req)
 		if (errno == EAGAIN)
 			return -EAGAIN;
 
-		pr_err("DEBUG: retry_uffd_copy error at 0x%llx errno=%d\n", req->address, errno);
 		lp_err(req->lpi, "EAGAIN copy retry failed for 0x%llx: %d\n",
 		       req->address, errno);
 		page_state_set(req->address, PAGE_STATE_DISCARDED);
@@ -1019,12 +1017,9 @@ static int retry_uffd_copy(struct uffd_eagain_request *req)
 	/* Check for soft error */
 	if (uffdio_copy.copy < 0) {
 		errno = -uffdio_copy.copy;
-		if (errno == EAGAIN) {
-			pr_err("DEBUG: retry_uffd_copy soft EAGAIN at 0x%llx\n", req->address);
+		if (errno == EAGAIN)
 			return -EAGAIN;
-		}
 
-		pr_err("DEBUG: retry_uffd_copy soft error at 0x%llx errno=%d\n", req->address, errno);
 		lp_err(req->lpi, "EAGAIN copy retry soft error for 0x%llx: %d\n",
 		       req->address, errno);
 		page_state_set(req->address, PAGE_STATE_DISCARDED);
@@ -1053,12 +1048,9 @@ static int retry_uffd_zero(struct uffd_eagain_request *req)
 	uffdio_zeropage.zeropage = 0;
 
 	if (ioctl(req->lpi->lpfd.fd, UFFDIO_ZEROPAGE, &uffdio_zeropage) == -1) {
-		if (errno == EAGAIN) {
-			pr_err("DEBUG: retry_uffd_zero still EAGAIN at 0x%llx\n", req->address);
+		if (errno == EAGAIN)
 			return -EAGAIN;
-		}
 
-		pr_err("DEBUG: retry_uffd_zero error at 0x%llx errno=%d\n", req->address, errno);
 		lp_err(req->lpi, "EAGAIN zero retry failed for 0x%llx: %d\n",
 		       req->address, errno);
 		page_state_set(req->address, PAGE_STATE_DISCARDED);
@@ -1068,12 +1060,9 @@ static int retry_uffd_zero(struct uffd_eagain_request *req)
 	/* Check for soft error */
 	if (uffdio_zeropage.zeropage < 0) {
 		errno = -uffdio_zeropage.zeropage;
-		if (errno == EAGAIN) {
-			pr_err("DEBUG: retry_uffd_zero soft EAGAIN at 0x%llx\n", req->address);
+		if (errno == EAGAIN)
 			return -EAGAIN;
-		}
 
-		pr_err("DEBUG: retry_uffd_zero soft error at 0x%llx errno=%d\n", req->address, errno);
 		lp_err(req->lpi, "EAGAIN zero retry soft error for 0x%llx: %d\n",
 		       req->address, errno);
 		page_state_set(req->address, PAGE_STATE_DISCARDED);
@@ -1101,18 +1090,10 @@ int cow_process_eagain_requests(void)
 
 	clock_gettime(CLOCK_MONOTONIC, &t_start);
 
-	queue_empty = list_empty(&eagain_requests);
-	if (queue_empty != last_queue_empty) {
-		pr_err("DEBUG: process_eagain_requests queue_empty changed: %d -> %d\n",
-		       last_queue_empty, queue_empty);
-		last_queue_empty = queue_empty;
-	}
-
 	list_for_each_entry_safe(req, n, &eagain_requests, l) {
 		/* Skip if process has exited */
 		if (req->lpi->exited) {
 			uffd_stats.eagain_skipped++;
-			pr_err("DEBUG: eagain 0x%llx skipped (lpi exited)\n", req->address);
 			page_state_set(req->address, PAGE_STATE_DISCARDED);
 			list_del(&req->l);
 			if (req->buf)
@@ -1136,7 +1117,6 @@ int cow_process_eagain_requests(void)
 		} else if (ret < 0) {
 			/* Error - remove from queue */
 			uffd_stats.eagain_errors++;
-			pr_err("DEBUG: eagain 0x%llx error ret=%d, removing\n", req->address, ret);
 			list_del(&req->l);
 			if (req->buf)
 				xfree(req->buf);
@@ -1158,12 +1138,6 @@ int cow_process_eagain_requests(void)
 	uffd_stats.eagain_total_ns += (t_end.tv_sec - t_start.tv_sec) * 1000000000 + (t_end.tv_nsec - t_start.tv_nsec);
 	uffd_stats.eagain_calls++;
 
-	queue_empty = list_empty(&eagain_requests);
-	if (queue_empty != last_queue_empty) {
-		pr_err("DEBUG: process_eagain_requests done, queue_empty changed: %d -> %d\n",
-		       last_queue_empty, queue_empty);
-		last_queue_empty = queue_empty;
-	}
 	return 0;
 }
 
@@ -1203,4 +1177,83 @@ void cow_dump_lazy_iov_list(struct lazy_pages_info *lpi, const char *name,
 
 	lp_err(lpi, "%s: count=%lu pages=%lu sorted=%s\n", name, count, pages,
 	       sorted ? "yes" : "no");
+}
+
+/*
+ * ============================================================================
+ * COW Restore State Management
+ * ============================================================================
+ *
+ * State variables and accessors for COW phased migration.
+ * These track the state of the restore process and communication with primary.
+ */
+
+/* State flags for COW restore synchronization */
+static bool cow_restore_connected = false;
+static bool cow_dirty_bitmap_received = false;
+static bool cow_inventory_ready_received = false;
+static bool cow_all_pages_sent_received = false;
+
+/* Check if restore has connected (uffd available) */
+bool cow_is_restore_connected(void)
+{
+	return cow_restore_connected;
+}
+
+/* Set restore connected flag */
+void cow_set_restore_connected(bool connected)
+{
+	cow_restore_connected = connected;
+}
+
+/* Check if dirty bitmap has been received from primary */
+bool cow_is_dirty_bitmap_received(void)
+{
+	return cow_dirty_bitmap_received;
+}
+
+/* Set dirty bitmap received flag */
+void cow_set_dirty_bitmap_received(bool received)
+{
+	cow_dirty_bitmap_received = received;
+}
+
+/* Check if inventory.img is ready on disk */
+bool cow_is_inventory_ready_received(void)
+{
+	return cow_inventory_ready_received;
+}
+
+/* Set inventory ready flag (called when PS_IOV_INVENTORY_READY received) */
+void cow_set_inventory_ready_received(void)
+{
+	pr_info("Received inventory ready signal from primary\n");
+	cow_inventory_ready_received = true;
+}
+
+/* Check if all pages have been sent by primary */
+bool cow_is_all_pages_sent_received(void)
+{
+	return cow_all_pages_sent_received;
+}
+
+/* Set all_pages_sent flag (called when PS_IOV_ALL_PAGES_SENT received) */
+void cow_set_all_pages_sent_received(void)
+{
+	pr_info("All pages sent signal received - can zero-fill new VMA pages\n");
+	cow_all_pages_sent_received = true;
+}
+
+/* Return uffd for a given vaddr (for background drain thread) */
+int cow_get_uffd_for_vaddr(struct list_head *lpis, unsigned long vaddr)
+{
+	struct lazy_pages_info *lpi;
+
+	list_for_each_entry(lpi, lpis, l) {
+		if (lpi->exited || lpi->lpfd.fd < 0)
+			continue;
+		if (cow_find_iov(lpi, vaddr))
+			return lpi->lpfd.fd;
+	}
+	return -1;
 }

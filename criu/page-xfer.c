@@ -1880,9 +1880,9 @@ static int page_server_async_read(struct epoll_rfd *f)
 static int page_server_hangup_event(struct epoll_rfd *rfd)
 {
 	pr_err("DEBUG_CALLBACK: page_server_hangup_event called fd=%d cow_dump=%d dirty_bitmap=%d bulk_done=%d\n",
-	       rfd->fd, opts.cow_dump, is_dirty_bitmap_received(), page_server_bulk_stream_done());
+	       rfd->fd, opts.cow_dump, cow_is_dirty_bitmap_received(), page_server_bulk_stream_done());
 
-	if (opts.cow_dump && is_dirty_bitmap_received()) {
+	if (opts.cow_dump && cow_is_dirty_bitmap_received()) {
 		pr_err("Page server closed connection after dirty bitmap received\n");
 		return 1;
 	}

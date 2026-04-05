@@ -18,35 +18,19 @@ extern int apply_buffered_pages(int uffd, unsigned long *dirty_ranges,
 /* Return uffd of first active lazy_pages_info. Used by page-xfer.c. */
 extern int get_first_lpi_uffd(void);
 
-/* Return uffd for a given vaddr (for background drain thread). */
-extern int get_uffd_for_vaddr(unsigned long vaddr);
-
 /*
- * EAGAIN handling functions are in cow-uffd.c:
- * - cow_queue_drain_eagain_request()
- * - cow_is_eagain_queue_empty()
+ * COW state accessors are in cow-uffd.c (include cow/cow-uffd.h):
+ * - cow_is_restore_connected(), cow_set_restore_connected()
+ * - cow_is_dirty_bitmap_received(), cow_set_dirty_bitmap_received()
+ * - cow_is_inventory_ready_received(), cow_set_inventory_ready_received()
+ * - cow_is_all_pages_sent_received(), cow_set_all_pages_sent_received()
+ * - cow_get_uffd_for_vaddr()
+ * - cow_queue_drain_eagain_request(), cow_is_eagain_queue_empty()
  */
 
-/* Check if restore has connected (uffd available) */
-extern bool is_restore_connected(void);
-
-/* Check if dirty bitmap has been received from primary (Phase 3 signal) */
-extern bool is_dirty_bitmap_received(void);
-
+/* Set dirty bitmap received and trigger convergence (complex logic in uffd.c) */
 extern void set_dirty_bitmap_received(unsigned long *dirty_ranges,
 				      unsigned int nr_dirty_ranges);
-
-/* Check if inventory.img is ready (PS_IOV_INVENTORY_READY received) */
-extern bool is_inventory_ready_received(void);
-
-/* Set inventory ready flag (called by page-xfer when signal received) */
-extern void set_inventory_ready_received(void);
-
-/* Check if all pages have been sent (PS_IOV_ALL_PAGES_SENT received) */
-extern bool is_all_pages_sent_received(void);
-
-/* Set all_pages_sent flag (called by page-xfer when signal received) */
-extern void set_all_pages_sent_received(void);
 
 /* COW Phase 2: Initialize page buffer for pre-buffering */
 extern int page_buffer_init(void);
