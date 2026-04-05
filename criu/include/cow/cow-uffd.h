@@ -104,4 +104,66 @@ extern void cow_set_all_pages_sent_received(void);
 /* Return uffd for a given vaddr (for background drain thread) */
 extern int cow_get_uffd_for_vaddr(struct list_head *lpis, unsigned long vaddr);
 
+/*
+ * COW Phase 2/3 Infrastructure
+ * These functions handle the pre-buffering and convergence phases.
+ */
+
+/* Initialize prebuffer reader for COW mode */
+extern int cow_setup_prebuffer_reader(void);
+
+/* Cleanup prebuffer resources */
+extern void cow_cleanup_prebuffer(void);
+
+/* Get prebuffer buf pointer (for convergence callback) */
+extern void *cow_get_prebuffer_buf(void);
+
+/* Switch to convergence callback mode */
+extern void cow_switch_to_convergence_callback(void);
+
+/* Convergence IO completion callback */
+extern int cow_convergence_io_complete(struct list_head *lpis,
+				       unsigned long vaddr,
+				       unsigned long nr_pages, void *buf);
+
+/* Handle lazy accept in COW mode */
+extern int cow_handle_lazy_accept(struct list_head *lpis, int epollfd,
+				  int client, bool phase3_active);
+
+/* Create IOVs for dirty ranges (new VMAs from Phase 1 to Phase 3) */
+extern int cow_create_iovs_for_new_ranges(struct list_head *lpis,
+					  unsigned long *dirty_ranges,
+					  unsigned int nr_dirty_ranges);
+
+/* Set dirty bitmap received and process pending ranges */
+extern void cow_process_dirty_bitmap(struct list_head *lpis,
+				     unsigned long *dirty_ranges,
+				     unsigned int nr_dirty_ranges);
+
+/* COW Phase 3 restore loop entry point */
+extern int cow_phase3_restore_loop_impl(struct list_head *lpis, int epollfd,
+					struct epoll_event **events, int nr_fds,
+					int (*handle_requests)(int, struct epoll_event **, int));
+
+/* Bulk IO completion callback for COW mode */
+extern int cow_uffd_io_complete_bulk(struct list_head *lpis,
+				     unsigned long vaddr,
+				     unsigned long nr_pages, void *buf);
+
+/* COW mode initialization for cr_lazy_pages */
+extern int cow_lazy_pages_init(void);
+
+/* COW mode cleanup for cr_lazy_pages */
+extern void cow_lazy_pages_cleanup(void);
+
+/* Store pending dirty ranges (before restore connects) */
+extern void cow_store_pending_dirty_ranges(unsigned long *ranges, unsigned int nr);
+
+/* Get and clear pending dirty ranges */
+extern unsigned long *cow_get_pending_dirty_ranges(unsigned int *nr);
+
+/* Set/get phase3_active flag */
+extern void cow_set_phase3_active(bool active);
+extern bool cow_is_phase3_active(void);
+
 #endif /* __CR_COW_UFFD_H__ */

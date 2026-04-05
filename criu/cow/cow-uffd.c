@@ -1287,3 +1287,255 @@ int cow_get_uffd_for_vaddr(struct list_head *lpis, unsigned long vaddr)
 	}
 	return -1;
 }
+
+/*
+ * ============================================================================
+ * COW Phase 2/3 Infrastructure
+ * ============================================================================
+ *
+ * Pre-buffer and convergence infrastructure for COW phased migration.
+ * Pages arrive before criu restore connects, so we buffer them
+ * in the hash table until the uffd is available.
+ */
+
+/* Pre-buffer state */
+static void *prebuffer_buf = NULL;
+static bool phase3_active_flag = false;
+
+/* Pending dirty bitmap — stored if it arrives before restore connects */
+static unsigned long *pending_dirty_ranges = NULL;
+static unsigned int pending_nr_dirty_ranges = 0;
+
+/* Forward declarations for page server async reader */
+extern int page_server_start_async_read_bulk(void *buf, unsigned long nr_pages,
+					     ps_async_read_complete complete, void *priv);
+extern int page_server_update_async_callback(ps_async_read_complete complete, void *priv);
+
+void cow_set_phase3_active(bool active)
+{
+	phase3_active_flag = active;
+}
+
+bool cow_is_phase3_active(void)
+{
+	return phase3_active_flag;
+}
+
+void *cow_get_prebuffer_buf(void)
+{
+	return prebuffer_buf;
+}
+
+/*
+ * Pre-buffer callback: pages arrive before criu restore connects.
+ * This should not be called - P3 bulk transfer handles all pages.
+ */
+static int prebuffer_io_complete_internal(unsigned long dst_id, unsigned long vaddr,
+					  unsigned long nr_pages, void *priv)
+{
+	pr_err("BUG: prebuffer_io_complete called - P3 should handle all pages\n");
+	BUG();
+	return -1;
+}
+
+int cow_setup_prebuffer_reader(void)
+{
+	int ret;
+
+	prebuffer_buf = xmalloc(PAGE_SIZE);
+	if (!prebuffer_buf)
+		return -1;
+
+	ret = page_server_start_async_read_bulk(
+		prebuffer_buf, 1, prebuffer_io_complete_internal, prebuffer_buf);
+
+	return ret;
+}
+
+void cow_cleanup_prebuffer(void)
+{
+	if (prebuffer_buf) {
+		xfree(prebuffer_buf);
+		prebuffer_buf = NULL;
+	}
+
+	if (pending_dirty_ranges) {
+		xfree(pending_dirty_ranges);
+		pending_dirty_ranges = NULL;
+	}
+	pending_nr_dirty_ranges = 0;
+}
+
+void cow_store_pending_dirty_ranges(unsigned long *ranges, unsigned int nr)
+{
+	pending_dirty_ranges = ranges;
+	pending_nr_dirty_ranges = nr;
+}
+
+unsigned long *cow_get_pending_dirty_ranges(unsigned int *nr)
+{
+	unsigned long *ranges = pending_dirty_ranges;
+	*nr = pending_nr_dirty_ranges;
+	pending_dirty_ranges = NULL;
+	pending_nr_dirty_ranges = 0;
+	return ranges;
+}
+
+/*
+ * Switch async reader to convergence mode.
+ * Called when BOTH restore is connected AND dirty bitmap is received.
+ */
+void cow_switch_to_convergence_callback(void)
+{
+	if (!prebuffer_buf) {
+		pr_warn("Cannot switch to convergence: no prebuffer_buf\n");
+		return;
+	}
+
+	/* The actual callback will be set by uffd.c using convergence_io_complete wrapper */
+	pr_info("Switching to convergence callback mode\n");
+}
+
+/*
+ * Create IOVs for dirty ranges that don't have existing IOVs.
+ * This handles new VMAs created between Phase 1 and Phase 3.
+ */
+int cow_create_iovs_for_new_ranges(struct list_head *lpis,
+				   unsigned long *dirty_ranges,
+				   unsigned int nr_dirty_ranges)
+{
+	struct lazy_pages_info *lpi;
+	unsigned int i;
+	int created = 0;
+
+	if (!dirty_ranges || nr_dirty_ranges == 0)
+		return 0;
+
+	/* Process each dirty range */
+	for (i = 0; i < nr_dirty_ranges; i++) {
+		unsigned long start = dirty_ranges[i * 2];
+		unsigned long len = dirty_ranges[i * 2 + 1];
+		unsigned long end = start + len;
+		bool fully_covered = false;
+
+		/*
+		 * Check if any lpi has IOVs fully covering this range.
+		 * New VMAs shouldn't overlap with existing IOVs since they
+		 * represent memory that didn't exist in Phase 1.
+		 */
+		list_for_each_entry(lpi, lpis, l) {
+			struct lazy_iov *iov_start, *iov_end;
+
+			if (lpi->exited)
+				continue;
+
+			iov_start = cow_find_iov(lpi, start);
+			iov_end = cow_find_iov(lpi, end - 1);
+
+			if (iov_start && iov_end) {
+				fully_covered = true;
+				break;
+			}
+		}
+
+		if (!fully_covered) {
+			/*
+			 * Range not fully covered - likely a new VMA.
+			 * Add IOV to the first active lpi.
+			 */
+			list_for_each_entry(lpi, lpis, l) {
+				struct lazy_iov *iov;
+
+				if (lpi->exited)
+					continue;
+
+				iov = xzalloc(sizeof(*iov));
+				if (!iov) {
+					pr_err("Failed to allocate IOV for new range\n");
+					return -1;
+				}
+
+				iov->start = start;
+				iov->end = end;
+				iov->img_start = start;
+				iov->is_new_vma = true;
+				list_add_tail(&iov->l, &lpi->iovs);
+
+				pr_info("Created IOV for new VMA: 0x%lx-0x%lx (%lu pages)\n",
+					start, end, len / PAGE_SIZE);
+				created++;
+				break;
+			}
+		}
+	}
+
+	if (created > 0)
+		pr_info("Created %d IOVs for new VMA ranges\n", created);
+
+	return 0;
+}
+
+/*
+ * Process dirty bitmap - create IOVs and enter convergence mode.
+ * Called when dirty bitmap is received from primary.
+ */
+void cow_process_dirty_bitmap(struct list_head *lpis,
+			      unsigned long *dirty_ranges,
+			      unsigned int nr_dirty_ranges)
+{
+	pr_info("Processing dirty bitmap (%u ranges)\n", nr_dirty_ranges);
+
+	cow_set_dirty_bitmap_received(true);
+
+	if (cow_is_restore_connected()) {
+		/* Restore already connected - process now */
+		if (cow_create_iovs_for_new_ranges(lpis, dirty_ranges, nr_dirty_ranges) < 0)
+			pr_warn("Failed to create IOVs for some new ranges\n");
+
+		xfree(dirty_ranges);
+
+		pr_info("Entering convergence mode\n");
+		cow_switch_to_convergence_callback();
+		cow_start_drain_thread(lpis);
+	} else {
+		/* Store for later processing when restore connects */
+		pr_info("Storing dirty ranges for later (%u ranges)\n", nr_dirty_ranges);
+		cow_store_pending_dirty_ranges(dirty_ranges, nr_dirty_ranges);
+	}
+}
+
+/*
+ * COW mode initialization for cr_lazy_pages.
+ * Initializes page buffer, trackers, etc.
+ */
+int cow_lazy_pages_init(void)
+{
+	if (cow_page_buffer_init() < 0) {
+		pr_err("Failed to initialize page buffer\n");
+		return -1;
+	}
+
+	if (page_state_init())
+		pr_warn("Failed to initialize page state tracker (non-fatal)\n");
+
+	if (unmapped_tracker_init())
+		pr_warn("Failed to initialize unmapped tracker (non-fatal)\n");
+
+	if (pf_tracker_init())
+		pr_warn("Failed to init hung page tracker (non-fatal)\n");
+
+	return 0;
+}
+
+/*
+ * COW mode cleanup for cr_lazy_pages.
+ */
+void cow_lazy_pages_cleanup(void)
+{
+	cow_page_buffer_destroy();
+	pf_tracker_destroy();
+	page_state_verify_all_terminal();
+	page_state_destroy();
+	unmapped_tracker_destroy();
+	cow_cleanup_prebuffer();
+}
