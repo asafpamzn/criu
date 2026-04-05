@@ -702,6 +702,13 @@ int cow_handle_exit(struct list_head *lpis)
 	if (send_all_pages_sent_ack() < 0)
 		pr_warn("Failed to send all_pages_sent ACK\n");
 
+	/*
+	 * Discard any remaining EAGAIN requests before freeing lpis.
+	 * This shouldn't happen normally (queue should be empty), but
+	 * ensures proper cleanup if there's a race condition.
+	 */
+	cow_discard_all_eagain_requests();
+
 	/* Cleanup all lpis */
 	list_for_each_entry_safe(lpi, n, lpis, l) {
 		lazy_pages_summary(lpi);
@@ -909,8 +916,9 @@ void check_and_print_uffd_stats(void)
  * ============================================================================
  */
 
-/* Pending EAGAIN requests list */
+/* Pending EAGAIN requests list - protected by eagain_mutex */
 static LIST_HEAD(eagain_requests);
+static pthread_mutex_t eagain_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /*
  * Queue an EAGAIN request for later retry in COW dump mode.
@@ -951,7 +959,9 @@ int cow_queue_eagain_request(struct lazy_pages_info *lpi, __u64 address,
 	req->buf = buf_copy;  /* NULL for zero operations */
 	INIT_LIST_HEAD(&req->l);
 
+	pthread_mutex_lock(&eagain_mutex);
 	list_add_tail(&req->l, &eagain_requests);
+	pthread_mutex_unlock(&eagain_mutex);
 
 	/* Only set page state after successfully queueing */
 	page_state_set(address, PAGE_STATE_EAGAIN_QUEUED);
@@ -989,7 +999,13 @@ int cow_queue_drain_eagain_request(struct list_head *lpis, unsigned long vaddr, 
 /* Check if EAGAIN requests queue is empty */
 bool cow_is_eagain_queue_empty(void)
 {
-	return list_empty(&eagain_requests);
+	bool empty;
+
+	pthread_mutex_lock(&eagain_mutex);
+	empty = list_empty(&eagain_requests);
+	pthread_mutex_unlock(&eagain_mutex);
+
+	return empty;
 }
 
 /*
@@ -1009,6 +1025,13 @@ static int retry_uffd_copy(struct uffd_eagain_request *req)
 	if (ioctl(req->lpi->lpfd.fd, UFFDIO_COPY, &uffdio_copy) == -1) {
 		if (errno == EAGAIN)
 			return -EAGAIN;
+
+		if (errno == EEXIST) {
+			pr_err("BUG: EAGAIN copy retry EEXIST at 0x%llx - duplicate copy!\n",
+			       req->address);
+			page_state_print_history(req->address);
+			BUG();
+		}
 
 		lp_err(req->lpi, "EAGAIN copy retry failed for 0x%llx: %d\n",
 		       req->address, errno);
@@ -1053,6 +1076,13 @@ static int retry_uffd_zero(struct uffd_eagain_request *req)
 		if (errno == EAGAIN)
 			return -EAGAIN;
 
+		if (errno == EEXIST) {
+			pr_err("BUG: EAGAIN zero retry EEXIST at 0x%llx - duplicate zero!\n",
+			       req->address);
+			page_state_print_history(req->address);
+			BUG();
+		}
+
 		lp_err(req->lpi, "EAGAIN zero retry failed for 0x%llx: %d\n",
 		       req->address, errno);
 		page_state_set(req->address, PAGE_STATE_DISCARDED);
@@ -1090,6 +1120,7 @@ int cow_process_eagain_requests(void)
 
 	clock_gettime(CLOCK_MONOTONIC, &t_start);
 
+	pthread_mutex_lock(&eagain_mutex);
 	list_for_each_entry_safe(req, n, &eagain_requests, l) {
 		/* Skip if process has exited */
 		if (req->lpi->exited) {
@@ -1113,10 +1144,15 @@ int cow_process_eagain_requests(void)
 		if (ret == -EAGAIN) {
 			/* Still blocked - keep in queue for next attempt */
 			uffd_stats.eagain_blocked++;
+			pr_debug("EAGAIN retry still blocked for 0x%llx (op=%s)\n",
+				 req->address, req->buf ? "copy" : "zero");
 			continue;
 		} else if (ret < 0) {
-			/* Error - remove from queue */
+			/* Error - remove from queue (state already set by retry func) */
 			uffd_stats.eagain_errors++;
+			pr_err("EAGAIN retry error for 0x%llx, removing from queue\n",
+			       req->address);
+			BUG();
 			list_del(&req->l);
 			if (req->buf)
 				xfree(req->buf);
@@ -1133,6 +1169,7 @@ int cow_process_eagain_requests(void)
 			xfree(req->buf);
 		xfree(req);
 	}
+	pthread_mutex_unlock(&eagain_mutex);
 
 	clock_gettime(CLOCK_MONOTONIC, &t_end);
 	uffd_stats.eagain_total_ns += (t_end.tv_sec - t_start.tv_sec) * 1000000000 + (t_end.tv_nsec - t_start.tv_nsec);
