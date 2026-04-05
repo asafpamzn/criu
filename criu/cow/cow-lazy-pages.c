@@ -193,7 +193,7 @@ int cr_lazy_pages_cow_phase2(bool daemon)
 	}
 
 	/* 6. Set up async bulk reader (uses prebuffer_io_complete in uffd.c) */
-	if (setup_prebuffer_reader()) {
+	if (cow_setup_prebuffer_reader()) {
 		pr_err("Failed to setup prebuffer reader\n");
 		goto err_disconnect;
 	}

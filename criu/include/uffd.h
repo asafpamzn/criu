@@ -36,7 +36,7 @@ extern void set_dirty_bitmap_received(unsigned long *dirty_ranges,
 extern int page_buffer_init(void);
 
 /* COW Phase 2: Set up async bulk reader for pre-buffering pages */
-extern int setup_prebuffer_reader(void);
+extern int cow_setup_prebuffer_reader(void);
 
 /* COW Phase 3: Enter restore loop after pages buffered and pstree loaded */
 extern int cow_phase3_restore_loop(int epollfd, struct epoll_event **events, int nr_fds);
