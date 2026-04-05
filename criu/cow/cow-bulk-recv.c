@@ -605,8 +605,10 @@ int page_server_async_read_bulk(struct epoll_rfd *f)
 		pr_info("page_server_async_read_bulk: BULK_STREAM_COMPLETE, returning 0\n");
 		return 0;
 	}
-	if (ret < 0)
+	if (ret < 0) {
+		pr_err("page_server_async_read_bulk: bulk_stream returned %d\n", ret);
 		return -1;
+	}
 
 	/* ret == BULK_STREAM_WOULD_BLOCK or BULK_STREAM_PROGRESS - keep going */
 	return 0;

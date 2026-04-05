@@ -1539,3 +1539,78 @@ void cow_lazy_pages_cleanup(void)
 	unmapped_tracker_destroy();
 	cow_cleanup_prebuffer();
 }
+
+/*
+ * Try to serve a page fault from the COW buffer.
+ * Returns:
+ *   1 - page found and copied (or handled)
+ *   0 - page not in buffer
+ *  <0 - error
+ *
+ * This extracts the buffer lookup and UFFD_COPY logic from handle_page_fault.
+ */
+int cow_handle_page_fault_buffer(struct lazy_pages_info *lpi,
+				 unsigned long long address)
+{
+	void *data;
+	struct uffdio_copy uffd_copy;
+
+	data = cow_page_buffer_lookup_and_remove(address);
+
+	pr_debug("COW_TRACE PF_LOOKUP: 0x%llx found=%s\n", address, data ? "YES" : "NO");
+
+	if (!data) {
+		/*
+		 * Page not in buffer. If all pages have been sent,
+		 * caller should zero-fill. Otherwise request from server.
+		 */
+		return 0;
+	}
+
+	/* Found in buffer - copy directly via UFFDIO_COPY */
+	uffd_copy.dst = address;
+	uffd_copy.src = (unsigned long)data;
+	uffd_copy.len = PAGE_SIZE;
+	uffd_copy.mode = 0;
+	uffd_copy.copy = 0;
+
+	page_state_set(address, PAGE_STATE_PF_PENDING);
+
+	if (ioctl(lpi->lpfd.fd, UFFDIO_COPY, &uffd_copy) < 0) {
+		if (errno == EEXIST) {
+			/* Duplicate copy - drain already handled it */
+			if (!unmapped_tracker_is_unmapped(address))
+				page_state_set(address, PAGE_STATE_DISCARDED);
+			page_pool_put(data);
+			return 1;
+		}
+		if (errno == EAGAIN) {
+			/* Queue for later retry instead of blocking */
+			pf_tracker_set_state(address, PF_STATE_PENDING_EAGAIN);
+			if (cow_queue_eagain_request(lpi, address, 1, data, "pf_buffer") < 0) {
+				page_pool_put(data);
+				return -1;
+			}
+			page_pool_put(data);
+			return 1;
+		}
+		if (errno == ENOENT) {
+			/* VMA was unmapped - mark in tracker if not already */
+			unmapped_tracker_mark_range(address, PAGE_SIZE);
+			page_pool_put(data);
+			return 1;
+		}
+		pr_err("COW_TRACE PF_COPY: 0x%llx FAILED errno=%d\n", address, errno);
+		page_state_print_history(address);
+		if (!unmapped_tracker_is_unmapped(address))
+			page_state_set(address, PAGE_STATE_DISCARDED);
+		/* Fall through - return error */
+	} else {
+		page_state_set(address, PAGE_STATE_COPIED);
+	}
+
+	page_pool_put(data);
+	lpi->copied_pages++;
+
+	return 1;
+}

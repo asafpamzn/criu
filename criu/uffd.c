@@ -848,7 +848,7 @@ static int uffd_copy(struct lazy_pages_info *lpi, __u64 address, unsigned long *
 {
 	struct uffdio_copy uffdio_copy;
 	unsigned long len = *nr_pages * page_size();
-	
+
 	uffdio_copy.dst = address;
 	uffdio_copy.src = (unsigned long)lpi->buf;
 	uffdio_copy.len = len;
@@ -951,7 +951,7 @@ static int uffd_io_complete(struct page_read *pr, unsigned long img_addr, unsign
 	unsigned long addr = 0, req_pages;
 	struct lazy_iov *req;
 	int ret;
-	
+
 	lpi = container_of(pr, struct lazy_pages_info, pr);
 	/*
 	 * The process may exit while we still have requests in
@@ -1016,7 +1016,6 @@ static int uffd_io_complete(struct page_read *pr, unsigned long img_addr, unsign
 	iov_list_insert(req, &lpi->iovs);
 	ret = drop_iovs(lpi, addr, nr * PAGE_SIZE);
 
-	
 	return ret;
 }
 
@@ -1187,7 +1186,7 @@ static int uffd_handle_pages(struct lazy_pages_info *lpi, __u64 address, unsigne
 	}
 
 	ret = lpi->pr.read_pages(&lpi->pr, address, nr, lpi->buf, flags);
-	
+
 	if (ret <= 0) {
 		lp_err(lpi, "failed reading pages at %llx\n", address);
 		return ret;
@@ -1401,84 +1400,19 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 
 	lp_debug(lpi, "#PF at 0x%llx\n", address);
 
-	/*
-	 * In COW phased migration, check if the page is already
-	 * buffered. If so, UFFD_COPY directly from buffer.
-	 * IMPORTANT: Only serve from buffer AFTER dirty bitmap received,
-	 * otherwise we may copy a page that will be re-sent as dirty.
-	 */
+	/* COW mode: try to serve from buffer first */
 	if (opts.cow_dump) {
-		void *data = cow_page_buffer_lookup_and_remove(address);
+		ret = cow_handle_page_fault_buffer(lpi, address);
+		if (ret < 0)
+			return ret;
+		if (ret > 0)
+			return 0;  /* Page served from buffer */
 
-		pr_debug("COW_TRACE PF_LOOKUP: 0x%llx found=%s\n", address, data ? "YES" : "NO");
-
-		if (data) {
-			struct uffdio_copy uffd_copy = {
-				.dst = address,
-				.src = (unsigned long)data,
-				.len = PAGE_SIZE,
-				.mode = 0,
-				.copy = 0,
-			};
-
-			/* Track: found in buffer, about to copy */
+		/* Page not in buffer - check if all pages sent */
+		if (cow_is_all_pages_sent_received()) {
+			lp_debug(lpi, "Page 0x%llx not in buffer, all pages sent - zero-filling\n", address);
 			page_state_set(address, PAGE_STATE_PF_PENDING);
-
-			lp_debug(lpi, "Page 0x%llx served from COW buffer\n", address);
-
-			if (ioctl(lpi->lpfd.fd, UFFDIO_COPY, &uffd_copy) < 0) {
-				if (errno == EEXIST) {
-					/* Duplicate copy - drain already handled it */
-					lp_debug(lpi, "PF buffer EEXIST at 0x%llx - drain won race\n", address);
-					if (!unmapped_tracker_is_unmapped(address))
-						page_state_set(address, PAGE_STATE_DISCARDED);
-					page_pool_put(data);
-					return 0;
-				}
-				if (errno == EAGAIN) {
-					/* Queue for later retry instead of blocking */
-					pf_tracker_set_state(address, PF_STATE_PENDING_EAGAIN);
-					/* page_state set to EAGAIN_QUEUED inside cow_queue_eagain_request on success */
-					if (cow_queue_eagain_request(lpi, address, 1, data, "pf_buffer") < 0) {
-						page_pool_put(data);
-						return -1;
-					}
-					page_pool_put(data);
-					return 0;
-				}
-				if (errno == ENOENT) {
-					/* VMA was unmapped - mark in tracker if not already */
-					lp_debug(lpi, "PF buffer ENOENT at 0x%llx - VMA unmapped\n", address);
-					unmapped_tracker_mark_range(address, PAGE_SIZE);
-					page_pool_put(data);
-					return 0;
-				}
-				pr_err("COW_TRACE PF_COPY: 0x%llx FAILED errno=%d\n", address, errno);
-				page_state_print_history(address);
-				if (!unmapped_tracker_is_unmapped(address))
-					page_state_set(address, PAGE_STATE_DISCARDED);
-			} else {
-				page_state_set(address, PAGE_STATE_COPIED);
-			}
-
-			page_pool_put(data);
-			
-			lpi->copied_pages++;
-			
-			return 0;
-		} else {
-			/*
-			 * Page not in buffer. If all pages have been sent,
-			 * zero-fill this page (applies to ALL VMAs).
-			 */
-			
-			if (cow_is_all_pages_sent_received()) {
-				lp_debug(lpi, "Page 0x%llx not in buffer, all pages sent - zero-filling\n", address);
-				page_state_set(address, PAGE_STATE_PF_PENDING);
-				return uffd_zero(lpi, address, 1);
-			}
-			
-			lp_debug(lpi, "DEBUG PF: Page 0x%llx NOT in buffer, will request from server\n", address);
+			return uffd_zero(lpi, address, 1);
 		}
 	}
 
@@ -1493,7 +1427,6 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 		unsigned long long img_addr;
 
 		/* Check if server is available for convergence requests */
-		
 		if (get_page_server_sk() < 0) {
 			/*
 			 * In COW mode, don't zero-fill - the correct data should
@@ -1503,11 +1436,9 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 			lp_debug(lpi, "Page 0x%llx server unavailable - waiting for drain\n", address);
 			return 0;
 		}
-		
 
-		
 		iov = find_iov(lpi, address);
-		
+
 		if (!iov) {
 			/*
 			 * IOV not found. If dirty bitmap received, all pages should
@@ -1528,8 +1459,7 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 		 */
 		if (iov->is_new_vma) {
 			lp_debug(lpi, "Page 0x%llx in new VMA - requesting from server\n", address);
-			if (opts.cow_dump)
-				cow_uffd_stats_inc_pf(1);
+			cow_uffd_stats_inc_pf(1);
 			pf_tracker_add(address, 1, lpi->pid, true);
 			if (request_remote_pages(lpi->pr.img_id, address, 1) < 0) {
 				lp_err(lpi, "Error requesting new VMA page 0x%llx\n", address);
@@ -1540,8 +1470,7 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 
 		img_addr = iov->img_start + (address - iov->start);
 
-		if (opts.cow_dump)
-			cow_uffd_stats_inc_pf(1);
+		cow_uffd_stats_inc_pf(1);
 		pf_tracker_add(address, 1, lpi->pid, true);
 
 		if (cow_is_phase3_active()) {
@@ -1550,7 +1479,7 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 				lp_err(lpi, "Error requesting page 0x%llx in Phase 3\n", address);
 				return -1;
 			}
-		
+
 		} else {		
 			ret = uffd_handle_pages(lpi, img_addr, 1, PR_ASYNC | PR_ASAP);			
 			if (ret < 0) {
@@ -1558,7 +1487,7 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 				return -1;
 			}
 		}
-		
+
 		return 0;
 	}
 
@@ -1607,13 +1536,8 @@ static int handle_uffd_event(struct epoll_rfd *lpfd)
 	struct uffd_msg msg;
 	int ret;
 
-	
-
 	lpi = container_of(lpfd, struct lazy_pages_info, lpfd);
-
-	
 	ret = read(lpfd->fd, &msg, sizeof(msg));
-	
 	if (ret < 0) {
 		/* we've already handled the page fault for another thread */
 		if (errno == EAGAIN)
@@ -1631,13 +1555,9 @@ static int handle_uffd_event(struct epoll_rfd *lpfd)
 		return -1;
 	}
 
-	
 	switch (msg.event) {
 	case UFFD_EVENT_PAGEFAULT:
-	
-		ret = handle_page_fault(lpi, &msg);
-	
-		return ret;
+		return handle_page_fault(lpi, &msg);
 	case UFFD_EVENT_REMOVE:
 	case UFFD_EVENT_UNMAP:
 		return handle_remove(lpi, &msg);

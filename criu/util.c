@@ -1539,11 +1539,12 @@ int epoll_run_rfds(int epollfd, struct epoll_event *evs, int nr_fds, int timeout
 			events = evs[i].events;
 
 			if (events & EPOLLIN) {
-				/* Print every event when timeout is small (restore_finished) */				
+				/* Print every event when timeout is small (restore_finished) */
 				epoll_stats.total_read_calls++;
 				ret = rfd->read_event(rfd);
-				
+
 				if (ret < 0) {
+					pr_err("DEBUG_EPOLL: read_event failed fd=%d ret=%d\n", rfd->fd, ret);
 					goto out;
 				}
 				if (ret > 0) {

@@ -167,4 +167,8 @@ extern unsigned long *cow_get_pending_dirty_ranges(unsigned int *nr);
 extern void cow_set_phase3_active(bool active);
 extern bool cow_is_phase3_active(void);
 
+/* Handle page fault from buffer - returns 1 if served, 0 if not found, <0 on error */
+extern int cow_handle_page_fault_buffer(struct lazy_pages_info *lpi,
+					unsigned long long address);
+
 #endif /* __CR_COW_UFFD_H__ */
