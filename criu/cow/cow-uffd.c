@@ -1246,6 +1246,8 @@ int cow_process_eagain_requests(void)
 		/* Skip if process has exited */
 		if (req->lpi->exited) {
 			uffd_stats.eagain_skipped++;
+			pr_err("EAGAIN retry failed lpi unmapped for 0x%llx (op=%s)\n",
+				 req->address, req->buf ? "copy" : "zero");
 			page_state_set(req->address, PAGE_STATE_DISCARDED);
 			list_del(&req->l);
 			if (req->buf)

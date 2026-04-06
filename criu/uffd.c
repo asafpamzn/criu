@@ -793,7 +793,7 @@ out:
 
 static int handle_exit(struct lazy_pages_info *lpi)
 {
-	lp_debug(lpi, "EXIT\n");
+	lp_err(lpi, "handle_exit EXIT lpi!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
 	if (epoll_del_rfd(epollfd, &lpi->lpfd))
 		return -1;
 	free_iovs(lpi);
