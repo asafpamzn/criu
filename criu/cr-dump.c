@@ -106,6 +106,7 @@ int __attribute__((weak)) arch_set_thread_regs(struct pstree_item *item, bool wi
 #define PERSONALITY_LENGTH 9
 static char loc_buf[PERSONALITY_LENGTH];
 
+static int cr_dump_tasks_cow_phased(pid_t pid);
 void free_mappings(struct vm_area_list *vma_area_list)
 {
 	struct vma_area *vma_area, *p;
@@ -2575,7 +2576,7 @@ err:
  *   Phase 3: freeze → dump skeleton (no pages) → PAGEMAP_SCAN dirty pages
  *   Phase 4: WP_SYNC on dirty pages → resume → convergence
  */
-int cr_dump_tasks_cow_phased(pid_t pid)
+static int cr_dump_tasks_cow_phased(pid_t pid)
 {
 	InventoryEntry he = INVENTORY_ENTRY__INIT;
 	InventoryEntry *parent_ie = NULL;
