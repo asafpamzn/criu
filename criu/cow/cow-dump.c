@@ -34,6 +34,7 @@
 #include "atomic-bitmap.h"
 #include "cow/cow-bitmap.h"
 #include "cow/mpsc-queue.h"
+#include "cow/cow-bulk-send.h"
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "cow-dump: "
@@ -2175,4 +2176,132 @@ int cow_setup_sync_for_dirty(unsigned long *dirty_ranges,
 	return 0;
 }
 
+/**
+ * cow_cleanup_async_uffd - Close async uffd without unregistering VMAs
+ *
+ * The kernel automatically cleans up uffd registrations when the fd is closed.
+ * This avoids the expensive UFFDIO_UNREGISTER page walks that can take minutes
+ * on large memory systems.
+ */
+void cow_cleanup_async_uffd(void)
+{
+	struct cow_dump_info *cdi = g_cow_info;
 
+	if (!cdi)
+		return;
+
+	if (cdi->uffd >= 0) {
+		pr_info("Closing async uffd fd=%d (skipping unregister)\n", cdi->uffd);
+		close(cdi->uffd);
+		cdi->uffd = -1;
+	}
+
+	/* Also close pre-created sync uffd if not used */
+	if (cdi->uffd_sync >= 0) {
+		pr_info("Closing unused sync uffd fd=%d\n", cdi->uffd_sync);
+		close(cdi->uffd_sync);
+		cdi->uffd_sync = -1;
+	}
+
+	cdi->phase = COW_PHASE_DONE;
+}
+
+/**
+ * cow_dump_dirty_pages - Dump dirty pages directly while process is frozen
+ * @dirty_ranges: Array of [start, len, start, len, ...] pairs
+ * @nr_dirty_ranges: Number of ranges
+ * @source_pid: PID of source process for process_vm_readv
+ *
+ * Reads dirty pages using process_vm_readv() and sends them using the
+ * existing batch compression protocol. Called during Phase 3 freeze,
+ * eliminating the need for WP_SYNC setup and convergence.
+ *
+ * Returns: 0 on success, -1 on error
+ */
+int cow_dump_dirty_pages(unsigned long *dirty_ranges, unsigned int nr_dirty_ranges,
+			 pid_t source_pid)
+{
+	struct cow_dump_info *cdi = g_cow_info;
+	unsigned int i;
+	int sk;
+	u64 dst_id;
+	unsigned long total_pages_sent = 0;
+	struct timeval t_start, t_end, t_delta;
+
+	if (!cdi || nr_dirty_ranges == 0) {
+		pr_info("No dirty pages to dump\n");
+		return 0;
+	}
+
+	sk = get_page_server_sk();
+	if (sk < 0) {
+		pr_err("No page server socket for dirty page dump\n");
+		return -1;
+	}
+
+	dst_id = cdi->dst_id;
+
+	gettimeofday(&t_start, NULL);
+	pr_info("Dumping %u dirty ranges while frozen (pid=%d dst_id=%lu)\n",
+		nr_dirty_ranges, source_pid, (unsigned long)dst_id);
+
+	for (i = 0; i < nr_dirty_ranges; i++) {
+		unsigned long start = dirty_ranges[i * 2];
+		unsigned long len = dirty_ranges[i * 2 + 1];
+		unsigned long offset = 0;
+
+		while (offset < len) {
+			void *buffer;
+			struct iovec local_iov, remote_iov;
+			unsigned long remaining = len - offset;
+			int batch_pages = remaining / PAGE_SIZE;
+			unsigned long batch_addr = start + offset;
+			ssize_t ret;
+
+			if (batch_pages > COW_BATCH_PAGES)
+				batch_pages = COW_BATCH_PAGES;
+			if (batch_pages == 0)
+				break;
+
+			buffer = xmalloc(batch_pages * PAGE_SIZE);
+			if (!buffer)
+				return -1;
+
+			/* Read pages from source process */
+			local_iov.iov_base = buffer;
+			local_iov.iov_len = batch_pages * PAGE_SIZE;
+			remote_iov.iov_base = (void *)batch_addr;
+			remote_iov.iov_len = batch_pages * PAGE_SIZE;
+
+			ret = process_vm_readv(source_pid, &local_iov, 1, &remote_iov, 1, 0);
+			if (ret != (ssize_t)(batch_pages * PAGE_SIZE)) {
+				pr_perror("Failed to read dirty pages at 0x%lx (%d pages)",
+					  batch_addr, batch_pages);
+				xfree(buffer);
+				/* Continue with next batch - page may be unmapped */
+				offset += batch_pages * PAGE_SIZE;
+				continue;
+			}
+
+			/* Send compressed batch */
+			ret = send_pages_batch_compressed(sk, buffer, batch_pages,
+							  dst_id, batch_addr);
+			xfree(buffer);
+
+			if (ret < 0) {
+				pr_err("Failed to send dirty pages at 0x%lx\n", batch_addr);
+				return -1;
+			}
+
+			total_pages_sent += batch_pages;
+			offset += batch_pages * PAGE_SIZE;
+		}
+	}
+
+	gettimeofday(&t_end, NULL);
+	timersub(&t_end, &t_start, &t_delta);
+	pr_err("TIMING: cow_dump_dirty_pages sent %lu pages in %ld.%06ld seconds\n",
+	       total_pages_sent, t_delta.tv_sec, t_delta.tv_usec);
+
+	return 0;
+}

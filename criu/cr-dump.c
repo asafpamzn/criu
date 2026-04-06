@@ -2942,38 +2942,33 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 		goto err;
 	}
 
-	/* === PHASE 4: WP_SYNC on dirty + unfreeze === */
-	pr_err("=== PHASE 4: WP_SYNC on dirty + unfreeze ===\n");
-
-	{
-		struct timeval t_start, t_end, t_delta;
-		gettimeofday(&t_start, NULL);
-		ret = cow_setup_sync_for_dirty(dirty_ranges, nr_dirty_ranges);
-		gettimeofday(&t_end, NULL);
-		timersub(&t_end, &t_start, &t_delta);
-		pr_err("TIMING: cow_setup_sync_for_dirty took %ld.%06ld seconds\n",
-		       t_delta.tv_sec, t_delta.tv_usec);
-	}
-	if (ret) {
-		pr_err("Failed to set up WP_SYNC for dirty pages\n");
-		goto err;
-	}
+	/* === PHASE 4: Dump dirty pages while frozen === */
+	pr_err("=== PHASE 4: Dump dirty pages (frozen) ===\n");
 
 	/*
-	 * Prepare lazy VMAs for convergence: clear sent_bitmap for dirty pages
-	 * so P3 will re-send them. Also sets convergence mode so add_active_image()
-	 * uses dirty page count instead of total page count.
+	 * Instead of setting up WP_SYNC for convergence (which requires expensive
+	 * UFFDIO_UNREGISTER that walks all page tables), dump dirty pages directly
+	 * while the process is still frozen. This eliminates the convergence phase.
 	 */
 	{
 		struct timeval t_start, t_end, t_delta;
 		gettimeofday(&t_start, NULL);
-		prepare_lazy_vmas_for_convergence(dirty_ranges, nr_dirty_ranges);
+		ret = cow_dump_dirty_pages(dirty_ranges, nr_dirty_ranges,
+					   root_item->pid->real);
 		gettimeofday(&t_end, NULL);
 		timersub(&t_end, &t_start, &t_delta);
-		pr_err("TIMING: prepare_lazy_vmas_for_convergence took %ld.%06ld seconds\n",
+		pr_err("TIMING: cow_dump_dirty_pages took %ld.%06ld seconds\n",
 		       t_delta.tv_sec, t_delta.tv_usec);
 	}
+	if (ret) {
+		pr_err("Failed to dump dirty pages\n");
+		goto err;
+	}
 
+	/* Close async uffd directly - no expensive unregister needed */
+	cow_cleanup_async_uffd();
+
+	/* Unfreeze process - dirty pages already sent, no convergence needed */
 	{
 		struct timeval t_start, t_end, t_delta;
 		gettimeofday(&t_start, NULL);
@@ -2990,7 +2985,7 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 	       freeze_delta.tv_sec, freeze_delta.tv_usec);
 
 	/*
-	 * Send dirty bitmap to replica so it can proceed with restore.
+	 * Send dirty bitmap to replica so it knows which pages were re-sent.
 	 * In COW phased migration, the socket was stored in page_server_sk
 	 * after receiving the bulk complete ACK.
 	 */
@@ -3003,18 +2998,12 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 	}
 	pr_info("Dirty bitmap sent successfully\n");
 
-	/* === PHASE 5-6: Convergence === */
-	pr_err("=== PHASE 5-6: Convergence page server ===\n");
+	/* === SKIP Phase 5-6: No convergence needed === */
+	pr_err("=== SKIP Phase 5-6: Dirty pages already sent during freeze ===\n");
 
-	/*
-	 * The all_pages_sent signal is sent by unified_page_server_thread
-	 * after final_queue_drain verifies all pages were sent via sent_bitmap.
-	 */
-
-	/* Close socket after thread signals completion */
+	/* Signal completion and close socket */
 	close_page_server_socket();
-	cow_set_phase(COW_PHASE_SYNC_CONVERGE);
-	/* Inventory was already written after skeleton dump - don't duplicate */
+	cow_set_phase(COW_PHASE_DONE);
 	xfree(dirty_ranges);
 	exit_code = 0;
 	goto finish;

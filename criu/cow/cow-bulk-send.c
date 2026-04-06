@@ -71,9 +71,9 @@ static unsigned long p3_total_pages_sent = 0;
  * Protocol: header (PS_IOV_ADD_F_COMPRESS) + compressed_size + compressed_data
  * Header contains nr_pages and base_vaddr.
  */
-static int send_pages_batch_compressed(int sk, const void *data,
-				       int nr_pages, u64 dst_id,
-				       unsigned long base_vaddr)
+int send_pages_batch_compressed(int sk, const void *data,
+				int nr_pages, u64 dst_id,
+				unsigned long base_vaddr)
 {
 	/* Allocate buffer for: header + compressed_size + compressed_data */
 	int max_compressed = LZ4_compressBound(nr_pages * PAGE_SIZE);

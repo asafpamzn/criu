@@ -6,6 +6,14 @@
 #define COW_BATCH_PAGES 64
 #define COW_BATCH_SIZE  (COW_BATCH_PAGES * PAGE_SIZE)  /* 256KB */
 
+/*
+ * Send a batch of pages with LZ4 compression.
+ * Used by bulk sender and dirty page dump.
+ */
+int send_pages_batch_compressed(int sk, const void *data,
+				int nr_pages, u64 dst_id,
+				unsigned long base_vaddr);
+
 /* Number of parallel P3 threads for bulk transfer */
 #define NUM_P3_THREADS 20
 

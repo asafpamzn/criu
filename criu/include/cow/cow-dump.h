@@ -254,4 +254,29 @@ extern int cow_merge_dirty_ranges(unsigned long *dirty_ranges, unsigned int nr_d
 				  unsigned long *new_ranges, unsigned int nr_new,
 				  unsigned long **merged_ranges, unsigned int *nr_merged);
 
+/**
+ * cow_cleanup_async_uffd - Close async uffd without unregistering VMAs
+ *
+ * Closes the async uffd file descriptor directly without issuing
+ * UFFDIO_UNREGISTER for each VMA. The kernel automatically cleans up
+ * registrations when the fd is closed. This avoids expensive page table
+ * walks that can take minutes on large memory systems (300GB+).
+ */
+extern void cow_cleanup_async_uffd(void);
+
+/**
+ * cow_dump_dirty_pages - Dump dirty pages directly while process is frozen
+ * @dirty_ranges: Array of [start, len, start, len, ...] pairs
+ * @nr_dirty_ranges: Number of ranges
+ * @source_pid: PID of source process for process_vm_readv
+ *
+ * Reads dirty pages using process_vm_readv() and sends them using LZ4
+ * compressed batches over the page server socket. Called during Phase 3
+ * freeze instead of setting up WP_SYNC for convergence.
+ *
+ * Returns: 0 on success, -1 on error
+ */
+extern int cow_dump_dirty_pages(unsigned long *dirty_ranges, unsigned int nr_dirty_ranges,
+				pid_t source_pid);
+
 #endif /* __CR_COW_DUMP_H_ */
