@@ -2279,46 +2279,29 @@ static int cr_dump_finish(int ret)
 		delete_link_remaps();
 	}
 
-	/* Resume process early if using COW dump with lazy pages */
-	if (!ret && opts.lazy_pages && opts.cow_dump) {
-		pr_info("Resuming process with COW protection active\n");
+	/*
+	 * COW phased dump path: if cow_get_phase() == COW_PHASE_DONE, everything
+	 * was already handled in cr_dump_tasks_cow_phased (dirty pages sent during
+	 * freeze, process already unfrozen). Skip to cleanup.
+	 */
+	if (opts.cow_dump && cow_get_phase() == COW_PHASE_DONE) {
+		pr_info("COW phased dump complete, skipping to cleanup\n");
+		goto out_release_cow;
+	}
 
-		if (cow_start_monitor_thread()) {
-			pr_err("Failed to start COW monitor thread\n");
-			ret = -1;
-			goto out_release_cow;
-		}
+	/* Standard path: transfer pages then resume */
+	if (!ret && opts.lazy_pages) {
+		pr_debug("DEBUG_SOCKET: About to call cr_lazy_mem_dump (standard path)\n");
+		ret = cr_lazy_mem_dump();
+	}
 
-		if (arch_set_thread_regs(root_item, true) < 0) {
-			ret = -1;
-			goto out_release_cow;
-		}
-
+	if (arch_set_thread_regs(root_item, true) < 0)
+		ret = -1;
+	else {
 		cr_plugin_fini(CR_PLUGIN_STAGE__DUMP, ret);
 
-		pstree_switch_state(root_item, TASK_ALIVE);
+		pstree_switch_state(root_item, (ret || post_dump_ret) ? TASK_ALIVE : opts.final_state);
 		timing_stop(TIME_FROZEN);
-
-		pr_err("START RESTORE!!!\n");
-
-		pr_debug("DEBUG_SOCKET: About to call cr_lazy_mem_dump (COW path)\n");
-		/* Now start lazy page transfer with process running */
-		ret = cr_lazy_mem_dump();
-	} else {
-		/* Standard path: transfer pages then resume */
-		if (!ret && opts.lazy_pages) {
-			pr_debug("DEBUG_SOCKET: About to call cr_lazy_mem_dump (standard path)\n");
-			ret = cr_lazy_mem_dump();
-		}
-		
-		if (arch_set_thread_regs(root_item, true) < 0)
-			ret = -1;
-		else {
-			cr_plugin_fini(CR_PLUGIN_STAGE__DUMP, ret);
-
-			pstree_switch_state(root_item, (ret || post_dump_ret) ? TASK_ALIVE : opts.final_state);
-			timing_stop(TIME_FROZEN);
-		}
 	}
 
 out_release_cow:
@@ -2984,24 +2967,24 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 	pr_err("TIMING: Phase 3-4 freeze ended - process frozen for %ld.%06ld seconds\n",
 	       freeze_delta.tv_sec, freeze_delta.tv_usec);
 
-	/*
-	 * Send dirty bitmap to replica so it knows which pages were re-sent.
-	 * In COW phased migration, the socket was stored in page_server_sk
-	 * after receiving the bulk complete ACK.
-	 */
-	pr_info("Sending dirty bitmap to replica (%u ranges)\n",
-		nr_dirty_ranges);
-	ret = send_cow_dirty_bitmap(dirty_ranges, nr_dirty_ranges);
-	if (ret) {
-		pr_err("Failed to send dirty bitmap to replica\n");
-		goto err;
-	}
-	pr_info("Dirty bitmap sent successfully\n");
-
 	/* === SKIP Phase 5-6: No convergence needed === */
 	pr_err("=== SKIP Phase 5-6: Dirty pages already sent during freeze ===\n");
 
-	/* Signal completion and close socket */
+	/*
+	 * Signal completion to replica. Dirty pages were already sent during
+	 * freeze, so replica can zero-fill any remaining faults.
+	 */
+	{
+		int sk = get_page_server_sk();
+		if (sk >= 0) {
+			pr_info("Sending all_pages_sent signal to replica\n");
+			if (send_all_pages_sent_signal(sk) < 0)
+				pr_warn("Failed to send all_pages_sent signal\n");
+			if (wait_for_all_pages_sent_ack(sk) < 0)
+				pr_warn("Failed to receive all_pages_sent ACK\n");
+		}
+	}
+
 	close_page_server_socket();
 	cow_set_phase(COW_PHASE_DONE);
 	xfree(dirty_ranges);

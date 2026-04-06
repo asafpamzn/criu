@@ -139,11 +139,12 @@ static int handle_end_of_transfer(struct ps_async_read_bulk *ar, u32 cmd)
 
 	/*
 	 * COW mode: don't return BULK_STREAM_COMPLETE yet.
-	 * The dirty bitmap will arrive later (Phase 4).
+	 * Dirty pages will arrive as compressed batches (Phase 4 sends them
+	 * directly during freeze), followed by PS_IOV_ALL_PAGES_SENT signal.
 	 * Reset to read next header and continue.
 	 */
-	if (opts.cow_dump && !cow_is_dirty_bitmap_received()) {
-		pr_err("COW mode Phase 2: waiting for dirty bitmap...\n");
+	if (opts.cow_dump && !cow_is_all_pages_sent_received()) {
+		pr_err("COW mode Phase 2: waiting for dirty pages and all_pages_sent...\n");
 		ar->rb = 0;
 		ar->compress_state = COMPRESS_STATE_READING_HEADER;
 		return BULK_STREAM_PROGRESS;

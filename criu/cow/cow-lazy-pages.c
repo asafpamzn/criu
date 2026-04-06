@@ -321,9 +321,9 @@ int cow_phase2_handle_pages(int epollfd, struct epoll_event *events, int nr_fds)
 			inventory_ready = true;
 		}
 
-		/* Dirty bitmap signals Phase 3 is ready */
-		if (cow_is_dirty_bitmap_received()) {
-			pr_err("Dirty bitmap received - Phase 3 ready\n");
+		/* All pages sent signals Phase 3 is complete */
+		if (cow_is_all_pages_sent_received()) {
+			pr_err("All pages sent - Phase 3 ready\n");
 			return 0;
 		}
 	}

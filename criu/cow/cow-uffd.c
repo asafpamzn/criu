@@ -1892,7 +1892,7 @@ int cow_handle_page_fault(struct lazy_pages_info *lpi,
 	iov = cow_find_iov(lpi, address);
 
 	if (!iov) {
-		if (cow_is_dirty_bitmap_received()) {
+		if (cow_is_all_pages_sent_received()) {
 			lp_debug(lpi, "Page 0x%llx IOV not found - zero fill\n", address);
 			return COW_PF_NOT_HANDLED;  /* Caller will call uffd_zero */
 		}
@@ -2034,11 +2034,11 @@ int cow_handle_page_fault_cow_mode(struct lazy_pages_info *lpi,
 
 	if (!iov) {
 		/*
-		 * IOV not found. If dirty bitmap received, all pages should
+		 * IOV not found. If all_pages_sent received, all pages should
 		 * have been transferred - zero-fill this page. Otherwise
 		 * wait for drain thread to fill it.
 		 */
-		if (cow_is_dirty_bitmap_received()) {
+		if (cow_is_all_pages_sent_received()) {
 			lp_debug(lpi, "Page 0x%llx IOV not found - zero fill\n", address);
 			return 2;  /* COW_PF_ZERO_FILL */
 		}
@@ -2192,22 +2192,11 @@ int cow_handle_lazy_accept_post_connect(struct list_head *lpis,
 					void (*switch_to_convergence)(void))
 {
 	/*
-	 * Start drain thread and switch to convergence callback only if
-	 * dirty bitmap already received. Both require uffd available.
-	 * If bitmap hasn't arrived yet, we'll do this when it does.
+	 * Start drain thread if all pages have been sent.
+	 * Dirty pages were sent directly during freeze (no separate dirty bitmap).
 	 */
-	if (cow_is_dirty_bitmap_received()) {
-		unsigned int nr_ranges;
-		unsigned long *dirty_ranges = cow_get_pending_dirty_ranges(&nr_ranges);
-
-		if (dirty_ranges) {
-			pr_info("Creating IOVs for %u pending dirty ranges\n", nr_ranges);
-			if (cow_create_iovs_for_new_ranges(lpis, dirty_ranges, nr_ranges) < 0)
-				pr_warn("Failed to create IOVs for some new ranges\n");
-			xfree(dirty_ranges);
-		}
-
-		pr_info("Dirty bitmap already received, entering convergence\n");
+	if (cow_is_all_pages_sent_received()) {
+		pr_info("All pages sent, starting drain thread\n");
 		if (switch_to_convergence)
 			switch_to_convergence();
 		cow_start_drain_thread(lpis);

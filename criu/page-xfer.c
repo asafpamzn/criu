@@ -1879,20 +1879,20 @@ static int page_server_async_read(struct epoll_rfd *f)
 
 static int page_server_hangup_event(struct epoll_rfd *rfd)
 {
-	pr_err("DEBUG_CALLBACK: page_server_hangup_event called fd=%d cow_dump=%d dirty_bitmap=%d bulk_done=%d\n",
-	       rfd->fd, opts.cow_dump, cow_is_dirty_bitmap_received(), page_server_bulk_stream_done());
+	pr_err("DEBUG_CALLBACK: page_server_hangup_event called fd=%d cow_dump=%d all_pages_sent=%d bulk_done=%d\n",
+	       rfd->fd, opts.cow_dump, cow_is_all_pages_sent_received(), page_server_bulk_stream_done());
 
-	if (opts.cow_dump && cow_is_dirty_bitmap_received()) {
-		pr_err("Page server closed connection after dirty bitmap received\n");
+	if (opts.cow_dump && cow_is_all_pages_sent_received()) {
+		pr_err("Page server closed connection after all pages sent\n");
 		return 1;
 	}
 	if (opts.cow_dump && page_server_bulk_stream_done()) {
 		/*
-		 * Bulk stream done but dirty bitmap not yet fully received.
+		 * Bulk stream done but all_pages_sent not yet received.
 		 * The data might still be in the socket buffer - let the
 		 * read handler drain it before we give up.
 		 */
-		pr_err("Page server closed, continuing to drain dirty bitmap data\n");
+		pr_err("Page server closed, continuing to drain remaining data\n");
 		return 1;
 	}
 	pr_err("Remote side closed connection\n");
