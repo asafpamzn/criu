@@ -1361,8 +1361,9 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 		return -1;
 	}
 
-	/* Track this page fault as waiting for server response */
-	pf_tracker_add(address, nr_pages, lpi->pid, true);
+	/* COW mode: track page fault as waiting for server response */
+	if (opts.cow_dump)
+		pf_tracker_add(address, nr_pages, lpi->pid, true);
 
 	return 0;
 }
@@ -1763,13 +1764,6 @@ err:
  * - cow_is_inventory_ready_received(), cow_set_inventory_ready_received()
  * - cow_is_all_pages_sent_received(), cow_set_all_pages_sent_received()
  */
-
-/* Wrapper: implementation is in cow-uffd.c */
-static int create_iovs_for_new_ranges(unsigned long *dirty_ranges,
-				      unsigned int nr_dirty_ranges)
-{
-	return cow_create_iovs_for_new_ranges(&lpis, dirty_ranges, nr_dirty_ranges);
-}
 
 /* Set dirty bitmap received flag (called when dirty bitmap fully received) */
 void set_dirty_bitmap_received(unsigned long *dirty_ranges,
