@@ -1810,7 +1810,7 @@ int cow_convergence_copy_page(struct list_head *lpis,
 
 		pages = uffd_copy.copy / PAGE_SIZE;
 		lpi->copied_pages += pages;
-		page_state_set(vaddr, PAGE_STATE_COMPLETED);
+		page_state_set(vaddr, PAGE_STATE_COPIED);
 		lp_debug(lpi, "Direct copy %lu pages at 0x%lx (convergence)\n", pages, vaddr);
 		return 0;
 	}
