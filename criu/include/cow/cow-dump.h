@@ -210,6 +210,17 @@ extern enum cow_dump_phase cow_get_phase(void);
 extern void cow_set_phase(enum cow_dump_phase phase);
 
 /**
+ * cow_is_phased_skeleton_dump - Check if we're in Phase 3 skeleton dump mode
+ *
+ * In COW phased migration, Phase 3 dumps everything EXCEPT memory pages
+ * (which were already transferred in Phase 2). This function returns true
+ * when dump_one_task() should skip page dumping and related COW init.
+ *
+ * Returns: true if in skeleton dump mode, false otherwise
+ */
+extern bool cow_is_phased_skeleton_dump(void);
+
+/**
  * cow_detect_new_vmas - Detect VMAs that appeared after Phase 1
  * @vmas: Current VMA list (from collect_mappings in Phase 3)
  * @new_ranges: Output array of [start, len, ...] pairs

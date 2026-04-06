@@ -1314,6 +1314,22 @@ void cow_set_phase(enum cow_dump_phase phase)
 		g_cow_info->phase = phase;
 }
 
+bool cow_is_phased_skeleton_dump(void)
+{
+	/*
+	 * In COW phased migration, Phase 3 (SCAN) dumps everything except
+	 * memory pages. This is detected by checking:
+	 * 1. COW dump mode is enabled
+	 * 2. Lazy pages is enabled (required for phased migration)
+	 * 3. We're at or past the SCAN phase (pages already sent in Phase 2)
+	 */
+	if (!opts.cow_dump || !opts.lazy_pages)
+		return false;
+	if (!g_cow_info)
+		return false;
+	return g_cow_info->phase >= COW_PHASE_SCAN;
+}
+
 /* ------------------------------------------------------------------ */
 /*  WP_ASYNC phased migration support                                  */
 /* ------------------------------------------------------------------ */
