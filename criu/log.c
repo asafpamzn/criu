@@ -38,6 +38,7 @@ static unsigned int current_loglevel = DEFAULT_LOGLEVEL;
 static void vprint_on_level(unsigned int, const char *, va_list);
 
 static char buffer[LOG_BUF_LEN];
+static spinlock_t log_lock = SPINLOCK_INIT;
 static char buf_off = 0;
 /*
  * The early_log_buffer is used to store log messages before
@@ -380,9 +381,17 @@ static void vprint_on_level(unsigned int loglevel, const char *format, va_list p
 		if (loglevel > current_loglevel)
 			return;
 		fd = log_get_fd();
-		if (current_loglevel >= LOG_TIMESTAMP)
-			print_ts();
 	}
+
+	/*
+	 * Protect the shared buffer from concurrent access by multiple
+	 * threads. Lock covers: print_ts(), vsnprintf(), write(), and
+	 * log_note_err() which all use the shared buffer.
+	 */
+	spin_lock(&log_lock);
+
+	if (loglevel != LOG_MSG && current_loglevel >= LOG_TIMESTAMP)
+		print_ts();
 
 	size = vsnprintf(buffer + buf_off, sizeof buffer - buf_off, format, params);
 	size += buf_off;
@@ -397,6 +406,8 @@ static void vprint_on_level(unsigned int loglevel, const char *format, va_list p
 	/* This is missing for messages in the early_log_buffer. */
 	if (loglevel == LOG_ERROR)
 		log_note_err(buffer + buf_off);
+
+	spin_unlock(&log_lock);
 
 	errno = _errno;
 }
