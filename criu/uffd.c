@@ -960,23 +960,9 @@ static int uffd_io_complete(struct page_read *pr, unsigned long img_addr, unsign
 	req_pages = (req->end - req->start) / PAGE_SIZE;
 	nr = min(nr, req_pages);
 
-	/*
-	 * In COW mode, the same page may be in the buffer from bulk transfer.
-	 * Remove it to avoid EEXIST when drain thread tries to copy it later.
-	 */
-	if (opts.cow_dump) {
-		unsigned long i;
-		for (i = 0; i < nr; i++) {
-			unsigned long page_addr = addr + i * PAGE_SIZE;
-			void *buffered = cow_page_buffer_lookup_and_remove(page_addr);
-			if (buffered) {
-				page_state_set(page_addr, PAGE_STATE_URGENT_PENDING);
-				page_pool_put(buffered);
-			} else {
-				page_state_set(page_addr, PAGE_STATE_URGENT_PENDING);
-			}
-		}
-	}
+	/* COW mode: remove from buffer to avoid EEXIST when drain copies later */
+	if (opts.cow_dump)
+		cow_uffd_remove_buffered_pages(addr, nr);
 
 	ret = uffd_copy(lpi, addr, &nr);
 	if (ret < 0)
@@ -1159,8 +1145,9 @@ static int xfer_pages(struct lazy_pages_info *lpi)
 		return -1;
 	}
 
-	/* Track this background transfer as waiting for server response */
-	pf_tracker_add(iov->start, nr_pages, lpi->pid, false);
+	/* COW mode: track background transfer as waiting for server response */
+	if (opts.cow_dump)
+		pf_tracker_add(iov->start, nr_pages, lpi->pid, false);
 
 	return 0;
 }
@@ -1174,14 +1161,9 @@ static int handle_remove(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 
 	lp_debug(lpi, "UNMAP: %llx-%llx\n", unreg.start, unreg.start + unreg.len);
 
-	/* Mark all pages in range as unmapped for state tracking */
-	page_state_mark_range_unmapped(unreg.start, unreg.len);
-
-	/* Track unmapped pages for production validation */
-	unmapped_tracker_mark_range(unreg.start, unreg.len);
-
-	/* Remove these pages from buffer - no point draining them */
-	cow_page_buffer_remove_range(unreg.start, unreg.len);
+	/* COW mode: track unmapped pages and remove from buffer */
+	if (opts.cow_dump)
+		cow_handle_remove_event(unreg.start, unreg.len);
 
 	/*
 	 * The REMOVE event does not change the VMA, so we need to
@@ -1310,8 +1292,10 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 
 	lp_debug(lpi, "#PF at 0x%llx\n", address);
 
-	/* COW mode: try to serve from buffer first */
+	/* COW mode: try to serve from buffer first, then handle COW-specific logic */
 	if (opts.cow_dump) {
+		unsigned long long img_addr = 0;
+
 		ret = cow_handle_page_fault_buffer(lpi, address);
 		if (ret < 0)
 			return ret;
@@ -1324,80 +1308,23 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 			page_state_set(address, PAGE_STATE_PF_PENDING);
 			return uffd_zero(lpi, address, 1);
 		}
-	}
 
-	if (opts.cow_dump) {
-		/*
-		 * In COW/bulk mode, pages arrive via the bulk stream,
-		 * but we still need to send an urgent request so the
-		 * server prioritizes this page. We do NOT split the IOV
-		 * or move it to the reqs list to avoid fragmenting the
-		 * IOV list.
-		 */
-		unsigned long long img_addr;
-
-		/* Check if server is available for convergence requests */
-		if (get_page_server_sk() < 0) {
-			/*
-			 * In COW mode, don't zero-fill - the correct data should
-			 * arrive via the drain thread. Return 0 to let the process
-			 * retry the fault when drain thread fills the page.
-			 */
-			lp_debug(lpi, "Page 0x%llx server unavailable - waiting for drain\n", address);
-			return 0;
-		}
-
-		iov = find_iov(lpi, address);
-
-		if (!iov) {
-			/*
-			 * IOV not found. If dirty bitmap received, all pages should
-			 * have been transferred - zero-fill this page. Otherwise
-			 * wait for drain thread to fill it.
-			 */
-			if (cow_is_dirty_bitmap_received()) {
-				lp_debug(lpi, "Page 0x%llx IOV not found - zero fill\n", address);
-				return uffd_zero(lpi, address, 1);
-			}
-			lp_debug(lpi, "Page 0x%llx IOV not found - waiting for drain\n", address);
-			return 0;
-		}
-
-		/*
-		 * New VMAs don't have pagemap entries - they didn't exist in Phase 1.
-		 * Request page directly from page server.
-		 */
-		if (iov->is_new_vma) {
-			lp_debug(lpi, "Page 0x%llx in new VMA - requesting from server\n", address);
-			cow_uffd_stats_inc_pf(1);
-			pf_tracker_add(address, 1, lpi->pid, true);
-			if (request_remote_pages(lpi->pr.img_id, address, 1) < 0) {
-				lp_err(lpi, "Error requesting new VMA page 0x%llx\n", address);
-				return -1;
-			}
-			return 0;
-		}
-
-		img_addr = iov->img_start + (address - iov->start);
-
-		cow_uffd_stats_inc_pf(1);
-		pf_tracker_add(address, 1, lpi->pid, true);
-
-		if (cow_is_phase3_active()) {
-			/* In Phase 3, pages arrive via convergence stream */
-			if (request_remote_pages(lpi->pr.img_id, address, 1) < 0) {
-				lp_err(lpi, "Error requesting page 0x%llx in Phase 3\n", address);
-				return -1;
-			}
-
-		} else {		
-			ret = uffd_handle_pages(lpi, img_addr, 1, PR_ASYNC | PR_ASAP);			
+		/* Handle COW-specific page fault logic */
+		ret = cow_handle_page_fault_cow_mode(lpi, address, &img_addr);
+		if (ret < 0)
+			return ret;
+		if (ret == 0)
+			return 0;  /* Handled or waiting */
+		if (ret == COW_PF_ZERO_FILL)
+			return uffd_zero(lpi, address, 1);
+		if (ret == COW_PF_HANDLE_PAGES) {
+			ret = uffd_handle_pages(lpi, img_addr, 1, PR_ASYNC | PR_ASAP);
 			if (ret < 0) {
 				lp_err(lpi, "Error during COW page fault request\n");
 				return -1;
 			}
+			return 0;
 		}
-
 		return 0;
 	}
 
@@ -1848,27 +1775,9 @@ static int create_iovs_for_new_ranges(unsigned long *dirty_ranges,
 void set_dirty_bitmap_received(unsigned long *dirty_ranges,
 			       unsigned int nr_dirty_ranges)
 {
-	pr_info("Dirty bitmap received from primary (%u ranges)\n", nr_dirty_ranges);
-
-	cow_set_dirty_bitmap_received(true);
-
-	/*
-	 * If restore is already connected, create IOVs for new VMAs now.
-	 * Otherwise store dirty_ranges for later processing in handle_lazy_accept().
-	 */
-	if (cow_is_restore_connected()) {
-		if (create_iovs_for_new_ranges(dirty_ranges, nr_dirty_ranges) < 0)
-			pr_warn("Failed to create IOVs for some new ranges\n");
-
-		xfree(dirty_ranges);
-
-		pr_info("Restore already connected, entering convergence\n");
-		switch_to_convergence_callback();
-		cow_start_drain_thread(&lpis);
-	} else {
-		pr_info("Storing dirty ranges for later (%u ranges)\n", nr_dirty_ranges);
-		cow_store_pending_dirty_ranges(dirty_ranges, nr_dirty_ranges);
-	}
+	cow_set_dirty_bitmap_received_and_process(&lpis, dirty_ranges,
+						  nr_dirty_ranges,
+						  switch_to_convergence_callback);
 }
 
 /*

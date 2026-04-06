@@ -5,6 +5,7 @@
 #include <string.h>
 #include <limits.h>
 #include <time.h>
+#include <fcntl.h>
 #include <sys/ioctl.h>
 #include <linux/userfaultfd.h>
 
@@ -1801,7 +1802,9 @@ int cow_convergence_copy_page(struct list_head *lpis,
 
 			if (errno == ENOENT) {
 				/* Queue for retry */
-				page_state_set(vaddr, PAGE_STATE_DISCARDED);
+				if (!unmapped_tracker_is_unmapped(vaddr)){
+					page_state_set(vaddr, PAGE_STATE_DISCARDED);
+				}				
 				return 0;
 			}
 			lp_err(lpi, "Direct convergence copy failed at 0x%lx errno=%d\n", vaddr, errno);
@@ -1818,6 +1821,118 @@ int cow_convergence_copy_page(struct list_head *lpis,
 	pr_err("BUG: Convergence callback with no lpi for vaddr 0x%lx\n", vaddr);
 	BUG();
 	return -1;
+}
+
+/*
+ * Remove buffered pages before urgent copy.
+ * Called from uffd_io_complete to prevent EEXIST when drain thread
+ * tries to copy the same page later.
+ */
+void cow_uffd_remove_buffered_pages(unsigned long addr, unsigned long nr)
+{
+	unsigned long i;
+
+	for (i = 0; i < nr; i++) {
+		unsigned long page_addr = addr + i * PAGE_SIZE;
+		void *buffered = cow_page_buffer_lookup_and_remove(page_addr);
+
+		if (buffered) {
+			page_state_set(page_addr, PAGE_STATE_URGENT_PENDING);
+			page_pool_put(buffered);
+		} else {
+			page_state_set(page_addr, PAGE_STATE_URGENT_PENDING);
+		}
+	}
+}
+
+/*
+ * Handle UNMAP/REMOVE event in COW mode.
+ * Marks pages as unmapped in trackers and removes from buffer.
+ */
+void cow_handle_remove_event(unsigned long start, unsigned long len)
+{
+	/* Mark all pages in range as unmapped for state tracking */
+	page_state_mark_range_unmapped(start, len);
+
+	/* Track unmapped pages for production validation */
+	unmapped_tracker_mark_range(start, len);
+
+	/* Remove these pages from buffer - no point draining them */
+	cow_page_buffer_remove_range(start, len);
+}
+
+/*
+ * COW-specific page fault handling (full flow).
+ * Returns:
+ *   0 - success (page handled or waiting)
+ *  -1 - error
+ *   COW_PF_ZERO_FILL (2) - caller should zero-fill the page
+ *   COW_PF_HANDLE_PAGES (3) - caller should call uffd_handle_pages with img_addr_out
+ */
+int cow_handle_page_fault_cow_mode(struct lazy_pages_info *lpi,
+				   unsigned long long address,
+				   unsigned long long *img_addr_out)
+{
+	struct lazy_iov *iov;
+
+	/* Check if server is available for convergence requests */
+	if (get_page_server_sk() < 0) {
+		/*
+		 * In COW mode, don't zero-fill - the correct data should
+		 * arrive via the drain thread. Return 0 to let the process
+		 * retry the fault when drain thread fills the page.
+		 */
+		lp_debug(lpi, "Page 0x%llx server unavailable - waiting for drain\n", address);
+		return 0;
+	}
+
+	iov = cow_find_iov(lpi, address);
+
+	if (!iov) {
+		/*
+		 * IOV not found. If dirty bitmap received, all pages should
+		 * have been transferred - zero-fill this page. Otherwise
+		 * wait for drain thread to fill it.
+		 */
+		if (cow_is_dirty_bitmap_received()) {
+			lp_debug(lpi, "Page 0x%llx IOV not found - zero fill\n", address);
+			return 2;  /* COW_PF_ZERO_FILL */
+		}
+		lp_debug(lpi, "Page 0x%llx IOV not found - waiting for drain\n", address);
+		return 0;
+	}
+
+	/*
+	 * New VMAs don't have pagemap entries - they didn't exist in Phase 1.
+	 * Request page directly from page server.
+	 */
+	if (iov->is_new_vma) {
+		lp_debug(lpi, "Page 0x%llx in new VMA - requesting from server\n", address);
+		cow_uffd_stats_inc_pf(1);
+		pf_tracker_add(address, 1, lpi->pid, true);
+		if (request_remote_pages(lpi->pr.img_id, address, 1) < 0) {
+			lp_err(lpi, "Error requesting new VMA page 0x%llx\n", address);
+			return -1;
+		}
+		return 0;
+	}
+
+	*img_addr_out = iov->img_start + (address - iov->start);
+
+	cow_uffd_stats_inc_pf(1);
+	pf_tracker_add(address, 1, lpi->pid, true);
+
+	if (cow_is_phase3_active()) {
+		/* In Phase 3, pages arrive via convergence stream */
+		if (request_remote_pages(lpi->pr.img_id, address, 1) < 0) {
+			lp_err(lpi, "Error requesting page 0x%llx in Phase 3\n", address);
+			return -1;
+		}
+		return 0;
+	}
+
+	/* Caller should call uffd_handle_pages with img_addr_out */
+	return 3;  /* COW_PF_HANDLE_PAGES */
 }
 
 /*
@@ -1899,4 +2014,114 @@ int cow_uffd_io_complete_bulk(struct lazy_pages_info *lpi,
 				   (t_end.tv_nsec - t_start.tv_nsec));
 
 	return 0;
+}
+
+/*
+ * Handle lazy accept in COW mode - sets up lpis for all tasks.
+ * This is the implementation called from uffd.c's handle_lazy_accept wrapper.
+ */
+int cow_handle_lazy_accept_impl(struct list_head *lpis, int epollfd,
+				int client, struct epoll_rfd *lazy_sk_rfd,
+				int (*lazy_sk_read_event)(struct epoll_rfd *),
+				int (*lazy_sk_hangup_event)(struct epoll_rfd *))
+{
+	/* This function is called from uffd.c after accept() succeeds.
+	 * The actual implementation remains in uffd.c since it needs
+	 * access to ud_open(), epoll_add_rfd(), etc.
+	 * This stub exists for future refactoring if needed.
+	 */
+	(void)lpis;
+	(void)epollfd;
+	(void)client;
+	(void)lazy_sk_rfd;
+	(void)lazy_sk_read_event;
+	(void)lazy_sk_hangup_event;
+	return 0;
+}
+
+/*
+ * Set dirty bitmap received and process.
+ * Called from uffd.c when dirty bitmap is received.
+ */
+void cow_set_dirty_bitmap_received_and_process(struct list_head *lpis,
+					       unsigned long *dirty_ranges,
+					       unsigned int nr_dirty_ranges,
+					       void (*switch_to_convergence)(void))
+{
+	pr_info("Dirty bitmap received from primary (%u ranges)\n", nr_dirty_ranges);
+
+	cow_set_dirty_bitmap_received(true);
+
+	/*
+	 * If restore is already connected, create IOVs for new VMAs now.
+	 * Otherwise store dirty_ranges for later processing.
+	 */
+	if (cow_is_restore_connected()) {
+		if (cow_create_iovs_for_new_ranges(lpis, dirty_ranges, nr_dirty_ranges) < 0)
+			pr_warn("Failed to create IOVs for some new ranges\n");
+
+		xfree(dirty_ranges);
+
+		pr_info("Restore already connected, entering convergence\n");
+		if (switch_to_convergence)
+			switch_to_convergence();
+		cow_start_drain_thread(lpis);
+	} else {
+		pr_info("Storing dirty ranges for later (%u ranges)\n", nr_dirty_ranges);
+		cow_store_pending_dirty_ranges(dirty_ranges, nr_dirty_ranges);
+	}
+}
+
+/*
+ * COW Phase 3 restore loop entry point.
+ * Sets up lazy socket and enters main event loop.
+ */
+int cow_phase3_restore_loop_entry(int *epollfd_ptr,
+				  struct epoll_event **events,
+				  int nr_fds,
+				  int (*prepare_lazy_socket)(void),
+				  struct epoll_rfd *lazy_listen_rfd,
+				  int (*handle_lazy_accept)(struct epoll_rfd *),
+				  int (*handle_requests)(int, struct epoll_event **, int))
+{
+	int lazy_sk;
+	int flags;
+	int ret;
+	int epollfd = *epollfd_ptr;
+
+	cow_set_phase3_active(true);
+
+	/* Create lazy socket for restore to connect */
+	lazy_sk = prepare_lazy_socket();
+	if (lazy_sk < 0) {
+		pr_err("Failed to create lazy socket for Phase 3\n");
+		return -1;
+	}
+
+	/* Make listen socket non-blocking and add to epoll */
+	flags = fcntl(lazy_sk, F_GETFL, 0);
+	fcntl(lazy_sk, F_SETFL, flags | O_NONBLOCK);
+
+	lazy_listen_rfd->fd = lazy_sk;
+	lazy_listen_rfd->read_event = handle_lazy_accept;
+	if (epoll_add_rfd(epollfd, lazy_listen_rfd)) {
+		close(lazy_sk);
+		return -1;
+	}
+
+	pr_info("COW Phase 3: Waiting for restore to connect\n");
+
+	/* Initialize buffer and switch directly to convergence callback for Phase 3 */
+	if (cow_setup_prebuffer_reader()) {
+		pr_err("Failed to setup prebuffer reader for Phase 3\n");
+		close(lazy_sk);
+		return -1;
+	}
+
+	/* Pages will be requested after restore connects */
+
+	/* Enter main event loop - handle page faults until restore finishes */
+	ret = handle_requests(epollfd, events, nr_fds);
+
+	return ret;
 }
