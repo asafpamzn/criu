@@ -1960,9 +1960,9 @@ int cow_convergence_copy_page(struct list_head *lpis,
 		return ret >= 0 ? 0 : -1;
 	}
 
-	pr_err("BUG: Convergence callback with no lpi for vaddr 0x%lx\n", vaddr);
-	BUG();
-	return -1;
+	pr_err("Copied to unmap range: Convergence callback with no lpi for vaddr 0x%lx\n", vaddr);
+	
+	return 1;
 }
 
 /*
