@@ -157,6 +157,7 @@ static enum cow_copy_result cow_uffd_copy_pages(int uffd, unsigned long dst,
  * Flags for cow_uffd_copy_and_track()
  */
 #define COW_TRACK_STRICT    (1 << 0)  /* BUG() on EEXIST/ERROR (drain mode) */
+#define COW_TRACK_RETRY     (1 << 1)  /* Retry mode: no buffer stats, return -EAGAIN */
 
 /*
  * Unified UFFDIO_COPY with full tracking.
@@ -176,6 +177,7 @@ static enum cow_copy_result cow_uffd_copy_pages(int uffd, unsigned long dst,
  *   1 - success (page copied)
  *   0 - soft handled (ENOENT unmapped, EAGAIN queued, EEXIST already done)
  *  -1 - error
+ *  -EAGAIN - kernel busy (only with COW_TRACK_RETRY flag)
  */
 static int cow_uffd_copy_and_track(int uffd, unsigned long vaddr, void *data,
 				   unsigned long nr_pages,
@@ -194,7 +196,8 @@ static int cow_uffd_copy_and_track(int uffd, unsigned long vaddr, void *data,
 
 	switch (res) {
 	case COW_COPY_OK:
-		__sync_fetch_and_add(&cow_buffer.nr_applied, 1);
+		if (!(flags & COW_TRACK_RETRY))
+			__sync_fetch_and_add(&cow_buffer.nr_applied, 1);
 		pf_tracker_set_state(vaddr, PF_STATE_COMPLETED);
 		page_state_set(vaddr, PAGE_STATE_COPIED);
 		if (lpi)
@@ -202,7 +205,8 @@ static int cow_uffd_copy_and_track(int uffd, unsigned long vaddr, void *data,
 		return 1;
 
 	case COW_COPY_EEXIST:
-		__sync_fetch_and_add(&cow_buffer.nr_discarded, 1);
+		if (!(flags & COW_TRACK_RETRY))
+			__sync_fetch_and_add(&cow_buffer.nr_discarded, 1);
 		pr_debug("COW_TRACE %s: 0x%lx EEXIST (already copied)\n", caller, vaddr);
 		if (!unmapped_tracker_is_unmapped(vaddr) &&
 		    page_state_get(vaddr) != PAGE_STATE_DIRTY)
@@ -215,7 +219,8 @@ static int cow_uffd_copy_and_track(int uffd, unsigned long vaddr, void *data,
 		return 0;  /* soft handled - drain already did it */
 
 	case COW_COPY_ENOENT:
-		__sync_fetch_and_add(&cow_buffer.nr_discarded, 1);
+		if (!(flags & COW_TRACK_RETRY))
+			__sync_fetch_and_add(&cow_buffer.nr_discarded, 1);
 		pr_debug("COW_TRACE %s: 0x%lx ENOENT (VMA unmapped)\n", caller, vaddr);
 		if (!unmapped_tracker_is_unmapped(vaddr)) {
 			page_state_set(vaddr, PAGE_STATE_DISCARDED);
@@ -224,6 +229,11 @@ static int cow_uffd_copy_and_track(int uffd, unsigned long vaddr, void *data,
 		return 0;
 
 	case COW_COPY_EAGAIN:
+		if (flags & COW_TRACK_RETRY) {
+			/* Retry mode - return -EAGAIN, don't queue */
+			pr_debug("COW_TRACE %s: 0x%lx EAGAIN (retry mode)\n", caller, vaddr);
+			return -EAGAIN;
+		}
 		__sync_fetch_and_add(&cow_buffer.nr_eagain, 1);
 		pr_debug("COW_TRACE %s: 0x%lx EAGAIN, queuing for retry\n", caller, vaddr);
 		if (lpis) {
@@ -245,8 +255,8 @@ static int cow_uffd_copy_and_track(int uffd, unsigned long vaddr, void *data,
 		if (!unmapped_tracker_is_unmapped(vaddr) &&
 		    page_state_get(vaddr) != PAGE_STATE_DIRTY)
 			page_state_set(vaddr, PAGE_STATE_DISCARDED);
-		if (flags & COW_TRACK_STRICT)
-			BUG();
+		
+		BUG();
 		return -1;
 	}
 
@@ -1151,33 +1161,23 @@ bool cow_is_eagain_queue_empty(void)
  */
 static int retry_uffd_copy(struct uffd_eagain_request *req)
 {
-	enum cow_copy_result res;
+	int ret;
 
-	res = cow_uffd_copy_pages(req->lpi->lpfd.fd, req->address,
-				  req->buf, req->nr_pages, NULL);
-	switch (res) {
-	case COW_COPY_OK:
-		req->lpi->copied_pages += req->nr_pages;
-		pf_tracker_set_state(req->address, PF_STATE_COMPLETED);
-		page_state_set(req->address, PAGE_STATE_COPIED);
+	ret = cow_uffd_copy_and_track(req->lpi->lpfd.fd, req->address,
+				      req->buf, req->nr_pages,
+				      req->lpi, NULL,
+				      COW_TRACK_RETRY | COW_TRACK_STRICT,
+				      "EAGAIN_RETRY", NULL);
+	if (ret == 1) {
 		lp_debug(req->lpi, "EAGAIN copy retry succeeded for 0x%llx\n", req->address);
 		return 0;
-	case COW_COPY_EAGAIN:
-		return -EAGAIN;
-	case COW_COPY_EEXIST:
-		pr_err("BUG: EAGAIN copy retry EEXIST at 0x%llx - duplicate copy!\n",
-		       req->address);
-		page_state_print_history(req->address);
-		BUG();
-		return -1;
-	case COW_COPY_ENOENT:
-	case COW_COPY_ERROR:
-		lp_err(req->lpi, "EAGAIN copy retry failed for 0x%llx: %d\n",
-		       req->address, errno);
-		page_state_set(req->address, PAGE_STATE_DISCARDED);
-		return -1;
 	}
-	return -1;  /* unreachable */
+	if (ret == -EAGAIN)
+		return -EAGAIN;
+
+	/* ENOENT or ERROR - unified handler already set page state */
+	lp_err(req->lpi, "EAGAIN copy retry failed for 0x%llx\n", req->address);
+	return -1;
 }
 
 /*
