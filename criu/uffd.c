@@ -954,7 +954,7 @@ static int uffd_io_complete(struct page_read *pr, unsigned long img_addr, unsign
 	 * list and let drop_iovs do the range math, free memory etc.
 	 */
 	iov_list_insert(req, &lpi->iovs);
-	return drop_iovs(lpi, addr, nr * PAGE_SIZE);
+	return 0;//drop_iovs(lpi, addr, nr * PAGE_SIZE);//WE do not drop_iov since it is not thread safe
 }
 
 /*
@@ -1148,7 +1148,7 @@ static int handle_remove(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 		return -1;
 	}
 
-	return drop_iovs(lpi, unreg.start, unreg.len);
+	return 0;//drop_iovs(lpi, unreg.start, unreg.len);WE do not drop_iov since it is not thread safe
 }
 
 static int handle_remap(struct lazy_pages_info *lpi, struct uffd_msg *msg)
