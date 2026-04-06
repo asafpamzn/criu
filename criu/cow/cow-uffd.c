@@ -23,6 +23,7 @@
 #include "cow/page-pool.h"
 #include "cow/unmapped-tracker.h"
 #include "cow/page-state-tracker.h"
+#include "pstree.h"
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "cow-uffd: "
@@ -558,7 +559,10 @@ static void *background_drain_thread(void *arg)
 								__sync_fetch_and_add(&cow_buffer.nr_discarded, 1);
 								pr_debug("COW_TRACE DRAIN_COPY: 0x%lx ENOENT (VMA unmapped)\n", vaddr);
 								/* Mark as unmapped - this is expected, not an error */
-								unmapped_tracker_mark_range(vaddr, PAGE_SIZE);
+								if (!unmapped_tracker_is_unmapped(vaddr)){
+									page_state_set(vaddr, PAGE_STATE_DISCARDED);
+									unmapped_tracker_mark_range(vaddr, PAGE_SIZE);
+								}
 							} else if (errno == EAGAIN) {
 								__sync_fetch_and_add(&cow_buffer.nr_eagain, 1);
 								if (drain_lpis && cow_queue_drain_eagain_request(drain_lpis, vaddr, data) == 0) {
@@ -571,6 +575,7 @@ static void *background_drain_thread(void *arg)
 								if (!unmapped_tracker_is_unmapped(vaddr) &&
 								    page_state_get(vaddr) != PAGE_STATE_DIRTY)
 									page_state_set(vaddr, PAGE_STATE_DISCARDED);
+								BUG();
 							}
 						} else {
 							__sync_fetch_and_add(&cow_buffer.nr_applied, 1);
@@ -584,6 +589,7 @@ static void *background_drain_thread(void *arg)
 						if (!unmapped_tracker_is_unmapped(vaddr) &&
 						    page_state_get(vaddr) != PAGE_STATE_DIRTY)
 							page_state_set(vaddr, PAGE_STATE_DISCARDED);
+						BUG();
 					}
 
 					if (free_data)
@@ -1543,6 +1549,59 @@ void cow_lazy_pages_cleanup(void)
 }
 
 /*
+ * Full COW page fault handler - consolidates all COW-specific logic.
+ * Returns: 0 on success, <0 on error
+ *
+ * This function handles:
+ *   1. Try to serve from buffer
+ *   2. Check if all pages sent -> zero fill
+ *   3. Call COW mode handler for server requests
+ *   4. Handle return codes with appropriate uffd operations
+ */
+int cow_handle_page_fault_full(struct lazy_pages_info *lpi,
+			       unsigned long long address,
+			       int (*do_zero)(struct lazy_pages_info *, __u64, unsigned long),
+			       int (*do_handle_pages)(struct lazy_pages_info *, __u64, unsigned long, unsigned))
+{
+	unsigned long long img_addr = 0;
+	int ret;
+
+	/* Try to serve from buffer first */
+	ret = cow_handle_page_fault_buffer(lpi, address);
+	if (ret < 0)
+		return ret;
+	if (ret > 0)
+		return 0;  /* Page served from buffer */
+
+	/* Page not in buffer - check if all pages sent */
+	if (cow_is_all_pages_sent_received()) {
+		lp_debug(lpi, "Page 0x%llx not in buffer, all pages sent - zero-filling\n", address);
+		page_state_set(address, PAGE_STATE_PF_PENDING);
+		return do_zero(lpi, address, 1);
+	}
+
+	/* Handle COW-specific page fault logic */
+	ret = cow_handle_page_fault_cow_mode(lpi, address, &img_addr);
+	if (ret < 0)
+		return ret;
+	if (ret == 0)
+		return 0;  /* Handled or waiting */
+	if (ret == COW_PF_ZERO_FILL)
+		return do_zero(lpi, address, 1);
+	if (ret == COW_PF_HANDLE_PAGES) {
+		/* PR_ASYNC | PR_ASAP = 0x3 */
+		ret = do_handle_pages(lpi, img_addr, 1, 0x3);
+		if (ret < 0) {
+			lp_err(lpi, "Error during COW page fault request\n");
+			return -1;
+		}
+		return 0;
+	}
+
+	return 0;
+}
+
+/*
  * Try to serve a page fault from the COW buffer.
  * Returns:
  *   1 - page found and copied (or handled)
@@ -1620,9 +1679,9 @@ int cow_handle_page_fault_buffer(struct lazy_pages_info *lpi,
 /*
  * Handle UFFDIO_COPY errors in COW mode.
  * Returns:
- *   1 - error handled (EAGAIN queued, EEXIST ignored)
+ *   1 - error handled (EAGAIN queued, EEXIST ignored), caller should return 0
  *   0 - continue with normal error handling
- *  -1 - fatal error
+ *  -1 - fatal error, caller should return -1
  */
 int cow_uffd_handle_copy_error(struct lazy_pages_info *lpi,
 			       __u64 address, unsigned long nr_pages,
@@ -1656,6 +1715,22 @@ int cow_uffd_handle_copy_error(struct lazy_pages_info *lpi,
 }
 
 /*
+ * COW mode wrapper for uffd_copy error handling.
+ * Combines error check + return logic into single call.
+ * Returns: -1 = fatal, 0 = handled (caller returns 0), 1 = not handled
+ */
+int cow_uffd_check_copy_error(struct lazy_pages_info *lpi,
+			      __u64 address, unsigned long nr_pages,
+			      void *buf, int saved_errno, long copy_result)
+{
+	int ret = cow_uffd_handle_copy_error(lpi, address, nr_pages,
+					     buf, saved_errno, copy_result);
+	if (ret != 0)
+		return ret < 0 ? -1 : 0;  /* Fatal or handled */
+	return 1;  /* Not handled - continue with normal error path */
+}
+
+/*
  * Handle UFFDIO_ZEROPAGE errors in COW mode.
  * Returns:
  *   1 - error handled (EAGAIN queued)
@@ -1671,6 +1746,20 @@ int cow_uffd_handle_zero_error(struct lazy_pages_info *lpi,
 		return cow_queue_eagain_request(lpi, address, nr_pages, NULL, "zero");
 
 	return 0;  /* Let caller continue with normal error handling */
+}
+
+/*
+ * COW mode wrapper for uffd_zero error handling (combines check + return).
+ * Returns: -1 = fatal, 0 = handled (caller returns 0), 1 = not handled
+ */
+int cow_uffd_check_zero_error(struct lazy_pages_info *lpi,
+			      __u64 address, unsigned long nr_pages,
+			      int saved_errno)
+{
+	int ret = cow_uffd_handle_zero_error(lpi, address, nr_pages, saved_errno);
+	if (ret != 0)
+		return ret < 0 ? -1 : 0;  /* Fatal or handled */
+	return 1;  /* Not handled - continue with normal error path */
 }
 
 /*
@@ -2017,29 +2106,6 @@ int cow_uffd_io_complete_bulk(struct lazy_pages_info *lpi,
 }
 
 /*
- * Handle lazy accept in COW mode - sets up lpis for all tasks.
- * This is the implementation called from uffd.c's handle_lazy_accept wrapper.
- */
-int cow_handle_lazy_accept_impl(struct list_head *lpis, int epollfd,
-				int client, struct epoll_rfd *lazy_sk_rfd,
-				int (*lazy_sk_read_event)(struct epoll_rfd *),
-				int (*lazy_sk_hangup_event)(struct epoll_rfd *))
-{
-	/* This function is called from uffd.c after accept() succeeds.
-	 * The actual implementation remains in uffd.c since it needs
-	 * access to ud_open(), epoll_add_rfd(), etc.
-	 * This stub exists for future refactoring if needed.
-	 */
-	(void)lpis;
-	(void)epollfd;
-	(void)client;
-	(void)lazy_sk_rfd;
-	(void)lazy_sk_read_event;
-	(void)lazy_sk_hangup_event;
-	return 0;
-}
-
-/*
  * Set dirty bitmap received and process.
  * Called from uffd.c when dirty bitmap is received.
  */
@@ -2073,55 +2139,63 @@ void cow_set_dirty_bitmap_received_and_process(struct list_head *lpis,
 }
 
 /*
- * COW Phase 3 restore loop entry point.
- * Sets up lazy socket and enters main event loop.
+ * COW post-connect initialization in handle_lazy_accept.
+ * Called after restore connects to handle dirty bitmap processing
+ * and Phase 3 page requests.
+ *
+ * Returns: 0 on success, -1 on error
  */
-int cow_phase3_restore_loop_entry(int *epollfd_ptr,
-				  struct epoll_event **events,
-				  int nr_fds,
-				  int (*prepare_lazy_socket)(void),
-				  struct epoll_rfd *lazy_listen_rfd,
-				  int (*handle_lazy_accept)(struct epoll_rfd *),
-				  int (*handle_requests)(int, struct epoll_event **, int))
+int cow_handle_lazy_accept_post_connect(struct list_head *lpis,
+					void (*switch_to_convergence)(void))
 {
-	int lazy_sk;
-	int flags;
-	int ret;
-	int epollfd = *epollfd_ptr;
+	/*
+	 * Start drain thread and switch to convergence callback only if
+	 * dirty bitmap already received. Both require uffd available.
+	 * If bitmap hasn't arrived yet, we'll do this when it does.
+	 */
+	if (cow_is_dirty_bitmap_received()) {
+		unsigned int nr_ranges;
+		unsigned long *dirty_ranges = cow_get_pending_dirty_ranges(&nr_ranges);
 
-	cow_set_phase3_active(true);
+		if (dirty_ranges) {
+			pr_info("Creating IOVs for %u pending dirty ranges\n", nr_ranges);
+			if (cow_create_iovs_for_new_ranges(lpis, dirty_ranges, nr_ranges) < 0)
+				pr_warn("Failed to create IOVs for some new ranges\n");
+			xfree(dirty_ranges);
+		}
 
-	/* Create lazy socket for restore to connect */
-	lazy_sk = prepare_lazy_socket();
-	if (lazy_sk < 0) {
-		pr_err("Failed to create lazy socket for Phase 3\n");
-		return -1;
+		pr_info("Dirty bitmap already received, entering convergence\n");
+		if (switch_to_convergence)
+			switch_to_convergence();
+		cow_start_drain_thread(lpis);
 	}
 
-	/* Make listen socket non-blocking and add to epoll */
-	flags = fcntl(lazy_sk, F_GETFL, 0);
-	fcntl(lazy_sk, F_SETFL, flags | O_NONBLOCK);
-
-	lazy_listen_rfd->fd = lazy_sk;
-	lazy_listen_rfd->read_event = handle_lazy_accept;
-	if (epoll_add_rfd(epollfd, lazy_listen_rfd)) {
-		close(lazy_sk);
-		return -1;
-	}
-
-	pr_info("COW Phase 3: Waiting for restore to connect\n");
-
-	/* Initialize buffer and switch directly to convergence callback for Phase 3 */
-	if (cow_setup_prebuffer_reader()) {
-		pr_err("Failed to setup prebuffer reader for Phase 3\n");
-		close(lazy_sk);
-		return -1;
-	}
-
-	/* Pages will be requested after restore connects */
-
-	/* Enter main event loop - handle page faults until restore finishes */
-	ret = handle_requests(epollfd, events, nr_fds);
-
-	return ret;
+	return 0;
 }
+
+/*
+ * COW Phase 3 page request after restore connects.
+ * Requests all pages for all alive tasks.
+ *
+ * Returns: 0 on success, -1 on error
+ */
+int cow_phase3_request_all_pages(void)
+{
+	struct pstree_item *pi;
+
+	if (!cow_is_phase3_active())
+		return 0;
+
+	for_each_pstree_item(pi) {
+		if (task_alive(pi)) {
+			pr_info("Requesting all remote pages for pid=%d\n", vpid(pi));
+			if (request_all_remote_pages(vpid(pi)) < 0) {
+				pr_err("Failed to request pages for pid=%d\n", vpid(pi));
+				return -1;
+			}
+		}
+	}
+
+	return 0;
+}
+

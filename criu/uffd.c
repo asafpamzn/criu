@@ -877,12 +877,9 @@ static int uffd_copy(struct lazy_pages_info *lpi, __u64 address, unsigned long *
 		int err = errno;
 
 		/* COW mode: use helper for EAGAIN/EEXIST handling */
-		if (opts.cow_dump) {
-			ret = cow_uffd_handle_copy_error(lpi, address, *nr_pages,
-							lpi->buf, err, uffdio_copy.copy);
-			if (ret != 0)
-				return ret < 0 ? -1 : 0;
-		}
+		if (opts.cow_dump && (ret = cow_uffd_check_copy_error(lpi, address, *nr_pages,
+						lpi->buf, err, uffdio_copy.copy)) <= 0)
+			return ret;
 
 		/* Non-COW mode or unhandled error */
 		if (uffd_check_op_error(lpi, "copy", nr_pages, uffdio_copy.copy))
@@ -895,12 +892,9 @@ static int uffd_copy(struct lazy_pages_info *lpi, __u64 address, unsigned long *
 		errno = err;
 
 		/* COW mode: use helper for EAGAIN/EEXIST handling */
-		if (opts.cow_dump) {
-			ret = cow_uffd_handle_copy_error(lpi, address, *nr_pages,
-							lpi->buf, err, uffdio_copy.copy);
-			if (ret != 0)
-				return ret < 0 ? -1 : 0;
-		}
+		if (opts.cow_dump && (ret = cow_uffd_check_copy_error(lpi, address, *nr_pages,
+						lpi->buf, err, uffdio_copy.copy)) <= 0)
+			return ret;
 
 		/* Non-COW mode or unhandled error */
 		if (uffd_check_op_error(lpi, "copy", nr_pages, uffdio_copy.copy))
@@ -1011,11 +1005,8 @@ static int uffd_zero(struct lazy_pages_info *lpi, __u64 address, unsigned long n
 		int err = errno;
 
 		/* COW mode: use helper for EAGAIN handling */
-		if (opts.cow_dump) {
-			ret = cow_uffd_handle_zero_error(lpi, address, nr_pages, err);
-			if (ret != 0)
-				return ret < 0 ? -1 : 0;
-		}
+		if (opts.cow_dump && (ret = cow_uffd_check_zero_error(lpi, address, nr_pages, err)) <= 0)
+			return ret;
 
 		/* Non-COW mode or unhandled error */
 		if (uffd_check_op_error(lpi, "zero", &nr_pages, uffdio_zeropage.zeropage))
@@ -1029,11 +1020,8 @@ static int uffd_zero(struct lazy_pages_info *lpi, __u64 address, unsigned long n
 		errno = err;
 
 		/* COW mode: use helper for EAGAIN handling */
-		if (opts.cow_dump) {
-			ret = cow_uffd_handle_zero_error(lpi, address, nr_pages, err);
-			if (ret != 0)
-				return ret < 0 ? -1 : 0;
-		}
+		if (opts.cow_dump && (ret = cow_uffd_check_zero_error(lpi, address, nr_pages, err)) <= 0)
+			return ret;
 
 		if (uffd_check_op_error(lpi, "zero", &nr_pages, uffdio_zeropage.zeropage))
 			return -1;
@@ -1292,41 +1280,9 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 
 	lp_debug(lpi, "#PF at 0x%llx\n", address);
 
-	/* COW mode: try to serve from buffer first, then handle COW-specific logic */
-	if (opts.cow_dump) {
-		unsigned long long img_addr = 0;
-
-		ret = cow_handle_page_fault_buffer(lpi, address);
-		if (ret < 0)
-			return ret;
-		if (ret > 0)
-			return 0;  /* Page served from buffer */
-
-		/* Page not in buffer - check if all pages sent */
-		if (cow_is_all_pages_sent_received()) {
-			lp_debug(lpi, "Page 0x%llx not in buffer, all pages sent - zero-filling\n", address);
-			page_state_set(address, PAGE_STATE_PF_PENDING);
-			return uffd_zero(lpi, address, 1);
-		}
-
-		/* Handle COW-specific page fault logic */
-		ret = cow_handle_page_fault_cow_mode(lpi, address, &img_addr);
-		if (ret < 0)
-			return ret;
-		if (ret == 0)
-			return 0;  /* Handled or waiting */
-		if (ret == COW_PF_ZERO_FILL)
-			return uffd_zero(lpi, address, 1);
-		if (ret == COW_PF_HANDLE_PAGES) {
-			ret = uffd_handle_pages(lpi, img_addr, 1, PR_ASYNC | PR_ASAP);
-			if (ret < 0) {
-				lp_err(lpi, "Error during COW page fault request\n");
-				return -1;
-			}
-			return 0;
-		}
-		return 0;
-	}
+	/* COW mode: handle full page fault flow */
+	if (opts.cow_dump)
+		return cow_handle_page_fault_full(lpi, address, uffd_zero, uffd_handle_pages);
 
 	if (is_page_queued(lpi, address)) {
 		lp_debug(lpi, "#PF at 0x%llx queued\n", address);
@@ -1712,42 +1668,12 @@ static int handle_lazy_accept(struct epoll_rfd *rfd)
 	pr_info("criu restore setup complete, %lu pages buffered\n",
 		cow_page_buffer_count());
 
-	/*
-	 * Start drain thread and switch to convergence callback only if
-	 * dirty bitmap already received. Both require uffd available.
-	 * If bitmap hasn't arrived yet, we'll do this when it does.
-	 */
-	if (opts.cow_dump && cow_is_dirty_bitmap_received()) {
-		unsigned int nr_ranges;
-		unsigned long *dirty_ranges = cow_get_pending_dirty_ranges(&nr_ranges);
-
-		if (dirty_ranges) {
-			pr_info("Creating IOVs for %u pending dirty ranges\n", nr_ranges);
-			if (cow_create_iovs_for_new_ranges(&lpis, dirty_ranges, nr_ranges) < 0)
-				pr_warn("Failed to create IOVs for some new ranges\n");
-			xfree(dirty_ranges);
-		}
-
-		pr_info("Dirty bitmap already received, entering convergence\n");
-		switch_to_convergence_callback();
-		cow_start_drain_thread(&lpis);
-	}
-
-	/* Phase 3: request all pages now that lpis are created */
-	if (cow_is_phase3_active()) {
-		struct pstree_item *pi;
-
-		for_each_pstree_item(pi) {
-			if (task_alive(pi)) {
-				pr_info("Requesting all remote pages for pid=%d\n",
-					vpid(pi));
-				if (request_all_remote_pages(vpid(pi)) < 0) {
-					pr_err("Failed to request pages for pid=%d\n",
-						vpid(pi));
-					goto err;
-				}
-			}
-		}
+	/* COW mode: handle post-connect initialization */
+	if (opts.cow_dump) {
+		if (cow_handle_lazy_accept_post_connect(&lpis, switch_to_convergence_callback) < 0)
+			goto err;
+		if (cow_phase3_request_all_pages() < 0)
+			goto err;
 	}
 
 	return 0;

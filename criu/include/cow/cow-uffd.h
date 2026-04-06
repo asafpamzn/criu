@@ -7,7 +7,6 @@
 /* Forward declarations */
 struct list_head;
 struct epoll_event;
-struct epoll_rfd;
 
 /* Initialize COW page buffer (hash table, locks) */
 int cow_page_buffer_init(void);
@@ -168,6 +167,15 @@ extern int cow_handle_page_fault_buffer(struct lazy_pages_info *lpi,
 					unsigned long long address);
 
 /*
+ * Full COW page fault handler - consolidates all COW-specific logic.
+ * Takes function pointers for uffd operations to avoid making them non-static.
+ */
+extern int cow_handle_page_fault_full(struct lazy_pages_info *lpi,
+				      unsigned long long address,
+				      int (*do_zero)(struct lazy_pages_info *, __u64, unsigned long),
+				      int (*do_handle_pages)(struct lazy_pages_info *, __u64, unsigned long, unsigned));
+
+/*
  * COW-specific uffd_copy/uffd_zero error handling
  * Returns: 0 = continue/success, -1 = fatal error, 1 = handled (queued EAGAIN)
  */
@@ -178,6 +186,17 @@ extern int cow_uffd_handle_zero_error(struct lazy_pages_info *lpi,
 				      __u64 address, unsigned long nr_pages,
 				      int saved_errno);
 extern void cow_uffd_copy_success(unsigned long address);
+
+/*
+ * COW mode wrappers for uffd error handling (combines check + return).
+ * Returns: -1 = fatal, 0 = handled (caller returns 0), 1 = not handled
+ */
+extern int cow_uffd_check_copy_error(struct lazy_pages_info *lpi,
+				     __u64 address, unsigned long nr_pages,
+				     void *buf, int saved_errno, long copy_result);
+extern int cow_uffd_check_zero_error(struct lazy_pages_info *lpi,
+				     __u64 address, unsigned long nr_pages,
+				     int saved_errno);
 
 /*
  * COW page fault handling (called from handle_page_fault when opts.cow_dump)
@@ -231,13 +250,17 @@ extern int cow_handle_page_fault_cow_mode(struct lazy_pages_info *lpi,
 					  unsigned long long *img_addr_out);
 
 /*
- * Handle lazy accept in COW mode - called from epoll handler.
- * Sets up lpis for all tasks and enters convergence mode if ready.
+ * COW post-connect initialization in handle_lazy_accept.
+ * Handles dirty bitmap processing and starts drain thread if ready.
  */
-extern int cow_handle_lazy_accept_impl(struct list_head *lpis, int epollfd,
-				       int client, struct epoll_rfd *lazy_sk_rfd,
-				       int (*lazy_sk_read_event)(struct epoll_rfd *),
-				       int (*lazy_sk_hangup_event)(struct epoll_rfd *));
+extern int cow_handle_lazy_accept_post_connect(struct list_head *lpis,
+					       void (*switch_to_convergence)(void));
+
+/*
+ * COW Phase 3 page request after restore connects.
+ * Requests all pages for all alive tasks.
+ */
+extern int cow_phase3_request_all_pages(void);
 
 /*
  * Set dirty bitmap received and process (wrapper for uffd.c).
@@ -246,16 +269,5 @@ extern void cow_set_dirty_bitmap_received_and_process(struct list_head *lpis,
 						      unsigned long *dirty_ranges,
 						      unsigned int nr_dirty_ranges,
 						      void (*switch_to_convergence)(void));
-
-/*
- * COW Phase 3 restore loop implementation.
- */
-extern int cow_phase3_restore_loop_entry(int *epollfd_ptr,
-					 struct epoll_event **events,
-					 int nr_fds,
-					 int (*prepare_lazy_socket)(void),
-					 struct epoll_rfd *lazy_listen_rfd,
-					 int (*handle_lazy_accept)(struct epoll_rfd *),
-					 int (*handle_requests)(int, struct epoll_event **, int));
 
 #endif /* __CR_COW_UFFD_H__ */
