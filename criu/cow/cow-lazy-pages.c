@@ -131,7 +131,7 @@ int cr_lazy_pages_cow_phase2(bool daemon)
 	int ret = -1;
 	int nr_fds;
 
-	pr_err("=== COW Phase 2: Page buffering mode ===\n");
+	pr_err("=== REPLICA PHASE 2: Page buffering mode ===\n");
 
 	/* 1. Discover tasks from pagemap files */
 	if (discover_tasks_from_pagemaps())
@@ -224,7 +224,7 @@ int cr_lazy_pages_cow_phase2(bool daemon)
 		goto err_disconnect;
 	}
 
-	pr_err("=== COW Phase 3: Starting restore ===\n");
+	pr_err("=== REPLICA PHASE 5: Starting restore ===\n");
 
 	/*
 	 * Phase 3: Dirty bitmap received, skeleton dump is ready.
@@ -311,19 +311,19 @@ int cow_phase2_handle_pages(int epollfd, struct epoll_event *events, int nr_fds)
 
 		/* Track bulk transfer completion */
 		if (!bulk_done && page_server_bulk_stream_done()) {
-			pr_err("Bulk page transfer complete, waiting for dirty bitmap...\n");
+			pr_info("Bulk page transfer complete, waiting for skeleton dump...\n");
 			bulk_done = true;
 		}
 
 		/* Track inventory ready signal */
 		if (!inventory_ready && cow_is_inventory_ready_received()) {
-			pr_err("Inventory ready signal received\n");
+			pr_info("Inventory ready signal received\n");
 			inventory_ready = true;
 		}
 
-		/* All pages sent signals Phase 3 is complete */
+		/* All pages sent signals Phase 4 is complete */
 		if (cow_is_all_pages_sent_received()) {
-			pr_err("All pages sent - Phase 3 ready\n");
+			pr_err("=== REPLICA: All phases complete, ready for restore ===\n");
 			return 0;
 		}
 	}

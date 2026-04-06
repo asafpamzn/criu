@@ -123,7 +123,8 @@ static int handle_end_of_transfer(struct ps_async_read_bulk *ar, u32 cmd)
 	};
 	int sk = get_page_server_sk();
 
-	pr_err("Received end-of-transfer marker (cmd=%u dst_id=%lu)\n", cmd,
+	pr_err("=== REPLICA PHASE 2: Bulk transfer complete ===\n");
+	pr_info("Received end-of-transfer marker (cmd=%u dst_id=%lu)\n", cmd,
 		(unsigned long)ar->pi.dst_id);
 	set_bulk_stream_done();
 
@@ -135,7 +136,7 @@ static int handle_end_of_transfer(struct ps_async_read_bulk *ar, u32 cmd)
 	if (page_server_send(sk, &ack, sizeof(ack), 0) != sizeof(ack))
 		pr_perror("Failed to send bulk complete ACK");
 	else
-		pr_err("Sent bulk complete ACK to primary\n");
+		pr_info("Sent bulk complete ACK to primary\n");
 
 	/*
 	 * COW mode: don't return BULK_STREAM_COMPLETE yet.
@@ -144,7 +145,7 @@ static int handle_end_of_transfer(struct ps_async_read_bulk *ar, u32 cmd)
 	 * Reset to read next header and continue.
 	 */
 	if (opts.cow_dump && !cow_is_all_pages_sent_received()) {
-		pr_err("COW mode Phase 2: waiting for dirty pages and all_pages_sent...\n");
+		pr_err("=== REPLICA: Waiting for PHASE 3-4 (skeleton + dirty pages) ===\n");
 		ar->rb = 0;
 		ar->compress_state = COMPRESS_STATE_READING_HEADER;
 		return BULK_STREAM_PROGRESS;
@@ -233,6 +234,7 @@ static int read_bulk_header(struct ps_async_read_bulk *ar, int flags)
 	switch (cmd) {
 	case PS_IOV_INVENTORY_READY:
 		/* Primary signals inventory.img is ready */
+		pr_err("=== REPLICA PHASE 3: Inventory ready signal received ===\n");
 		cow_set_inventory_ready_received();
 		ar->rb = 0;
 		ar->compress_state = COMPRESS_STATE_READING_HEADER;
@@ -240,7 +242,7 @@ static int read_bulk_header(struct ps_async_read_bulk *ar, int flags)
 
 	case PS_IOV_ALL_PAGES_SENT:
 		/* Primary signals all pages sent - replica can zero-fill rest */
-		pr_info("Received all_pages_sent signal from primary\n");
+		pr_err("=== REPLICA PHASE 4: All pages sent signal received ===\n");
 		cow_set_all_pages_sent_received();
 		ar->rb = 0;
 		ar->compress_state = COMPRESS_STATE_READING_HEADER;
