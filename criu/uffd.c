@@ -688,6 +688,9 @@ static int collect_iovs(struct lazy_pages_info *lpi)
 			iov->end = iov->start + len;
 			list_add_tail(&iov->l, &lpi->iovs);
 
+			pr_info("Created IOV for VMA: 0x%lx-0x%lx (%lu pages)\n",
+					start, end, len / PAGE_SIZE);
+
 			if (len > max_iov_len)
 				max_iov_len = len;
 
@@ -695,8 +698,7 @@ static int collect_iovs(struct lazy_pages_info *lpi)
 				break;
 
 			start = vma->end;
-			pr_info("Created IOV for VMA: 0x%lx-0x%lx (%lu pages)\n",
-					start, end, len / PAGE_SIZE);
+			
 		}
 	}
 
