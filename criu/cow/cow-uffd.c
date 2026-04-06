@@ -84,6 +84,175 @@ static inline unsigned int page_buffer_hash(unsigned long vaddr)
 	return (vaddr >> PAGE_SHIFT) & (PAGE_BUFFER_HASH_SIZE - 1);
 }
 
+/*
+ * Result codes for cow_uffd_copy_pages()
+ */
+enum cow_copy_result {
+	COW_COPY_OK = 0,
+	COW_COPY_EAGAIN = 1,
+	COW_COPY_EEXIST = 2,
+	COW_COPY_ENOENT = 3,
+	COW_COPY_ERROR = -1,
+};
+
+/*
+ * Unified UFFDIO_COPY wrapper for COW mode.
+ * Performs the ioctl and handles soft errors uniformly.
+ *
+ * @uffd: userfaultfd file descriptor
+ * @dst: destination address in target process
+ * @src: source buffer
+ * @nr_pages: number of pages to copy
+ * @copied_out: if non-NULL, set to number of pages actually copied on success
+ *
+ * Returns: COW_COPY_OK on success, or appropriate error code
+ */
+static enum cow_copy_result cow_uffd_copy_pages(int uffd, unsigned long dst,
+						void *src, unsigned long nr_pages,
+						unsigned long *copied_out)
+{
+	struct uffdio_copy uffd_copy = {
+		.dst = dst,
+		.src = (unsigned long)src,
+		.len = nr_pages * PAGE_SIZE,
+		.mode = 0,
+		.copy = 0,
+	};
+
+	if (ioctl(uffd, UFFDIO_COPY, &uffd_copy) < 0) {
+		switch (errno) {
+		case EAGAIN:
+			return COW_COPY_EAGAIN;
+		case EEXIST:
+			return COW_COPY_EEXIST;
+		case ENOENT:
+			return COW_COPY_ENOENT;
+		default:
+			return COW_COPY_ERROR;
+		}
+	}
+
+	/* Check for soft error (error returned in .copy field) */
+	if (uffd_copy.copy < 0) {
+		errno = -uffd_copy.copy;
+		switch (errno) {
+		case EAGAIN:
+			return COW_COPY_EAGAIN;
+		case EEXIST:
+			return COW_COPY_EEXIST;
+		case ENOENT:
+			return COW_COPY_ENOENT;
+		default:
+			return COW_COPY_ERROR;
+		}
+	}
+
+	if (copied_out)
+		*copied_out = uffd_copy.copy / PAGE_SIZE;
+
+	return COW_COPY_OK;
+}
+
+/*
+ * Flags for cow_uffd_copy_and_track()
+ */
+#define COW_TRACK_STRICT    (1 << 0)  /* BUG() on EEXIST/ERROR (drain mode) */
+
+/*
+ * Unified UFFDIO_COPY with full tracking.
+ * Handles buffer stats, page state, unmapped tracker, and EAGAIN queue.
+ *
+ * @uffd: userfaultfd file descriptor
+ * @vaddr: destination virtual address
+ * @data: source data buffer
+ * @nr_pages: number of pages to copy
+ * @lpi: lazy_pages_info (NULL for drain mode)
+ * @lpis: list of lpis for drain EAGAIN queue (NULL if lpi provided)
+ * @flags: COW_TRACK_* flags
+ * @caller: caller name for debug messages
+ * @data_owned: output - set to true if data ownership transferred (EAGAIN drain mode)
+ *
+ * Returns:
+ *   1 - success (page copied)
+ *   0 - soft handled (ENOENT unmapped, EAGAIN queued, EEXIST already done)
+ *  -1 - error
+ */
+static int cow_uffd_copy_and_track(int uffd, unsigned long vaddr, void *data,
+				   unsigned long nr_pages,
+				   struct lazy_pages_info *lpi,
+				   struct list_head *lpis,
+				   unsigned int flags,
+				   const char *caller,
+				   bool *data_owned)
+{
+	enum cow_copy_result res;
+
+	if (data_owned)
+		*data_owned = false;
+
+	res = cow_uffd_copy_pages(uffd, vaddr, data, nr_pages, NULL);
+
+	switch (res) {
+	case COW_COPY_OK:
+		__sync_fetch_and_add(&cow_buffer.nr_applied, 1);
+		pf_tracker_set_state(vaddr, PF_STATE_COMPLETED);
+		page_state_set(vaddr, PAGE_STATE_COPIED);
+		if (lpi)
+			lpi->copied_pages += nr_pages;
+		return 1;
+
+	case COW_COPY_EEXIST:
+		__sync_fetch_and_add(&cow_buffer.nr_discarded, 1);
+		pr_debug("COW_TRACE %s: 0x%lx EEXIST (already copied)\n", caller, vaddr);
+		if (!unmapped_tracker_is_unmapped(vaddr) &&
+		    page_state_get(vaddr) != PAGE_STATE_DIRTY)
+			page_state_set(vaddr, PAGE_STATE_DISCARDED);
+		if (flags & COW_TRACK_STRICT) {
+			pr_err("BUG: %s EEXIST at 0x%lx - duplicate copy!\n", caller, vaddr);
+			page_state_print_history(vaddr);
+			BUG();
+		}
+		return 0;  /* soft handled - drain already did it */
+
+	case COW_COPY_ENOENT:
+		__sync_fetch_and_add(&cow_buffer.nr_discarded, 1);
+		pr_debug("COW_TRACE %s: 0x%lx ENOENT (VMA unmapped)\n", caller, vaddr);
+		if (!unmapped_tracker_is_unmapped(vaddr)) {
+			page_state_set(vaddr, PAGE_STATE_DISCARDED);
+			unmapped_tracker_mark_range(vaddr, nr_pages * PAGE_SIZE);
+		}
+		return 0;
+
+	case COW_COPY_EAGAIN:
+		__sync_fetch_and_add(&cow_buffer.nr_eagain, 1);
+		pr_debug("COW_TRACE %s: 0x%lx EAGAIN, queuing for retry\n", caller, vaddr);
+		if (lpis) {
+			/* Drain mode - use drain EAGAIN queue */
+			if (cow_queue_drain_eagain_request(lpis, vaddr, data) == 0) {
+				if (data_owned)
+					*data_owned = true;
+			}
+		} else if (lpi) {
+			/* Normal mode - use regular EAGAIN queue */
+			pf_tracker_set_state(vaddr, PF_STATE_PENDING_EAGAIN);
+			cow_queue_eagain_request(lpi, vaddr, nr_pages, data, caller);
+		}
+		return 0;
+
+	case COW_COPY_ERROR:
+		pr_err("COW_TRACE %s: 0x%lx FAILED errno=%d\n", caller, vaddr, errno);
+		page_state_print_history(vaddr);
+		if (!unmapped_tracker_is_unmapped(vaddr) &&
+		    page_state_get(vaddr) != PAGE_STATE_DIRTY)
+			page_state_set(vaddr, PAGE_STATE_DISCARDED);
+		if (flags & COW_TRACK_STRICT)
+			BUG();
+		return -1;
+	}
+
+	return -1;  /* unreachable */
+}
+
 int cow_page_buffer_init(void)
 {
 	int i;
@@ -535,56 +704,23 @@ static void *background_drain_thread(void *arg)
 					pthread_spin_unlock(&hash_locks[lock_idx]);
 					__sync_fetch_and_sub(&cow_buffer.nr_pages, 1);
 
-					/* Find uffd for this address and UFFDIO_COPY */
+					/* Find uffd for this address and copy */
 					uffd = cow_get_uffd_for_vaddr(drain_lpis, vaddr);
 					if (uffd >= 0) {
-						struct uffdio_copy uffd_copy = {
-							.dst = vaddr,
-							.src = (unsigned long)data,
-							.len = PAGE_SIZE,
-							.mode = 0,
-							.copy = 0,
-						};
+						bool data_owned = false;
+						int ret;
 
-						if (ioctl(uffd, UFFDIO_COPY, &uffd_copy) < 0) {
-							if (errno == EEXIST) {
-								__sync_fetch_and_add(&cow_buffer.nr_discarded, 1);
-								pr_err("BUG: DRAIN_COPY EEXIST at 0x%lx - duplicate copy!\n", vaddr);
-								page_state_print_history(vaddr);
-								if (!unmapped_tracker_is_unmapped(vaddr) &&
-								    page_state_get(vaddr) != PAGE_STATE_DIRTY)
-									page_state_set(vaddr, PAGE_STATE_DISCARDED);
-								BUG();
-							} else if (errno == ENOENT) {
-								__sync_fetch_and_add(&cow_buffer.nr_discarded, 1);
-								pr_debug("COW_TRACE DRAIN_COPY: 0x%lx ENOENT (VMA unmapped)\n", vaddr);
-								/* Mark as unmapped - this is expected, not an error */
-								if (!unmapped_tracker_is_unmapped(vaddr)){
-									page_state_set(vaddr, PAGE_STATE_DISCARDED);
-									unmapped_tracker_mark_range(vaddr, PAGE_SIZE);
-								}
-							} else if (errno == EAGAIN) {
-								__sync_fetch_and_add(&cow_buffer.nr_eagain, 1);
-								if (drain_lpis && cow_queue_drain_eagain_request(drain_lpis, vaddr, data) == 0) {
-									free_data = false;  /* ownership transferred */
-								}
-								pr_debug("COW_TRACE DRAIN_COPY: 0x%lx EAGAIN, queued for retry\n", vaddr);
-							} else {
-								pr_err("COW_TRACE DRAIN_COPY: 0x%lx FAILED errno=%d\n", vaddr, errno);
-								page_state_print_history(vaddr);
-								if (!unmapped_tracker_is_unmapped(vaddr) &&
-								    page_state_get(vaddr) != PAGE_STATE_DIRTY)
-									page_state_set(vaddr, PAGE_STATE_DISCARDED);
-								BUG();
-							}
-						} else {
-							__sync_fetch_and_add(&cow_buffer.nr_applied, 1);
-							page_state_set(vaddr, PAGE_STATE_COPIED);
+						ret = cow_uffd_copy_and_track(uffd, vaddr, data, 1,
+									     NULL, drain_lpis,
+									     COW_TRACK_STRICT,
+									     "DRAIN", &data_owned);
+						if (ret > 0)
 							drained++;
-						}
+						if (data_owned)
+							free_data = false;
 					} else {
 						__sync_fetch_and_add(&cow_buffer.nr_discarded, 1);
-						pr_err("COW_TRACE DRAIN_COPY: 0x%lx no uffd found\n", vaddr);
+						pr_err("COW_TRACE DRAIN: 0x%lx no uffd found\n", vaddr);
 						page_state_print_history(vaddr);
 						if (!unmapped_tracker_is_unmapped(vaddr) &&
 						    page_state_get(vaddr) != PAGE_STATE_DIRTY)
@@ -1015,49 +1151,33 @@ bool cow_is_eagain_queue_empty(void)
  */
 static int retry_uffd_copy(struct uffd_eagain_request *req)
 {
-	struct uffdio_copy uffdio_copy;
+	enum cow_copy_result res;
 
-	uffdio_copy.dst = req->address;
-	uffdio_copy.src = (unsigned long)req->buf;
-	uffdio_copy.len = req->nr_pages * page_size();
-	uffdio_copy.mode = 0;
-	uffdio_copy.copy = 0;
-
-	if (ioctl(req->lpi->lpfd.fd, UFFDIO_COPY, &uffdio_copy) == -1) {
-		if (errno == EAGAIN)
-			return -EAGAIN;
-
-		if (errno == EEXIST) {
-			pr_err("BUG: EAGAIN copy retry EEXIST at 0x%llx - duplicate copy!\n",
-			       req->address);
-			page_state_print_history(req->address);
-			BUG();
-		}
-
+	res = cow_uffd_copy_pages(req->lpi->lpfd.fd, req->address,
+				  req->buf, req->nr_pages, NULL);
+	switch (res) {
+	case COW_COPY_OK:
+		req->lpi->copied_pages += req->nr_pages;
+		pf_tracker_set_state(req->address, PF_STATE_COMPLETED);
+		page_state_set(req->address, PAGE_STATE_COPIED);
+		lp_debug(req->lpi, "EAGAIN copy retry succeeded for 0x%llx\n", req->address);
+		return 0;
+	case COW_COPY_EAGAIN:
+		return -EAGAIN;
+	case COW_COPY_EEXIST:
+		pr_err("BUG: EAGAIN copy retry EEXIST at 0x%llx - duplicate copy!\n",
+		       req->address);
+		page_state_print_history(req->address);
+		BUG();
+		return -1;
+	case COW_COPY_ENOENT:
+	case COW_COPY_ERROR:
 		lp_err(req->lpi, "EAGAIN copy retry failed for 0x%llx: %d\n",
 		       req->address, errno);
 		page_state_set(req->address, PAGE_STATE_DISCARDED);
 		return -1;
 	}
-
-	/* Check for soft error */
-	if (uffdio_copy.copy < 0) {
-		errno = -uffdio_copy.copy;
-		if (errno == EAGAIN)
-			return -EAGAIN;
-
-		lp_err(req->lpi, "EAGAIN copy retry soft error for 0x%llx: %d\n",
-		       req->address, errno);
-		page_state_set(req->address, PAGE_STATE_DISCARDED);
-		return -1;
-	}
-
-	/* Success */
-	req->lpi->copied_pages += req->nr_pages;
-	pf_tracker_set_state(req->address, PF_STATE_COMPLETED);
-	page_state_set(req->address, PAGE_STATE_COPIED);
-	lp_debug(req->lpi, "EAGAIN copy retry succeeded for 0x%llx\n", req->address);
-	return 0;
+	return -1;  /* unreachable */
 }
 
 /*
@@ -1614,7 +1734,7 @@ int cow_handle_page_fault_buffer(struct lazy_pages_info *lpi,
 				 unsigned long long address)
 {
 	void *data;
-	struct uffdio_copy uffd_copy;
+	int ret;
 
 	data = cow_page_buffer_lookup_and_remove(address);
 
@@ -1628,52 +1748,15 @@ int cow_handle_page_fault_buffer(struct lazy_pages_info *lpi,
 		return 0;
 	}
 
-	/* Found in buffer - copy directly via UFFDIO_COPY */
-	uffd_copy.dst = address;
-	uffd_copy.src = (unsigned long)data;
-	uffd_copy.len = PAGE_SIZE;
-	uffd_copy.mode = 0;
-	uffd_copy.copy = 0;
-
 	page_state_set(address, PAGE_STATE_PF_PENDING);
 
-	if (ioctl(lpi->lpfd.fd, UFFDIO_COPY, &uffd_copy) < 0) {
-		if (errno == EEXIST) {
-			/* Duplicate copy - drain already handled it */
-			if (!unmapped_tracker_is_unmapped(address))
-				page_state_set(address, PAGE_STATE_DISCARDED);
-			page_pool_put(data);
-			return 1;
-		}
-		if (errno == EAGAIN) {
-			/* Queue for later retry instead of blocking */
-			pf_tracker_set_state(address, PF_STATE_PENDING_EAGAIN);
-			if (cow_queue_eagain_request(lpi, address, 1, data, "pf_buffer") < 0) {
-				page_pool_put(data);
-				return -1;
-			}
-			page_pool_put(data);
-			return 1;
-		}
-		if (errno == ENOENT) {
-			/* VMA was unmapped - mark in tracker if not already */
-			unmapped_tracker_mark_range(address, PAGE_SIZE);
-			page_pool_put(data);
-			return 1;
-		}
-		pr_err("COW_TRACE PF_COPY: 0x%llx FAILED errno=%d\n", address, errno);
-		page_state_print_history(address);
-		if (!unmapped_tracker_is_unmapped(address))
-			page_state_set(address, PAGE_STATE_DISCARDED);
-		/* Fall through - return error */
-	} else {
-		page_state_set(address, PAGE_STATE_COPIED);
-	}
+	ret = cow_uffd_copy_and_track(lpi->lpfd.fd, address, data, 1,
+				      lpi, NULL, 0, "PF_BUFFER", NULL);
 
 	page_pool_put(data);
-	lpi->copied_pages++;
 
-	return 1;
+	/* Return 1 for success or soft-handled, -1 for error */
+	return ret >= 0 ? 1 : -1;
 }
 
 /*
@@ -1857,8 +1940,6 @@ int cow_convergence_copy_page(struct list_head *lpis,
 	struct lazy_pages_info *lpi;
 
 	list_for_each_entry(lpi, lpis, l) {
-		struct uffdio_copy uffd_copy;
-		unsigned long pages;
 		int ret;
 
 		if (lpi->exited || lpi->lpfd.fd < 0)
@@ -1866,45 +1947,17 @@ int cow_convergence_copy_page(struct list_head *lpis,
 		if (!cow_find_iov(lpi, vaddr))
 			continue;
 
-		/* Found the lpi - copy buffer to lpi->buf and call UFFDIO_COPY */
+		/* Found the lpi - copy buffer to lpi->buf and do UFFDIO_COPY */
 		memcpy(lpi->buf, buf, nr_pages * PAGE_SIZE);
 
-		uffd_copy.dst = vaddr;
-		uffd_copy.src = (unsigned long)lpi->buf;
-		uffd_copy.len = nr_pages * PAGE_SIZE;
-		uffd_copy.mode = 0;
-		uffd_copy.copy = 0;
+		ret = cow_uffd_copy_and_track(lpi->lpfd.fd, vaddr, lpi->buf, nr_pages,
+					      lpi, NULL, COW_TRACK_STRICT,
+					      "CONVERGENCE", NULL);
 
-		ret = ioctl(lpi->lpfd.fd, UFFDIO_COPY, &uffd_copy);
-		if (ret < 0) {
-			if (errno == EEXIST) {
-				/* Already copied - not an error */
-				lp_err(lpi, "Convergence EEXIST at 0x%lx (already copied)\n", vaddr);
-				BUG();
-				return -1;
-			}
-			if (errno == EAGAIN) {
-				/* Queue for retry */
-				pf_tracker_set_state(vaddr, PF_STATE_PENDING_EAGAIN);
-				return cow_queue_eagain_request(lpi, vaddr, nr_pages, lpi->buf, "convergence");
-			}
+		lp_debug(lpi, "Convergence copy %lu pages at 0x%lx ret=%d\n", nr_pages, vaddr, ret);
 
-			if (errno == ENOENT) {
-				/* Queue for retry */
-				if (!unmapped_tracker_is_unmapped(vaddr)){
-					page_state_set(vaddr, PAGE_STATE_DISCARDED);
-				}				
-				return 0;
-			}
-			lp_err(lpi, "Direct convergence copy failed at 0x%lx errno=%d\n", vaddr, errno);
-			return -1;
-		}
-
-		pages = uffd_copy.copy / PAGE_SIZE;
-		lpi->copied_pages += pages;
-		page_state_set(vaddr, PAGE_STATE_COPIED);
-		lp_debug(lpi, "Direct copy %lu pages at 0x%lx (convergence)\n", pages, vaddr);
-		return 0;
+		/* Return 0 for success or soft-handled (ENOENT/EAGAIN), -1 for error */
+		return ret >= 0 ? 0 : -1;
 	}
 
 	pr_err("BUG: Convergence callback with no lpi for vaddr 0x%lx\n", vaddr);
@@ -2038,7 +2091,6 @@ int cow_uffd_io_complete_bulk(struct lazy_pages_info *lpi,
 	struct lazy_iov *iov;
 	unsigned long pages = nr_pages;
 	unsigned long tracked_pages;
-	struct uffdio_copy uffd_copy;
 	int ret;
 	struct timespec t_start, t_end;
 
@@ -2076,33 +2128,22 @@ int cow_uffd_io_complete_bulk(struct lazy_pages_info *lpi,
 	if (!pages)
 		return 0;
 
-	/* Copy pages to userspace */
-	uffd_copy.dst = vaddr;
-	uffd_copy.src = (unsigned long)lpi->buf;
-	uffd_copy.len = pages * PAGE_SIZE;
-	uffd_copy.mode = 0;
-	uffd_copy.copy = 0;
+	ret = cow_uffd_copy_and_track(lpi->lpfd.fd, vaddr, lpi->buf, pages,
+				      lpi, NULL, 0, "BULK_IO", NULL);
 
-	ret = ioctl(lpi->lpfd.fd, UFFDIO_COPY, &uffd_copy);
-	if (ret < 0) {
-		int err = errno;
-		ret = cow_uffd_handle_copy_error(lpi, vaddr, pages, lpi->buf, err, uffd_copy.copy);
-		if (ret != 0)
-			return ret < 0 ? ret : 0;
-		/* Normal error - check if process exited */
-		if (lpi->exited)
-			return 0;
-		return -1;
+	/* Only record timing for successful copies */
+	if (ret > 0) {
+		clock_gettime(CLOCK_MONOTONIC, &t_end);
+		cow_uffd_stats_add_io_bulk((t_end.tv_sec - t_start.tv_sec) * 1000000000 +
+					   (t_end.tv_nsec - t_start.tv_nsec));
 	}
 
-	lpi->copied_pages += pages;
-	cow_uffd_copy_success(vaddr);
+	/* If process exited during error, treat as success */
+	if (ret < 0 && lpi->exited)
+		return 0;
 
-	clock_gettime(CLOCK_MONOTONIC, &t_end);
-	cow_uffd_stats_add_io_bulk((t_end.tv_sec - t_start.tv_sec) * 1000000000 +
-				   (t_end.tv_nsec - t_start.tv_nsec));
-
-	return 0;
+	/* Return 0 for success or soft-handled, -1 for error */
+	return ret >= 0 ? 0 : -1;
 }
 
 /*
