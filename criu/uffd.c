@@ -695,6 +695,8 @@ static int collect_iovs(struct lazy_pages_info *lpi)
 				break;
 
 			start = vma->end;
+			pr_info("Created IOV for VMA: 0x%lx-0x%lx (%lu pages)\n",
+					start, end, len / PAGE_SIZE);
 		}
 	}
 
@@ -1121,7 +1123,7 @@ static int handle_remove(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 	unreg.start = msg->arg.remove.start;
 	unreg.len = msg->arg.remove.end - msg->arg.remove.start;
 
-	lp_debug(lpi, "%s: %llx(%llx)\n", msg->event == UFFD_EVENT_REMOVE ? "REMOVE" : "UNMAP", unreg.start, unreg.len);
+	lp_err(lpi, "%s: %llx(%llx)\n", msg->event == UFFD_EVENT_REMOVE ? "REMOVE" : "UNMAP", unreg.start, unreg.len);
 
 	/* COW mode: track unmapped pages and remove from buffer */
 	if (opts.cow_dump)
