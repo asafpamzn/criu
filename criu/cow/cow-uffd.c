@@ -207,7 +207,7 @@ static int cow_uffd_copy_and_track(int uffd, unsigned long vaddr, void *data,
 	case COW_COPY_EEXIST:
 		if (!(flags & COW_TRACK_RETRY))
 			__sync_fetch_and_add(&cow_buffer.nr_discarded, 1);
-		pr_debug("COW_TRACE %s: 0x%lx EEXIST (already copied)\n", caller, vaddr);
+		pr_err("COW_TRACE %s: 0x%lx EEXIST (already copied)\n", caller, vaddr);
 		if (!unmapped_tracker_is_unmapped(vaddr) &&
 		    page_state_get(vaddr) != PAGE_STATE_DIRTY)
 			page_state_set(vaddr, PAGE_STATE_DISCARDED);
@@ -221,7 +221,7 @@ static int cow_uffd_copy_and_track(int uffd, unsigned long vaddr, void *data,
 	case COW_COPY_ENOENT:
 		if (!(flags & COW_TRACK_RETRY))
 			__sync_fetch_and_add(&cow_buffer.nr_discarded, 1);
-		pr_debug("COW_TRACE %s: 0x%lx ENOENT (VMA unmapped)\n", caller, vaddr);
+		pr_err("COW_TRACE %s: 0x%lx ENOENT (VMA unmapped)\n", caller, vaddr);
 		if (!unmapped_tracker_is_unmapped(vaddr)) {
 			page_state_set(vaddr, PAGE_STATE_DISCARDED);
 			unmapped_tracker_mark_range(vaddr, nr_pages * PAGE_SIZE);
