@@ -552,6 +552,7 @@ static void *background_drain_thread(void *arg)
 								if (!unmapped_tracker_is_unmapped(vaddr) &&
 								    page_state_get(vaddr) != PAGE_STATE_DIRTY)
 									page_state_set(vaddr, PAGE_STATE_DISCARDED);
+								BUG();
 							} else if (errno == ENOENT) {
 								__sync_fetch_and_add(&cow_buffer.nr_discarded, 1);
 								pr_debug("COW_TRACE DRAIN_COPY: 0x%lx ENOENT (VMA unmapped)\n", vaddr);
@@ -1788,13 +1789,20 @@ int cow_convergence_copy_page(struct list_head *lpis,
 		if (ret < 0) {
 			if (errno == EEXIST) {
 				/* Already copied - not an error */
-				lp_debug(lpi, "Convergence EEXIST at 0x%lx (already copied)\n", vaddr);
-				return 0;
+				lp_err(lpi, "Convergence EEXIST at 0x%lx (already copied)\n", vaddr);
+				BUG();
+				return -1;
 			}
 			if (errno == EAGAIN) {
 				/* Queue for retry */
 				pf_tracker_set_state(vaddr, PF_STATE_PENDING_EAGAIN);
 				return cow_queue_eagain_request(lpi, vaddr, nr_pages, lpi->buf, "convergence");
+			}
+
+			if (errno == ENOENT) {
+				/* Queue for retry */
+				page_state_set(vaddr, PAGE_STATE_DISCARDED);
+				return 0;
 			}
 			lp_err(lpi, "Direct convergence copy failed at 0x%lx errno=%d\n", vaddr, errno);
 			return -1;
@@ -1802,6 +1810,7 @@ int cow_convergence_copy_page(struct list_head *lpis,
 
 		pages = uffd_copy.copy / PAGE_SIZE;
 		lpi->copied_pages += pages;
+		page_state_set(vaddr, PAGE_STATE_COMPLETED);
 		lp_debug(lpi, "Direct copy %lu pages at 0x%lx (convergence)\n", pages, vaddr);
 		return 0;
 	}
