@@ -1173,8 +1173,7 @@ static int handle_remove(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 		return -1;
 	}
 
-	return 0;//drop_iovs(lpi, unreg.start, unreg.len);
-
+	return drop_iovs(lpi, unreg.start, unreg.len);
 }
 
 static int handle_remap(struct lazy_pages_info *lpi, struct uffd_msg *msg)
@@ -1271,12 +1270,9 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 	unsigned long long address;
 	int ret;
 	unsigned long nr_pages;
-	static unsigned long pf_count = 0;
 
 	/* Align requested address to the next page boundary */
 	address = msg->arg.pagefault.address & ~(page_size() - 1);
-
-	pf_count++;
 
 	lp_debug(lpi, "#PF at 0x%llx\n", address);
 
