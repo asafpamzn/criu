@@ -254,6 +254,4 @@ extern int cow_merge_dirty_ranges(unsigned long *dirty_ranges, unsigned int nr_d
 				  unsigned long *new_ranges, unsigned int nr_new,
 				  unsigned long **merged_ranges, unsigned int *nr_merged);
 
-int cr_dump_tasks_cow_phased(pid_t pid);
-
 #endif /* __CR_COW_DUMP_H_ */
