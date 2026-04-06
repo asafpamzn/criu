@@ -66,6 +66,7 @@
 #include "mem.h"
 #include "page-pipe.h"
 #include "cow/cow-dump.h"
+#include "cow/cow-page-xfer.h"
 #include "posix-timer.h"
 #include "vdso.h"
 #include "vma.h"
