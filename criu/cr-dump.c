@@ -2933,6 +2933,7 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 	 */
 	{
 		int sk = get_page_server_sk();
+		pr_err("get_page_server_sk = %d\n",  sk);
 		if (sk >= 0) {
 			pr_info("Sending all_pages_sent signal to replica\n");
 			if (send_all_pages_sent_signal(sk) < 0)
