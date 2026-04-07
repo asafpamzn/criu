@@ -324,6 +324,8 @@ int cow_phase2_handle_pages(int epollfd, struct epoll_event *events, int nr_fds)
 		/* All pages sent signals Phase 4 is complete */
 		if (cow_is_all_pages_sent_received()) {
 			pr_err("=== REPLICA: All phases complete, ready for restore ===\n");
+			if (send_all_pages_sent_ack() < 0)
+				pr_warn("Failed to send all_pages_sent ACK\n");
 			return 0;
 		}
 	}

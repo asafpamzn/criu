@@ -885,11 +885,12 @@ int cow_handle_exit(struct list_head *lpis)
 		pr_err("cow_handle_exit: waiting for EAGAIN requests to be processed\n");
 		return 0;
 	}
-
+#if 0
 	/* All conditions met - send ACK to primary */
 	pr_err("All pages received and drained, sending ACK to primary\n");
 	if (send_all_pages_sent_ack() < 0)
 		pr_warn("Failed to send all_pages_sent ACK\n");
+#endif
 
 	/* Cleanup all lpis */
 	list_for_each_entry_safe(lpi, n, lpis, l) {
