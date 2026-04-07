@@ -2697,7 +2697,7 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 		struct timeval t_start, t_end, t_delta, t_elapsed;
 		gettimeofday(&t_start, NULL);
 		timersub(&t_start, &freeze_start, &t_elapsed);
-		pr_err("TIMING @%ld.%06ld: reseize_pstree starting\n",
+		pr_warn("TIMING @%ld.%06ld: reseize_pstree starting\n",
 		       t_elapsed.tv_sec, t_elapsed.tv_usec);
 		ret = reseize_pstree();
 		gettimeofday(&t_end, NULL);
@@ -2876,7 +2876,7 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 		struct timeval t_start, t_end, t_delta, t_elapsed;
 		gettimeofday(&t_start, NULL);
 		timersub(&t_start, &freeze_start, &t_elapsed);
-		pr_err("TIMING @%ld.%06ld: skeleton dump loop starting\n",
+		pr_warn("TIMING @%ld.%06ld: skeleton dump loop starting\n",
 		       t_elapsed.tv_sec, t_elapsed.tv_usec);
 		for_each_pstree_item(item) {
 			if (dump_one_task(item, parent_ie))
@@ -2898,7 +2898,7 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 		struct timeval t_start, t_end, t_delta, t_elapsed;
 		gettimeofday(&t_start, NULL);
 		timersub(&t_start, &freeze_start, &t_elapsed);
-		pr_err("TIMING @%ld.%06ld: cr_dump_post_task_operations starting\n",
+		pr_warn("TIMING @%ld.%06ld: cr_dump_post_task_operations starting\n",
 		       t_elapsed.tv_sec, t_elapsed.tv_usec);
 		if (cr_dump_post_task_operations(&he))
 			goto err;
@@ -2927,7 +2927,7 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 		struct timeval t_start, t_end, t_delta, t_elapsed;
 		gettimeofday(&t_start, NULL);
 		timersub(&t_start, &freeze_start, &t_elapsed);
-		pr_err("TIMING @%ld.%06ld: write_img_inventory starting\n",
+		pr_warn("TIMING @%ld.%06ld: write_img_inventory starting\n",
 		       t_elapsed.tv_sec, t_elapsed.tv_usec);
 		if (write_img_inventory(&he))
 			goto err;
@@ -2942,7 +2942,7 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 		struct timeval t_start, t_end, t_delta, t_elapsed;
 		gettimeofday(&t_start, NULL);
 		timersub(&t_start, &freeze_start, &t_elapsed);
-		pr_err("TIMING @%ld.%06ld: send_inventory_ready_signal starting\n",
+		pr_warn("TIMING @%ld.%06ld: send_inventory_ready_signal starting\n",
 		       t_elapsed.tv_sec, t_elapsed.tv_usec);
 		ret = send_inventory_ready_signal();
 		gettimeofday(&t_end, NULL);
@@ -2964,7 +2964,7 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 		struct timeval t_start, t_end, t_delta, t_elapsed;
 		gettimeofday(&t_start, NULL);
 		timersub(&t_start, &freeze_start, &t_elapsed);
-		pr_err("TIMING @%ld.%06ld: cow_wait_p3_threads starting\n",
+		pr_warn("TIMING @%ld.%06ld: cow_wait_p3_threads starting\n",
 		       t_elapsed.tv_sec, t_elapsed.tv_usec);
 		cow_wait_p3_threads();
 		gettimeofday(&t_end, NULL);
@@ -2979,7 +2979,7 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 		struct timeval t_start, t_end, t_delta, t_elapsed;
 		gettimeofday(&t_start, NULL);
 		timersub(&t_start, &freeze_start, &t_elapsed);
-		pr_err("TIMING @%ld.%06ld: cow_cleanup_async_uffd starting\n",
+		pr_warn("TIMING @%ld.%06ld: cow_cleanup_async_uffd starting\n",
 		       t_elapsed.tv_sec, t_elapsed.tv_usec);
 		cow_cleanup_async_uffd();
 		gettimeofday(&t_end, NULL);
@@ -2993,7 +2993,7 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 		struct timeval t_start, t_end, t_delta, t_elapsed;
 		gettimeofday(&t_start, NULL);
 		timersub(&t_start, &freeze_start, &t_elapsed);
-		pr_err("TIMING @%ld.%06ld: pstree_switch_state starting\n",
+		pr_warn("TIMING @%ld.%06ld: pstree_switch_state starting\n",
 		       t_elapsed.tv_sec, t_elapsed.tv_usec);
 		pstree_switch_state(root_item, TASK_ALIVE);
 		gettimeofday(&t_end, NULL);
