@@ -451,7 +451,7 @@ void cow_dump_fini(void)
 
 
 	wait_for_page_server_thread();
-	pr_info("Cleaning up COW dump\n");
+	pr_err("Cleaning up COW dump\n");
 
 	if (g_monitor_eventfd >= 0) {
 		close(g_monitor_eventfd);

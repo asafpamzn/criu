@@ -2067,7 +2067,7 @@ err:
 		pr_err("Pre-dumping FAILED.\n");
 	else {
 		write_stats(DUMP_STATS);
-		pr_info("Pre-dumping finished successfully\n");
+		pr_warn("Pre-dumping finished successfully\n");
 	}
 	return ret;
 }
@@ -2295,7 +2295,7 @@ out_release_cow:
 		pr_err("Dumping FAILED.\n");
 	} else {
 		write_stats(DUMP_STATS);
-		pr_info("Dumping finished successfully\n");
+		pr_warn("Dumping finished successfully\n");
 	}
 	return post_dump_ret ?: (ret != 0);
 }

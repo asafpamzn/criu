@@ -1619,6 +1619,13 @@ static int handle_lazy_accept(struct epoll_rfd *rfd)
 			goto err;
 		if (lpi == NULL)
 			continue;
+		/*
+		 * COW mode with all pages buffered: skip adding UFFD to epoll.
+		 * We drain from buffer, no page fault handling needed.
+		 * Process stays frozen until drain completes.
+		 */
+		if (opts.cow_dump && cow_is_all_pages_sent_received())
+			continue;
 		if (epoll_add_rfd(epollfd, &lpi->lpfd))
 			goto err;
 	}
