@@ -9,7 +9,7 @@
  * When disabled, all functions become no-ops for zero overhead.
  * Define CONFIG_HUNG_PAGE_TRACKER to enable.
  */
-#define CONFIG_HUNG_PAGE_TRACKER
+// #define CONFIG_HUNG_PAGE_TRACKER
 
 /*
  * Hung page (page fault) tracker for debugging slow/stuck page requests.

@@ -9,7 +9,7 @@
  * When disabled, all functions become no-ops for zero overhead.
  * Define CONFIG_PAGE_STATE_TRACKER to enable.
  */
-#define CONFIG_PAGE_STATE_TRACKER
+// #define CONFIG_PAGE_STATE_TRACKER
 
 /*
  * Comprehensive page state tracking for COW lazy restore debugging.
