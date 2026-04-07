@@ -59,7 +59,7 @@ echo "Lazy-pages started (PID: $LAZY_PAGES_PID)"
 
 # Step 5: Wait for Phase 3 skeleton dump
 echo "Step 5: Waiting for skeleton dump..."
-SKELETON_READY_PATTERN="START RESTORE!!!"
+SKELETON_READY_PATTERN="PHASE 3 SKELETON DUMP COMPLETE"
 PHASE3_READY_PATTERN="COW Phase 3: Waiting for restore to connect"
 
 while true; do
