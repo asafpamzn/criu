@@ -435,7 +435,7 @@ static void *p3_bulk_sender_thread(void *arg)
 		ctx->below_threshold =
 			(ctx->last_dirty_count < DIRTY_CONVERGENCE_THRESHOLD);
 
-		pr_info"P3[%d] iter=%u dirty=%lu threshold=%s\n",
+		pr_info("P3[%d] iter=%u dirty=%lu threshold=%s\n",
 		       thread_id, ctx->iteration, ctx->last_dirty_count,
 		       ctx->below_threshold ? "YES" : "NO");
 
