@@ -178,8 +178,14 @@ static int send_lazy_vma_pages_batch(int sk, struct lazy_vma_entry *lve,
 		nr_pages++;
 	}
 
-	if (nr_pages == 0)
+	if (nr_pages == 0) {
+		unsigned long first_page_idx = page_idx_base;
+		bool sent = lve->sent_bitmap ? atomic_bitmap_test(lve->sent_bitmap, first_page_idx) : false;
+		bool cow = lve->cow_bitmap ? atomic_bitmap_test(lve->cow_bitmap, first_page_idx) : false;
+		pr_err("BATCH EMPTY: base=%lx lve=%lx-%lx max=%d idx=%lu sent=%d cow=%d\n",
+		       base_vaddr, lve->start, lve->end, max_pages, first_page_idx, sent, cow);
 		return 0;
+	}
 
 	/* Allocate buffer for batch */
 	buffer = xmalloc(nr_pages * PAGE_SIZE);
