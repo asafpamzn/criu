@@ -2974,20 +2974,6 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 	}
 	pr_err("P3 threads completed: %lu total pages sent\n", cow_p3_pages_sent());
 
-	/* Close async uffd directly - no expensive unregister needed */
-	{
-		struct timeval t_start, t_end, t_delta, t_elapsed;
-		gettimeofday(&t_start, NULL);
-		timersub(&t_start, &freeze_start, &t_elapsed);
-		pr_warn("TIMING @%ld.%06ld: cow_cleanup_async_uffd starting\n",
-		       t_elapsed.tv_sec, t_elapsed.tv_usec);
-		cow_cleanup_async_uffd();
-		gettimeofday(&t_end, NULL);
-		timersub(&t_end, &t_start, &t_delta);
-		pr_err("TIMING: cow_cleanup_async_uffd took %ld.%06ld seconds\n",
-		       t_delta.tv_sec, t_delta.tv_usec);
-	}
-
 	/* Unfreeze process - dirty pages already sent by P3 threads */
 	{
 		struct timeval t_start, t_end, t_delta, t_elapsed;
@@ -3006,6 +2992,17 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 	timersub(&freeze_end, &freeze_start, &freeze_delta);
 	pr_err("TIMING: Phase 3 freeze ended - process frozen for %ld.%06ld seconds\n",
 	       freeze_delta.tv_sec, freeze_delta.tv_usec);
+
+	/* Close async uffd - moved outside freeze period */
+	{
+		struct timeval t_start, t_end, t_delta;
+		gettimeofday(&t_start, NULL);
+		cow_cleanup_async_uffd();
+		gettimeofday(&t_end, NULL);
+		timersub(&t_end, &t_start, &t_delta);
+		pr_err("TIMING: cow_cleanup_async_uffd took %ld.%06ld seconds (after unfreeze)\n",
+		       t_delta.tv_sec, t_delta.tv_usec);
+	}
 
 	/*
 	 * Signal completion to replica. Dirty pages were sent by P3 threads,
