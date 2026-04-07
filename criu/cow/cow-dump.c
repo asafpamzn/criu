@@ -278,7 +278,6 @@ void cow_set_dst_id(u64 dst_id)
 		g_cow_info->dst_id = dst_id;
 }
 
-static _Atomic bool g_stop_monitoring = false;
 static pthread_mutex_t g_monitor_state_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_monitor_eventfd = -1;
 static struct cow_page_queue_entry *g_putback_list = NULL;
@@ -300,93 +299,7 @@ struct cow_fault_worker {
 	unsigned int pool_count;
 };
 
-static struct cow_fault_worker *g_workers = NULL;
-static unsigned int g_nr_workers = 0;
-static _Atomic bool g_workers_running = false;
 
-/* Forward declarations */
-static void cow_worker_pool_init(struct cow_fault_worker *w);
-static void cow_worker_pool_fini(struct cow_fault_worker *w);
-static void *cow_worker_pool_get(struct cow_fault_worker *w);
-
-/* ------------------------------------------------------------------ */
-/*  Statistics (atomically updated, safe from any thread)              */
-/* ------------------------------------------------------------------ */
-
-static struct {
-	unsigned long write_faults;
-	unsigned long fork_events;
-	unsigned long remap_events;
-	unsigned long unknown_events;
-	unsigned long pages_copied;
-	unsigned long pages_unprotected;
-	unsigned long pages_woken;
-	unsigned long alloc_failures;
-	unsigned long read_failures;
-	unsigned long unprotect_failures;
-	unsigned long wake_failures;
-	unsigned long eagain_errors;
-	unsigned long read_errors;
-	time_t last_print_time;
-} cow_stats;
-
-#define COW_STAT_INC(field) \
-	__atomic_fetch_add(&cow_stats.field, 1, __ATOMIC_RELAXED)
-
-static void check_and_print_cow_stats(void)
-{
-	time_t now = time(NULL);
-	time_t last = __atomic_load_n(&cow_stats.last_print_time, __ATOMIC_RELAXED);
-	unsigned long wr, fk, rm, un, cp, up, wk, af, rf, uf, wf, re, ea;
-
-	if (now - last < 60)
-		return;
-	if (!__atomic_compare_exchange_n(&cow_stats.last_print_time, &last, now,
-					 false, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
-		return;
-
-	wr = __atomic_exchange_n(&cow_stats.write_faults, 0, __ATOMIC_RELAXED);
-	fk = __atomic_exchange_n(&cow_stats.fork_events, 0, __ATOMIC_RELAXED);
-	rm = __atomic_exchange_n(&cow_stats.remap_events, 0, __ATOMIC_RELAXED);
-	un = __atomic_exchange_n(&cow_stats.unknown_events, 0, __ATOMIC_RELAXED);
-	cp = __atomic_exchange_n(&cow_stats.pages_copied, 0, __ATOMIC_RELAXED);
-	up = __atomic_exchange_n(&cow_stats.pages_unprotected, 0, __ATOMIC_RELAXED);
-	wk = __atomic_exchange_n(&cow_stats.pages_woken, 0, __ATOMIC_RELAXED);
-	af = __atomic_exchange_n(&cow_stats.alloc_failures, 0, __ATOMIC_RELAXED);
-	rf = __atomic_exchange_n(&cow_stats.read_failures, 0, __ATOMIC_RELAXED);
-	uf = __atomic_exchange_n(&cow_stats.unprotect_failures, 0, __ATOMIC_RELAXED);
-	wf = __atomic_exchange_n(&cow_stats.wake_failures, 0, __ATOMIC_RELAXED);
-	re = __atomic_exchange_n(&cow_stats.read_errors, 0, __ATOMIC_RELAXED);
-	ea = __atomic_exchange_n(&cow_stats.eagain_errors, 0, __ATOMIC_RELAXED);
-
-	pr_err("[COW_STATS] events: wr=%lu fork=%lu remap=%lu unk=%lu | "
-	       "ops: copied=%lu unprot=%lu woken=%lu | "
-	       "errs: alloc=%lu read=%lu unprot_err=%lu wake_err=%lu "
-	       "read_err=%lu eagain_err=%lu\n",
-	       wr, fk, rm, un, cp, up, wk, af, rf, uf, wf, re, ea);
-}
-
-
-static void cow_monitor_wakeup(void)
-{
-	uint64_t one = 1;
-	ssize_t ret;
-
-	if (g_monitor_eventfd < 0)
-		return;
-	ret = write(g_monitor_eventfd, &one, sizeof(one));
-	(void)ret;
-}
-
-static void cow_monitor_drain_eventfd(void)
-{
-	uint64_t v;
-
-	if (g_monitor_eventfd < 0)
-		return;
-	while (read(g_monitor_eventfd, &v, sizeof(v)) == sizeof(v))
-		;
-}
 
 /* ------------------------------------------------------------------ */
 /*  Kernel support check                                               */
@@ -886,42 +799,6 @@ static int cow_handle_write_fault(struct cow_dump_info *cdi,
 
 	return 0;
 }
-
-
-
-
-/* ------------------------------------------------------------------ */
-/*  Per-worker page buffer pool                                        */
-/* ------------------------------------------------------------------ */
-
-static void cow_worker_pool_init(struct cow_fault_worker *w)
-{
-	unsigned int i;
-
-	for (i = 0; i < COW_PAGE_POOL_SIZE; i++) {
-		w->page_pool[i] = xmalloc(PAGE_SIZE);
-		if (!w->page_pool[i])
-			break;
-	}
-	w->pool_count = i;
-}
-
-static void cow_worker_pool_fini(struct cow_fault_worker *w)
-{
-	unsigned int i;
-
-	for (i = 0; i < w->pool_count; i++)
-		xfree(w->page_pool[i]);
-	w->pool_count = 0;
-}
-
-static void *cow_worker_pool_get(struct cow_fault_worker *w)
-{
-	if (w->pool_count > 0)
-		return w->page_pool[--w->pool_count];
-	return xmalloc(PAGE_SIZE);
-}
-
 
 
 /* ------------------------------------------------------------------ */
