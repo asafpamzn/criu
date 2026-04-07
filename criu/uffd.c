@@ -59,6 +59,7 @@
 #define LAZY_PAGES_SOCK_NAME "lazy-pages.socket"
 
 #define LAZY_PAGES_RESTORE_FINISHED 0x52535446 /* ReSTore Finished */
+#define LAZY_PAGES_DRAIN_COMPLETE   0x44524E43 /* DRaiN Complete (COW mode) */
 
 /*
  * Background transfer parameters.
@@ -1442,6 +1443,28 @@ int lazy_pages_finish_restore(void)
 		return -1;
 	}
 
+	/*
+	 * COW mode: Wait for lazy-pages to signal drain complete before
+	 * allowing restore to unfreeze the process. This ensures all
+	 * pages are copied to process memory while it's still frozen.
+	 */
+	if (opts.cow_dump) {
+		uint32_t drain_signal;
+		pr_info("COW mode: Waiting for drain complete signal...\n");
+		ret = recv(fd, &drain_signal, sizeof(drain_signal), MSG_WAITALL);
+		if (ret != sizeof(drain_signal)) {
+			pr_perror("Failed receiving drain complete signal");
+			close(fd);
+			return -1;
+		}
+		if (drain_signal != LAZY_PAGES_DRAIN_COMPLETE) {
+			pr_err("Unexpected signal: %x (expected drain complete)\n", drain_signal);
+			close(fd);
+			return -1;
+		}
+		pr_info("COW mode: Drain complete, proceeding to unfreeze\n");
+	}
+
 	ret = send(fd, &fin, sizeof(fin), 0);
 	if (ret != sizeof(fin))
 		pr_perror("Failed sending restore finished indication");
@@ -1724,6 +1747,18 @@ int cow_phase3_restore_loop(int ep_fd, struct epoll_event **events, int nr_fds)
 	}
 
 	pr_info("Drain complete, buffer empty\n");
+
+	/*
+	 * Signal restore that drain is complete and it's safe to unfreeze.
+	 * Restore is waiting in lazy_pages_finish_restore() for this signal.
+	 */
+	if (opts.cow_dump) {
+		uint32_t drain_complete = LAZY_PAGES_DRAIN_COMPLETE;
+		if (send(lazy_sk_rfd.fd, &drain_complete, sizeof(drain_complete), 0) != sizeof(drain_complete))
+			pr_perror("Failed to send drain complete signal");
+		else
+			pr_info("Sent drain complete signal to restore\n");
+	}
 
 	return 0;
 }

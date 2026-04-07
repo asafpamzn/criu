@@ -195,19 +195,18 @@ fi
 # skeleton images (everything except memory pages which are already being
 # streamed), then writes "PHASE 3 SKELETON DUMP COMPLETE" to the log.
 # We must wait for this before starting criu restore.
-SKELETON_READY_PATTERN="START RESTORE!!!"
+
 PHASE3_READY_PATTERN="COW Phase 3: Waiting for restore to connect"
 echo "Step 5: Waiting for Phase 3 skeleton dump..."
 START_TIME=$(date +%s)
 while true; do
-	# Check both: primary skeleton dump ready AND lazy-pages in Phase 3
-	if [ -f "$LOG_FILE" ] && sudo grep -q "$SKELETON_READY_PATTERN" "$LOG_FILE" 2>/dev/null; then
-		if [ -f "$LOG_FILE_SERVER" ] && sudo grep -q "$PHASE3_READY_PATTERN" "$LOG_FILE_SERVER" 2>/dev/null; then
-			echo "Phase 3 skeleton dump ready and lazy-pages ready"
-			mark_phase_event "REPLICA_SKELETON_DUMP_READY"
-			break
-		fi
+	# Check both: primary skeleton dump ready AND lazy-pages in Phase 3	
+	if [ -f "$LOG_FILE_SERVER" ] && sudo grep -q "$PHASE3_READY_PATTERN" "$LOG_FILE_SERVER" 2>/dev/null; then
+		echo "Phase 3 skeleton dump ready and lazy-pages ready"
+		mark_phase_event "REPLICA_SKELETON_DUMP_READY"
+		break
 	fi
+	
 	# Also check that lazy-pages is still alive
 	if ! kill -0 "$LAZY_PAGES_PID" 2>/dev/null; then
 		echo "ERROR: lazy-pages died while waiting for skeleton dump"
