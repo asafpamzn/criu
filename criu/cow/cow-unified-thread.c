@@ -753,9 +753,6 @@ static void *unified_page_server_thread(void *arg)
 			pthread_spin_unlock(&active_images_lock);
 
 			if (is_convergence_mode()) {
-				long unsent;
-
-				
 
 				if (send_all_pages_sent_signal(img->main_sk) < 0)
 					pr_err("Failed to send all_pages_sent signal\n");
