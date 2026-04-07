@@ -1643,12 +1643,11 @@ static int handle_lazy_accept(struct epoll_rfd *rfd)
 	pr_info("criu restore setup complete, %lu pages buffered\n",
 		cow_page_buffer_count());
 
-	/* COW mode: handle post-connect initialization */
+	/* COW mode: start drain thread (all pages already in buffer) */
 	if (opts.cow_dump) {
-		if (cow_handle_lazy_accept_post_connect(&lpis, switch_to_convergence_callback) < 0)
+		if (cow_handle_lazy_accept_post_connect(&lpis, NULL) < 0)
 			goto err;
-		if (cow_phase3_request_all_pages() < 0)
-			goto err;
+		/* No page requests needed - all pages are buffered */
 	}
 
 	return 0;

@@ -2261,12 +2261,13 @@ int cow_handle_lazy_accept_post_connect(struct list_head *lpis,
 {
 	/*
 	 * Start drain thread if all pages have been sent.
-	 * Dirty pages were sent directly during freeze (no separate dirty bitmap).
+	 * Skip switch_to_convergence() - the async bulk reader was already
+	 * cleaned up when we received all_pages_sent, and we don't need it
+	 * anymore since all pages are in the buffer.
 	 */
 	if (cow_is_all_pages_sent_received()) {
 		pr_info("All pages sent, starting drain thread\n");
-		if (switch_to_convergence)
-			switch_to_convergence();
+		/* Don't call switch_to_convergence - no page server connection */
 		cow_start_drain_thread(lpis);
 	}
 
@@ -2285,6 +2286,15 @@ int cow_phase3_request_all_pages(void)
 
 	if (!cow_is_phase3_active())
 		return 0;
+
+	/*
+	 * Skip page requests if all pages have been sent - no page server
+	 * connection exists and all pages are already in the buffer.
+	 */
+	if (cow_is_all_pages_sent_received()) {
+		pr_info("All pages already buffered, skipping page requests\n");
+		return 0;
+	}
 
 	for_each_pstree_item(pi) {
 		if (task_alive(pi)) {
