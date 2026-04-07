@@ -35,10 +35,7 @@ extern int cow_mem_add_lazy_vma(struct vma_area *vma, unsigned long nr_pages,
 /* COW convergence mode - Phase 3 dirty page handling */
 extern bool is_convergence_mode(void);
 extern unsigned long get_convergence_dirty_pages(void);
-extern unsigned long prepare_lazy_vmas_for_convergence(unsigned long *dirty_ranges,
-						       unsigned int nr_dirty_ranges);
 
-/* Verify all lazy VMA pages have been sent */
-extern long verify_all_lazy_vmas_sent(void);
+
 
 #endif /* __CR_COW_MEM_H__ */

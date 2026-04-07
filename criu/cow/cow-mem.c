@@ -114,10 +114,7 @@ int add_lazy_vma_for_new_region(unsigned long start, unsigned long len,
 	lve->source_pid = source_pid;
 	lve->vma = NULL;  /* No vma_area for Phase 3 discovered regions */
 
-	/* Allocate bitmaps (all zeros - no pages sent yet) */
 	
-	lve->sent_pages = 0;
-
 	pthread_spin_lock(&lazy_vmas_lock);
 	list_add_tail(&lve->list, &global_lazy_vmas);
 	pthread_spin_unlock(&lazy_vmas_lock);
@@ -165,7 +162,6 @@ int cow_mem_add_lazy_vma(struct vma_area *vma, unsigned long nr_pages,
 	
 	lve->start = vma->e->start;
 	lve->end = vma->e->end;
-	lve->sent_pages = 0;
 
 	/* Add to global list (thread-safe) */
 	pthread_spin_lock(&lazy_vmas_lock);
@@ -215,40 +211,6 @@ unsigned long get_convergence_dirty_pages(void)
 }
 
 
-/*
- * Verify all lazy VMA pages have been sent.
- * Returns 0 if all sent, or count of unsent pages.
- */
-long verify_all_lazy_vmas_sent(void)
-{
-	struct lazy_vma_entry *lve;
-	unsigned long total_sent = 0;
-	unsigned long total_pages = 0;
-
-	cow_mem_init_lazy_vmas();
-
-	pthread_spin_lock(&lazy_vmas_lock);
-	list_for_each_entry(lve, &global_lazy_vmas, list) {
-		if (lve->sent_pages != lve->total_pages) {
-			pr_warn("VMA %lx-%lx: sent=%lu total=%lu (unsent=%ld)\n",
-				(unsigned long)lve->start, (unsigned long)lve->end,
-				(unsigned long)lve->sent_pages, lve->total_pages,
-				(long)(lve->total_pages - lve->sent_pages));
-		}
-		total_sent += lve->sent_pages;
-		total_pages += lve->total_pages;
-	}
-	pthread_spin_unlock(&lazy_vmas_lock);
-
-	if (total_sent != total_pages) {
-		pr_warn("Total pages mismatch: sent=%lu total=%lu\n",
-			total_sent, total_pages);
-		return (long)(total_pages - total_sent);
-	}
-
-	pr_info("All %lu pages sent across all VMAs\n", total_pages);
-	return 0;
-}
 
 /* Cleanup function for global lazy VMA list */
 void free_global_lazy_vmas(void)

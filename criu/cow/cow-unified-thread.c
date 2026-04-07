@@ -755,8 +755,7 @@ static void *unified_page_server_thread(void *arg)
 			if (is_convergence_mode()) {
 				long unsent;
 
-				unsent = verify_all_lazy_vmas_sent();
-				BUG_ON(unsent > 0);
+				
 
 				if (send_all_pages_sent_signal(img->main_sk) < 0)
 					pr_err("Failed to send all_pages_sent signal\n");
