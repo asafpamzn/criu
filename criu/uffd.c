@@ -1716,7 +1716,7 @@ int cow_phase3_restore_loop(int ep_fd, struct epoll_event **events, int nr_fds)
 		return -1;
 	}
 
-	pr_info("COW Phase 3: Waiting for restore to connect\n");
+	pr_err("COW Phase 3: Waiting for restore to connect\n");
 
 	/*
 	 * Simplified flow for COW bulk transfer:
