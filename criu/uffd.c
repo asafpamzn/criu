@@ -1689,20 +1689,43 @@ int cow_phase3_restore_loop(int ep_fd, struct epoll_event **events, int nr_fds)
 
 	pr_info("COW Phase 3: Waiting for restore to connect\n");
 
-	/* Initialize buffer and switch directly to convergence callback for Phase 3 */
-	if (cow_setup_prebuffer_reader()) {
-		pr_err("Failed to setup prebuffer reader for Phase 3\n");
-		close(lazy_sk);
-		return -1;
+	/*
+	 * Simplified flow for COW bulk transfer:
+	 * 1. Wait for restore to connect (accept via epoll)
+	 * 2. handle_lazy_accept() sets up LPIs and starts drain thread
+	 * 3. Wait for drain to complete (all pages UFFDIO_COPY'd)
+	 * 4. Return - process unfreezes with all pages in place
+	 *
+	 * No page fault handling needed since all pages are already buffered
+	 * and will be drained to process memory while frozen.
+	 */
+
+	/* Wait for restore to connect - single epoll iteration */
+	while (!cow_is_restore_connected()) {
+		ret = epoll_run_rfds(epollfd, *events, nr_fds, 1000);
+		if (ret < 0) {
+			pr_err("epoll failed waiting for restore\n");
+			close(lazy_sk);
+			return -1;
+		}
 	}
-	switch_to_convergence_callback();
 
-	/* Pages will be requested in handle_lazy_accept() after restore connects */
+	pr_info("Restore connected, waiting for drain to complete (%lu pages)\n",
+		cow_page_buffer_count());
 
-	/* Enter main event loop - handle page faults until restore finishes */
-	ret = handle_requests(epollfd, events, nr_fds);
+	/* Wait for drain thread to finish copying all pages */
+	while (cow_drain_thread_running() || cow_page_buffer_count() > 0) {
+		usleep(10000);  /* 10ms poll */
+		/* Handle any EAGAIN retries */
+		if (!cow_is_eagain_queue_empty()) {
+			/* Process EAGAIN queue - drain thread handles this */
+			continue;
+		}
+	}
 
-	return ret;
+	pr_info("Drain complete, buffer empty\n");
+
+	return 0;
 }
 
 int cr_lazy_pages(bool daemon)

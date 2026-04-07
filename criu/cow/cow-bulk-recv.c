@@ -671,3 +671,22 @@ int page_server_update_async_callback(ps_async_read_complete complete, void *pri
 	ar->priv = priv;
 	return 0;
 }
+
+/*
+ * Cleanup async bulk reader state.
+ * Called when closing the page server socket to prevent stale fd reads.
+ */
+void page_server_cleanup_async_bulk(void)
+{
+	struct ps_async_read_bulk *ar, *tmp;
+
+	list_for_each_entry_safe(ar, tmp, &bulk_async_reads, l) {
+		list_del(&ar->l);
+		if (ar->compressed_buf)
+			xfree(ar->compressed_buf);
+		if (ar->dirty_ranges)
+			xfree(ar->dirty_ranges);
+		xfree(ar);
+	}
+	pr_debug("Cleaned up async bulk reader state\n");
+}

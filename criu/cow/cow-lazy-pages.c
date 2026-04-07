@@ -26,6 +26,7 @@
 #include "uffd.h"
 #include "cow/cow-uffd.h"
 #include "cow/cow-bulk-send.h"
+#include "cow/cow-bulk-recv.h"
 #include "pstree.h"
 #include "cow/pf-tracker.h"
 #include "cow/unmapped-tracker.h"
@@ -326,6 +327,8 @@ int cow_phase2_handle_pages(int epollfd, struct epoll_event *events, int nr_fds)
 			pr_err("=== REPLICA: All phases complete, ready for restore ===\n");
 			if (send_all_pages_sent_ack() < 0)
 				pr_warn("Failed to send all_pages_sent ACK\n");
+			/* Clean up async bulk reader before socket is closed */
+			page_server_cleanup_async_bulk();
 			return 0;
 		}
 	}
