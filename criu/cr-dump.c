@@ -2694,8 +2694,11 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 	 * We need to re-attach to perform the skeleton dump.
 	 */
 	{
-		struct timeval t_start, t_end, t_delta;
+		struct timeval t_start, t_end, t_delta, t_elapsed;
 		gettimeofday(&t_start, NULL);
+		timersub(&t_start, &freeze_start, &t_elapsed);
+		pr_err("TIMING @%ld.%06ld: reseize_pstree starting\n",
+		       t_elapsed.tv_sec, t_elapsed.tv_usec);
 		ret = reseize_pstree();
 		gettimeofday(&t_end, NULL);
 		timersub(&t_end, &t_start, &t_delta);
@@ -2870,8 +2873,11 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 
 	/* Dump skeleton (everything except pages) */
 	{
-		struct timeval t_start, t_end, t_delta;
+		struct timeval t_start, t_end, t_delta, t_elapsed;
 		gettimeofday(&t_start, NULL);
+		timersub(&t_start, &freeze_start, &t_elapsed);
+		pr_err("TIMING @%ld.%06ld: skeleton dump loop starting\n",
+		       t_elapsed.tv_sec, t_elapsed.tv_usec);
 		for_each_pstree_item(item) {
 			if (dump_one_task(item, parent_ie))
 				goto err;
@@ -2889,8 +2895,11 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 
 	/* Standard post-task dump operations */
 	{
-		struct timeval t_start, t_end, t_delta;
+		struct timeval t_start, t_end, t_delta, t_elapsed;
 		gettimeofday(&t_start, NULL);
+		timersub(&t_start, &freeze_start, &t_elapsed);
+		pr_err("TIMING @%ld.%06ld: cr_dump_post_task_operations starting\n",
+		       t_elapsed.tv_sec, t_elapsed.tv_usec);
 		if (cr_dump_post_task_operations(&he))
 			goto err;
 		gettimeofday(&t_end, NULL);
@@ -2915,8 +2924,11 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 		he.allow_uprobes = true;
 	}
 	{
-		struct timeval t_start, t_end, t_delta;
+		struct timeval t_start, t_end, t_delta, t_elapsed;
 		gettimeofday(&t_start, NULL);
+		timersub(&t_start, &freeze_start, &t_elapsed);
+		pr_err("TIMING @%ld.%06ld: write_img_inventory starting\n",
+		       t_elapsed.tv_sec, t_elapsed.tv_usec);
 		if (write_img_inventory(&he))
 			goto err;
 		gettimeofday(&t_end, NULL);
@@ -2927,8 +2939,11 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 
 	/* Signal replica that inventory.img is ready */
 	{
-		struct timeval t_start, t_end, t_delta;
+		struct timeval t_start, t_end, t_delta, t_elapsed;
 		gettimeofday(&t_start, NULL);
+		timersub(&t_start, &freeze_start, &t_elapsed);
+		pr_err("TIMING @%ld.%06ld: send_inventory_ready_signal starting\n",
+		       t_elapsed.tv_sec, t_elapsed.tv_usec);
 		ret = send_inventory_ready_signal();
 		gettimeofday(&t_end, NULL);
 		timersub(&t_end, &t_start, &t_delta);
@@ -2946,8 +2961,11 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 	 */
 	pr_err("=== Waiting for P3 threads final scan ===\n");
 	{
-		struct timeval t_start, t_end, t_delta;
+		struct timeval t_start, t_end, t_delta, t_elapsed;
 		gettimeofday(&t_start, NULL);
+		timersub(&t_start, &freeze_start, &t_elapsed);
+		pr_err("TIMING @%ld.%06ld: cow_wait_p3_threads starting\n",
+		       t_elapsed.tv_sec, t_elapsed.tv_usec);
 		cow_wait_p3_threads();
 		gettimeofday(&t_end, NULL);
 		timersub(&t_end, &t_start, &t_delta);
@@ -2957,12 +2975,26 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 	pr_err("P3 threads completed: %lu total pages sent\n", cow_p3_pages_sent());
 
 	/* Close async uffd directly - no expensive unregister needed */
-	cow_cleanup_async_uffd();
+	{
+		struct timeval t_start, t_end, t_delta, t_elapsed;
+		gettimeofday(&t_start, NULL);
+		timersub(&t_start, &freeze_start, &t_elapsed);
+		pr_err("TIMING @%ld.%06ld: cow_cleanup_async_uffd starting\n",
+		       t_elapsed.tv_sec, t_elapsed.tv_usec);
+		cow_cleanup_async_uffd();
+		gettimeofday(&t_end, NULL);
+		timersub(&t_end, &t_start, &t_delta);
+		pr_err("TIMING: cow_cleanup_async_uffd took %ld.%06ld seconds\n",
+		       t_delta.tv_sec, t_delta.tv_usec);
+	}
 
 	/* Unfreeze process - dirty pages already sent by P3 threads */
 	{
-		struct timeval t_start, t_end, t_delta;
+		struct timeval t_start, t_end, t_delta, t_elapsed;
 		gettimeofday(&t_start, NULL);
+		timersub(&t_start, &freeze_start, &t_elapsed);
+		pr_err("TIMING @%ld.%06ld: pstree_switch_state starting\n",
+		       t_elapsed.tv_sec, t_elapsed.tv_usec);
 		pstree_switch_state(root_item, TASK_ALIVE);
 		gettimeofday(&t_end, NULL);
 		timersub(&t_end, &t_start, &t_delta);
