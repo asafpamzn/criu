@@ -743,11 +743,16 @@ static void *unified_page_server_thread(void *arg)
 					if (cow_start_p3_threads(p3_sockets, num_sockets,
 								 img->dst_id, source_pid) < 0) {
 						pr_err("Failed to start P3 threads\n");
+						close_p3_sockets(p3_sockets, num_sockets);
 					} else {
-						cow_wait_p3_threads();
-						stats.priority3_pages += cow_p3_pages_sent();
+						/*
+						 * P3 threads now run in iterative dirty scan loop.
+						 * Main thread monitors convergence and signals last_scan.
+						 * Do NOT wait here - let unified thread exit.
+						 * Do NOT close sockets - threads still using them.
+						 */
+						pr_info("P3 threads started, unified thread exiting\n");
 					}
-					close_p3_sockets(p3_sockets, num_sockets);
 				}
 			} else {
 				list_for_each_entry(lve, get_global_lazy_vmas(), list) {

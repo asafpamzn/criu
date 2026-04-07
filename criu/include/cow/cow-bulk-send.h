@@ -14,8 +14,11 @@ int send_pages_batch_compressed(int sk, const void *data,
 				int nr_pages, u64 dst_id,
 				unsigned long base_vaddr);
 
-/* Number of parallel P3 threads for bulk transfer */
+/* Number of parallel P3 threads for bulk transfer + dirty scan */
 #define NUM_P3_THREADS 20
+
+/* Dirty page convergence threshold (per-thread) */
+#define DIRTY_CONVERGENCE_THRESHOLD 1000
 
 /*
  * Start multiple P3 bulk sender threads (up to 20 threads for parallel transfer).
@@ -51,5 +54,22 @@ unsigned long cow_p3_pages_sent(void);
  * Get the number of P3 threads (for creating sockets).
  */
 int cow_get_num_p3_threads(void);
+
+/*
+ * Check if all P3 threads are below dirty page convergence threshold.
+ * Returns true only when ALL active threads report < DIRTY_CONVERGENCE_THRESHOLD.
+ */
+bool cow_all_threads_below_threshold(void);
+
+/*
+ * Signal P3 threads to do final scan and exit.
+ * Called by main thread after freezing the process.
+ */
+void cow_signal_last_scan(void);
+
+/*
+ * Check if last scan has been signaled.
+ */
+bool cow_is_last_scan_signaled(void);
 
 #endif /* __CR_COW_BULK_SEND_H__ */

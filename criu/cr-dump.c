@@ -67,6 +67,7 @@
 #include "page-pipe.h"
 #include "cow/cow-dump.h"
 #include "cow/cow-page-xfer.h"
+#include "cow/cow-bulk-send.h"
 #include "posix-timer.h"
 #include "vdso.h"
 #include "vma.h"
@@ -2675,11 +2676,12 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 	pr_err("TIMING: Phase 1 freeze ended - process frozen for %ld.%06ld seconds\n",
 	       freeze_delta.tv_sec, freeze_delta.tv_usec);
 
-	/* === PHASE 2: Bulk page transfer === */
-	pr_err("=== PHASE 2: Bulk page transfer ===\n");
+	/* === PHASE 2: Bulk page transfer + iterative dirty scan === */
+	pr_err("=== PHASE 2: Bulk page transfer + dirty scan convergence ===\n");
 
 	/*
-	 * Start the page server to send all pages while the process runs.
+	 * Start the page server which starts P3 threads.
+	 * P3 threads do bulk transfer then iterative dirty scanning.
 	 * WP_ASYNC tracks writes without generating faults.
 	 */
 	ret = cr_page_server(false, true, -1);
@@ -2707,8 +2709,18 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 		}
 	}
 
-	/* === PHASE 3: Re-freeze + skeleton dump + dirty scan === */
-	pr_err("=== PHASE 3: Re-freeze + skeleton dump + dirty scan ===\n");
+	/*
+	 * Wait for P3 threads to converge (all below dirty page threshold).
+	 * Threads are running iterative dirty scan loop.
+	 */
+	pr_err("=== Waiting for dirty page convergence ===\n");
+	while (!cow_all_threads_below_threshold()) {
+		usleep(10000);  /* 10ms poll */
+	}
+	pr_err("=== CONVERGENCE: All threads below threshold ===\n");
+
+	/* === PHASE 3: Freeze + skeleton dump === */
+	pr_err("=== PHASE 3: Freeze + skeleton dump ===\n");
 
 	gettimeofday(&freeze_start, NULL);
 	pr_err("TIMING: Phase 3 freeze started\n");
@@ -2732,22 +2744,15 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 		goto err;
 	}
 
-	{
-		struct timeval t_start, t_end, t_delta;
-		gettimeofday(&t_start, NULL);
-		ret = cow_scan_dirty_pages(&dirty_ranges, &nr_dirty_ranges, &total_dirty_pages);
-		gettimeofday(&t_end, NULL);
-		timersub(&t_end, &t_start, &t_delta);
-		pr_err("TIMING: cow_scan_dirty_pages took %ld.%06ld seconds\n",
-		       t_delta.tv_sec, t_delta.tv_usec);
-	}
-	if (ret) {
-		pr_err("Failed to scan dirty pages\n");
-		goto err;
-	}
+	/* Signal P3 threads to do final scan (process is now frozen) */
+	cow_signal_last_scan();
 
-	pr_info("Found %u dirty ranges, %lu total dirty pages\n",
-		nr_dirty_ranges, total_dirty_pages);
+	/*
+	 * P3 threads do dirty scanning - no need for cow_scan_dirty_pages here.
+	 * Just set dummy values for compatibility.
+	 */
+	nr_dirty_ranges = 0;
+	total_dirty_pages = 0;
 
 	/*
 	 * Collect pstree IDs now so vpid(item) is valid for the VMA detection.
@@ -2926,33 +2931,26 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 		goto err;
 	}
 
-	/* === PHASE 4: Dump dirty pages while frozen === */
-	pr_err("=== PHASE 4: Dump dirty pages (frozen) ===\n");
-
 	/*
-	 * Instead of setting up WP_SYNC for convergence (which requires expensive
-	 * UFFDIO_UNREGISTER that walks all page tables), dump dirty pages directly
-	 * while the process is still frozen. This eliminates the convergence phase.
+	 * Wait for P3 threads to complete their final scan (process is frozen,
+	 * last_scan flag was set above). Threads will send any remaining dirty pages.
 	 */
+	pr_err("=== Waiting for P3 threads final scan ===\n");
 	{
 		struct timeval t_start, t_end, t_delta;
 		gettimeofday(&t_start, NULL);
-		ret = cow_dump_dirty_pages(dirty_ranges, nr_dirty_ranges,
-					   root_item->pid->real);
+		cow_wait_p3_threads();
 		gettimeofday(&t_end, NULL);
 		timersub(&t_end, &t_start, &t_delta);
-		pr_err("TIMING: cow_dump_dirty_pages took %ld.%06ld seconds\n",
+		pr_err("TIMING: cow_wait_p3_threads took %ld.%06ld seconds\n",
 		       t_delta.tv_sec, t_delta.tv_usec);
 	}
-	if (ret) {
-		pr_err("Failed to dump dirty pages\n");
-		goto err;
-	}
+	pr_err("P3 threads completed: %lu total pages sent\n", cow_p3_pages_sent());
 
 	/* Close async uffd directly - no expensive unregister needed */
 	cow_cleanup_async_uffd();
 
-	/* Unfreeze process - dirty pages already sent, no convergence needed */
+	/* Unfreeze process - dirty pages already sent by P3 threads */
 	{
 		struct timeval t_start, t_end, t_delta;
 		gettimeofday(&t_start, NULL);
@@ -2965,15 +2963,12 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 
 	gettimeofday(&freeze_end, NULL);
 	timersub(&freeze_end, &freeze_start, &freeze_delta);
-	pr_err("TIMING: Phase 3-4 freeze ended - process frozen for %ld.%06ld seconds\n",
+	pr_err("TIMING: Phase 3 freeze ended - process frozen for %ld.%06ld seconds\n",
 	       freeze_delta.tv_sec, freeze_delta.tv_usec);
 
-	/* === SKIP Phase 5-6: No convergence needed === */
-	pr_err("=== SKIP Phase 5-6: Dirty pages already sent during freeze ===\n");
-
 	/*
-	 * Signal completion to replica. Dirty pages were already sent during
-	 * freeze, so replica can zero-fill any remaining faults.
+	 * Signal completion to replica. Dirty pages were sent by P3 threads,
+	 * so replica can zero-fill any remaining faults.
 	 */
 	{
 		int sk = get_page_server_sk();

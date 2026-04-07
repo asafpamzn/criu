@@ -9,11 +9,14 @@
 
 #include <sys/uio.h>
 #include <sys/socket.h>
+#include <sys/ioctl.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <errno.h>
 #include <time.h>
+#include <string.h>
 #include <lz4.h>
 
 #include "int.h"
@@ -30,6 +33,7 @@
 #include "cr_options.h"
 #include "tls.h"
 #include "pagemap.h"
+#include "pagemap_scan.h"
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "cow-bulk: "
@@ -60,11 +64,20 @@ struct p3_thread_ctx {
 	unsigned long pages_sent;
 	volatile bool active;
 	volatile bool error;  /* Set if thread encountered an error */
+
+	/* Dirty scan state (for iterative convergence) */
+	int pagemap_fd;                  /* Per-thread /proc/<pid>/pagemap fd */
+	unsigned long last_dirty_count;  /* Dirty pages found in last scan */
+	volatile bool below_threshold;   /* True when last_dirty_count < threshold */
+	unsigned int iteration;          /* 0=bulk, 1+=dirty scan */
 };
 
 static struct p3_thread_ctx p3_threads[NUM_P3_THREADS];
 static volatile int p3_threads_active = 0;
 static unsigned long p3_total_pages_sent = 0;
+
+/* Global flag for signaling last scan (set by main thread after freeze) */
+static volatile bool g_last_scan_flag = false;
 
 /*
  * Send a batch of pages with LZ4 compression.
@@ -206,8 +219,146 @@ static int send_lazy_vma_pages_batch(int sk, struct lazy_vma_entry *lve,
 }
 
 /*
+ * Calculate this thread's chunk of a VMA for parallel processing.
+ * Returns true if this thread should process the VMA, false to skip.
+ */
+static bool get_thread_vma_range(struct p3_thread_ctx *ctx,
+				 struct lazy_vma_entry *lve,
+				 unsigned long *out_start,
+				 unsigned long *out_end)
+{
+	unsigned long vma_size = lve->end - lve->start;
+	unsigned long chunk_size;
+	int thread_id = ctx->thread_id;
+
+	if (lve->dst_id != ctx->dst_id)
+		return false;
+
+	if (vma_size < MIN_VMA_SIZE_FOR_SPLIT) {
+		/* Small VMAs (< 256KB) - only thread 0 handles them */
+		if (thread_id != 0)
+			return false;
+		*out_start = lve->start;
+		*out_end = lve->end;
+	} else {
+		/* Large VMAs (>= 256KB) - threads 1-N split them */
+		if (thread_id == 0)
+			return false;
+
+		chunk_size = vma_size / NUM_P3_SPLITTER_THREADS;
+		chunk_size = (chunk_size / PAGE_SIZE) * PAGE_SIZE;
+
+		*out_start = lve->start + (thread_id - 1) * chunk_size;
+
+		if (thread_id == NUM_P3_THREADS - 1)
+			*out_end = lve->end;
+		else
+			*out_end = *out_start + chunk_size;
+	}
+
+	return true;
+}
+
+/*
+ * Scan for dirty pages in this thread's VMA ranges and send them.
+ * Uses PAGEMAP_SCAN with PM_SCAN_WP_MATCHING to atomically detect and clear dirty bits.
+ * Returns total number of dirty pages found and sent.
+ */
+static unsigned long do_dirty_scan_and_send(struct p3_thread_ctx *ctx)
+{
+	struct lazy_vma_entry *lve;
+	struct list_head *lazy_vmas;
+	struct page_region *regs = NULL;
+	unsigned long total_dirty = 0;
+	int thread_id = ctx->thread_id;
+	const int max_regs = 1000;
+
+	regs = xmalloc(max_regs * sizeof(struct page_region));
+	if (!regs) {
+		pr_err("P3[%d] dirty scan: failed to allocate regs buffer\n", thread_id);
+		return 0;
+	}
+
+	lazy_vmas = get_global_lazy_vmas();
+
+	list_for_each_entry(lve, lazy_vmas, list) {
+		unsigned long my_start, my_end;
+		struct pm_scan_arg args;
+		long regs_len;
+
+		if (!get_thread_vma_range(ctx, lve, &my_start, &my_end))
+			continue;
+
+		memset(&args, 0, sizeof(args));
+		args.size = sizeof(args);
+		args.flags = PM_SCAN_WP_MATCHING;  /* Clear dirty bit after scan */
+		args.start = my_start;
+		args.end = my_end;
+		args.walk_end = my_start;
+		args.vec = (u64)(unsigned long)regs;
+		args.vec_len = max_regs;
+		args.max_pages = 0;
+		args.category_anyof_mask = PAGE_IS_WRITTEN;
+		args.return_mask = PAGE_IS_WRITTEN;
+
+		do {
+			int i;
+			args.start = args.walk_end;
+
+			regs_len = ioctl(ctx->pagemap_fd, PAGEMAP_SCAN, &args);
+			if (regs_len < 0) {
+				pr_perror("P3[%d] PAGEMAP_SCAN failed", thread_id);
+				break;
+			}
+
+			if (regs_len == 0)
+				break;
+
+			/* Process each dirty region */
+			for (i = 0; i < regs_len; i++) {
+				unsigned long start = regs[i].start;
+				unsigned long end = regs[i].end;
+				unsigned long pages = (end - start) / PAGE_SIZE;
+				unsigned long vaddr;
+
+				pr_debug("P3[%d] dirty region: 0x%lx-0x%lx (%lu pages)\n",
+					 thread_id, start, end, pages);
+
+				/* Send dirty pages in batches */
+				for (vaddr = start; vaddr < end;
+				     vaddr += COW_BATCH_PAGES * PAGE_SIZE) {
+					int batch_pages = (end - vaddr) / PAGE_SIZE;
+					int sent;
+
+					if (batch_pages > COW_BATCH_PAGES)
+						batch_pages = COW_BATCH_PAGES;
+
+					sent = send_lazy_vma_pages_batch(
+						ctx->socket, lve, vaddr, batch_pages,
+						ctx->dst_id, ctx->source_pid);
+
+					if (sent < 0) {
+						pr_err("P3[%d] dirty scan: send failed at 0x%lx\n",
+						       thread_id, vaddr);
+						goto out;
+					}
+
+					total_dirty += sent;
+					ctx->pages_sent += sent;
+				}
+			}
+		} while (args.walk_end < my_end);
+	}
+
+out:
+	xfree(regs);
+	return total_dirty;
+}
+
+/*
  * P3 bulk sender thread - sends regular pages in batches.
  * Each thread handles 1/NUM_P3_THREADS of each VMA's address range.
+ * After bulk transfer, transitions to iterative dirty scanning until convergence.
  */
 static void *p3_bulk_sender_thread(void *arg)
 {
@@ -217,6 +368,7 @@ static void *p3_bulk_sender_thread(void *arg)
 	unsigned long total_sent = 0;
 	struct timespec t_start, t_end;
 	int thread_id = ctx->thread_id;
+	char pagemap_path[64];
 
 	pr_info("P3[%d] bulk sender thread started (batch=%d pages)\n",
 		thread_id, COW_BATCH_PAGES);
@@ -224,51 +376,32 @@ static void *p3_bulk_sender_thread(void *arg)
 	       thread_id, ctx->socket, (unsigned long)ctx->dst_id);
 	clock_gettime(CLOCK_MONOTONIC, &t_start);
 
+	/* Open pagemap fd for dirty scanning */
+	snprintf(pagemap_path, sizeof(pagemap_path), "/proc/%d/pagemap",
+		 ctx->source_pid);
+	ctx->pagemap_fd = open(pagemap_path, O_RDWR);
+	if (ctx->pagemap_fd < 0) {
+		pr_perror("P3[%d] cannot open %s", thread_id, pagemap_path);
+		ctx->error = true;
+		goto out_no_pagemap;
+	}
+
+	/* Initialize dirty scan state */
+	ctx->iteration = 0;
+	ctx->last_dirty_count = 0;
+	ctx->below_threshold = false;
+
 	lazy_vmas = get_global_lazy_vmas();
 
+	/* === Iteration 0: Bulk transfer === */
 	list_for_each_entry(lve, lazy_vmas, list) {
-		unsigned long vma_size, chunk_size;
 		unsigned long my_start, my_end;
 		unsigned long vaddr;
 
-		if (lve->dst_id != ctx->dst_id)
+		if (!get_thread_vma_range(ctx, lve, &my_start, &my_end))
 			continue;
 
-		/* Calculate this thread's chunk of the VMA */
-		vma_size = lve->end - lve->start;
-
-		if (vma_size < MIN_VMA_SIZE_FOR_SPLIT) {
-			/*
-			 * Small VMAs (< 256KB) - only thread 0 handles them.
-			 * No splitting to avoid overhead and edge cases.
-			 */
-			if (thread_id != 0)
-				continue;
-			my_start = lve->start;
-			my_end = lve->end;
-		} else {
-			/*
-			 * Large VMAs (>= 256KB) - threads 1-9 split them.
-			 * Thread 0 skips these entirely.
-			 */
-			if (thread_id == 0)
-				continue;
-
-			/* 9 splitter threads (thread_id 1-9) */
-			chunk_size = vma_size / NUM_P3_SPLITTER_THREADS;
-			chunk_size = (chunk_size / PAGE_SIZE) * PAGE_SIZE;
-
-			/* Map thread_id 1-9 to index 0-8 */
-			my_start = lve->start + (thread_id - 1) * chunk_size;
-
-			/* Last splitter thread (id=9) takes remainder */
-			if (thread_id == NUM_P3_THREADS - 1)
-				my_end = lve->end;
-			else
-				my_end = my_start + chunk_size;
-		}
-
-		pr_info("P3[%d]: Processing VMA %lx-%lx chunk %lx-%lx\n",
+		pr_info("P3[%d]: Bulk VMA %lx-%lx chunk %lx-%lx\n",
 			thread_id,
 			(unsigned long)lve->start, (unsigned long)lve->end,
 			my_start, my_end);
@@ -278,7 +411,6 @@ static void *p3_bulk_sender_thread(void *arg)
 			int batch_pages;
 			int sent;
 
-			/* Limit batch to not exceed this thread's assigned range */
 			batch_pages = (my_end - vaddr) / PAGE_SIZE;
 			if (batch_pages > COW_BATCH_PAGES)
 				batch_pages = COW_BATCH_PAGES;
@@ -295,29 +427,57 @@ static void *p3_bulk_sender_thread(void *arg)
 			}
 
 			total_sent += sent;
-			if (total_sent % 1000 == 0 && total_sent > 0)
-				pr_debug("DEBUG_THREAD: P3 sender[%d] progress: %lu pages sent\n",
-				       thread_id, total_sent);
 		}
 	}
 
+	pr_info("P3[%d] bulk transfer done: %lu pages, starting dirty scan loop\n",
+		thread_id, total_sent);
+
+	/* === Iterations 1+: Dirty scan loop until convergence === */
+	while (!g_last_scan_flag) {
+		ctx->iteration++;
+		ctx->last_dirty_count = do_dirty_scan_and_send(ctx);
+
+		ctx->below_threshold =
+			(ctx->last_dirty_count < DIRTY_CONVERGENCE_THRESHOLD);
+
+		pr_err("P3[%d] iter=%u dirty=%lu threshold=%s\n",
+		       thread_id, ctx->iteration, ctx->last_dirty_count,
+		       ctx->below_threshold ? "YES" : "NO");
+
+		/*
+		 * Small sleep to avoid busy-looping when there are few dirty pages.
+		 * This gives the application time to dirty more pages.
+		 */
+		if (ctx->last_dirty_count < 100)
+			usleep(1000);  /* 1ms */
+	}
+
+	/* === Final scan after freeze === */
+	ctx->iteration++;
+	pr_err("P3[%d] final scan (frozen) iter=%u\n", thread_id, ctx->iteration);
+	ctx->last_dirty_count = do_dirty_scan_and_send(ctx);
+	pr_err("P3[%d] final scan done: %lu dirty pages\n",
+	       thread_id, ctx->last_dirty_count);
+
 out:
-	pr_debug("DEBUG_THREAD: P3 sender[%d] CLOSING socket=%d pages_sent=%lu\n",
-	       thread_id, ctx->socket, total_sent);
+	if (ctx->pagemap_fd >= 0) {
+		close(ctx->pagemap_fd);
+		ctx->pagemap_fd = -1;
+	}
+
+out_no_pagemap:
 	clock_gettime(CLOCK_MONOTONIC, &t_end);
 	{
 		long elapsed_ms = (t_end.tv_sec - t_start.tv_sec) * 1000 +
 				  (t_end.tv_nsec - t_start.tv_nsec) / 1000000;
-		float rate = elapsed_ms > 0 ? (float)total_sent * 1000 / elapsed_ms : 0;
 
-		pr_info("P3[%d] done: %lu pages in %ld ms (%.0f pages/sec)\n",
-			thread_id, total_sent, elapsed_ms, rate);
+		pr_err("P3[%d] done: %lu pages, %u iterations, %ld ms\n",
+		       thread_id, ctx->pages_sent, ctx->iteration, elapsed_ms);
 	}
 
-	ctx->pages_sent = total_sent;
 	ctx->active = false;
 	__sync_fetch_and_sub(&p3_threads_active, 1);
-	pr_debug("DEBUG_THREAD: P3 sender[%d] TERMINATED pages=%lu\n", thread_id, total_sent);
 	return NULL;
 }
 
@@ -330,6 +490,9 @@ int cow_start_p3_threads(int *sockets, int num_sockets, u64 dst_id, pid_t source
 		pr_warn("P3 threads already running\n");
 		return 0;
 	}
+
+	/* Reset global flags */
+	g_last_scan_flag = false;
 
 	/* Start one thread per socket */
 	threads_to_start = num_sockets < NUM_P3_THREADS ? num_sockets : NUM_P3_THREADS;
@@ -344,6 +507,11 @@ int cow_start_p3_threads(int *sockets, int num_sockets, u64 dst_id, pid_t source
 		p3_threads[i].active = true;
 		p3_threads[i].error = false;
 		p3_threads[i].thread = 0;
+		/* Initialize dirty scan state */
+		p3_threads[i].pagemap_fd = -1;
+		p3_threads[i].last_dirty_count = 0;
+		p3_threads[i].below_threshold = false;
+		p3_threads[i].iteration = 0;
 		__sync_fetch_and_add(&p3_threads_active, 1);
 
 		if (pthread_create(&p3_threads[i].thread, NULL,
@@ -415,4 +583,38 @@ unsigned long cow_p3_pages_sent(void)
 int cow_get_num_p3_threads(void)
 {
 	return NUM_P3_THREADS;
+}
+
+/*
+ * Check if all P3 threads are below dirty page convergence threshold.
+ * Returns true only when ALL active threads report below_threshold.
+ */
+bool cow_all_threads_below_threshold(void)
+{
+	int i;
+
+	for (i = 0; i < NUM_P3_THREADS; i++) {
+		if (p3_threads[i].active && !p3_threads[i].below_threshold)
+			return false;
+	}
+	return p3_threads_active > 0;  /* Must have at least one active thread */
+}
+
+/*
+ * Signal P3 threads to do final scan and exit.
+ * Called by main thread after freezing the process.
+ */
+void cow_signal_last_scan(void)
+{
+	pr_err("=== CONVERGENCE: Signaling last scan ===\n");
+	g_last_scan_flag = true;
+	__sync_synchronize();  /* Memory barrier */
+}
+
+/*
+ * Check if last scan has been signaled.
+ */
+bool cow_is_last_scan_signaled(void)
+{
+	return g_last_scan_flag;
 }

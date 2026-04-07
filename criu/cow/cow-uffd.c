@@ -28,6 +28,12 @@
 #undef LOG_PREFIX
 #define LOG_PREFIX "cow-uffd: "
 
+/*
+ * Main thread reuses P3 thread 0's pool for Phase 4 dirty pages.
+ * P3 receivers are stopped by Phase 4, so no contention.
+ */
+#define PHASE4_POOL_ID 0
+
 #define PAGE_BUFFER_HASH_BITS 20
 #define PAGE_BUFFER_HASH_SIZE (1 << PAGE_BUFFER_HASH_BITS)  /* 1M buckets */
 
@@ -1457,15 +1463,23 @@ void *cow_get_prebuffer_buf(void)
 }
 
 /*
- * Pre-buffer callback: pages arrive before criu restore connects.
- * This should not be called - P3 bulk transfer handles all pages.
+ * Pre-buffer callback: Phase 4 dirty pages arrive on main socket.
+ * P3 receivers handle Phase 2 bulk pages, but Phase 4 pages flow here.
+ * These pages overwrite existing buffered pages (dirty page updates).
  */
 static int prebuffer_io_complete_internal(unsigned long dst_id, unsigned long vaddr,
 					  unsigned long nr_pages, void *priv)
 {
-	pr_err("BUG: prebuffer_io_complete called - P3 should handle all pages\n");
-	BUG();
-	return -1;
+	void *data = priv;  /* Points to prebuffer_buf with page data */
+
+	pr_debug("prebuffer_io_complete: buffering Phase 4 dirty page vaddr=0x%lx\n", vaddr);
+
+	/* Buffer/overwrite using P3 thread 0's pool (P3 threads stopped by Phase 4) */
+	if (cow_page_buffer_add(vaddr, data, PHASE4_POOL_ID, false) < 0) {
+		pr_err("Failed to buffer dirty page at 0x%lx\n", vaddr);
+		return -1;
+	}
+	return 0;
 }
 
 int cow_setup_prebuffer_reader(void)
@@ -1475,6 +1489,18 @@ int cow_setup_prebuffer_reader(void)
 	prebuffer_buf = xmalloc(PAGE_SIZE);
 	if (!prebuffer_buf)
 		return -1;
+
+	/*
+	 * Initialize pool 0 for Phase 4 dirty pages. P3 receivers will also
+	 * init this pool later, but cow_page_buffer_thread_init is idempotent.
+	 */
+	ret = cow_page_buffer_thread_init(PHASE4_POOL_ID);
+	if (ret < 0) {
+		pr_err("Failed to init page pool for Phase 4\n");
+		xfree(prebuffer_buf);
+		prebuffer_buf = NULL;
+		return -1;
+	}
 
 	ret = page_server_start_async_read_bulk(
 		prebuffer_buf, 1, prebuffer_io_complete_internal, prebuffer_buf);
