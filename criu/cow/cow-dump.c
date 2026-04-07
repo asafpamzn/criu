@@ -109,52 +109,7 @@ static void *cow_wp_worker(void *arg)
 	return NULL;
 }
 
-/* Parallel unregister worker - same pattern as cow_wp_worker */
-static void *cow_unreg_worker(void *arg)
-{
-	struct cow_wp_job *job = arg;
-	struct uffdio_range unreg;
-	struct timeval t_start, t_end, t_delta;
-	unsigned int i;
-	int thread_id = job->start_idx; /* Use start_idx as thread identifier */
 
-	gettimeofday(&t_start, NULL);
-	pr_err("TIMING: unreg_worker[%u] START (VMAs %u-%u)\n",
-	       thread_id, job->start_idx, job->end_idx);
-
-	for (i = job->start_idx; i < job->end_idx; i++) {
-		struct timeval t_vma_start, t_vma_end, t_vma_delta;
-
-		unreg.start = job->ranges[i].start;
-		unreg.len = job->ranges[i].len;
-
-		gettimeofday(&t_vma_start, NULL);
-		if (ioctl(job->uffd, UFFDIO_UNREGISTER, &unreg)) {
-			/* Ignore errors - VMA may have changed */
-			pr_debug("UFFDIO_UNREGISTER 0x%lx-0x%lx: %s\n",
-				 (unsigned long)unreg.start,
-				 (unsigned long)(unreg.start + unreg.len),
-				 strerror(errno));
-		}
-		gettimeofday(&t_vma_end, NULL);
-		timersub(&t_vma_end, &t_vma_start, &t_vma_delta);
-
-		/* Log if this VMA took more than 10ms */
-		if (t_vma_delta.tv_sec > 0 || t_vma_delta.tv_usec > 10000) {
-			pr_err("TIMING: unreg_worker[%u] VMA[%u] 0x%lx (%lu pages) took %ld.%06ld s\n",
-			       thread_id, i, (unsigned long)unreg.start,
-			       (unsigned long)(unreg.len / 4096),
-			       t_vma_delta.tv_sec, t_vma_delta.tv_usec);
-		}
-	}
-
-	gettimeofday(&t_end, NULL);
-	timersub(&t_end, &t_start, &t_delta);
-	pr_err("TIMING: unreg_worker[%u] END took %ld.%06ld seconds\n",
-	       thread_id, t_delta.tv_sec, t_delta.tv_usec);
-
-	return NULL;
-}
 
 static unsigned int cow_wp_nr_threads(unsigned int nr_ranges)
 {
