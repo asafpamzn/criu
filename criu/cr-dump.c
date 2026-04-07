@@ -2569,7 +2569,6 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 	unsigned long *dirty_ranges = NULL;
 	unsigned int nr_dirty_ranges = 0;
 	struct timeval freeze_start, freeze_end, freeze_delta;
-	unsigned long total_dirty_pages = 0;
 	int ret;
 	int exit_code = -1;
 
@@ -2749,10 +2748,8 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 
 	/*
 	 * P3 threads do dirty scanning - no need for cow_scan_dirty_pages here.
-	 * Just set dummy values for compatibility.
+	 * nr_dirty_ranges starts at 0, used only for merging with new VMAs.
 	 */
-	nr_dirty_ranges = 0;
-	total_dirty_pages = 0;
 
 	/*
 	 * Collect pstree IDs now so vpid(item) is valid for the VMA detection.
