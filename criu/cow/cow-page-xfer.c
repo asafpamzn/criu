@@ -95,19 +95,25 @@ int send_dirty_bitmap_to_replica(int sk, u64 dst_id,
 /*
  * Wait for all_pages_sent ACK from replica.
  * Called by primary after sending PS_IOV_ALL_PAGES_SENT.
- *
- * Note: The ACK is received by page_server_serve() which sets a flag.
- * We poll the flag here to avoid race conditions with socket reads.
+ * Actually reads from socket to receive the ACK.
  */
 int wait_for_all_pages_sent_ack(int sk)
 {
-	(void)sk;  /* unused - ACK comes via page_server_serve() */
+	struct page_server_iov pi;
 
 	pr_info("Waiting for all_pages_sent ACK from replica...\n");
-	while (!is_all_pages_sent_ack_received()) {
-		usleep(1000);  /* 1ms poll */
+	if (page_server_recv(sk, &pi, sizeof(pi), MSG_WAITALL) != sizeof(pi)) {
+		pr_perror("Failed to receive all_pages_sent ACK");
+		return -1;
 	}
+
+	if (decode_ps_cmd(pi.cmd) != PS_IOV_ALL_PAGES_SENT_ACK) {
+		pr_err("Expected all_pages_sent ACK, got cmd=%u\n", decode_ps_cmd(pi.cmd));
+		return -1;
+	}
+
 	pr_info("Received all_pages_sent ACK from replica\n");
+	set_all_pages_sent_ack_received();
 	return 0;
 }
 
