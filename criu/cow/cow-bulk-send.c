@@ -449,10 +449,20 @@ static void *p3_bulk_sender_thread(void *arg)
 
 	/* === Final scan after freeze === */
 	ctx->iteration++;
-	pr_err("P3[%d] final scan (frozen) iter=%u\n", thread_id, ctx->iteration);
-	ctx->last_dirty_count = do_dirty_scan_and_send(ctx);
-	pr_err("P3[%d] final scan done: %lu dirty pages\n",
-	       thread_id, ctx->last_dirty_count);
+	{
+		struct timespec fs_start, fs_end;
+		long fs_elapsed_ms;
+
+		clock_gettime(CLOCK_MONOTONIC, &fs_start);
+		pr_err("P3[%d] final scan (frozen) iter=%u\n", thread_id, ctx->iteration);
+		ctx->last_dirty_count = do_dirty_scan_and_send(ctx);
+		clock_gettime(CLOCK_MONOTONIC, &fs_end);
+
+		fs_elapsed_ms = (fs_end.tv_sec - fs_start.tv_sec) * 1000 +
+				(fs_end.tv_nsec - fs_start.tv_nsec) / 1000000;
+		pr_err("P3[%d] final scan done: %lu dirty pages, TIMING: %ld ms\n",
+		       thread_id, ctx->last_dirty_count, fs_elapsed_ms);
+	}
 
 out:
 	if (ctx->pagemap_fd >= 0) {

@@ -2811,22 +2811,62 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 		       t_delta.tv_sec, t_delta.tv_usec);
 	}
 
-	if (rpc_query_external_files())
-		goto err;
+	{
+		struct timeval t_start, t_end, t_delta;
+		gettimeofday(&t_start, NULL);
+		if (rpc_query_external_files())
+			goto err;
+		gettimeofday(&t_end, NULL);
+		timersub(&t_end, &t_start, &t_delta);
+		pr_err("TIMING: rpc_query_external_files took %ld.%06ld seconds\n",
+		       t_delta.tv_sec, t_delta.tv_usec);
+	}
 
-	if (collect_file_locks())
-		goto err;
+	{
+		struct timeval t_start, t_end, t_delta;
+		gettimeofday(&t_start, NULL);
+		if (collect_file_locks())
+			goto err;
+		gettimeofday(&t_end, NULL);
+		timersub(&t_end, &t_start, &t_delta);
+		pr_err("TIMING: collect_file_locks took %ld.%06ld seconds\n",
+		       t_delta.tv_sec, t_delta.tv_usec);
+	}
 
-	if (collect_namespaces(true) < 0)
-		goto err;
+	{
+		struct timeval t_start, t_end, t_delta;
+		gettimeofday(&t_start, NULL);
+		if (collect_namespaces(true) < 0)
+			goto err;
+		gettimeofday(&t_end, NULL);
+		timersub(&t_end, &t_start, &t_delta);
+		pr_err("TIMING: collect_namespaces took %ld.%06ld seconds\n",
+		       t_delta.tv_sec, t_delta.tv_usec);
+	}
 
-	glob_imgset = cr_glob_imgset_open(O_DUMP);
-	if (!glob_imgset)
-		goto err;
+	{
+		struct timeval t_start, t_end, t_delta;
+		gettimeofday(&t_start, NULL);
+		glob_imgset = cr_glob_imgset_open(O_DUMP);
+		if (!glob_imgset)
+			goto err;
+		gettimeofday(&t_end, NULL);
+		timersub(&t_end, &t_start, &t_delta);
+		pr_err("TIMING: cr_glob_imgset_open took %ld.%06ld seconds\n",
+		       t_delta.tv_sec, t_delta.tv_usec);
+	}
 	pr_err("DEBUG: glob_imgset opened for skeleton dump (COW path)\n");
 
-	if (seccomp_collect_dump_filters() < 0)
-		goto err;
+	{
+		struct timeval t_start, t_end, t_delta;
+		gettimeofday(&t_start, NULL);
+		if (seccomp_collect_dump_filters() < 0)
+			goto err;
+		gettimeofday(&t_end, NULL);
+		timersub(&t_end, &t_start, &t_delta);
+		pr_err("TIMING: seccomp_collect_dump_filters took %ld.%06ld seconds\n",
+		       t_delta.tv_sec, t_delta.tv_usec);
+	}
 
 	/* Dump skeleton (everything except pages) */
 	{
@@ -2848,8 +2888,16 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 	}
 
 	/* Standard post-task dump operations */
-	if (cr_dump_post_task_operations(&he))
-		goto err;
+	{
+		struct timeval t_start, t_end, t_delta;
+		gettimeofday(&t_start, NULL);
+		if (cr_dump_post_task_operations(&he))
+			goto err;
+		gettimeofday(&t_end, NULL);
+		timersub(&t_end, &t_start, &t_delta);
+		pr_err("TIMING: cr_dump_post_task_operations took %ld.%06ld seconds\n",
+		       t_delta.tv_sec, t_delta.tv_usec);
+	}
 
 	/*
 	 * Signal to the replica that skeleton dump is complete.
