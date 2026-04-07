@@ -32,7 +32,6 @@
 #include "criu-log.h"
 #include "parasite.h"
 #include "atomic-bitmap.h"
-#include "cow/cow-bitmap.h"
 #include "cow/mpsc-queue.h"
 #include "cow/cow-bulk-send.h"
 

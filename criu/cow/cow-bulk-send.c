@@ -155,37 +155,18 @@ static int send_lazy_vma_pages_batch(int sk, struct lazy_vma_entry *lve,
 	struct iovec local_iov, remote_iov;
 	int nr_pages = 0;
 	unsigned long vaddr;
-	unsigned long page_idx_base;
 	int ret, i;
 
-	/* Find contiguous run of unsent, non-COW pages from base_vaddr */
-	page_idx_base = (base_vaddr - lve->start) / PAGE_SIZE;
-
+	/* Find contiguous run of pages from base_vaddr */
 	for (i = 0; i < max_pages; i++) {
-		unsigned long page_idx = 0;
 		vaddr = base_vaddr + i * PAGE_SIZE;
 		if (vaddr >= lve->end)
 			break;
-
-		 page_idx = page_idx_base + i;
-
-		if (atomic_bitmap_test(lve->sent_bitmap, page_idx))
-			break;  /* Stop at first already-sent */
-
-		if (lve->cow_bitmap && atomic_bitmap_test(lve->cow_bitmap, page_idx))
-			break;  /* Stop at first COW page */
-
 		nr_pages++;
 	}
 
-	if (nr_pages == 0) {
-		unsigned long first_page_idx = page_idx_base;
-		bool sent = lve->sent_bitmap ? atomic_bitmap_test(lve->sent_bitmap, first_page_idx) : false;
-		bool cow = lve->cow_bitmap ? atomic_bitmap_test(lve->cow_bitmap, first_page_idx) : false;
-		pr_err("BATCH EMPTY: base=%lx lve=%lx-%lx max=%d idx=%lu sent=%d cow=%d\n",
-		       base_vaddr, lve->start, lve->end, max_pages, first_page_idx, sent, cow);
+	if (nr_pages == 0)
 		return 0;
-	}
 
 	/* Allocate buffer for batch */
 	buffer = xmalloc(nr_pages * PAGE_SIZE);
@@ -212,14 +193,6 @@ static int send_lazy_vma_pages_batch(int sk, struct lazy_vma_entry *lve,
 
 	if (ret < 0)
 		return -1;
-
-	/* Mark all pages as sent (atomic for multi-threaded access) */
-	for (i = 0; i < nr_pages; i++) {
-		unsigned long page_idx = page_idx_base + i;
-		/* atomic_bitmap_test_and_set returns true if already set */
-		if (!atomic_bitmap_test_and_set(lve->sent_bitmap, page_idx))
-			__sync_fetch_and_add(&lve->sent_pages, 1);
-	}
 
 	return nr_pages;
 }

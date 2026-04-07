@@ -274,8 +274,6 @@ struct unified_thread_stats {
 	unsigned long priority1_pages;
 	unsigned long priority2_pages;
 	unsigned long priority3_pages;
-	unsigned long skip_already_sent;
-	unsigned long skip_cow_bitmap;
 };
 
 static void print_thread_stats(struct unified_thread_stats *stats)
@@ -293,11 +291,10 @@ static void print_thread_stats(struct unified_thread_stats *stats)
 	clock_gettime(CLOCK_REALTIME, &ts);
 	tm = localtime(&ts.tv_sec);
 
-	pr_err("[UNIFIED_THREAD_STATS] [%02d:%02d:%02d.%03ld] P1(COW)=%lu P2(Req)=%lu P3(Reg)=%lu | Skip: sent=%lu cow=%lu | COW_Q=%lu Req_Q=%lu | Compress: %lu->%lu (%.1f%%)\n",
+	pr_err("[UNIFIED_THREAD_STATS] [%02d:%02d:%02d.%03ld] P1(COW)=%lu P2(Req)=%lu P3(Reg)=%lu | COW_Q=%lu Req_Q=%lu | Compress: %lu->%lu (%.1f%%)\n",
 		tm->tm_hour, tm->tm_min, tm->tm_sec, ts.tv_nsec / 1000000,
 		stats->priority1_pages, stats->priority2_pages,
 		stats->priority3_pages,
-		stats->skip_already_sent, stats->skip_cow_bitmap,
 		cow_queue, req_queue,
 		g_compress_uncompressed_bytes, g_compress_compressed_bytes,
 		compress_ratio);
@@ -321,8 +318,6 @@ static void print_thread_stats(struct unified_thread_stats *stats)
 	stats->priority1_pages = 0;
 	stats->priority2_pages = 0;
 	stats->priority3_pages = 0;
-	stats->skip_already_sent = 0;
-	stats->skip_cow_bitmap = 0;
 }
 
 static void maybe_print_stats(struct unified_thread_stats *stats)
@@ -408,10 +403,8 @@ static int send_cow_page_lazy(struct cow_page_queue_entry *entry,
 			      struct active_image *img, pid_t source_pid)
 {
 	struct lazy_vma_entry *lve;
-	unsigned long page_idx;
 	int ret;
 	struct timespec t1, t2;
-	bool was_already_sent;
 
 	clock_gettime(CLOCK_MONOTONIC, &t1);
 
@@ -427,12 +420,6 @@ static int send_cow_page_lazy(struct cow_page_queue_entry *entry,
 		       entry->vaddr, img->dst_id);
 		return -1;
 	}
-
-	page_idx = (entry->vaddr - lve->start) / PAGE_SIZE;
-	was_already_sent = bitmap_test_nonatomic(lve->sent_bitmap, page_idx);
-
-	if (was_already_sent)
-		return 2;
 
 	if (!entry->data) {
 		pr_err("COW queue entry 0x%lx has no data!\n", entry->vaddr);
@@ -458,7 +445,6 @@ static int send_cow_page_lazy(struct cow_page_queue_entry *entry,
 		return -2;
 	}
 
-	bitmap_set_nonatomic(lve->sent_bitmap, page_idx, &lve->sent_pages);
 	return 1;
 }
 
@@ -472,25 +458,11 @@ static int send_request_page_lazy(struct page_request_entry *req,
 	for (i = 0; i < req->nr_pages; i++) {
 		unsigned long page_vaddr = req->vaddr + (i * PAGE_SIZE);
 		struct lazy_vma_entry *lve;
-		unsigned long page_idx;
 
 		lve = find_lazy_vma_for_addr(page_vaddr, req->dst_id);
 		if (!lve) {
 			pr_err("Request page 0x%lx not in any lazy VMA\n", page_vaddr);
 			return -1;
-		}
-
-		page_idx = (page_vaddr - lve->start) / PAGE_SIZE;
-
-		if (bitmap_test_nonatomic(lve->sent_bitmap, page_idx)) {
-			pr_debug("Request page 0x%lx already sent, skipping\n", page_vaddr);
-			continue;
-		}
-
-		if (lve->cow_bitmap &&
-		    atomic_bitmap_test(lve->cow_bitmap, page_idx)) {
-			pr_err("P2: page 0x%lx is COW, skipping for P1\n", page_vaddr);
-			continue;
 		}
 
 		pr_debug("[SEND_PAGE] Sending #PF req page at vaddr=0x%lx pid=%d\n",
@@ -500,7 +472,6 @@ static int send_request_page_lazy(struct page_request_entry *req,
 		if (ret < 0)
 			return -1;
 
-		bitmap_set_nonatomic(lve->sent_bitmap, page_idx, &lve->sent_pages);
 		sent_count++;
 	}
 
@@ -596,24 +567,12 @@ static int send_single_lazy_page(struct active_image *img,
 {
 	int ret;
 
-	if (bitmap_test_nonatomic(lve->sent_bitmap, page_idx)) {
-		stats->skip_already_sent++;
-		return 0;
-	}
-
-	if (lve->cow_bitmap &&
-	    atomic_bitmap_test(lve->cow_bitmap, page_idx)) {
-		stats->skip_cow_bitmap++;
-		return 0;
-	}
-
 	ret = send_lazy_vma_page(img->main_sk, vaddr, img->dst_id, source_pid);
 	if (ret < 0) {
 		pr_err("Failed to send lazy VMA page at %lx\n", vaddr);
 		return -1;
 	}
 
-	bitmap_set_nonatomic(lve->sent_bitmap, page_idx, &lve->sent_pages);
 	stats->priority3_pages++;
 
 	return 1;

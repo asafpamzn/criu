@@ -15,9 +15,6 @@
  *                                 (b) Single-threaded reader with atomic writers (sent_bitmap pattern)
  *                                     where false negatives are acceptable (idempotent sentinel bits)
  *
- * Typical usage:
- *   cow_bitmap:   Thread 1 sets atomically, Thread 3 tests atomically (full sync)
- *   sent_bitmap:  Thread 3 sets non-atomically, Thread 3 tests non-atomically (same thread)
  *
  * All functions take a byte-array bitmap and a zero-based page index.
  */

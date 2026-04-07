@@ -92,7 +92,6 @@ obj-y			+= cow/page-state-tracker.o
 obj-y			+= cow/unmapped-tracker.o
 obj-y			+= cow/hung-page-tracker.o
 obj-y			+= cow/page-pool.o
-obj-y			+= cow/cow-bitmap.o
 obj-y			+= cow/cow-lazy-pages.o
 obj-y			+= cow/cow-uffd.o
 obj-y			+= cow/cow-bulk-send.o
