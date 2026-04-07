@@ -394,14 +394,29 @@ static void *p3_bulk_sender_thread(void *arg)
 	lazy_vmas = get_global_lazy_vmas();
 
 	/* === Iteration 0: Bulk transfer === */
+	{
+		int vma_count = 0;
+		pr_err("P3[%d]: Starting bulk transfer, scanning lazy_vmas\n", thread_id);
+		list_for_each_entry(lve, lazy_vmas, list) {
+			vma_count++;
+		}
+		pr_err("P3[%d]: Found %d VMAs in lazy_vmas list\n", thread_id, vma_count);
+	}
 	list_for_each_entry(lve, lazy_vmas, list) {
 		unsigned long my_start, my_end;
 		unsigned long vaddr;
+		unsigned long vma_size = lve->end - lve->start;
 
-		if (!get_thread_vma_range(ctx, lve, &my_start, &my_end))
+		pr_err("P3[%d]: Checking VMA %lx-%lx (%lu KB) dst_id=%lu (my dst_id=%lu)\n",
+		       thread_id, lve->start, lve->end, vma_size / 1024,
+		       lve->dst_id, ctx->dst_id);
+
+		if (!get_thread_vma_range(ctx, lve, &my_start, &my_end)) {
+			pr_err("P3[%d]: -> Skipped by get_thread_vma_range\n", thread_id);
 			continue;
+		}
 
-		pr_info("P3[%d]: Bulk VMA %lx-%lx chunk %lx-%lx\n",
+		pr_err("P3[%d]: Bulk VMA %lx-%lx chunk %lx-%lx\n",
 			thread_id,
 			(unsigned long)lve->start, (unsigned long)lve->end,
 			my_start, my_end);
@@ -430,7 +445,7 @@ static void *p3_bulk_sender_thread(void *arg)
 		}
 	}
 
-	pr_info("P3[%d] bulk transfer done: %lu pages, starting dirty scan loop\n",
+	pr_err("P3[%d] bulk transfer done: %lu pages, starting dirty scan loop\n",
 		thread_id, total_sent);
 
 	/* === Iterations 1+: Dirty scan loop until convergence === */
