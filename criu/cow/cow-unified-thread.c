@@ -722,12 +722,28 @@ static void *unified_page_server_thread(void *arg)
 
 			pr_info("Processing image dst_id=%lu\n", img->dst_id);
 
-			list_for_each_entry(lve, get_global_lazy_vmas(), list) {
-				if (lve->dst_id == img->dst_id) {
-					source_pid = lve->source_pid;
-					break;
+			/* Debug: dump all lazy VMAs to understand dst_id matching */
+			{
+				int lve_count = 0;
+				pr_err("DEBUG: Searching lazy_vmas for dst_id=%lu:\n", img->dst_id);
+				list_for_each_entry(lve, get_global_lazy_vmas(), list) {
+					pr_err("  LVE[%d]: dst_id=%lu start=0x%lx end=0x%lx source_pid=%d\n",
+					       lve_count++, lve->dst_id, lve->start, lve->end,
+					       lve->source_pid);
+					if (lve->dst_id == img->dst_id) {
+						source_pid = lve->source_pid;
+						pr_err("  -> MATCH FOUND! source_pid=%d\n", source_pid);
+						break;
+					}
 				}
+				if (lve_count == 0)
+					pr_err("  -> lazy_vmas list is EMPTY!\n");
+				else if (source_pid == 0)
+					pr_err("  -> NO MATCH found for dst_id=%lu\n", img->dst_id);
 			}
+
+			pr_err("DEBUG: source_pid=%d is_convergence_mode=%d\n",
+			       source_pid, is_convergence_mode());
 
 			if (!is_convergence_mode() && source_pid != 0) {
 				int num_threads = cow_get_num_p3_threads();
