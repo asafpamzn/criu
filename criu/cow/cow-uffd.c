@@ -12,6 +12,7 @@
 #include "int.h"
 #include "page.h"
 #include "cow/cow-uffd.h"
+#include "cow/cow-bulk-send.h"
 #include "uffd.h"
 #include "uffd-internal.h"
 #include "page-xfer.h"
@@ -323,6 +324,7 @@ int cow_page_buffer_add(unsigned long vaddr, void *data, int thread_id, bool noc
 	/*
 	 * Server rule: each page is sent only once, unless dirty (re-sent with
 	 * newer data). DIRTY -> IN_BUFFER is valid (dirty page re-sent).
+	 * IN_BUFFER -> IN_BUFFER is valid (dirty page overwrites existing).
 	 * COPIED/DISCARDED -> IN_BUFFER is a bug - server sent duplicate
 	 * non-dirty page.
 	 */
@@ -333,19 +335,43 @@ int cow_page_buffer_add(unsigned long vaddr, void *data, int thread_id, bool noc
 		page_state_print_history(vaddr);
 		BUG();  /* Protocol violation - stop immediately */
 	}
-	/* PAGE_STATE_DIRTY is OK - page being re-sent with newer data */
+	/* PAGE_STATE_DIRTY and PAGE_STATE_IN_BUFFER are OK */
 
 	hash = page_buffer_hash(vaddr);
 	lock_idx = lock_index(hash);
 
+	/*
+	 * First pass: check if page already exists.
+	 * If so, memcpy directly into existing buffer (no allocation).
+	 */
+	pthread_spin_lock(&hash_locks[lock_idx]);
+
+	hlist_for_each_entry(node, &cow_buffer.hash_table[hash], hash) {
+		for (i = 0; i < node->count; i++) {
+			if (node->entries[i].vaddr == vaddr) {
+				/*
+				 * Page exists - memcpy directly into existing buffer.
+				 * No allocation needed, no freeing old data.
+				 */
+				memcpy(node->entries[i].data, data, PAGE_SIZE);
+				page_state_set(vaddr, PAGE_STATE_IN_BUFFER);
+				pthread_spin_unlock(&hash_locks[lock_idx]);
+				pr_debug("COW_TRACE OVERWRITE: 0x%lx\n", vaddr);
+				return 0;
+			}
+		}
+	}
+
+	pthread_spin_unlock(&hash_locks[lock_idx]);
+
+	/*
+	 * Page doesn't exist - now allocate (if not nocopy).
+	 * Allocation is done outside lock for better concurrency.
+	 */
 	if (nocopy) {
 		/* Take ownership of data pointer directly (from page_pool_get_chunk) */
 		page_data = data;
 	} else {
-		/*
-		 * Allocate page data outside lock using per-thread pool.
-		 * All callers must have a valid thread_id with initialized pool.
-		 */
 		if (thread_id < 0) {
 			pr_err("BUG: cow_page_buffer_add called with invalid thread_id %d\n",
 			       thread_id);
@@ -359,22 +385,26 @@ int cow_page_buffer_add(unsigned long vaddr, void *data, int thread_id, bool noc
 		memcpy(page_data, data, PAGE_SIZE);
 	}
 
+	/*
+	 * Second pass: add to existing node or create new one.
+	 * Re-check under lock since state may have changed.
+	 */
 	pthread_spin_lock(&hash_locks[lock_idx]);
-	
-	/* Check for duplicate and find space in existing nodes (cache-friendly) */
+
+	/* Re-check for duplicate (another thread may have added it) */
 	hlist_for_each_entry(node, &cow_buffer.hash_table[hash], hash) {
-		/* Check all entries in this node - contiguous in memory */
 		for (i = 0; i < node->count; i++) {
 			if (node->entries[i].vaddr == vaddr) {
-				/* Update existing entry with newer data */
-				pr_debug("cow_page_buffer_add replacing existing entry vaddr=0x%lx\n", vaddr);
-				page_pool_put(node->entries[i].data);
-				node->entries[i].data = page_data;
+				/* Race: page was added by another thread, overwrite */
+				memcpy(node->entries[i].data, data, PAGE_SIZE);
+				page_state_set(vaddr, PAGE_STATE_IN_BUFFER);
 				pthread_spin_unlock(&hash_locks[lock_idx]);
+				/* Free our allocation since we didn't use it */
+				page_pool_put(page_data);
 				return 0;
 			}
 		}
-		/* If this node has space, add here */
+		/* Found node with space - add new entry */
 		if (node->count < PAGE_NODE_ENTRIES) {
 			node->entries[node->count].vaddr = vaddr;
 			node->entries[node->count].data = page_data;
@@ -402,7 +432,6 @@ int cow_page_buffer_add(unsigned long vaddr, void *data, int thread_id, bool noc
 
 	pthread_spin_lock(&hash_locks[lock_idx]);
 	hlist_add_head(&node->hash, &cow_buffer.hash_table[hash]);
-	/* Track page state while holding lock to prevent race with drain */
 	page_state_set(vaddr, PAGE_STATE_IN_BUFFER);
 	pthread_spin_unlock(&hash_locks[lock_idx]);
 
@@ -1466,18 +1495,26 @@ void *cow_get_prebuffer_buf(void)
  * Pre-buffer callback: Phase 4 dirty pages arrive on main socket.
  * P3 receivers handle Phase 2 bulk pages, but Phase 4 pages flow here.
  * These pages overwrite existing buffered pages (dirty page updates).
+ * Handles batches of pages (compressed transfers send up to 64 pages).
  */
 static int prebuffer_io_complete_internal(unsigned long dst_id, unsigned long vaddr,
 					  unsigned long nr_pages, void *priv)
 {
 	void *data = priv;  /* Points to prebuffer_buf with page data */
+	unsigned long i;
 
-	pr_debug("prebuffer_io_complete: buffering Phase 4 dirty page vaddr=0x%lx\n", vaddr);
+	pr_debug("prebuffer_io_complete: buffering %lu Phase 4 dirty pages at vaddr=0x%lx\n",
+		 nr_pages, vaddr);
 
-	/* Buffer/overwrite using P3 thread 0's pool (P3 threads stopped by Phase 4) */
-	if (cow_page_buffer_add(vaddr, data, PHASE4_POOL_ID, false) < 0) {
-		pr_err("Failed to buffer dirty page at 0x%lx\n", vaddr);
-		return -1;
+	/* Buffer/overwrite each page using P3 thread 0's pool */
+	for (i = 0; i < nr_pages; i++) {
+		unsigned long page_vaddr = vaddr + i * PAGE_SIZE;
+		void *page_data = (char *)data + i * PAGE_SIZE;
+
+		if (cow_page_buffer_add(page_vaddr, page_data, PHASE4_POOL_ID, false) < 0) {
+			pr_err("Failed to buffer dirty page at 0x%lx\n", page_vaddr);
+			return -1;
+		}
 	}
 	return 0;
 }
@@ -1486,7 +1523,11 @@ int cow_setup_prebuffer_reader(void)
 {
 	int ret;
 
-	prebuffer_buf = xmalloc(PAGE_SIZE);
+	/*
+	 * Allocate buffer for batch reception (up to 64 pages = 256KB).
+	 * Compressed batches from P3 senders can contain multiple pages.
+	 */
+	prebuffer_buf = xmalloc(COW_BATCH_SIZE);
 	if (!prebuffer_buf)
 		return -1;
 
@@ -1503,7 +1544,7 @@ int cow_setup_prebuffer_reader(void)
 	}
 
 	ret = page_server_start_async_read_bulk(
-		prebuffer_buf, 1, prebuffer_io_complete_internal, prebuffer_buf);
+		prebuffer_buf, COW_BATCH_PAGES, prebuffer_io_complete_internal, prebuffer_buf);
 
 	return ret;
 }

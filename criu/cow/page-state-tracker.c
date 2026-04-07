@@ -106,7 +106,8 @@ static bool is_valid_transition(enum page_state from, enum page_state to)
 		/* Can transition to any initial state */
 		return true;
 	case PAGE_STATE_IN_BUFFER:
-		return to == PAGE_STATE_PF_PENDING ||
+		return to == PAGE_STATE_IN_BUFFER ||  /* Dirty page update overwrites existing */
+		       to == PAGE_STATE_PF_PENDING ||
 		       to == PAGE_STATE_DRAIN_PENDING ||
 		       to == PAGE_STATE_DIRTY ||
 		       to == PAGE_STATE_DISCARDED ||
