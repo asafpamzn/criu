@@ -1802,30 +1802,6 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 		mdc.stat = &pps_buf;
 		mdc.parent_ie = parent_ie;
 
-		if (opts.cow_dump) {
-			ret = cow_dump_init(item, &vmas, parasite_ctl);
-			gettimeofday(&t_now, NULL);
-			timersub(&t_now, &t_checkpoint, &t_delta);
-			pr_err("TIMING: cow_dump_init took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
-			t_checkpoint = t_now;
-			if (ret) {
-				pr_err("Failed to initialize COW dump for VMAs\n");
-				goto err_cure;
-			}
-
-			/*
-			 * COW tracking applies UFFD write-protect to writable VMAs.
-			 * The parasite itself can fault on protected pages (e.g. rseq/TLS
-			 * writes) while we are still in dump_one_task(), so start monitor
-			 * early to service those faults and avoid deadlock in RPC commands.
-			 */
-			if (opts.lazy_pages && cow_start_monitor_thread()) {
-				pr_err("Failed to start COW monitor thread\n");
-				ret = -1;
-				goto err_cure;
-			}
-		}
-
 		ret = parasite_dump_pages_seized(item, &vmas, &mdc, parasite_ctl);
 		gettimeofday(&t_now, NULL);
 		timersub(&t_now, &t_checkpoint, &t_delta);
@@ -1885,18 +1861,6 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 		goto err_cure;
 	}
 
-	/*
-	 * In COW phased migration Phase 3, pre-create WP_SYNC uffd while
-	 * parasite is still alive. On kernels without /proc/<pid>/userfaultfd,
-	 * Phase 4 needs a uffd created inside the target process via parasite RPC.
-	 */
-	if (cow_is_phased_skeleton_dump()) {
-		ret = cow_precreate_sync_uffd(parasite_ctl);
-		if (ret) {
-			pr_err("Failed to pre-create WP_SYNC uffd (pid: %d)\n", pid);
-			goto err_cure;
-		}
-	}
 
 	ret = compel_stop_daemon(parasite_ctl);
 	gettimeofday(&t_now, NULL);

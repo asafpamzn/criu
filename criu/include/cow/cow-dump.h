@@ -71,25 +71,8 @@ extern void cow_set_dst_id(u64 dst_id);
  */
 extern bool cow_check_kernel_support(void);
 
-/**
- * cow_start_monitor_thread - Start background thread to monitor page faults
- *
- * Creates a pthread that continuously monitors the userfaultfd for
- * write faults and handles them immediately, preventing the target
- * process from blocking during the dump phase.
- *
- * Returns: 0 on success, -1 on error
- */
-extern int cow_start_monitor_thread(void);
 
-/**
- * cow_stop_monitor_thread - Stop the monitoring thread
- *
- * Signals the monitor thread to stop and waits for it to complete.
- *
- * Returns: 0 on success, -1 on error
- */
-extern int cow_stop_monitor_thread(void);
+
 
 /**
  * cow_get_uffd_for_pid - Get the userfaultfd for a tracked source pid
@@ -182,19 +165,6 @@ extern int cow_scan_dirty_pages(unsigned long **dirty_ranges,
 				unsigned int *nr_dirty_ranges,
 				unsigned long *total_dirty_pages);
 
-/**
- * cow_setup_sync_for_dirty - Switch to WP_SYNC mode for dirty pages
- * @dirty_ranges: Array of [start, len] pairs from cow_scan_dirty_pages()
- * @nr_dirty_ranges: Number of ranges
- *
- * Creates a new uffd with WP_SYNC, registers and write-protects only
- * the dirty ranges, and starts the monitor thread for convergence.
- *
- * Returns: 0 on success, -1 on error
- */
-extern int cow_precreate_sync_uffd(struct parasite_ctl *ctl);
-extern int cow_setup_sync_for_dirty(unsigned long *dirty_ranges,
-				    unsigned int nr_dirty_ranges);
 
 /**
  * cow_get_phase - Get the current COW dump phase
