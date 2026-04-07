@@ -228,23 +228,12 @@ int cr_lazy_pages_cow_phase2(bool daemon)
 	pr_err("=== REPLICA PHASE 5: Starting restore ===\n");
 
 	/*
-	 * Phase 3: Dirty bitmap received, skeleton dump is ready.
-	 * Primary closed the socket after sending dirty bitmap.
-	 * Stop P3 receivers and reconnect for convergence phase.
+	 * All pages received, primary closed connection.
+	 * No reconnect needed - serve everything from buffer.
+	 * Remove page server fd from epoll to avoid hangup events.
 	 */
 	stop_p3_receiver_connections();
-	close_page_server_socket();
-
-	/* Small delay for primary to start new page server */
-	usleep(100000);  /* 100ms */
-
-	/* Reconnect to convergence page server */
-	if (connect_to_page_server_to_recv(epollfd)) {
-		pr_warn("Cannot reconnect to page server - will serve from buffer only\n");
-		/* Continue anyway - most pages should be in buffer */
-	} else {
-		pr_info("Reconnected to convergence page server\n");
-	}
+	remove_page_server_from_epoll(epollfd);
 
 	/*
 	 * Now inventory.img and pstree.img exist on disk.
@@ -285,7 +274,7 @@ err_disconnect:
 	/* Verify all pages reached terminal states before cleanup */
 	page_state_verify_all_terminal();
 	page_state_destroy();
-	disconnect_from_page_server();
+	/* Note: page server already closed after all_pages_sent ACK */
 err_epoll:
 	xfree(events);
 err_tasks:

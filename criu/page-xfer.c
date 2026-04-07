@@ -1923,6 +1923,22 @@ int connect_to_page_server_to_recv(int epfd)
 	return epoll_add_rfd(epfd, &ps_rfd);
 }
 
+/*
+ * Remove page server socket from epoll and close it.
+ * Called after all pages are received to prevent hangup events.
+ */
+int remove_page_server_from_epoll(int epfd)
+{
+	if (page_server_sk < 0)
+		return 0;
+
+	pr_info("Removing page server fd=%d from epoll\n", page_server_sk);
+	epoll_del_rfd(epfd, &ps_rfd);
+	close(page_server_sk);
+	page_server_sk = -1;
+	return 0;
+}
+
 int request_remote_pages(unsigned long img_id, unsigned long addr, unsigned long nr_pages)
 {
 	struct page_server_iov pi = {

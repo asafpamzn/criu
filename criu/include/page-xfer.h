@@ -100,6 +100,7 @@ extern int page_xfer_dump_pages(struct page_xfer *, struct page_pipe *);
 extern int page_xfer_predump_pages(int pid, struct page_xfer *, struct page_pipe *);
 extern int connect_to_page_server_to_send(void);
 extern int connect_to_page_server_to_recv(int epfd);
+extern int remove_page_server_from_epoll(int epfd);
 extern int disconnect_from_page_server(void);
 extern void close_page_server_socket(void);
 extern int get_page_server_sk(void);
