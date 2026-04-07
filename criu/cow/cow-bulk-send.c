@@ -386,16 +386,16 @@ static void *p3_bulk_sender_thread(void *arg)
 		unsigned long vaddr;
 		unsigned long vma_size = lve->end - lve->start;
 
-		pr_err("P3[%d]: Checking VMA %lx-%lx (%lu KB) dst_id=%lu (my dst_id=%lu)\n",
+		pr_info("P3[%d]: Checking VMA %lx-%lx (%lu KB) dst_id=%lu (my dst_id=%lu)\n",
 		       thread_id, lve->start, lve->end, vma_size / 1024,
 		       lve->dst_id, ctx->dst_id);
 
 		if (!get_thread_vma_range(ctx, lve, &my_start, &my_end)) {
-			pr_err("P3[%d]: -> Skipped by get_thread_vma_range\n", thread_id);
+			pr_info("P3[%d]: -> Skipped by get_thread_vma_range\n", thread_id);
 			continue;
 		}
 
-		pr_err("P3[%d]: Bulk VMA %lx-%lx chunk %lx-%lx\n",
+		pr_info("P3[%d]: Bulk VMA %lx-%lx chunk %lx-%lx\n",
 			thread_id,
 			(unsigned long)lve->start, (unsigned long)lve->end,
 			my_start, my_end);
