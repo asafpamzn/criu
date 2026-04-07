@@ -2855,7 +2855,7 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 	 * Signal to the replica that skeleton dump is complete.
 	 * restore.sh polls for this marker before starting criu restore.
 	 */
-	pr_info("PHASE 3 SKELETON DUMP COMPLETE\n");
+	pr_err("PHASE 3 SKELETON DUMP COMPLETE\n");
 
 	/*
 	 * Write inventory now so replica can load pstree.
