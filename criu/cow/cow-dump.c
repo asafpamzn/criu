@@ -278,7 +278,6 @@ void cow_set_dst_id(u64 dst_id)
 		g_cow_info->dst_id = dst_id;
 }
 
-static pthread_mutex_t g_monitor_state_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_monitor_eventfd = -1;
 static struct cow_page_queue_entry *g_putback_list = NULL;
 
@@ -440,129 +439,7 @@ static void free_cow_page_entry(struct cow_page_queue_entry *entry)
 	xfree(entry);
 }
 
-int cow_dump_init(struct pstree_item *item, struct vm_area_list *vma_area_list,
-		  struct parasite_ctl *ctl)
-{
-	struct cow_dump_info *cdi = g_cow_info;
-	struct parasite_cow_dump_args *args = NULL;
-	bool created_session = false;
-	int ret;
-	unsigned long args_size;
 
-	pr_info("Initializing COW dump for pid %d\n", item->pid->real);
-
-	if (cdi) {
-		pr_warn("COW tracking already initialized for pid %d, skipping\n",
-			cdi->source_pid);
-		return 0;
-	}
-
-	if (!cow_check_kernel_support()) {
-		pr_err("Kernel doesn't support COW dump\n");
-		return -1;
-	}
-
-	cdi = xzalloc(sizeof(*cdi));
-	if (!cdi)
-		return -1;
-
-	cdi->source_pid = item->pid->real;
-	cdi->dst_id = vpid(item);
-	cdi->uffd = -1;
-	cdi->uffd_async = -1;
-	cdi->uffd_sync = -1;
-	cdi->phase = COW_PHASE_IDLE;
-
-	if (mpsc_init(cdi->page_queue.head, cdi->page_queue.tail,
-		      cdi->page_queue.size, struct cow_page_mpsc_node)) {
-		xfree(cdi);
-		return -1;
-	}
-
-	g_cow_info = cdi;
-	created_session = true;
-
-	if (g_monitor_eventfd >= 0) {
-		close(g_monitor_eventfd);
-		g_monitor_eventfd = -1;
-	}
-	g_monitor_eventfd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
-	if (g_monitor_eventfd < 0) {
-		pr_perror("Failed to create cow monitor eventfd");
-		goto err;
-	}
-
-	if (!ctl) {
-		pr_err("Parasite control required for WP_ASYNC uffd creation\n");
-		goto err;
-	}
-
-	args_size = sizeof(*args);
-	args = compel_parasite_args_s(ctl, args_size);
-	if (!args) {
-		pr_err("Failed to allocate parasite args\n");
-		goto err;
-	}
-
-	args->nr_vmas = 0;
-	args->total_pages = 0;
-	args->nr_failed_vmas = 0;
-	args->uffd_features = UFFD_FEATURE_WP_ASYNC;
-	args->ret = -1;
-
-	ret = compel_rpc_call(PARASITE_CMD_COW_DUMP_INIT, ctl);
-	if (ret < 0) {
-		pr_err("Failed to initiate COW dump RPC\n");
-		goto err;
-	}
-
-	compel_util_recv_fd(ctl, &cdi->uffd);
-	if (cdi->uffd < 0) {
-		pr_err("Failed to receive uffd from parasite: %d\n",
-		       cdi->uffd);
-		goto err;
-	}
-
-	ret = compel_rpc_sync(PARASITE_CMD_COW_DUMP_INIT, ctl);
-	if (ret < 0 || args->ret != 0) {
-		pr_err("Parasite COW dump init failed: %d (ret=%d)\n",
-		       ret, args->ret);
-		goto err;
-	}
-
-	cdi->uffd_async = cdi->uffd;
-	cdi->phase = COW_PHASE_ASYNC_BULK;
-
-	ret = cow_register_vmas(cdi, vma_area_list, &cdi->total_pages);
-	if (ret)
-		goto err;
-
-	if (cow_apply_writeprotect(cdi))
-		goto err;
-
-	pr_info("COW dump initialized for pid %d: tracked=%u pages=%lu uffd=%d\n",
-		item->pid->real, cdi->nr_tracked_vmas,
-		cdi->total_pages, cdi->uffd);
-	return 0;
-
-err:
-	if (created_session) {
-		if (cdi->uffd >= 0)
-			close(cdi->uffd);
-		xfree(cdi->tracked_vmas);
-		if (cdi->page_queue.head) {
-			mpsc_drain(cdi->page_queue.head, free_cow_page_entry);
-			cdi->page_queue.tail = NULL;
-		}
-		xfree(cdi);
-		g_cow_info = NULL;
-		if (g_monitor_eventfd >= 0) {
-			close(g_monitor_eventfd);
-			g_monitor_eventfd = -1;
-		}
-	}
-	return -1;
-}
 
 void cow_dump_fini(void)
 {

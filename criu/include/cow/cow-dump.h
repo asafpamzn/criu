@@ -29,21 +29,7 @@ enum cow_dump_phase {
 	COW_PHASE_DONE,
 };
 
-/**
- * cow_dump_init - Initialize COW dump for a process
- * @item: Process tree item to set up COW tracking for
- * @vma_area_list: List of VMAs to track
- * @ctl: Parasite control structure for RPC (NULL to use /proc/<pid>/userfaultfd)
- *
- * Sets up userfaultfd with write-protection for all writable memory
- * regions of the target process.  When kdat.has_uffd_proc is true the
- * userfaultfd is created via /proc/<pid>/userfaultfd and VMAs are
- * registered directly from CRIU (ctl may be NULL).  Otherwise falls
- * back to parasite RPC.
- *
- * Returns: 0 on success, -1 on error
- */
-extern int cow_dump_init(struct pstree_item *item, struct vm_area_list *vma_area_list, struct parasite_ctl *ctl);
+
 
 /**
  * cow_dump_fini - Clean up COW dump resources
