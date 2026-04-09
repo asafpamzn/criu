@@ -2775,29 +2775,12 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 		}
 
 		if (nr_new_vma_ranges > 0) {
-			unsigned long *merged_ranges = NULL;
-			unsigned int nr_merged = 0;
-
 			pr_info("Found %u new VMA regions since Phase 1\n",
 				nr_new_vma_ranges);
 
-			ret = cow_merge_dirty_ranges(dirty_ranges, nr_dirty_ranges,
-						     new_vma_ranges, nr_new_vma_ranges,
-						     &merged_ranges, &nr_merged);
-			xfree(new_vma_ranges);
-
-			if (ret) {
-				pr_err("Failed to merge dirty ranges\n");
-				goto err;
-			}
-
-			/* Replace dirty_ranges with merged result */
-			xfree(dirty_ranges);
-			dirty_ranges = merged_ranges;
-			nr_dirty_ranges = nr_merged;
-
-			pr_info("After merge: %u total ranges for WP_SYNC\n",
-				nr_dirty_ranges);
+			/* Pass new VMA ranges to P3 threads for sending during final scan */
+			cow_set_new_vma_ranges(new_vma_ranges, nr_new_vma_ranges);
+			/* Don't free - P3 threads will use it */
 		} else {
 			xfree(new_vma_ranges);
 		}
@@ -2973,6 +2956,9 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 		       t_delta.tv_sec, t_delta.tv_usec);
 	}
 	pr_err("P3 threads completed: %lu total pages sent\n", cow_p3_pages_sent());
+
+	/* Free new VMA ranges after P3 threads are done using them */
+	cow_free_new_vma_ranges();
 
 	/* Unfreeze process - dirty pages already sent by P3 threads */
 	{

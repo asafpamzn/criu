@@ -72,4 +72,16 @@ void cow_signal_last_scan(void);
  */
 bool cow_is_last_scan_signaled(void);
 
+/*
+ * Set new VMA ranges detected in Phase 3 for P3 threads to send.
+ * ranges: array of [start, len, start, len, ...] pairs
+ * nr_ranges: number of ranges
+ */
+void cow_set_new_vma_ranges(unsigned long *ranges, unsigned int nr_ranges);
+
+/*
+ * Free new VMA ranges after P3 threads complete.
+ */
+void cow_free_new_vma_ranges(void);
+
 #endif /* __CR_COW_BULK_SEND_H__ */

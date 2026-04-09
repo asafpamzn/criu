@@ -79,6 +79,26 @@ static unsigned long p3_total_pages_sent = 0;
 /* Global flag for signaling last scan (set by main thread after freeze) */
 static volatile bool g_last_scan_flag = false;
 
+/* New VMA ranges detected in Phase 3 - set by main thread before last scan */
+static unsigned long *g_new_vma_ranges = NULL;  /* [start, len, start, len, ...] */
+static unsigned int g_nr_new_vma_ranges = 0;
+
+void cow_set_new_vma_ranges(unsigned long *ranges, unsigned int nr_ranges)
+{
+	g_new_vma_ranges = ranges;
+	g_nr_new_vma_ranges = nr_ranges;
+	pr_info("Set %u new VMA ranges for P3 threads to send\n", nr_ranges);
+}
+
+void cow_free_new_vma_ranges(void)
+{
+	if (g_new_vma_ranges) {
+		xfree(g_new_vma_ranges);
+		g_new_vma_ranges = NULL;
+		g_nr_new_vma_ranges = 0;
+	}
+}
+
 /*
  * Send a batch of pages with LZ4 compression.
  * Protocol: header (PS_IOV_ADD_F_COMPRESS) + compressed_size + compressed_data
@@ -335,6 +355,89 @@ out:
 }
 
 /*
+ * Send all pages from new VMAs detected in Phase 3.
+ * New VMAs need ALL their pages sent (not just dirty), split among threads.
+ */
+static unsigned long send_new_vma_pages(struct p3_thread_ctx *ctx)
+{
+	unsigned int i;
+	unsigned long total_sent = 0;
+	unsigned int ranges_per_thread, my_start_idx, my_end_idx;
+	void *buffer;
+	struct iovec local_iov, remote_iov;
+	int thread_id = ctx->thread_id;
+
+	if (!g_new_vma_ranges || g_nr_new_vma_ranges == 0)
+		return 0;
+
+	/* Split ranges among threads */
+	ranges_per_thread = (g_nr_new_vma_ranges + NUM_P3_THREADS - 1) / NUM_P3_THREADS;
+	my_start_idx = thread_id * ranges_per_thread;
+	my_end_idx = my_start_idx + ranges_per_thread;
+	if (my_end_idx > g_nr_new_vma_ranges)
+		my_end_idx = g_nr_new_vma_ranges;
+
+	if (my_start_idx >= g_nr_new_vma_ranges)
+		return 0;  /* No ranges for this thread */
+
+	pr_info("P3[%d] sending new VMA pages: ranges %u-%u of %u\n",
+		thread_id, my_start_idx, my_end_idx, g_nr_new_vma_ranges);
+
+	buffer = xmalloc(COW_BATCH_PAGES * PAGE_SIZE);
+	if (!buffer)
+		return 0;
+
+	for (i = my_start_idx; i < my_end_idx; i++) {
+		unsigned long start = g_new_vma_ranges[i * 2];
+		unsigned long len = g_new_vma_ranges[i * 2 + 1];
+		unsigned long vaddr;
+
+		pr_debug("P3[%d] new VMA %lx-%lx (%lu pages)\n",
+			 thread_id, start, start + len, len / PAGE_SIZE);
+
+		for (vaddr = start; vaddr < start + len; ) {
+			int batch_pages = (start + len - vaddr) / PAGE_SIZE;
+			int ret;
+
+			if (batch_pages > COW_BATCH_PAGES)
+				batch_pages = COW_BATCH_PAGES;
+
+			/* Read pages from source process */
+			local_iov.iov_base = buffer;
+			local_iov.iov_len = batch_pages * PAGE_SIZE;
+			remote_iov.iov_base = (void *)vaddr;
+			remote_iov.iov_len = batch_pages * PAGE_SIZE;
+
+			ret = process_vm_readv(ctx->source_pid, &local_iov, 1,
+					       &remote_iov, 1, 0);
+			if (ret != (ssize_t)(batch_pages * PAGE_SIZE)) {
+				pr_warn("P3[%d] failed to read new VMA pages at %lx: %s\n",
+					thread_id, vaddr, strerror(errno));
+				vaddr += batch_pages * PAGE_SIZE;
+				continue;
+			}
+
+			/* Send compressed batch */
+			ret = send_pages_batch_compressed(ctx->socket, buffer,
+							  batch_pages, ctx->dst_id, vaddr);
+			if (ret < 0) {
+				pr_err("P3[%d] failed to send new VMA pages at %lx\n",
+				       thread_id, vaddr);
+				break;
+			}
+
+			total_sent += batch_pages;
+			ctx->pages_sent += batch_pages;
+			vaddr += batch_pages * PAGE_SIZE;
+		}
+	}
+
+	xfree(buffer);
+	pr_info("P3[%d] sent %lu pages from new VMAs\n", thread_id, total_sent);
+	return total_sent;
+}
+
+/*
  * P3 bulk sender thread - sends regular pages in batches.
  * Each thread handles 1/NUM_P3_THREADS of each VMA's address range.
  * After bulk transfer, transitions to iterative dirty scanning until convergence.
@@ -452,16 +555,21 @@ static void *p3_bulk_sender_thread(void *arg)
 	{
 		struct timespec fs_start, fs_end;
 		long fs_elapsed_ms;
+		unsigned long new_vma_pages = 0;
 
 		clock_gettime(CLOCK_MONOTONIC, &fs_start);
 		pr_err("P3[%d] final scan (frozen) iter=%u\n", thread_id, ctx->iteration);
 		ctx->last_dirty_count = do_dirty_scan_and_send(ctx);
+
+		/* Also send pages from new VMAs detected in Phase 3 */
+		new_vma_pages = send_new_vma_pages(ctx);
+
 		clock_gettime(CLOCK_MONOTONIC, &fs_end);
 
 		fs_elapsed_ms = (fs_end.tv_sec - fs_start.tv_sec) * 1000 +
 				(fs_end.tv_nsec - fs_start.tv_nsec) / 1000000;
-		pr_err("P3[%d] final scan done: %lu dirty pages, TIMING: %ld ms\n",
-		       thread_id, ctx->last_dirty_count, fs_elapsed_ms);
+		pr_err("P3[%d] final scan done: %lu dirty + %lu new VMA pages, TIMING: %ld ms\n",
+		       thread_id, ctx->last_dirty_count, new_vma_pages, fs_elapsed_ms);
 	}
 
 out:
