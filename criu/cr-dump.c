@@ -2530,8 +2530,6 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 	InventoryEntry he = INVENTORY_ENTRY__INIT;
 	InventoryEntry *parent_ie = NULL;
 	struct pstree_item *item;
-	unsigned long *dirty_ranges = NULL;
-	unsigned int nr_dirty_ranges = 0;
 	struct timeval freeze_start, freeze_end, freeze_delta;
 	int ret;
 	int exit_code = -1;
@@ -2713,10 +2711,7 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 	/* Signal P3 threads to do final scan (process is now frozen) */
 	cow_signal_last_scan();
 
-	/*
-	 * P3 threads do dirty scanning - no need for cow_scan_dirty_pages here.
-	 * nr_dirty_ranges starts at 0, used only for merging with new VMAs.
-	 */
+	/* P3 threads do dirty scanning - no need for cow_scan_dirty_pages here. */
 
 	/*
 	 * Collect pstree IDs now so vpid(item) is valid for the VMA detection.
@@ -3008,7 +3003,6 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 
 	close_page_server_socket();
 	cow_set_phase(COW_PHASE_DONE);
-	xfree(dirty_ranges);
 	exit_code = 0;
 	goto finish;
 
@@ -3023,7 +3017,6 @@ err_refreeze:
 err:
 	if (parent_ie)
 		inventory_entry__free_unpacked(parent_ie, NULL);
-	xfree(dirty_ranges);
 
 finish:
 	return cr_dump_finish(exit_code);
