@@ -861,7 +861,13 @@ static void *background_drain_worker(void *arg)
 
 	/* Decrement active thread count */
 	if (atomic_fetch_sub(&drain_threads_active, 1) == 1) {
-		/* Last thread to exit - log final stats */
+		/*
+		 * Last thread to exit. Add full memory barrier to ensure all
+		 * UFFDIO_COPY writes are visible before signaling drain complete.
+		 * This is critical on ARM where memory ordering is weaker.
+		 */
+		atomic_thread_fence(memory_order_seq_cst);
+
 		pr_err("DRAIN_PROGRESS: ALL_DONE total=%lu applied=%lu discarded=%lu eagain=%lu remaining=%lu\n",
 		       atomic_load(&total_drained), cow_buffer.nr_applied,
 		       cow_buffer.nr_discarded, cow_buffer.nr_eagain, cow_buffer.nr_pages);
