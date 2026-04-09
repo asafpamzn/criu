@@ -1259,6 +1259,12 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 
 	lp_debug(lpi, "#PF at 0x%llx\n", address);
 
+	/* Debug: detect page faults during drain */
+	if (cow_drain_thread_running()) {
+		pr_err("PAGE_FAULT_DURING_DRAIN: vaddr=0x%llx pid=%d\n",
+		       address, lpi->pid);
+	}
+
 	/* COW mode: handle full page fault flow */
 	if (opts.cow_dump)
 		return cow_handle_page_fault_full(lpi, address, uffd_zero, uffd_handle_pages);

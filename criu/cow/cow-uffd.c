@@ -209,10 +209,17 @@ static int cow_uffd_copy_and_track(int uffd, unsigned long vaddr, void *data,
 				   const char *caller,
 				   bool *data_owned)
 {
+	static atomic_ulong copy_log_count = 0;
 	enum cow_copy_result res;
 
 	if (data_owned)
 		*data_owned = false;
+
+	/* Debug: sample UFFDIO_COPY addresses every 1M copies */
+	if (atomic_fetch_add(&copy_log_count, 1) % 1000000 == 0) {
+		pr_err("DRAIN_COPY_SAMPLE: vaddr=0x%lx uffd=%d caller=%s count=%lu\n",
+		       vaddr, uffd, caller, atomic_load(&copy_log_count));
+	}
 
 	res = cow_uffd_copy_pages(uffd, vaddr, data, nr_pages, NULL);
 
