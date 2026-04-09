@@ -1156,12 +1156,42 @@ int cow_merge_dirty_ranges(unsigned long *dirty_ranges, unsigned int nr_dirty,
 void cow_cleanup_async_uffd(void)
 {
 	struct cow_dump_info *cdi = g_cow_info;
+	struct uffdio_range range;
+	unsigned int i;
+	int ret;
 
 	if (!cdi)
 		return;
 
+	/*
+	 * Unregister VMAs in chunks with yields between each.
+	 * This spreads the kernel page-table walk time and allows
+	 * the target process to make progress between chunks.
+	 */
+	if (cdi->uffd >= 0 && cdi->tracked_vmas && cdi->nr_tracked_vmas > 0) {
+		pr_info("Unregistering %u VMAs from uffd fd=%d (chunked)\n",
+			cdi->nr_tracked_vmas, cdi->uffd);
+
+		for (i = 0; i < cdi->nr_tracked_vmas; i++) {
+			range.start = cdi->tracked_vmas[i].start;
+			range.len = cdi->tracked_vmas[i].end - cdi->tracked_vmas[i].start;
+
+			ret = ioctl(cdi->uffd, UFFDIO_UNREGISTER, &range);
+			if (ret < 0 && errno != EINVAL) {
+				/* EINVAL = already unregistered, ignore */
+				pr_debug("UFFDIO_UNREGISTER %lx-%lx failed: %s\n",
+					 range.start, range.start + range.len,
+					 strerror(errno));
+			}
+
+			/* Yield to let target process run between chunks */
+			if ((i + 1) % 10 == 0)
+				usleep(1000);  /* 1ms every 10 VMAs */
+		}
+	}
+
 	if (cdi->uffd >= 0) {
-		pr_info("Closing async uffd fd=%d (skipping unregister)\n", cdi->uffd);
+		pr_info("Closing async uffd fd=%d\n", cdi->uffd);
 		close(cdi->uffd);
 		cdi->uffd = -1;
 	}
