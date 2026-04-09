@@ -574,7 +574,7 @@ void cow_page_buffer_destroy(void)
 
 	/* Stop drain thread first */
 	cow_stop_drain_thread();
-
+	pr_warn("file = %s, line = %d\n",__FILE__, __LINE__);
 	/* Lock all buckets and destroy contents */
 	for (i = 0; i < PAGE_BUFFER_HASH_SIZE; i++) {
 		int lock_idx = lock_index(i);
@@ -588,16 +588,16 @@ void cow_page_buffer_destroy(void)
 		}
 		pthread_spin_unlock(&hash_locks[lock_idx]);
 	}
-
+	pr_warn("file = %s, line = %d\n",__FILE__, __LINE__);
 	xfree(cow_buffer.hash_table);
 	cow_buffer.hash_table = NULL;
 	cow_buffer.initialized = false;
-
+	pr_warn("file = %s, line = %d\n",__FILE__, __LINE__);
 	/* Destroy all fine-grained locks */
 	for (i = 0; i < NUM_HASH_LOCKS; i++)
 		pthread_spin_destroy(&hash_locks[i]);
 	pthread_spin_destroy(&counter_lock);
-
+	pr_warn("file = %s, line = %d\n",__FILE__, __LINE__);
 	pr_warn("COW page buffer destroyed: applied=%lu discarded=%lu max_bucket=%lu\n",
 		cow_buffer.nr_applied, cow_buffer.nr_discarded,
 		cow_buffer.max_bucket_depth);
