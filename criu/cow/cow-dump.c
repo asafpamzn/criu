@@ -1180,7 +1180,8 @@ void cow_cleanup_async_uffd(void)
 			if (ret < 0 && errno != EINVAL) {
 				/* EINVAL = already unregistered, ignore */
 				pr_debug("UFFDIO_UNREGISTER %lx-%lx failed: %s\n",
-					 range.start, range.start + range.len,
+					 (unsigned long)range.start,
+					 (unsigned long)(range.start + range.len),
 					 strerror(errno));
 			}
 
