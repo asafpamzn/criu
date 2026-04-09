@@ -744,6 +744,11 @@ static void *background_drain_worker(void *arg)
 	int thread_id = args->thread_id;
 	int start_bucket = args->start_bucket;
 	int end_bucket = args->end_bucket;
+	char thread_name[16];
+
+	/* Set thread name for debugging (max 15 chars + null) */
+	snprintf(thread_name, sizeof(thread_name), "cow-drain-%d", thread_id);
+	pthread_setname_np(pthread_self(), thread_name);
 
 	pr_info("Drain worker %d started: buckets [%d, %d) (%lu pages buffered)\n",
 		thread_id, start_bucket, end_bucket, cow_buffer.nr_pages);
