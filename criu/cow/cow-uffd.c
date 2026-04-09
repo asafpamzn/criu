@@ -215,10 +215,13 @@ static int cow_uffd_copy_and_track(int uffd, unsigned long vaddr, void *data,
 	if (data_owned)
 		*data_owned = false;
 
-	/* Debug: sample UFFDIO_COPY addresses every 1M copies */
+	/* Debug: sample UFFDIO_COPY addresses and data every 1M copies */
 	if (atomic_fetch_add(&copy_log_count, 1) % 1000000 == 0) {
-		pr_err("DRAIN_COPY_SAMPLE: vaddr=0x%lx uffd=%d caller=%s count=%lu\n",
-		       vaddr, uffd, caller, atomic_load(&copy_log_count));
+		unsigned long *p = (unsigned long *)data;
+		unsigned long first8 = p[0];
+		unsigned long is_zeros = (p[0] == 0 && p[1] == 0 && p[2] == 0 && p[3] == 0);
+		pr_err("DRAIN_COPY_SAMPLE: vaddr=0x%lx uffd=%d caller=%s count=%lu first8=0x%lx zeros=%lu\n",
+		       vaddr, uffd, caller, atomic_load(&copy_log_count), first8, is_zeros);
 	}
 
 	res = cow_uffd_copy_pages(uffd, vaddr, data, nr_pages, NULL);

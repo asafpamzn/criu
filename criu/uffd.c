@@ -1763,7 +1763,16 @@ int cow_phase3_restore_loop(int ep_fd, struct epoll_event **events, int nr_fds)
 	}
 
 	pr_warn("Drain complete, buffer empty\n");
-	sleep(1000);
+
+	/*
+	 * DEBUG: Add small delay after drain completes to test timing hypothesis.
+	 * If this fixes the crash, the issue is a race between drain completion
+	 * and process unfreeze (e.g., TLB flush, kernel page table updates).
+	 */
+	pr_warn("DEBUG: Sleeping 100ms after drain to test timing...\n");
+	usleep(100000);  /* 100ms */
+	pr_warn("DEBUG: Sleep done, sending signal\n");
+
 	/*
 	 * Signal restore that drain is complete and it's safe to unfreeze.
 	 * Restore is waiting in lazy_pages_finish_restore() for this signal.
@@ -1775,11 +1784,6 @@ int cow_phase3_restore_loop(int ep_fd, struct epoll_event **events, int nr_fds)
 		else
 			pr_warn("COW Phase 3: Sent drain complete signal to restore\n");
 	}
-	pr_warn("file = %s, line = %d\n",__FILE__, __LINE__);
-
-	sleep(100000);
-	pr_warn("file = %s, line = %d\n",__FILE__, __LINE__);
-
 	return 0;
 }
 
