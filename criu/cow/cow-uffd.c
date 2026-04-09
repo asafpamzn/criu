@@ -1555,28 +1555,17 @@ int cow_get_uffd_for_vaddr(struct list_head *lpis, unsigned long vaddr)
 	struct lazy_pages_info *lpi;
 	pthread_t self = pthread_self();
 	unsigned long count = atomic_fetch_add(&call_count, 1);
-	bool should_log = (count % 1000 == 0);  /* Log every 1000 calls */
-
-	if (should_log)
-		pr_warn("RACE_DEBUG: [%lu] cow_get_uffd_for_vaddr ENTER #%lu vaddr=0x%lx\n",
-			(unsigned long)self, count, vaddr);
 
 	list_for_each_entry(lpi, lpis, l) {
-		if (should_log)
-			pr_warn("RACE_DEBUG: [%lu] checking lpi=%p exited=%d fd=%d\n",
-				(unsigned long)self, lpi, lpi->exited, lpi->lpfd.fd);
+		
 		if (lpi->exited || lpi->lpfd.fd < 0)
 			continue;
 		if (cow_find_iov(lpi, vaddr)) {
-			if (should_log)
-				pr_warn("RACE_DEBUG: [%lu] cow_get_uffd_for_vaddr EXIT fd=%d\n",
-					(unsigned long)self, lpi->lpfd.fd);
+			
 			return lpi->lpfd.fd;
 		}
 	}
-	if (should_log)
-		pr_warn("RACE_DEBUG: [%lu] cow_get_uffd_for_vaddr EXIT fd=-1\n",
-			(unsigned long)self);
+	
 	return -1;
 }
 
