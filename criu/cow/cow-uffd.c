@@ -741,6 +741,8 @@ static void *background_drain_worker(void *arg)
 	struct hlist_node *tmp;
 	int bucket;
 	unsigned long drained = 0;
+	unsigned long last_progress_drained = 0;
+	time_t last_progress_time = 0;
 	int thread_id = args->thread_id;
 	int start_bucket = args->start_bucket;
 	int end_bucket = args->end_bucket;
@@ -750,8 +752,9 @@ static void *background_drain_worker(void *arg)
 	snprintf(thread_name, sizeof(thread_name), "cow-drain-%d", thread_id);
 	pthread_setname_np(pthread_self(), thread_name);
 
-	pr_info("Drain worker %d started: buckets [%d, %d) (%lu pages buffered)\n",
-		thread_id, start_bucket, end_bucket, cow_buffer.nr_pages);
+	pr_err("DRAIN_PROGRESS: thread=%d STARTED buckets=[%d,%d) buffered=%lu\n",
+	       thread_id, start_bucket, end_bucket, cow_buffer.nr_pages);
+	last_progress_time = time(NULL);
 
 	while (!atomic_load(&drain_thread_stop) && cow_buffer.nr_pages > 0) {
 		bool made_progress = false;
@@ -795,8 +798,17 @@ static void *background_drain_worker(void *arg)
 									     NULL, drain_lpis,
 									     COW_TRACK_STRICT,
 									     "DRAIN", &data_owned);
-						if (ret > 0)
+						if (ret > 0) {
 							drained++;
+							/* Log progress every 100k pages or 10 seconds */
+							if (drained - last_progress_drained >= 100000 ||
+							    time(NULL) - last_progress_time >= 10) {
+								pr_err("DRAIN_PROGRESS: thread=%d drained=%lu remaining=%lu\n",
+								       thread_id, drained, cow_buffer.nr_pages);
+								last_progress_drained = drained;
+								last_progress_time = time(NULL);
+							}
+						}
 						if (data_owned)
 							free_data = false;
 					} else {
@@ -838,14 +850,14 @@ static void *background_drain_worker(void *arg)
 	/* Update global statistics */
 	atomic_fetch_add(&total_drained, drained);
 
-	pr_info("Drain worker %d done: %lu drained\n", thread_id, drained);
+	pr_err("DRAIN_PROGRESS: thread=%d FINISHED drained=%lu\n", thread_id, drained);
 
 	/* Decrement active thread count */
 	if (atomic_fetch_sub(&drain_threads_active, 1) == 1) {
 		/* Last thread to exit - log final stats */
-		pr_info("All drain workers done: total=%lu applied=%lu discarded=%lu eagain=%lu\n",
-			atomic_load(&total_drained), cow_buffer.nr_applied,
-			cow_buffer.nr_discarded, cow_buffer.nr_eagain);
+		pr_err("DRAIN_PROGRESS: ALL_DONE total=%lu applied=%lu discarded=%lu eagain=%lu remaining=%lu\n",
+		       atomic_load(&total_drained), cow_buffer.nr_applied,
+		       cow_buffer.nr_discarded, cow_buffer.nr_eagain, cow_buffer.nr_pages);
 	}
 
 	return NULL;
@@ -891,8 +903,8 @@ int cow_start_drain_thread(struct list_head *lpis)
 		return -1;
 	}
 
-	pr_info("Started %d/%d drain threads (%lu pages buffered)\n",
-		created, NUM_DRAIN_THREADS, cow_buffer.nr_pages);
+	pr_err("DRAIN_PROGRESS: STARTING %d/%d drain threads, buffered=%lu\n",
+	       created, NUM_DRAIN_THREADS, cow_buffer.nr_pages);
 
 	return 0;
 }
