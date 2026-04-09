@@ -1,4 +1,5 @@
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <pthread.h>
 #include <errno.h>
 #include <unistd.h>
@@ -81,10 +82,24 @@ static inline int lock_index(unsigned int hash)
 	return hash / BUCKETS_PER_LOCK;
 }
 
-static pthread_t drain_thread;
-static volatile bool drain_thread_stop = false;
-static volatile bool drain_thread_active = false;
+/*
+ * Multithreaded drain configuration.
+ * Each thread handles a range of hash buckets for parallel draining.
+ */
+#define NUM_DRAIN_THREADS 10
+
+struct drain_thread_args {
+	int thread_id;
+	int start_bucket;
+	int end_bucket;
+};
+
+static pthread_t drain_threads[NUM_DRAIN_THREADS];
+static struct drain_thread_args drain_args[NUM_DRAIN_THREADS];
+static atomic_bool drain_thread_stop = false;
+static atomic_int drain_threads_active = 0;
 static struct list_head *drain_lpis = NULL;  /* lpis list for EAGAIN handling */
+static atomic_ulong total_drained = 0;  /* Total pages drained across all threads */
 
 static inline unsigned int page_buffer_hash(unsigned long vaddr)
 {
@@ -710,28 +725,42 @@ void cow_page_buffer_readd(unsigned long vaddr, void *data)
 }
 
 /*
- * Background drain thread - proactively UFFDIO_COPY pages
+ * Background drain worker thread - proactively UFFDIO_COPY pages
  * from buffer to reduce future page faults and free memory.
+ *
+ * Each worker handles a subset of hash buckets for parallel draining.
+ * Thread safety is ensured by:
+ *   - Fine-grained hash bucket locks (hash_locks[])
+ *   - Atomic counters for shared statistics
+ *   - Thread-safe page_state and pf_tracker APIs
  */
-static void *background_drain_thread(void *arg)
+static void *background_drain_worker(void *arg)
 {
+	struct drain_thread_args *args = (struct drain_thread_args *)arg;
 	struct page_buffer_node *node;
 	struct hlist_node *tmp;
 	int bucket;
 	unsigned long drained = 0;
+	int thread_id = args->thread_id;
+	int start_bucket = args->start_bucket;
+	int end_bucket = args->end_bucket;
 
-	pr_info("Background drain thread started (%lu pages buffered)\n",
-		cow_buffer.nr_pages);
+	pr_info("Drain worker %d started: buckets [%d, %d) (%lu pages buffered)\n",
+		thread_id, start_bucket, end_bucket, cow_buffer.nr_pages);
 
-	while (!drain_thread_stop && cow_buffer.nr_pages > 0) {
-		for (bucket = 0; bucket < PAGE_BUFFER_HASH_SIZE && !drain_thread_stop; bucket++) {
+	while (!atomic_load(&drain_thread_stop) && cow_buffer.nr_pages > 0) {
+		bool made_progress = false;
+
+		for (bucket = start_bucket;
+		     bucket < end_bucket && !atomic_load(&drain_thread_stop);
+		     bucket++) {
 			int lock_idx = lock_index(bucket);
 
 			pthread_spin_lock(&hash_locks[lock_idx]);
 			hlist_for_each_entry_safe(node, tmp,
 						  &cow_buffer.hash_table[bucket], hash) {
 				/* Process all entries in this node */
-				while (node->count > 0 && !drain_thread_stop) {
+				while (node->count > 0 && !atomic_load(&drain_thread_stop)) {
 					/* Take last entry (avoids moving data) */
 					int idx = node->count - 1;
 					unsigned long vaddr = node->entries[idx].vaddr;
@@ -740,11 +769,13 @@ static void *background_drain_thread(void *arg)
 					bool free_data = true;
 
 					node->count--;
+					made_progress = true;
 
 					/* Track: removed from buffer, about to copy */
 					page_state_set(vaddr, PAGE_STATE_DRAIN_PENDING);
 
-					pr_debug("COW_TRACE DRAIN_REMOVE: 0x%lx (remaining=%lu)\n", vaddr, cow_buffer.nr_pages);
+					pr_debug("COW_TRACE DRAIN[%d]: 0x%lx (remaining=%lu)\n",
+						 thread_id, vaddr, cow_buffer.nr_pages);
 
 					pthread_spin_unlock(&hash_locks[lock_idx]);
 					__sync_fetch_and_sub(&cow_buffer.nr_pages, 1);
@@ -765,7 +796,8 @@ static void *background_drain_thread(void *arg)
 							free_data = false;
 					} else {
 						__sync_fetch_and_add(&cow_buffer.nr_discarded, 1);
-						pr_err("COW_TRACE DRAIN: 0x%lx no uffd found\n", vaddr);
+						pr_err("COW_TRACE DRAIN[%d]: 0x%lx no uffd found\n",
+						       thread_id, vaddr);
 						page_state_print_history(vaddr);
 						if (!unmapped_tracker_is_unmapped(vaddr) &&
 						    page_state_get(vaddr) != PAGE_STATE_DIRTY)
@@ -786,50 +818,104 @@ static void *background_drain_thread(void *arg)
 			}
 			pthread_spin_unlock(&hash_locks[lock_idx]);
 		}
+
+		/*
+		 * If no progress made in this pass and buffer not empty,
+		 * yield to let other threads or page receivers work.
+		 * This prevents busy-spinning when pages are being added
+		 * to buckets outside our range.
+		 */
+		if (!made_progress && cow_buffer.nr_pages > 0) {
+			usleep(100);  /* 100us yield */
+		}
 	}
 
-	pr_info("Drain thread done: %lu drained, %lu applied, %lu discarded, %lu eagain\n",
-		drained, cow_buffer.nr_applied, cow_buffer.nr_discarded,
-		cow_buffer.nr_eagain);
+	/* Update global statistics */
+	atomic_fetch_add(&total_drained, drained);
 
-	drain_thread_active = false;
+	pr_info("Drain worker %d done: %lu drained\n", thread_id, drained);
+
+	/* Decrement active thread count */
+	if (atomic_fetch_sub(&drain_threads_active, 1) == 1) {
+		/* Last thread to exit - log final stats */
+		pr_info("All drain workers done: total=%lu applied=%lu discarded=%lu eagain=%lu\n",
+			atomic_load(&total_drained), cow_buffer.nr_applied,
+			cow_buffer.nr_discarded, cow_buffer.nr_eagain);
+	}
+
 	return NULL;
 }
 
 int cow_start_drain_thread(struct list_head *lpis)
 {
-	if (drain_thread_active)
+	int i;
+	int buckets_per_thread;
+	int created = 0;
+
+	if (atomic_load(&drain_threads_active) > 0)
 		return 0;
 
 	if (cow_buffer.nr_pages == 0)
 		return 0;
 
 	drain_lpis = lpis;  /* Store for EAGAIN handling */
-	drain_thread_stop = false;
-	drain_thread_active = true;
+	atomic_store(&drain_thread_stop, false);
+	atomic_store(&total_drained, 0);
 
-	if (pthread_create(&drain_thread, NULL, background_drain_thread, NULL)) {
-		pr_perror("Failed to create drain thread");
-		drain_thread_active = false;
+	/* Divide buckets evenly among threads */
+	buckets_per_thread = PAGE_BUFFER_HASH_SIZE / NUM_DRAIN_THREADS;
+
+	for (i = 0; i < NUM_DRAIN_THREADS; i++) {
+		drain_args[i].thread_id = i;
+		drain_args[i].start_bucket = i * buckets_per_thread;
+		drain_args[i].end_bucket = (i == NUM_DRAIN_THREADS - 1)
+			? PAGE_BUFFER_HASH_SIZE
+			: (i + 1) * buckets_per_thread;
+
+		if (pthread_create(&drain_threads[i], NULL,
+				   background_drain_worker, &drain_args[i])) {
+			pr_perror("Failed to create drain thread %d", i);
+			continue;
+		}
+		atomic_fetch_add(&drain_threads_active, 1);
+		created++;
+	}
+
+	if (created == 0) {
+		pr_err("Failed to create any drain threads\n");
 		return -1;
 	}
+
+	pr_info("Started %d/%d drain threads (%lu pages buffered)\n",
+		created, NUM_DRAIN_THREADS, cow_buffer.nr_pages);
 
 	return 0;
 }
 
 void cow_stop_drain_thread(void)
 {
-	if (!drain_thread_active)
+	int i;
+
+	if (atomic_load(&drain_threads_active) == 0)
 		return;
 
-	drain_thread_stop = true;
-	pthread_join(drain_thread, NULL);
-	drain_thread_active = false;
+	atomic_store(&drain_thread_stop, true);
+
+	/* Join all threads */
+	for (i = 0; i < NUM_DRAIN_THREADS; i++) {
+		if (drain_threads[i]) {
+			pthread_join(drain_threads[i], NULL);
+			drain_threads[i] = 0;
+		}
+	}
+
+	/* Reset state for potential restart */
+	atomic_store(&drain_threads_active, 0);
 }
 
 bool cow_drain_thread_running(void)
 {
-	return drain_thread_active;
+	return atomic_load(&drain_threads_active) > 0;
 }
 
 /*
