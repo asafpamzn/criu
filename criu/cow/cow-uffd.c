@@ -379,7 +379,7 @@ int cow_page_buffer_add(unsigned long vaddr, void *data, int thread_id, bool noc
 				 * No allocation needed, no freeing old data.
 				 */
 				memcpy(node->entries[i].data, data, PAGE_SIZE);
-				page_state_set(vaddr, PAGE_STATE_IN_BUFFER);
+				page_state_set_with_crc(vaddr, PAGE_STATE_IN_BUFFER, data);
 				pthread_spin_unlock(&hash_locks[lock_idx]);
 				pr_debug("COW_TRACE OVERWRITE: 0x%lx\n", vaddr);
 				return 0;
@@ -422,7 +422,7 @@ int cow_page_buffer_add(unsigned long vaddr, void *data, int thread_id, bool noc
 			if (node->entries[i].vaddr == vaddr) {
 				/* Race: page was added by another thread, overwrite */
 				memcpy(node->entries[i].data, data, PAGE_SIZE);
-				page_state_set(vaddr, PAGE_STATE_IN_BUFFER);
+				page_state_set_with_crc(vaddr, PAGE_STATE_IN_BUFFER, data);
 				pthread_spin_unlock(&hash_locks[lock_idx]);
 				/* Free our allocation since we didn't use it */
 				page_pool_put(page_data);
@@ -434,7 +434,7 @@ int cow_page_buffer_add(unsigned long vaddr, void *data, int thread_id, bool noc
 			node->entries[node->count].vaddr = vaddr;
 			node->entries[node->count].data = page_data;
 			node->count++;
-			page_state_set(vaddr, PAGE_STATE_IN_BUFFER);
+			page_state_set_with_crc(vaddr, PAGE_STATE_IN_BUFFER, page_data);
 			pthread_spin_unlock(&hash_locks[lock_idx]);
 			__sync_fetch_and_add(&cow_buffer.nr_pages, 1);
 			return 0;
@@ -457,7 +457,7 @@ int cow_page_buffer_add(unsigned long vaddr, void *data, int thread_id, bool noc
 
 	pthread_spin_lock(&hash_locks[lock_idx]);
 	hlist_add_head(&node->hash, &cow_buffer.hash_table[hash]);
-	page_state_set(vaddr, PAGE_STATE_IN_BUFFER);
+	page_state_set_with_crc(vaddr, PAGE_STATE_IN_BUFFER, page_data);
 	pthread_spin_unlock(&hash_locks[lock_idx]);
 
 	__sync_fetch_and_add(&cow_buffer.nr_pages, 1);
@@ -803,6 +803,15 @@ static void *background_drain_worker(void *arg)
 					if (uffd >= 0) {
 						bool data_owned = false;
 						int ret;
+						u32 stored_crc;
+
+						/* Check CRC before copy to detect dirty page races */
+						if (!page_state_check_crc(vaddr, data, &stored_crc)) {
+							u32 buf_count = page_state_get_buffer_count(vaddr);
+							pr_err("DRAIN_CRC_MISMATCH: 0x%lx buffer_count=%u "
+							       "- data changed between buffer and copy!\n",
+							       vaddr, buf_count);
+						}
 
 						ret = cow_uffd_copy_and_track(uffd, vaddr, data, 1,
 									     NULL, drain_lpis,

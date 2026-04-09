@@ -49,6 +49,20 @@ extern void page_state_mark_dirty_ranges(unsigned long *ranges, unsigned int nr_
 /* Verify all pages reached terminal states (COPIED, DISCARDED, UNMAPPED) - BUGs if not */
 extern int page_state_verify_all_terminal(void);
 
+/* CRC tracking for debugging dirty page races */
+/* Set state with CRC - call when adding to buffer */
+extern int page_state_set_with_crc(unsigned long vaddr, enum page_state new_state,
+				   const void *data);
+
+/* Check CRC before copy - returns true if match or no previous CRC */
+extern bool page_state_check_crc(unsigned long vaddr, const void *data, u32 *stored_crc);
+
+/* Get buffer count (how many times page was buffered) */
+extern u32 page_state_get_buffer_count(unsigned long vaddr);
+
+/* Get stored CRC for a page */
+extern u32 page_state_get_crc(unsigned long vaddr);
+
 #else /* !CONFIG_PAGE_STATE_TRACKER */
 
 static inline int page_state_init(void) { return 0; }
@@ -85,6 +99,31 @@ static inline void page_state_mark_dirty_ranges(unsigned long *ranges, unsigned 
 	(void)nr_ranges;
 }
 static inline int page_state_verify_all_terminal(void) { return 0; }
+static inline int page_state_set_with_crc(unsigned long vaddr, enum page_state new_state,
+					  const void *data)
+{
+	(void)vaddr;
+	(void)new_state;
+	(void)data;
+	return 0;
+}
+static inline bool page_state_check_crc(unsigned long vaddr, const void *data, u32 *stored_crc)
+{
+	(void)vaddr;
+	(void)data;
+	(void)stored_crc;
+	return true;
+}
+static inline u32 page_state_get_buffer_count(unsigned long vaddr)
+{
+	(void)vaddr;
+	return 0;
+}
+static inline u32 page_state_get_crc(unsigned long vaddr)
+{
+	(void)vaddr;
+	return 0;
+}
 
 #endif /* CONFIG_PAGE_STATE_TRACKER */
 

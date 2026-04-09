@@ -44,6 +44,9 @@ struct page_state_entry {
 	/* History of state changes */
 	struct page_state_history history[PAGE_STATE_HISTORY_SIZE];
 	int history_count;
+	/* CRC tracking for debugging dirty page races */
+	u32 last_crc;           /* CRC of page data when last buffered */
+	u32 buffer_count;       /* How many times page was buffered */
 };
 
 struct page_state_bucket {
@@ -84,6 +87,25 @@ const char *page_state_name(enum page_state state)
 static inline unsigned int page_state_hash(unsigned long vaddr)
 {
 	return (vaddr >> PAGE_SHIFT) & (PAGE_STATE_HASH_SIZE - 1);
+}
+
+/*
+ * Simple CRC32 for page data verification.
+ * Used to detect dirty page races during debugging.
+ */
+static u32 simple_crc32(const void *data, size_t len)
+{
+	const u8 *p = data;
+	u32 crc = 0xFFFFFFFF;
+	size_t i;
+	int j;
+
+	for (i = 0; i < len; i++) {
+		crc ^= p[i];
+		for (j = 0; j < 8; j++)
+			crc = (crc >> 1) ^ (0xEDB88320 & -(crc & 1));
+	}
+	return ~crc;
 }
 
 /*
@@ -346,6 +368,8 @@ int page_state_set(unsigned long vaddr, enum page_state new_state)
 		entry->state = new_state;
 		entry->last_change = now;
 		entry->history_count = 0;
+		entry->last_crc = 0;
+		entry->buffer_count = 0;
 		INIT_HLIST_NODE(&entry->hash);
 
 		/* Add initial state to history */
@@ -604,6 +628,156 @@ int page_state_verify_all_terminal(void)
 	pr_info("Page state verification passed: all %lu pages in terminal states\n",
 		g_page_state.total_pages);
 	return 0;
+}
+
+/*
+ * Set page state with CRC tracking.
+ * Call when adding page to buffer to track data fingerprint.
+ * Logs if page data changed (dirty page arrived).
+ */
+int page_state_set_with_crc(unsigned long vaddr, enum page_state new_state,
+			    const void *data)
+{
+	struct page_state_entry *entry;
+	struct page_state_bucket *bucket;
+	unsigned int hash;
+	u32 new_crc;
+
+	if (!g_page_state.initialized)
+		return -1;
+
+	new_crc = simple_crc32(data, PAGE_SIZE);
+
+	hash = page_state_hash(vaddr);
+	bucket = &g_page_state.buckets[hash];
+
+	pthread_spin_lock(&bucket->lock);
+
+	entry = page_state_find_in_bucket(bucket, vaddr);
+	if (entry) {
+		u32 old_crc = entry->last_crc;
+		u32 old_count = entry->buffer_count;
+
+		entry->buffer_count++;
+
+		/* Detect dirty page overwrites */
+		if (old_crc != 0 && old_crc != new_crc) {
+			pr_err("PAGE_CRC_CHANGE: 0x%lx old_crc=0x%08x new_crc=0x%08x "
+			       "buffer_count=%u->%u state=%s (dirty page arrived)\n",
+			       vaddr, old_crc, new_crc, old_count, entry->buffer_count,
+			       page_state_name(entry->state));
+		} else if (old_crc != 0 && old_crc == new_crc && old_count > 0) {
+			pr_err("PAGE_CRC_SAME: 0x%lx crc=0x%08x buffer_count=%u->%u "
+			       "state=%s (same data re-buffered)\n",
+			       vaddr, new_crc, old_count, entry->buffer_count,
+			       page_state_name(entry->state));
+		}
+
+		entry->last_crc = new_crc;
+	}
+
+	pthread_spin_unlock(&bucket->lock);
+
+	/* Call regular page_state_set for state transition */
+	return page_state_set(vaddr, new_state);
+}
+
+/*
+ * Check if CRC matches stored value before UFFDIO_COPY.
+ * Returns true if CRC matches or no stored CRC.
+ * Returns false if mismatch (dirty page race detected).
+ * Stores the previous CRC in *stored_crc if not NULL.
+ */
+bool page_state_check_crc(unsigned long vaddr, const void *data, u32 *stored_crc)
+{
+	struct page_state_entry *entry;
+	struct page_state_bucket *bucket;
+	unsigned int hash;
+	u32 current_crc, saved_crc = 0;
+	bool match = true;
+
+	if (!g_page_state.initialized)
+		return true;
+
+	current_crc = simple_crc32(data, PAGE_SIZE);
+
+	hash = page_state_hash(vaddr);
+	bucket = &g_page_state.buckets[hash];
+
+	pthread_spin_lock(&bucket->lock);
+
+	entry = page_state_find_in_bucket(bucket, vaddr);
+	if (entry && entry->last_crc != 0) {
+		saved_crc = entry->last_crc;
+		if (saved_crc != current_crc) {
+			pr_err("CRC_MISMATCH_AT_COPY: 0x%lx stored=0x%08x current=0x%08x "
+			       "buffer_count=%u state=%s - DATA CHANGED!\n",
+			       vaddr, saved_crc, current_crc, entry->buffer_count,
+			       page_state_name(entry->state));
+			match = false;
+		}
+	}
+
+	pthread_spin_unlock(&bucket->lock);
+
+	if (stored_crc)
+		*stored_crc = saved_crc;
+
+	return match;
+}
+
+/*
+ * Get the buffer count for a page (how many times it was buffered).
+ */
+u32 page_state_get_buffer_count(unsigned long vaddr)
+{
+	struct page_state_entry *entry;
+	struct page_state_bucket *bucket;
+	unsigned int hash;
+	u32 count = 0;
+
+	if (!g_page_state.initialized)
+		return 0;
+
+	hash = page_state_hash(vaddr);
+	bucket = &g_page_state.buckets[hash];
+
+	pthread_spin_lock(&bucket->lock);
+
+	entry = page_state_find_in_bucket(bucket, vaddr);
+	if (entry)
+		count = entry->buffer_count;
+
+	pthread_spin_unlock(&bucket->lock);
+
+	return count;
+}
+
+/*
+ * Get stored CRC for a page.
+ */
+u32 page_state_get_crc(unsigned long vaddr)
+{
+	struct page_state_entry *entry;
+	struct page_state_bucket *bucket;
+	unsigned int hash;
+	u32 crc = 0;
+
+	if (!g_page_state.initialized)
+		return 0;
+
+	hash = page_state_hash(vaddr);
+	bucket = &g_page_state.buckets[hash];
+
+	pthread_spin_lock(&bucket->lock);
+
+	entry = page_state_find_in_bucket(bucket, vaddr);
+	if (entry)
+		crc = entry->last_crc;
+
+	pthread_spin_unlock(&bucket->lock);
+
+	return crc;
 }
 
 void page_state_destroy(void)
