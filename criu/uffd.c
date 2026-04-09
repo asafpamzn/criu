@@ -1743,7 +1743,7 @@ int cow_phase3_restore_loop(int ep_fd, struct epoll_event **events, int nr_fds)
 		}
 	}
 
-	pr_info("Restore connected, waiting for drain to complete (%lu pages)\n",
+	pr_warn("Restore connected, waiting for drain to complete (%lu pages)\n",
 		cow_page_buffer_count());
 
 	/* Wait for drain thread to finish copying all pages */
@@ -1756,7 +1756,7 @@ int cow_phase3_restore_loop(int ep_fd, struct epoll_event **events, int nr_fds)
 		}
 	}
 
-	pr_info("Drain complete, buffer empty\n");
+	pr_warn("Drain complete, buffer empty\n");
 
 	/*
 	 * Signal restore that drain is complete and it's safe to unfreeze.
@@ -1767,7 +1767,7 @@ int cow_phase3_restore_loop(int ep_fd, struct epoll_event **events, int nr_fds)
 		if (send(lazy_sk_rfd.fd, &drain_complete, sizeof(drain_complete), 0) != sizeof(drain_complete))
 			pr_perror("Failed to send drain complete signal");
 		else
-			pr_info("Sent drain complete signal to restore\n");
+			pr_warn("COW Phase 3: Sent drain complete signal to restore\n");
 	}
 
 	return 0;
@@ -1787,8 +1787,12 @@ int cr_lazy_pages(bool daemon)
 	 * COW Phase 2: No inventory/pstree yet, just buffer pages.
 	 * Use separate code path with minimal dependencies.
 	 */
-	if (opts.cow_dump && opts.use_page_server)
-		return cr_lazy_pages_cow_phase2(daemon);
+	if (opts.cow_dump && opts.use_page_server){
+
+		ret = cr_lazy_pages_cow_phase2(daemon);
+		pr_warn("file = %s, line = %d\n",__FILE__, __LINE__);
+		return ret;
+	}
 
 	if (prepare_dummy_pstree())
 		return -1;

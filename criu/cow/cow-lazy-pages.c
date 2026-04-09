@@ -266,11 +266,13 @@ int cr_lazy_pages_cow_phase2(bool daemon)
 	ret = cow_phase3_restore_loop(epollfd, &events, nr_fds);
 	if (ret < 0)
 		pr_err("Phase 3 restore loop failed\n");
-
+	pr_warn("file = %s, line = %d\n",__FILE__, __LINE__);
 err_disconnect:
 	/* Print page state statistics and cleanup */
 	stop_p3_receiver_connections();
+	pr_warn("file = %s, line = %d\n",__FILE__, __LINE__);
 	pf_tracker_destroy();
+	pr_warn("file = %s, line = %d\n",__FILE__, __LINE__);
 	/* Verify all pages reached terminal states before cleanup */
 	page_state_verify_all_terminal();
 	page_state_destroy();
@@ -279,6 +281,7 @@ err_epoll:
 	xfree(events);
 err_tasks:
 	free_cow_tasks();
+	pr_warn("file = %s, line = %d\n",__FILE__, __LINE__);
 	return ret;
 }
 
