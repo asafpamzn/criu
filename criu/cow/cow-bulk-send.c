@@ -87,6 +87,7 @@ void cow_set_new_vma_ranges(unsigned long *ranges, unsigned int nr_ranges)
 {
 	g_new_vma_ranges = ranges;
 	g_nr_new_vma_ranges = nr_ranges;
+	__sync_synchronize();  /* Memory barrier for ARM */
 	pr_info("Set %u new VMA ranges for P3 threads to send\n", nr_ranges);
 }
 
@@ -397,7 +398,7 @@ static unsigned long send_new_vma_pages(struct p3_thread_ctx *ctx)
 
 		for (vaddr = start; vaddr < start + len; ) {
 			int batch_pages = (start + len - vaddr) / PAGE_SIZE;
-			int ret;
+			ssize_t ret;
 
 			if (batch_pages > COW_BATCH_PAGES)
 				batch_pages = COW_BATCH_PAGES;
@@ -421,9 +422,10 @@ static unsigned long send_new_vma_pages(struct p3_thread_ctx *ctx)
 			ret = send_pages_batch_compressed(ctx->socket, buffer,
 							  batch_pages, ctx->dst_id, vaddr);
 			if (ret < 0) {
-				pr_err("P3[%d] failed to send new VMA pages at %lx\n",
+				pr_err("P3[%d] failed to send new VMA pages at %lx, aborting\n",
 				       thread_id, vaddr);
-				break;
+				xfree(buffer);
+				return total_sent;  /* Abort - socket is likely broken */
 			}
 
 			total_sent += batch_pages;
