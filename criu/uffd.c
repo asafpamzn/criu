@@ -1763,7 +1763,7 @@ int cow_phase3_restore_loop(int ep_fd, struct epoll_event **events, int nr_fds)
 	}
 
 	pr_warn("Drain complete, buffer empty\n");
-
+	sleep(1000);
 	/*
 	 * Signal restore that drain is complete and it's safe to unfreeze.
 	 * Restore is waiting in lazy_pages_finish_restore() for this signal.
