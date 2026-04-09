@@ -1551,10 +1551,8 @@ void cow_set_all_pages_sent_received(void)
 /* Return uffd for a given vaddr (for background drain thread) */
 int cow_get_uffd_for_vaddr(struct list_head *lpis, unsigned long vaddr)
 {
-	static atomic_ulong call_count = 0;
 	struct lazy_pages_info *lpi;
 	pthread_t self = pthread_self();
-	unsigned long count = atomic_fetch_add(&call_count, 1);
 
 	list_for_each_entry(lpi, lpis, l) {
 		
