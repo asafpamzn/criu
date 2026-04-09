@@ -984,11 +984,16 @@ int cow_handle_exit(struct list_head *lpis)
 #endif
 
 	/* Cleanup all lpis */
+	pr_err("RACE_DEBUG: [MAIN] cow_handle_exit CLEANUP START - drain_active=%d\n",
+	       atomic_load(&drain_threads_active));
 	list_for_each_entry_safe(lpi, n, lpis, l) {
+		pr_err("RACE_DEBUG: [MAIN] list_del lpi=%p BEFORE\n", lpi);
 		lazy_pages_summary(lpi);
 		list_del(&lpi->l);
+		pr_err("RACE_DEBUG: [MAIN] list_del lpi=%p AFTER - calling lpi_put\n", lpi);
 		lpi_put(lpi);
 	}
+	pr_err("RACE_DEBUG: [MAIN] cow_handle_exit CLEANUP DONE\n");
 
 	return 1;  /* Exit main loop */
 }
@@ -1534,14 +1539,32 @@ void cow_set_all_pages_sent_received(void)
 /* Return uffd for a given vaddr (for background drain thread) */
 int cow_get_uffd_for_vaddr(struct list_head *lpis, unsigned long vaddr)
 {
+	static atomic_ulong call_count = 0;
 	struct lazy_pages_info *lpi;
+	pthread_t self = pthread_self();
+	unsigned long count = atomic_fetch_add(&call_count, 1);
+	bool should_log = (count % 1000 == 0);  /* Log every 1000 calls */
+
+	if (should_log)
+		pr_warn("RACE_DEBUG: [%lu] cow_get_uffd_for_vaddr ENTER #%lu vaddr=0x%lx\n",
+			(unsigned long)self, count, vaddr);
 
 	list_for_each_entry(lpi, lpis, l) {
+		if (should_log)
+			pr_warn("RACE_DEBUG: [%lu] checking lpi=%p exited=%d fd=%d\n",
+				(unsigned long)self, lpi, lpi->exited, lpi->lpfd.fd);
 		if (lpi->exited || lpi->lpfd.fd < 0)
 			continue;
-		if (cow_find_iov(lpi, vaddr))
+		if (cow_find_iov(lpi, vaddr)) {
+			if (should_log)
+				pr_warn("RACE_DEBUG: [%lu] cow_get_uffd_for_vaddr EXIT fd=%d\n",
+					(unsigned long)self, lpi->lpfd.fd);
 			return lpi->lpfd.fd;
+		}
 	}
+	if (should_log)
+		pr_warn("RACE_DEBUG: [%lu] cow_get_uffd_for_vaddr EXIT fd=-1\n",
+			(unsigned long)self);
 	return -1;
 }
 

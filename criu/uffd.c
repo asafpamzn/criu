@@ -794,17 +794,21 @@ out:
 
 static int handle_exit(struct lazy_pages_info *lpi)
 {
-	lp_err(lpi, "handle_exit EXIT lpi!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
+	lp_err(lpi, "RACE_DEBUG: [MAIN] handle_exit ENTER lpi=%p fd=%d\n", lpi, lpi->lpfd.fd);
 	if (epoll_del_rfd(epollfd, &lpi->lpfd))
 		return -1;
 	free_iovs(lpi);
+	lp_err(lpi, "RACE_DEBUG: [MAIN] handle_exit closing fd=%d\n", lpi->lpfd.fd);
 	close(lpi->lpfd.fd);
 	lpi->lpfd.fd = -lpi->lpfd.fd;
+	lp_err(lpi, "RACE_DEBUG: [MAIN] handle_exit setting exited=true lpi=%p\n", lpi);
 	lpi->exited = true;
 
 	/* keep it for tracking in-flight requests and for the summary */
+	lp_err(lpi, "RACE_DEBUG: [MAIN] handle_exit list_move_tail lpi=%p\n", lpi);
 	list_move_tail(&lpi->l, &lpis);
 
+	lp_err(lpi, "RACE_DEBUG: [MAIN] handle_exit EXIT lpi=%p\n", lpi);
 	return 0;
 }
 
