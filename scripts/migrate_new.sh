@@ -59,7 +59,7 @@ sudo "$CRIU_BIN" dump \
   --ext-unix-sk \
   --leave-running \
   --display-stats \
-  -v2 -o "$IMAGES_DIR/lazy-primary.log"
+  -v3 -o "$IMAGES_DIR/lazy-primary.log"
 
 # Step 5: Wait for replica master_link_status:up
 echo "Step 5: Waiting for replica master_link_status:up..."
