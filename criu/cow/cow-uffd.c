@@ -1552,7 +1552,6 @@ void cow_set_all_pages_sent_received(void)
 int cow_get_uffd_for_vaddr(struct list_head *lpis, unsigned long vaddr)
 {
 	struct lazy_pages_info *lpi;
-	pthread_t self = pthread_self();
 
 	list_for_each_entry(lpi, lpis, l) {
 		
