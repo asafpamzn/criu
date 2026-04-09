@@ -65,7 +65,7 @@ sudo "$CRIU_BIN" dump \
 echo "Step 5: Waiting for replica master_link_status:up..."
 REPLICA_PORT="${REPLICA_PORT:-6379}"
 START_TIME=$(date +%s%3N)
-for i in $(seq 1 120); do
+for i in $(seq 1 30); do
   STATUS=$($SSH ubuntu@$REPLICA_SSH_HOST "valkey-cli -p $REPLICA_PORT info replication 2>/dev/null | grep master_link_status" || true)
   if [[ "$STATUS" == *"master_link_status:up"* ]]; then
     END_TIME=$(date +%s%3N)
