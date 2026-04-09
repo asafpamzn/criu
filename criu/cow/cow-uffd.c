@@ -263,11 +263,11 @@ static int cow_uffd_copy_and_track(int uffd, unsigned long vaddr, void *data,
 	case COW_COPY_EAGAIN:
 		if (flags & COW_TRACK_RETRY) {
 			/* Retry mode - return -EAGAIN, don't queue */
-			pr_debug("COW_TRACE %s: 0x%lx EAGAIN (retry mode)\n", caller, vaddr);
+			pr_err("COW_TRACE %s: 0x%lx EAGAIN (retry mode)\n", caller, vaddr);
 			return -EAGAIN;
 		}
 		__sync_fetch_and_add(&cow_buffer.nr_eagain, 1);
-		pr_debug("COW_TRACE %s: 0x%lx EAGAIN, queuing for retry\n", caller, vaddr);
+		pr_err("COW_TRACE %s: 0x%lx EAGAIN, queuing for retry\n", caller, vaddr);
 		if (lpis) {
 			/* Drain mode - use drain EAGAIN queue */
 			if (cow_queue_drain_eagain_request(lpis, vaddr, data) == 0) {
