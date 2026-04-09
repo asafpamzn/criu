@@ -2708,9 +2708,6 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 		goto err;
 	}
 
-	/* Signal P3 threads to do final scan (process is now frozen) */
-	cow_signal_last_scan();
-
 	/* P3 threads do dirty scanning - no need for cow_scan_dirty_pages here. */
 
 	/*
@@ -2780,6 +2777,12 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 			xfree(new_vma_ranges);
 		}
 	}
+
+	/*
+	 * Signal P3 threads to do final scan (process is frozen, new VMA ranges set).
+	 * Must be after cow_set_new_vma_ranges() so threads can send new VMA pages.
+	 */
+	cow_signal_last_scan();
 
 	{
 		struct timeval t_start, t_end, t_delta;
