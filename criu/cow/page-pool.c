@@ -272,5 +272,5 @@ void page_pool_destroy_all(void)
 		pools[i].next_page = 0;
 	}
 
-	pr_info("All page pools destroyed\n");
+	pr_warn("All page pools destroyed\n");
 }

@@ -598,7 +598,7 @@ void cow_page_buffer_destroy(void)
 		pthread_spin_destroy(&hash_locks[i]);
 	pthread_spin_destroy(&counter_lock);
 
-	pr_info("COW page buffer destroyed: applied=%lu discarded=%lu max_bucket=%lu\n",
+	pr_warn("COW page buffer destroyed: applied=%lu discarded=%lu max_bucket=%lu\n",
 		cow_buffer.nr_applied, cow_buffer.nr_discarded,
 		cow_buffer.max_bucket_depth);
 
