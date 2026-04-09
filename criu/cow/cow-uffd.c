@@ -86,7 +86,7 @@ static inline int lock_index(unsigned int hash)
  * Multithreaded drain configuration.
  * Each thread handles a range of hash buckets for parallel draining.
  */
-#define NUM_DRAIN_THREADS 10
+#define NUM_DRAIN_THREADS 1
 
 struct drain_thread_args {
 	int thread_id;
