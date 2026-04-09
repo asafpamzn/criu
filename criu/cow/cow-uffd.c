@@ -86,7 +86,7 @@ static inline int lock_index(unsigned int hash)
  * Multithreaded drain configuration.
  * Each thread handles a range of hash buckets for parallel draining.
  */
-#define NUM_DRAIN_THREADS 1
+#define NUM_DRAIN_THREADS 10
 
 struct drain_thread_args {
 	int thread_id;
@@ -100,6 +100,9 @@ static atomic_bool drain_thread_stop = false;
 static atomic_int drain_threads_active = 0;
 static struct list_head *drain_lpis = NULL;  /* lpis list for EAGAIN handling */
 static atomic_ulong total_drained = 0;  /* Total pages drained across all threads */
+
+/* Mutex to serialize UFFDIO_COPY calls - debugging concurrent access race */
+static pthread_mutex_t uffd_copy_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static inline unsigned int page_buffer_hash(unsigned long vaddr)
 {
@@ -140,9 +143,17 @@ static enum cow_copy_result cow_uffd_copy_pages(int uffd, unsigned long dst,
 		.mode = 0,
 		.copy = 0,
 	};
+	int ioctl_ret;
+	int saved_errno;
 
-	if (ioctl(uffd, UFFDIO_COPY, &uffd_copy) < 0) {
-		switch (errno) {
+	/* Serialize UFFDIO_COPY calls to debug concurrent access race */
+	pthread_mutex_lock(&uffd_copy_mutex);
+	ioctl_ret = ioctl(uffd, UFFDIO_COPY, &uffd_copy);
+	saved_errno = errno;
+	pthread_mutex_unlock(&uffd_copy_mutex);
+
+	if (ioctl_ret < 0) {
+		switch (saved_errno) {
 		case EAGAIN:
 			return COW_COPY_EAGAIN;
 		case EEXIST:
@@ -150,6 +161,7 @@ static enum cow_copy_result cow_uffd_copy_pages(int uffd, unsigned long dst,
 		case ENOENT:
 			return COW_COPY_ENOENT;
 		default:
+			errno = saved_errno;
 			return COW_COPY_ERROR;
 		}
 	}
