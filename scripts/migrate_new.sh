@@ -60,3 +60,24 @@ sudo "$CRIU_BIN" dump \
   --leave-running \
   --display-stats \
   -v2 -o "$IMAGES_DIR/lazy-primary.log"
+
+# Step 5: Wait for replica master_link_status:up
+echo "Step 5: Waiting for replica master_link_status:up..."
+REPLICA_PORT="${REPLICA_PORT:-6379}"
+START_TIME=$(date +%s%3N)
+for i in $(seq 1 120); do
+  STATUS=$($SSH ubuntu@$REPLICA_SSH_HOST "valkey-cli -p $REPLICA_PORT info replication 2>/dev/null | grep master_link_status" || true)
+  if [[ "$STATUS" == *"master_link_status:up"* ]]; then
+    END_TIME=$(date +%s%3N)
+    ELAPSED=$((END_TIME - START_TIME))
+    echo "Replica master_link_status:up after ${ELAPSED}ms"
+    break
+  fi
+  sleep 0.5
+done
+
+if [[ "$STATUS" != *"master_link_status:up"* ]]; then
+  echo "WARNING: master_link_status:up not reached within 60s"
+fi
+
+echo "Migration complete"
