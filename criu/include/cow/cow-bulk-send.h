@@ -2,9 +2,40 @@
 #define __CR_COW_BULK_SEND_H__
 
 #include "int.h"
+#include "cow/spsc-queue.h"
 
 #define COW_BATCH_PAGES 64
 #define COW_BATCH_SIZE  (COW_BATCH_PAGES * PAGE_SIZE)  /* 256KB */
+
+/* Convergence threshold: freeze when scanner finds < 1M dirty pages */
+#define DIRTY_SCAN_FREEZE_THRESHOLD 1000000
+
+/*
+ * Dirty region entry - passed from scanner thread to sender threads via SPSC queue.
+ * Each entry represents a contiguous range of dirty pages to be transferred.
+ */
+struct dirty_region_entry {
+	unsigned long start;      /* Start address of dirty region */
+	unsigned long end;        /* End address of dirty region */
+	u64 dst_id;               /* Destination image ID */
+	pid_t source_pid;         /* Source process PID */
+};
+
+/* SPSC queue node for dirty regions */
+DECLARE_SPSC_NODE(dirty_region, struct dirty_region_entry);
+
+/*
+ * Per-sender-thread queue for receiving dirty regions from scanner.
+ * Cache-line padded to avoid false sharing.
+ */
+struct sender_queue {
+	struct dirty_region_spsc_node *head;
+	char _pad1[64 - sizeof(struct dirty_region_spsc_node *)];
+	struct dirty_region_spsc_node *tail;
+	char _pad2[64 - sizeof(struct dirty_region_spsc_node *)];
+	unsigned long size;
+	char _pad3[64 - sizeof(unsigned long)];
+};
 
 /*
  * Send a batch of pages with LZ4 compression.
@@ -17,8 +48,41 @@ int send_pages_batch_compressed(int sk, const void *data,
 /* Number of parallel P3 threads for bulk transfer + dirty scan */
 #define NUM_P3_THREADS 20
 
-/* Dirty page convergence threshold (per-thread) */
+/* Dirty page convergence threshold (per-thread) - legacy, replaced by DIRTY_SCAN_FREEZE_THRESHOLD */
 #define DIRTY_CONVERGENCE_THRESHOLD 50000
+
+/*
+ * Initialize sender queues (one per thread).
+ * Returns 0 on success, -1 on error.
+ */
+int cow_init_sender_queues(void);
+
+/*
+ * Start the dirty scanner thread.
+ * Scanner scans all VMAs and distributes dirty regions to sender queues.
+ * Returns 0 on success, -1 on error.
+ */
+int cow_start_scanner_thread(pid_t source_pid);
+
+/*
+ * Signal scanner to do final scan and exit.
+ */
+void cow_signal_scanner_freeze(void);
+
+/*
+ * Wait for scanner thread to complete.
+ */
+void cow_wait_scanner_thread(void);
+
+/*
+ * Check if scanner has completed (for senders to know when to exit).
+ */
+bool cow_is_scan_complete(void);
+
+/*
+ * Get sender queue for a thread.
+ */
+struct sender_queue *cow_get_sender_queue(int thread_id);
 
 /*
  * Start multiple P3 bulk sender threads (up to 20 threads for parallel transfer).

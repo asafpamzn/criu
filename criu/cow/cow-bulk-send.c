@@ -83,6 +83,297 @@ static volatile bool g_last_scan_flag = false;
 static unsigned long *g_new_vma_ranges = NULL;  /* [start, len, start, len, ...] */
 static unsigned int g_nr_new_vma_ranges = 0;
 
+/*
+ * Single Scanner + Multiple Senders Architecture
+ * ===============================================
+ * Scanner thread does all PAGEMAP_SCAN (single TLB flush per iteration)
+ * and distributes dirty regions to sender threads via SPSC queues.
+ */
+static struct sender_queue sender_queues[NUM_P3_THREADS];
+static volatile bool g_scan_complete = false;
+static volatile bool g_scanner_freeze_signal = false;
+static pthread_t scanner_thread_handle;
+static pid_t g_scanner_source_pid;
+static int g_scanner_pagemap_fd = -1;
+
+int cow_init_sender_queues(void)
+{
+	int i;
+
+	for (i = 0; i < NUM_P3_THREADS; i++) {
+		if (spsc_init(sender_queues[i].head, sender_queues[i].tail,
+			      sender_queues[i].size,
+			      struct dirty_region_spsc_node)) {
+			pr_err("Failed to init sender queue %d\n", i);
+			return -1;
+		}
+	}
+	g_scan_complete = false;
+	g_scanner_freeze_signal = false;
+	pr_info("Initialized %d sender queues\n", NUM_P3_THREADS);
+	return 0;
+}
+
+struct sender_queue *cow_get_sender_queue(int thread_id)
+{
+	if (thread_id < 0 || thread_id >= NUM_P3_THREADS)
+		return NULL;
+	return &sender_queues[thread_id];
+}
+
+bool cow_is_scan_complete(void)
+{
+	return __atomic_load_n(&g_scan_complete, __ATOMIC_ACQUIRE);
+}
+
+void cow_signal_scanner_freeze(void)
+{
+	pr_err("=== SCANNER: Signaling freeze ===\n");
+	__atomic_store_n(&g_scanner_freeze_signal, true, __ATOMIC_RELEASE);
+	__sync_synchronize();
+}
+
+static void free_dirty_region_entry(struct dirty_region_entry *entry)
+{
+	xfree(entry);
+}
+
+/*
+ * Scanner thread - single thread does all PAGEMAP_SCAN to minimize TLB flushes.
+ * Distributes dirty regions to sender threads via SPSC queues (round-robin).
+ */
+static void *dirty_scanner_thread(void *arg)
+{
+	struct list_head *lazy_vmas;
+	struct lazy_vma_entry *lve;
+	struct page_region *regs;
+	const int max_regs = 1000;
+	unsigned int iteration = 0;
+	char pagemap_path[64];
+	struct timespec t_start, t_end;
+
+	pr_err("Scanner thread started, source_pid=%d\n", g_scanner_source_pid);
+	clock_gettime(CLOCK_MONOTONIC, &t_start);
+
+	/* Open pagemap fd */
+	snprintf(pagemap_path, sizeof(pagemap_path), "/proc/%d/pagemap",
+		 g_scanner_source_pid);
+	g_scanner_pagemap_fd = open(pagemap_path, O_RDWR);
+	if (g_scanner_pagemap_fd < 0) {
+		pr_perror("Scanner: cannot open %s", pagemap_path);
+		goto out;
+	}
+
+	regs = xmalloc(max_regs * sizeof(struct page_region));
+	if (!regs) {
+		pr_err("Scanner: failed to allocate regs buffer\n");
+		goto out_close;
+	}
+
+	lazy_vmas = get_global_lazy_vmas();
+
+	/* Iterative dirty scanning until freeze signal */
+	while (!__atomic_load_n(&g_scanner_freeze_signal, __ATOMIC_ACQUIRE)) {
+		unsigned long total_dirty_pages = 0;
+		unsigned int queue_idx = 0;
+		struct timespec iter_start, iter_end;
+
+		iteration++;
+		clock_gettime(CLOCK_MONOTONIC, &iter_start);
+
+		/* Scan ALL VMAs in single pass */
+		list_for_each_entry(lve, lazy_vmas, list) {
+			struct pm_scan_arg args;
+			long regs_len;
+
+			memset(&args, 0, sizeof(args));
+			args.size = sizeof(args);
+			args.flags = PM_SCAN_WP_MATCHING;  /* Clear dirty bit after scan */
+			args.start = lve->start;
+			args.end = lve->end;
+			args.walk_end = lve->start;
+			args.vec = (u64)(unsigned long)regs;
+			args.vec_len = max_regs;
+			args.max_pages = 0;
+			args.category_anyof_mask = PAGE_IS_WRITTEN;
+			args.return_mask = PAGE_IS_WRITTEN;
+
+			do {
+				int i;
+				args.start = args.walk_end;
+
+				regs_len = ioctl(g_scanner_pagemap_fd, PAGEMAP_SCAN, &args);
+				if (regs_len < 0) {
+					pr_perror("Scanner: PAGEMAP_SCAN failed");
+					break;
+				}
+
+				if (regs_len == 0)
+					break;
+
+				/* Distribute dirty regions to sender queues (round-robin) */
+				for (i = 0; i < regs_len; i++) {
+					struct dirty_region_entry *entry;
+					unsigned long pages;
+
+					pages = (regs[i].end - regs[i].start) / PAGE_SIZE;
+					total_dirty_pages += pages;
+
+					entry = xmalloc(sizeof(*entry));
+					if (!entry) {
+						pr_err("Scanner: failed to alloc dirty_region_entry\n");
+						continue;
+					}
+					entry->start = regs[i].start;
+					entry->end = regs[i].end;
+					entry->dst_id = lve->dst_id;
+					entry->source_pid = g_scanner_source_pid;
+
+					/* Round-robin distribution to sender queues */
+					spsc_enqueue(sender_queues[queue_idx].tail,
+						     sender_queues[queue_idx].size,
+						     entry, struct dirty_region_spsc_node);
+					queue_idx = (queue_idx + 1) % NUM_P3_THREADS;
+				}
+			} while (args.walk_end < lve->end);
+		}
+
+		clock_gettime(CLOCK_MONOTONIC, &iter_end);
+		{
+			long iter_ms = (iter_end.tv_sec - iter_start.tv_sec) * 1000 +
+				       (iter_end.tv_nsec - iter_start.tv_nsec) / 1000000;
+			pr_err("Scanner: iter=%u, %lu dirty pages distributed, %ld ms\n",
+			       iteration, total_dirty_pages, iter_ms);
+		}
+
+		/* Check convergence - signal freeze if < 1M dirty pages */
+		if (total_dirty_pages < DIRTY_SCAN_FREEZE_THRESHOLD) {
+			pr_err("Scanner: %lu pages < %d threshold, requesting freeze\n",
+			       total_dirty_pages, DIRTY_SCAN_FREEZE_THRESHOLD);
+			/* Signal main thread to freeze - it will call cow_signal_scanner_freeze() */
+			g_last_scan_flag = true;  /* Reuse existing flag for backward compat */
+			break;
+		}
+
+		/* Brief sleep to let senders catch up */
+		usleep(1000);
+	}
+
+	/* Final scan after freeze */
+	if (__atomic_load_n(&g_scanner_freeze_signal, __ATOMIC_ACQUIRE)) {
+		unsigned long final_dirty = 0;
+		unsigned int queue_idx = 0;
+		struct timespec fs_start, fs_end;
+
+		clock_gettime(CLOCK_MONOTONIC, &fs_start);
+		pr_err("Scanner: final scan (frozen)\n");
+
+		list_for_each_entry(lve, lazy_vmas, list) {
+			struct pm_scan_arg args;
+			long regs_len;
+
+			memset(&args, 0, sizeof(args));
+			args.size = sizeof(args);
+			args.flags = PM_SCAN_WP_MATCHING;
+			args.start = lve->start;
+			args.end = lve->end;
+			args.walk_end = lve->start;
+			args.vec = (u64)(unsigned long)regs;
+			args.vec_len = max_regs;
+			args.max_pages = 0;
+			args.category_anyof_mask = PAGE_IS_WRITTEN;
+			args.return_mask = PAGE_IS_WRITTEN;
+
+			do {
+				int i;
+				args.start = args.walk_end;
+
+				regs_len = ioctl(g_scanner_pagemap_fd, PAGEMAP_SCAN, &args);
+				if (regs_len < 0)
+					break;
+				if (regs_len == 0)
+					break;
+
+				for (i = 0; i < regs_len; i++) {
+					struct dirty_region_entry *entry;
+
+					final_dirty += (regs[i].end - regs[i].start) / PAGE_SIZE;
+
+					entry = xmalloc(sizeof(*entry));
+					if (!entry)
+						continue;
+					entry->start = regs[i].start;
+					entry->end = regs[i].end;
+					entry->dst_id = lve->dst_id;
+					entry->source_pid = g_scanner_source_pid;
+
+					spsc_enqueue(sender_queues[queue_idx].tail,
+						     sender_queues[queue_idx].size,
+						     entry, struct dirty_region_spsc_node);
+					queue_idx = (queue_idx + 1) % NUM_P3_THREADS;
+				}
+			} while (args.walk_end < lve->end);
+		}
+
+		clock_gettime(CLOCK_MONOTONIC, &fs_end);
+		{
+			long fs_ms = (fs_end.tv_sec - fs_start.tv_sec) * 1000 +
+				     (fs_end.tv_nsec - fs_start.tv_nsec) / 1000000;
+			pr_err("Scanner: final scan done, %lu dirty pages, %ld ms\n",
+			       final_dirty, fs_ms);
+		}
+	}
+
+	xfree(regs);
+
+out_close:
+	if (g_scanner_pagemap_fd >= 0) {
+		close(g_scanner_pagemap_fd);
+		g_scanner_pagemap_fd = -1;
+	}
+
+out:
+	clock_gettime(CLOCK_MONOTONIC, &t_end);
+	{
+		long elapsed_ms = (t_end.tv_sec - t_start.tv_sec) * 1000 +
+				  (t_end.tv_nsec - t_start.tv_nsec) / 1000000;
+		pr_err("Scanner thread done: %u iterations, %ld ms\n", iteration, elapsed_ms);
+	}
+
+	/* Signal senders that scanning is complete */
+	__atomic_store_n(&g_scan_complete, true, __ATOMIC_RELEASE);
+	return NULL;
+}
+
+int cow_start_scanner_thread(pid_t source_pid)
+{
+	g_scanner_source_pid = source_pid;
+	g_scan_complete = false;
+	g_scanner_freeze_signal = false;
+
+	if (pthread_create(&scanner_thread_handle, NULL, dirty_scanner_thread, NULL)) {
+		pr_perror("Failed to create scanner thread");
+		return -1;
+	}
+
+	pr_info("Started dirty scanner thread for pid %d\n", source_pid);
+	return 0;
+}
+
+void cow_wait_scanner_thread(void)
+{
+	if (scanner_thread_handle) {
+		pthread_join(scanner_thread_handle, NULL);
+		scanner_thread_handle = 0;
+		pr_info("Scanner thread joined\n");
+	}
+
+	/* Drain any remaining entries from queues */
+	for (int i = 0; i < NUM_P3_THREADS; i++) {
+		spsc_drain(sender_queues[i].head, free_dirty_region_entry);
+	}
+}
+
 void cow_set_new_vma_ranges(unsigned long *ranges, unsigned int nr_ranges)
 {
 	g_new_vma_ranges = ranges;
@@ -216,6 +507,63 @@ static int send_lazy_vma_pages_batch(int sk, struct lazy_vma_entry *lve,
 		return -1;
 
 	return nr_pages;
+}
+
+/*
+ * Send pages from a dirty region entry (from scanner queue).
+ * Returns number of pages sent, or -1 on error.
+ */
+static int send_dirty_region(struct p3_thread_ctx *ctx,
+			     struct dirty_region_entry *region)
+{
+	void *buffer;
+	struct iovec local_iov, remote_iov;
+	unsigned long vaddr;
+	int total_sent = 0;
+
+	buffer = xmalloc(COW_BATCH_PAGES * PAGE_SIZE);
+	if (!buffer)
+		return -1;
+
+	for (vaddr = region->start; vaddr < region->end;
+	     vaddr += COW_BATCH_PAGES * PAGE_SIZE) {
+		int batch_pages = (region->end - vaddr) / PAGE_SIZE;
+		ssize_t ret;
+
+		if (batch_pages > COW_BATCH_PAGES)
+			batch_pages = COW_BATCH_PAGES;
+
+		/* Read pages from source process */
+		local_iov.iov_base = buffer;
+		local_iov.iov_len = batch_pages * PAGE_SIZE;
+		remote_iov.iov_base = (void *)vaddr;
+		remote_iov.iov_len = batch_pages * PAGE_SIZE;
+
+		ret = process_vm_readv(region->source_pid, &local_iov, 1,
+				       &remote_iov, 1, 0);
+		if (ret != (ssize_t)(batch_pages * PAGE_SIZE)) {
+			pr_debug("P3[%d] failed to read dirty region at %lx: %s\n",
+				 ctx->thread_id, vaddr, strerror(errno));
+			/* Skip this batch, continue with next */
+			continue;
+		}
+
+		/* Compress and send */
+		ret = send_pages_batch_compressed(ctx->socket, buffer,
+						  batch_pages, region->dst_id, vaddr);
+		if (ret < 0) {
+			pr_err("P3[%d] failed to send dirty region at %lx\n",
+			       ctx->thread_id, vaddr);
+			xfree(buffer);
+			return -1;
+		}
+
+		total_sent += batch_pages;
+		ctx->pages_sent += batch_pages;
+	}
+
+	xfree(buffer);
+	return total_sent;
 }
 
 /*
@@ -452,7 +800,6 @@ static void *p3_bulk_sender_thread(void *arg)
 	unsigned long total_sent = 0;
 	struct timespec t_start, t_end;
 	int thread_id = ctx->thread_id;
-	char pagemap_path[64];
 
 	pr_info("P3[%d] bulk sender thread started (batch=%d pages)\n",
 		thread_id, COW_BATCH_PAGES);
@@ -460,17 +807,10 @@ static void *p3_bulk_sender_thread(void *arg)
 	       thread_id, ctx->socket, (unsigned long)ctx->dst_id);
 	clock_gettime(CLOCK_MONOTONIC, &t_start);
 
-	/* Open pagemap fd for dirty scanning */
-	snprintf(pagemap_path, sizeof(pagemap_path), "/proc/%d/pagemap",
-		 ctx->source_pid);
-	ctx->pagemap_fd = open(pagemap_path, O_RDWR);
-	if (ctx->pagemap_fd < 0) {
-		pr_perror("P3[%d] cannot open %s", thread_id, pagemap_path);
-		ctx->error = true;
-		goto out_no_pagemap;
-	}
+	/* No longer need pagemap fd - scanner thread handles PAGEMAP_SCAN */
+	ctx->pagemap_fd = -1;
 
-	/* Initialize dirty scan state */
+	/* Initialize state */
 	ctx->iteration = 0;
 	ctx->last_dirty_count = 0;
 	ctx->below_threshold = false;
@@ -540,13 +880,51 @@ static void *p3_bulk_sender_thread(void *arg)
 		       thread_id, total_sent, bulk_elapsed_ms);
 	}
 
-	/* === Iterations 1+: Dirty scan loop until convergence === */
+	/* === Phase 2: Consume dirty regions from scanner queue === */
 	{
 		struct timespec loop_start, loop_end;
 		long loop_elapsed_ms;
-		unsigned long loop_total_dirty = 0;
+		unsigned long loop_total_pages = 0;
+		unsigned long regions_processed = 0;
+		struct sender_queue *my_queue = cow_get_sender_queue(thread_id);
 
 		clock_gettime(CLOCK_MONOTONIC, &loop_start);
+		pr_info("P3[%d] starting queue consumption\n", thread_id);
+
+		/* Consume dirty regions from queue until scanner completes */
+		while (!cow_is_scan_complete() || spsc_peek(my_queue->head)) {
+			struct dirty_region_entry *region;
+			int sent;
+
+			region = spsc_dequeue(my_queue->head, my_queue->size);
+			if (!region) {
+				/* Queue empty, brief wait */
+				usleep(100);
+				continue;
+			}
+
+			/* Send the dirty region */
+			sent = send_dirty_region(ctx, region);
+			if (sent > 0) {
+				loop_total_pages += sent;
+				regions_processed++;
+			}
+			xfree(region);
+		}
+
+		clock_gettime(CLOCK_MONOTONIC, &loop_end);
+		loop_elapsed_ms = (loop_end.tv_sec - loop_start.tv_sec) * 1000 +
+				  (loop_end.tv_nsec - loop_start.tv_nsec) / 1000000;
+		pr_err("P3[%d] TIMING: Queue consumption done: %lu regions, %lu pages in %ld ms\n",
+		       thread_id, regions_processed, loop_total_pages, loop_elapsed_ms);
+
+		/* Mark as below threshold for compatibility */
+		ctx->below_threshold = true;
+
+		/* Skip legacy dirty scan code */
+		goto skip_legacy_dirty_scan;
+
+		/* Legacy code - kept for reference but skipped */
 		while (!g_last_scan_flag) {
 			ctx->iteration++;
 			ctx->last_dirty_count = do_dirty_scan_and_send(ctx);
@@ -557,8 +935,6 @@ static void *p3_bulk_sender_thread(void *arg)
 			pr_info("P3[%d] iter=%u dirty=%lu threshold=%s\n",
 				thread_id, ctx->iteration, ctx->last_dirty_count,
 				ctx->below_threshold ? "YES" : "NO");
-
-			loop_total_dirty += ctx->last_dirty_count;
 
 			/*
 			 * Thread 0 handles small VMAs - once below threshold, stop scanning
@@ -578,14 +954,10 @@ static void *p3_bulk_sender_thread(void *arg)
 			if (ctx->last_dirty_count < 1000 || ctx->iteration > 3)
 				usleep(30000);  /* 30ms */
 		}
-		clock_gettime(CLOCK_MONOTONIC, &loop_end);
-		loop_elapsed_ms = (loop_end.tv_sec - loop_start.tv_sec) * 1000 +
-				  (loop_end.tv_nsec - loop_start.tv_nsec) / 1000000;
-		pr_err("P3[%d] TIMING: Dirty scan loop done: %u iterations, %lu dirty pages in %ld ms\n",
-		       thread_id, ctx->iteration, loop_total_dirty, loop_elapsed_ms);
 	}
 
-	/* === Final scan after freeze === */
+skip_legacy_dirty_scan:
+	/* === Final: Send pages from new VMAs detected in Phase 3 === */
 	ctx->iteration++;
 	{
 		struct timespec fs_start, fs_end;
@@ -593,27 +965,20 @@ static void *p3_bulk_sender_thread(void *arg)
 		unsigned long new_vma_pages = 0;
 
 		clock_gettime(CLOCK_MONOTONIC, &fs_start);
-		pr_err("P3[%d] final scan (frozen) iter=%u\n", thread_id, ctx->iteration);
-		ctx->last_dirty_count = do_dirty_scan_and_send(ctx);
+		pr_err("P3[%d] sending new VMA pages (if any)\n", thread_id);
 
-		/* Also send pages from new VMAs detected in Phase 3 */
+		/* Send pages from new VMAs detected in Phase 3 */
 		new_vma_pages = send_new_vma_pages(ctx);
 
 		clock_gettime(CLOCK_MONOTONIC, &fs_end);
 
 		fs_elapsed_ms = (fs_end.tv_sec - fs_start.tv_sec) * 1000 +
 				(fs_end.tv_nsec - fs_start.tv_nsec) / 1000000;
-		pr_err("P3[%d] final scan done: %lu dirty + %lu new VMA pages, TIMING: %ld ms\n",
-		       thread_id, ctx->last_dirty_count, new_vma_pages, fs_elapsed_ms);
+		pr_err("P3[%d] new VMA pages done: %lu pages, TIMING: %ld ms\n",
+		       thread_id, new_vma_pages, fs_elapsed_ms);
 	}
 
 out:
-	if (ctx->pagemap_fd >= 0) {
-		close(ctx->pagemap_fd);
-		ctx->pagemap_fd = -1;
-	}
-
-out_no_pagemap:
 	clock_gettime(CLOCK_MONOTONIC, &t_end);
 	{
 		long elapsed_ms = (t_end.tv_sec - t_start.tv_sec) * 1000 +
@@ -640,8 +1005,22 @@ int cow_start_p3_threads(int *sockets, int num_sockets, u64 dst_id, pid_t source
 
 	/* Reset global flags */
 	g_last_scan_flag = false;
+	g_scan_complete = false;
+	g_scanner_freeze_signal = false;
 
-	/* Start one thread per socket */
+	/* Initialize sender queues */
+	if (cow_init_sender_queues()) {
+		pr_err("Failed to initialize sender queues\n");
+		return -1;
+	}
+
+	/* Start scanner thread */
+	if (cow_start_scanner_thread(source_pid)) {
+		pr_err("Failed to start scanner thread\n");
+		return -1;
+	}
+
+	/* Start one sender thread per socket */
 	threads_to_start = num_sockets < NUM_P3_THREADS ? num_sockets : NUM_P3_THREADS;
 	p3_total_pages_sent = 0;
 
@@ -688,6 +1067,10 @@ void cow_wait_p3_threads(void)
 	unsigned long total = 0;
 	int errors = 0;
 
+	/* Wait for scanner thread first */
+	cow_wait_scanner_thread();
+
+	/* Then wait for sender threads */
 	for (i = 0; i < NUM_P3_THREADS; i++) {
 		if (p3_threads[i].thread) {
 			pr_debug("DEBUG_THREAD: Waiting for P3 sender[%d] to join\n", i);
@@ -755,6 +1138,7 @@ void cow_signal_last_scan(void)
 {
 	pr_err("=== CONVERGENCE: Signaling last scan ===\n");
 	g_last_scan_flag = true;
+	cow_signal_scanner_freeze();  /* Signal scanner to do final scan */
 	__sync_synchronize();  /* Memory barrier */
 }
 
