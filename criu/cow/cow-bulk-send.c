@@ -1143,18 +1143,14 @@ int cow_get_num_p3_threads(void)
 }
 
 /*
- * Check if all P3 threads are below dirty page convergence threshold.
- * Returns true only when ALL active threads report below_threshold.
+ * Check if ready to freeze.
+ * In scanner architecture: returns true when scanner signals freeze (g_last_scan_flag).
+ * This replaces the old per-thread threshold check.
  */
 bool cow_all_threads_below_threshold(void)
 {
-	int i;
-
-	for (i = 0; i < NUM_P3_THREADS; i++) {
-		if (p3_threads[i].active && !p3_threads[i].below_threshold)
-			return false;
-	}
-	return p3_threads_active > 0;  /* Must have at least one active thread */
+	/* Scanner decides when to freeze based on total dirty pages < 1M */
+	return g_last_scan_flag && p3_threads_active > 0;
 }
 
 /*
