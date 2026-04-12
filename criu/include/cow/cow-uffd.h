@@ -32,8 +32,6 @@ unsigned long cow_page_buffer_count(void);
 /* Destroy COW page buffer and free all resources */
 void cow_page_buffer_destroy(void);
 
-/* Discard dirty pages from buffer (called when dirty bitmap received) */
-void cow_page_buffer_discard_dirty(unsigned long *dirty_ranges, unsigned int nr_dirty_ranges);
 
 /* Start background drain thread (lpis needed for EAGAIN handling) */
 int cow_start_drain_thread(struct list_head *lpis);
@@ -110,8 +108,6 @@ extern int cow_get_uffd_for_vaddr(struct list_head *lpis, unsigned long vaddr);
 /* Initialize prebuffer reader for COW mode */
 extern int cow_setup_prebuffer_reader(void);
 
-/* Cleanup prebuffer resources */
-extern void cow_cleanup_prebuffer(void);
 
 /* Get prebuffer buf pointer (for convergence callback) */
 extern void *cow_get_prebuffer_buf(void);
@@ -120,16 +116,6 @@ extern void *cow_get_prebuffer_buf(void);
 /* Handle lazy accept in COW mode */
 extern int cow_handle_lazy_accept(struct list_head *lpis, int epollfd,
 				  int client, bool phase3_active);
-
-/* Create IOVs for dirty ranges (new VMAs from Phase 1 to Phase 3) */
-extern int cow_create_iovs_for_new_ranges(struct list_head *lpis,
-					  unsigned long *dirty_ranges,
-					  unsigned int nr_dirty_ranges);
-
-
-
-/* Store pending dirty ranges (before restore connects) */
-extern void cow_store_pending_dirty_ranges(unsigned long *ranges, unsigned int nr);
 
 
 /* Set/get phase3_active flag */
@@ -225,7 +211,6 @@ extern int cow_handle_page_fault_cow_mode(struct lazy_pages_info *lpi,
 
 /*
  * COW post-connect initialization in handle_lazy_accept.
- * Handles dirty bitmap processing and starts drain thread if ready.
  */
 extern int cow_handle_lazy_accept_post_connect(struct list_head *lpis,
 					       void (*switch_to_convergence)(void));

@@ -512,67 +512,6 @@ unsigned long cow_page_buffer_count(void)
 	return cow_buffer.nr_pages;
 }
 
-void cow_page_buffer_discard_dirty(unsigned long *dirty_ranges,
-				   unsigned int nr_dirty_ranges)
-{
-	unsigned int r;
-	unsigned long discarded = 0;
-
-	if (!cow_buffer.initialized || !dirty_ranges || nr_dirty_ranges == 0)
-		return;
-
-	/* Iterate dirty ranges and do O(1) hash lookups with fine-grained locks */
-	for (r = 0; r < nr_dirty_ranges; r++) {
-		unsigned long start = dirty_ranges[r * 2];
-		unsigned long len = dirty_ranges[r * 2 + 1];
-		unsigned long vaddr;
-
-		/* Iterate each page in this dirty range */
-		for (vaddr = start; vaddr < start + len; vaddr += PAGE_SIZE) {
-			unsigned int hash = page_buffer_hash(vaddr);
-			int lock_idx = lock_index(hash);
-			struct page_buffer_node *node;
-			struct hlist_node *tmp;
-			int i;
-			bool found = false;
-
-			pthread_spin_lock(&hash_locks[lock_idx]);
-			hlist_for_each_entry_safe(node, tmp,
-						  &cow_buffer.hash_table[hash], hash) {
-				for (i = 0; i < node->count; i++) {
-					if (node->entries[i].vaddr == vaddr) {
-						page_pool_put(node->entries[i].data);
-						/* Move last entry to fill gap */
-						node->count--;
-						if (i < node->count) {
-							node->entries[i] = node->entries[node->count];
-						}
-						/* Remove empty nodes */
-						if (node->count == 0) {
-							hlist_del(&node->hash);
-							xfree(node);
-						}
-						found = true;
-						break;
-					}
-				}
-				if (found)
-					break;
-			}
-			pthread_spin_unlock(&hash_locks[lock_idx]);
-
-			if (found) {
-				__sync_fetch_and_sub(&cow_buffer.nr_pages, 1);
-				__sync_fetch_and_add(&cow_buffer.nr_discarded, 1);
-				discarded++;
-				page_state_set(vaddr, PAGE_STATE_DIRTY);
-			}
-		}
-	}
-
-	pr_info("Discarded %lu dirty pages from buffer\n", discarded);
-}
-
 void cow_page_buffer_destroy(void)
 {
 	struct page_buffer_node *node;
@@ -1593,9 +1532,6 @@ int cow_get_uffd_for_vaddr(struct list_head *lpis, unsigned long vaddr)
 static void *prebuffer_buf = NULL;
 static bool phase3_active_flag = false;
 
-/* Pending dirty bitmap — stored if it arrives before restore connects */
-static unsigned long *pending_dirty_ranges = NULL;
-static unsigned int pending_nr_dirty_ranges = 0;
 
 /* Forward declarations for page server async reader */
 extern int page_server_start_async_read_bulk(void *buf, unsigned long nr_pages,
@@ -1674,109 +1610,6 @@ int cow_setup_prebuffer_reader(void)
 
 	return ret;
 }
-
-void cow_cleanup_prebuffer(void)
-{
-	if (prebuffer_buf) {
-		xfree(prebuffer_buf);
-		prebuffer_buf = NULL;
-	}
-
-	if (pending_dirty_ranges) {
-		xfree(pending_dirty_ranges);
-		pending_dirty_ranges = NULL;
-	}
-	pending_nr_dirty_ranges = 0;
-}
-
-void cow_store_pending_dirty_ranges(unsigned long *ranges, unsigned int nr)
-{
-	pending_dirty_ranges = ranges;
-	pending_nr_dirty_ranges = nr;
-}
-
-
-/*
- * Create IOVs for dirty ranges that don't have existing IOVs.
- * This handles new VMAs created between Phase 1 and Phase 3.
- */
-int cow_create_iovs_for_new_ranges(struct list_head *lpis,
-				   unsigned long *dirty_ranges,
-				   unsigned int nr_dirty_ranges)
-{
-	struct lazy_pages_info *lpi;
-	unsigned int i;
-	int created = 0;
-
-	if (!dirty_ranges || nr_dirty_ranges == 0)
-		return 0;
-
-	/* Process each dirty range */
-	for (i = 0; i < nr_dirty_ranges; i++) {
-		unsigned long start = dirty_ranges[i * 2];
-		unsigned long len = dirty_ranges[i * 2 + 1];
-		unsigned long end = start + len;
-		bool fully_covered = false;
-
-		/*
-		 * Check if any lpi has IOVs fully covering this range.
-		 * New VMAs shouldn't overlap with existing IOVs since they
-		 * represent memory that didn't exist in Phase 1.
-		 */
-		list_for_each_entry(lpi, lpis, l) {
-			struct lazy_iov *iov_start, *iov_end;
-
-			if (lpi->exited)
-				continue;
-
-			iov_start = cow_find_iov(lpi, start);
-			iov_end = cow_find_iov(lpi, end - 1);
-
-			if (iov_start && iov_end) {
-				fully_covered = true;
-				break;
-			}
-		}
-
-		if (!fully_covered) {
-			/*
-			 * Range not fully covered - likely a new VMA.
-			 * Add IOV to the first active lpi.
-			 */
-			list_for_each_entry(lpi, lpis, l) {
-				struct lazy_iov *iov;
-
-				if (lpi->exited)
-					continue;
-
-				iov = xzalloc(sizeof(*iov));
-				if (!iov) {
-					pr_err("Failed to allocate IOV for new range\n");
-					return -1;
-				}
-
-				iov->start = start;
-				iov->end = end;
-				iov->img_start = start;
-				iov->is_new_vma = true;
-				list_add_tail(&iov->l, &lpi->iovs);
-
-				pr_info("Created IOV for new VMA: 0x%lx-0x%lx (%lu pages)\n",
-					start, end, len / PAGE_SIZE);
-				created++;
-				break;
-			}
-		}
-	}
-
-	if (created > 0)
-		pr_info("Created %d IOVs for new VMA ranges\n", created);
-
-	return 0;
-}
-
-
-
 
 
 
@@ -2260,7 +2093,6 @@ int cow_uffd_io_complete_bulk(struct lazy_pages_info *lpi,
 
 /*
  * COW post-connect initialization in handle_lazy_accept.
- * Called after restore connects to handle dirty bitmap processing
  * and Phase 3 page requests.
  *
  * Returns: 0 on success, -1 on error
