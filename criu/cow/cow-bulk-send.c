@@ -96,6 +96,10 @@ static pthread_t scanner_thread_handle;
 static pid_t g_scanner_source_pid;
 static int g_scanner_pagemap_fd = -1;
 
+/* Synchronization: scanner waits for bulk transfer to complete */
+static volatile int g_bulk_transfer_done_count = 0;
+static volatile int g_num_sender_threads = 0;
+
 int cow_init_sender_queues(void)
 {
 	int i;
@@ -154,6 +158,18 @@ static void *dirty_scanner_thread(void *arg)
 
 	pr_err("Scanner thread started, source_pid=%d\n", g_scanner_source_pid);
 	clock_gettime(CLOCK_MONOTONIC, &t_start);
+
+	/* Wait for all sender threads to complete bulk transfer first */
+	pr_err("Scanner: waiting for %d sender threads to complete bulk transfer...\n",
+	       g_num_sender_threads);
+	while (__atomic_load_n(&g_bulk_transfer_done_count, __ATOMIC_ACQUIRE) <
+	       __atomic_load_n(&g_num_sender_threads, __ATOMIC_ACQUIRE)) {
+		/* Check if we should abort early */
+		if (__atomic_load_n(&g_scanner_freeze_signal, __ATOMIC_ACQUIRE))
+			goto out;
+		usleep(10000);  /* 10ms poll */
+	}
+	pr_err("Scanner: all sender threads completed bulk transfer, starting dirty scan\n");
 
 	/* Open pagemap fd */
 	snprintf(pagemap_path, sizeof(pagemap_path), "/proc/%d/pagemap",
@@ -246,13 +262,17 @@ static void *dirty_scanner_thread(void *arg)
 			       iteration, total_dirty_pages, iter_ms);
 		}
 
-		/* Check convergence - signal freeze if < 1M dirty pages */
-		if (total_dirty_pages < DIRTY_SCAN_FREEZE_THRESHOLD) {
+		/*
+		 * Check convergence - signal freeze if < 1M dirty pages.
+		 * Scanner continues running until main thread actually freezes
+		 * and calls cow_signal_scanner_freeze().
+		 */
+		if (total_dirty_pages < DIRTY_SCAN_FREEZE_THRESHOLD && !g_last_scan_flag) {
 			pr_err("Scanner: %lu pages < %d threshold, requesting freeze\n",
 			       total_dirty_pages, DIRTY_SCAN_FREEZE_THRESHOLD);
 			/* Signal main thread to freeze - it will call cow_signal_scanner_freeze() */
-			g_last_scan_flag = true;  /* Reuse existing flag for backward compat */
-			break;
+			g_last_scan_flag = true;
+			/* Don't break - keep scanning until freeze signal arrives */
 		}
 
 		/* Brief sleep to let senders catch up */
@@ -878,6 +898,9 @@ static void *p3_bulk_sender_thread(void *arg)
 				  (bulk_end.tv_nsec - bulk_start.tv_nsec) / 1000000;
 		pr_err("P3[%d] TIMING: Bulk transfer done: %lu pages in %ld ms\n",
 		       thread_id, total_sent, bulk_elapsed_ms);
+
+		/* Signal scanner that this thread's bulk transfer is complete */
+		__atomic_fetch_add(&g_bulk_transfer_done_count, 1, __ATOMIC_RELEASE);
 	}
 
 	/* === Phase 2: Consume dirty regions from scanner queue === */
@@ -1007,12 +1030,17 @@ int cow_start_p3_threads(int *sockets, int num_sockets, u64 dst_id, pid_t source
 	g_last_scan_flag = false;
 	g_scan_complete = false;
 	g_scanner_freeze_signal = false;
+	g_bulk_transfer_done_count = 0;
 
 	/* Initialize sender queues */
 	if (cow_init_sender_queues()) {
 		pr_err("Failed to initialize sender queues\n");
 		return -1;
 	}
+
+	/* Calculate number of threads to start (before starting scanner) */
+	threads_to_start = num_sockets < NUM_P3_THREADS ? num_sockets : NUM_P3_THREADS;
+	g_num_sender_threads = threads_to_start;
 
 	/* Start scanner thread */
 	if (cow_start_scanner_thread(source_pid)) {
@@ -1021,7 +1049,6 @@ int cow_start_p3_threads(int *sockets, int num_sockets, u64 dst_id, pid_t source
 	}
 
 	/* Start one sender thread per socket */
-	threads_to_start = num_sockets < NUM_P3_THREADS ? num_sockets : NUM_P3_THREADS;
 	p3_total_pages_sent = 0;
 
 	for (i = 0; i < threads_to_start; i++) {
