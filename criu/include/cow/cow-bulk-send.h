@@ -18,7 +18,7 @@ int send_pages_batch_compressed(int sk, const void *data,
 #define NUM_P3_THREADS 20
 
 /* Dirty page convergence threshold (per-thread) */
-#define DIRTY_CONVERGENCE_THRESHOLD 1000
+#define DIRTY_CONVERGENCE_THRESHOLD 50000
 
 /*
  * Start multiple P3 bulk sender threads (up to 20 threads for parallel transfer).
