@@ -1519,7 +1519,6 @@ void cow_dump_lazy_iov_list(struct lazy_pages_info *lpi, const char *name,
 
 /* State flags for COW restore synchronization */
 static bool cow_restore_connected = false;
-static bool cow_dirty_bitmap_received = false;
 static bool cow_inventory_ready_received = false;
 static bool cow_all_pages_sent_received = false;
 
@@ -1535,17 +1534,6 @@ void cow_set_restore_connected(bool connected)
 	cow_restore_connected = connected;
 }
 
-/* Check if dirty bitmap has been received from primary */
-bool cow_is_dirty_bitmap_received(void)
-{
-	return cow_dirty_bitmap_received;
-}
-
-/* Set dirty bitmap received flag */
-void cow_set_dirty_bitmap_received(bool received)
-{
-	cow_dirty_bitmap_received = received;
-}
 
 /* Check if inventory.img is ready on disk */
 bool cow_is_inventory_ready_received(void)
@@ -2286,38 +2274,6 @@ int cow_uffd_io_complete_bulk(struct lazy_pages_info *lpi,
 	return ret >= 0 ? 0 : -1;
 }
 
-/*
- * Set dirty bitmap received and process.
- * Called from uffd.c when dirty bitmap is received.
- */
-void cow_set_dirty_bitmap_received_and_process(struct list_head *lpis,
-					       unsigned long *dirty_ranges,
-					       unsigned int nr_dirty_ranges,
-					       void (*switch_to_convergence)(void))
-{
-	pr_info("Dirty bitmap received from primary (%u ranges)\n", nr_dirty_ranges);
-
-	cow_set_dirty_bitmap_received(true);
-
-	/*
-	 * If restore is already connected, create IOVs for new VMAs now.
-	 * Otherwise store dirty_ranges for later processing.
-	 */
-	if (cow_is_restore_connected()) {
-		if (cow_create_iovs_for_new_ranges(lpis, dirty_ranges, nr_dirty_ranges) < 0)
-			pr_warn("Failed to create IOVs for some new ranges\n");
-
-		xfree(dirty_ranges);
-
-		pr_info("Restore already connected, entering convergence\n");
-		if (switch_to_convergence)
-			switch_to_convergence();
-		cow_start_drain_thread(lpis);
-	} else {
-		pr_info("Storing dirty ranges for later (%u ranges)\n", nr_dirty_ranges);
-		cow_store_pending_dirty_ranges(dirty_ranges, nr_dirty_ranges);
-	}
-}
 
 /*
  * COW post-connect initialization in handle_lazy_accept.

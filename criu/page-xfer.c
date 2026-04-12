@@ -201,7 +201,6 @@ int send_psi(int sk, struct page_server_iov *pi)
 
 /*
  * COW page functions (send_page_compressed, send_page_uncompressed,
- * send_dirty_bitmap_to_replica, send_cow_dirty_bitmap, send_all_pages_sent_signal,
  * send_all_pages_sent_ack, send_inventory_ready_signal) are now in cow-page-xfer.c
  */
 
@@ -1458,7 +1457,6 @@ static int page_server_serve(int sk)
 	/*
 	 * COW phased migration: after receiving bulk complete ACK,
 	 * keep the socket open for Phase 4 dirty bitmap transfer.
-	 * Store the socket globally so send_cow_dirty_bitmap() can use it.
 	 */
 	if (opts.cow_dump && bulk_ack_received) {
 		pr_info("Bulk ACK received, storing socket (sk=%d) for dirty bitmap\n", sk);

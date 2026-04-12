@@ -127,14 +127,6 @@ typedef int (*ps_async_read_complete)(unsigned long img_id, unsigned long vaddr,
 extern int page_server_start_read(void *buf, unsigned long nr_pages, ps_async_read_complete complete, void *priv, unsigned flags);
 extern int page_server_update_async_callback(ps_async_read_complete complete, void *priv);
 
-/* COW phased migration: send dirty bitmap from primary to replica */
-extern int send_dirty_bitmap_to_replica(int sk, u64 dst_id,
-					unsigned long *ranges,
-					unsigned int nr_ranges);
-
-/* COW phased migration: send dirty bitmap using current page server connection */
-extern int send_cow_dirty_bitmap(unsigned long *ranges, unsigned int nr_ranges);
-
 /* COW phased migration: signal replica all pages sent, can zero-fill rest */
 extern int send_all_pages_sent_signal(int sk);
 

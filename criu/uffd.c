@@ -1676,20 +1676,11 @@ err:
 
 /*
  * Simple COW state accessors are in cow-uffd.c:
- * - cow_is_dirty_bitmap_received(), cow_set_dirty_bitmap_received()
  * - cow_is_restore_connected(), cow_set_restore_connected()
  * - cow_is_inventory_ready_received(), cow_set_inventory_ready_received()
  * - cow_is_all_pages_sent_received(), cow_set_all_pages_sent_received()
  */
 
-/* Set dirty bitmap received flag (called when dirty bitmap fully received) */
-void set_dirty_bitmap_received(unsigned long *dirty_ranges,
-			       unsigned int nr_dirty_ranges)
-{
-	cow_set_dirty_bitmap_received_and_process(&lpis, dirty_ranges,
-						  nr_dirty_ranges,
-						  switch_to_convergence_callback);
-}
 
 /*
  * COW Phase 3: Enter restore loop after pages are buffered and pstree loaded.

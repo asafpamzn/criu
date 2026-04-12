@@ -78,9 +78,6 @@ static struct {
 	time_t last_print_time;
 } bulk_stats;
 
-/* Forward declarations */
-static int read_dirty_bitmap(struct ps_async_read_bulk *ar, int flags);
-
 /*
  * Helper function for common recv pattern with stats tracking.
  * Returns bytes received on success, -EAGAIN on would-block, -1 on error.
@@ -154,50 +151,7 @@ static int handle_end_of_transfer(struct ps_async_read_bulk *ar, u32 cmd)
 	return BULK_STREAM_COMPLETE;
 }
 
-/*
- * Handle dirty bitmap header: process empty bitmap or allocate buffer for data.
- * Returns BULK_STREAM_* on completion, 0 to continue to reading data.
- */
-static int handle_dirty_bitmap_header(struct ps_async_read_bulk *ar)
-{
-	ar->nr_dirty_ranges = ar->pi.nr_pages;  /* overloaded */
-	ar->dirty_ranges_size = ar->nr_dirty_ranges * 2 * sizeof(unsigned long);
 
-	if (ar->dirty_ranges_size == 0) {
-		/* No dirty ranges - all buffered pages are clean */
-		/* Do NOT start drain thread here - wait for restore to connect */
-		/* Drain thread will start in handle_lazy_accept() when restore connects */
-		ar->rb = 0;
-		ar->compress_state = COMPRESS_STATE_READING_HEADER;
-		pr_info("Dirty bitmap: 0 ranges, all pages clean\n");
-
-		/*
-		 * COW mode: dirty bitmap (even empty) marks end of bulk phase.
-		 * Send ACK to primary before marking complete.
-		 * Drain thread will start when restore connects
-		 */
-		if (opts.cow_dump) {
-			pr_info("COW mode: dirty bitmap complete (0 ranges), bulk phase done\n");
-			if (send_dirty_bitmap_ack())
-				return -1;
-			set_dirty_bitmap_received(NULL, 0);
-			return BULK_STREAM_COMPLETE;
-		}
-		return BULK_STREAM_PROGRESS;
-	}
-
-	ar->dirty_ranges = xmalloc(ar->dirty_ranges_size);
-	if (!ar->dirty_ranges) {
-		pr_err("Failed to allocate dirty ranges buffer\n");
-		return -1;
-	}
-	ar->dirty_rb = 0;
-	ar->compress_state = COMPRESS_STATE_READING_DIRTY_BITMAP;
-	pr_info("Dirty bitmap: expecting %u ranges (%lu bytes)\n",
-		ar->nr_dirty_ranges, ar->dirty_ranges_size);
-
-	return 0;  /* Continue to read dirty bitmap data */
-}
 
 /*
  * Read bulk header and dispatch to next state.
@@ -227,7 +181,7 @@ static int read_bulk_header(struct ps_async_read_bulk *ar, int flags)
 	/* Header complete, dispatch based on command */
 	cmd = decode_ps_cmd(ar->pi.cmd);
 
-	if (ar->pi.nr_pages == 0 && cmd != PS_IOV_DIRTY_BITMAP &&
+	if (ar->pi.nr_pages == 0 &&
 	    cmd != PS_IOV_INVENTORY_READY && cmd != PS_IOV_ALL_PAGES_SENT)
 		return handle_end_of_transfer(ar, cmd);
 
@@ -251,16 +205,6 @@ static int read_bulk_header(struct ps_async_read_bulk *ar, int flags)
 		 * The main loop will check cow_handle_exit() and send the ACK.
 		 */
 		return BULK_STREAM_COMPLETE;
-
-	case PS_IOV_DIRTY_BITMAP:
-		ret = handle_dirty_bitmap_header(ar);
-		if (ret != 0)
-			return ret;
-		/*
-		 * Continue to read dirty bitmap data immediately.
-		 * After hangup, no more EPOLLIN events will trigger us.
-		 */
-		return read_dirty_bitmap(ar, flags);
 
 	case PS_IOV_ADD_F_COMPRESS:
 		ar->compress_state = COMPRESS_STATE_READING_SIZE;
@@ -449,79 +393,6 @@ static int read_uncompressed_data(struct ps_async_read_bulk *ar, int flags)
 }
 
 /*
- * Read dirty bitmap data, apply or store for later.
- */
-static int read_dirty_bitmap(struct ps_async_read_bulk *ar, int flags)
-{
-	int ret;
-	int need = ar->dirty_ranges_size - ar->dirty_rb;
-	void *buf = ((char *)ar->dirty_ranges) + ar->dirty_rb;
-	int sk = get_page_server_sk();
-
-	pr_debug("Dirty bitmap read: need=%d dirty_rb=%lu total=%lu flags=%d sk=%d\n",
-		need, ar->dirty_rb, ar->dirty_ranges_size, flags, sk);
-
-	ret = page_server_recv(sk, buf, need, flags);
-
-	pr_debug("Dirty bitmap recv: ret=%d errno=%d\n", ret, ret < 0 ? errno : 0);
-
-	if (ret < 0) {
-		if (flags == MSG_DONTWAIT && (errno == EAGAIN || errno == EINTR)) {
-			pr_info("Dirty bitmap: WOULD_BLOCK (errno=%d)\n", errno);
-			return BULK_STREAM_WOULD_BLOCK;
-		}
-		pr_perror("Error reading dirty bitmap");
-		xfree(ar->dirty_ranges);
-		ar->dirty_ranges = NULL;
-		return -1;
-	}
-	if (ret == 0) {
-		pr_err("EOF while reading dirty bitmap (got %lu of %lu bytes)\n",
-		       ar->dirty_rb, ar->dirty_ranges_size);
-		xfree(ar->dirty_ranges);
-		ar->dirty_ranges = NULL;
-		return -1;
-	}
-	ar->dirty_rb += ret;
-
-	if (ar->dirty_rb < ar->dirty_ranges_size)
-		return BULK_STREAM_PROGRESS;
-
-	/* Dirty bitmap complete - discard dirty pages from buffer */
-	pr_info("Dirty bitmap received: %u ranges\n", ar->nr_dirty_ranges);
-
-	if (ar->nr_dirty_ranges > 0 && ar->dirty_ranges)
-		cow_page_buffer_discard_dirty(ar->dirty_ranges, ar->nr_dirty_ranges);
-
-	ar->rb = 0;
-	ar->compress_state = COMPRESS_STATE_READING_HEADER;
-
-	/*
-	 * COW mode: dirty bitmap marks end of bulk phase.
-	 * Send ACK to primary before marking complete.
-	 * Ownership of dirty_ranges is transferred to set_dirty_bitmap_received().
-	 */
-	if (opts.cow_dump) {
-		pr_info("COW mode: dirty bitmap complete (%u ranges), bulk phase done\n",
-			ar->nr_dirty_ranges);
-		if (send_dirty_bitmap_ack()) {
-			pr_err("COW mode: send_dirty_bitmap_ack FAILED!!!!\n");
-			xfree(ar->dirty_ranges);
-			ar->dirty_ranges = NULL;
-			return -1;
-		}
-		/* Pass ownership of dirty_ranges to uffd.c for IOV creation */
-		set_dirty_bitmap_received(ar->dirty_ranges, ar->nr_dirty_ranges);
-		ar->dirty_ranges = NULL;
-		return BULK_STREAM_COMPLETE;
-	}
-
-	xfree(ar->dirty_ranges);
-	ar->dirty_ranges = NULL;
-	return BULK_STREAM_PROGRESS;
-}
-
-/*
  * Bulk mode continuous stream reader.
  * Processes headers and pages as they arrive without correlation to requests.
  * The server's background thread sends pages continuously.
@@ -544,9 +415,6 @@ static int page_server_read_bulk_stream(struct ps_async_read_bulk *ar, int flags
 
 	case COMPRESS_STATE_READING_UNCOMPRESSED:
 		return read_uncompressed_data(ar, flags);
-
-	case COMPRESS_STATE_READING_DIRTY_BITMAP:
-		return read_dirty_bitmap(ar, flags);
 
 	default:
 		pr_err("Invalid bulk stream state: %d\n", ar->compress_state);

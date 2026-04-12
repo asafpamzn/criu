@@ -90,9 +90,6 @@ extern struct lazy_iov *cow_find_iov(struct lazy_pages_info *lpi, unsigned long 
 extern bool cow_is_restore_connected(void);
 extern void cow_set_restore_connected(bool connected);
 
-/* Check/set if dirty bitmap has been received from primary */
-extern bool cow_is_dirty_bitmap_received(void);
-extern void cow_set_dirty_bitmap_received(bool received);
 
 /* Check/set if inventory.img is ready on disk */
 extern bool cow_is_inventory_ready_received(void);
@@ -241,12 +238,5 @@ extern int cow_handle_lazy_accept_post_connect(struct list_head *lpis,
 					       void (*switch_to_convergence)(void));
 
 
-/*
- * Set dirty bitmap received and process (wrapper for uffd.c).
- */
-extern void cow_set_dirty_bitmap_received_and_process(struct list_head *lpis,
-						      unsigned long *dirty_ranges,
-						      unsigned int nr_dirty_ranges,
-						      void (*switch_to_convergence)(void));
 
 #endif /* __CR_COW_UFFD_H__ */
