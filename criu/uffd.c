@@ -1589,18 +1589,6 @@ static int convergence_io_complete(unsigned long dst_id, unsigned long vaddr,
 	return cow_convergence_copy_page(&lpis, vaddr, nr_pages, priv);
 }
 
-/* Switch to convergence mode - wrapper that sets up callback */
-static void switch_to_convergence_callback(void)
-{
-	void *buf = cow_get_prebuffer_buf();
-	if (!buf) {
-		pr_warn("Cannot switch to convergence: no prebuffer_buf\n");
-		return;
-	}
-
-	if (page_server_update_async_callback(convergence_io_complete, buf) < 0)
-		pr_warn("Failed to switch to convergence callback\n");
-}
 
 /*
  * Non-blocking accept handler for when criu restore connects.

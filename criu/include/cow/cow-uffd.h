@@ -116,8 +116,6 @@ extern void cow_cleanup_prebuffer(void);
 /* Get prebuffer buf pointer (for convergence callback) */
 extern void *cow_get_prebuffer_buf(void);
 
-/* Switch to convergence callback mode */
-extern void cow_switch_to_convergence_callback(void);
 
 /* Convergence IO completion callback */
 extern int cow_convergence_io_complete(struct list_head *lpis,

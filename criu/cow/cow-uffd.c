@@ -1696,22 +1696,6 @@ void cow_store_pending_dirty_ranges(unsigned long *ranges, unsigned int nr)
 }
 
 
-
-/*
- * Switch async reader to convergence mode.
- * Called when BOTH restore is connected AND dirty bitmap is received.
- */
-void cow_switch_to_convergence_callback(void)
-{
-	if (!prebuffer_buf) {
-		pr_warn("Cannot switch to convergence: no prebuffer_buf\n");
-		return;
-	}
-
-	/* The actual callback will be set by uffd.c using convergence_io_complete wrapper */
-	pr_info("Switching to convergence callback mode\n");
-}
-
 /*
  * Create IOVs for dirty ranges that don't have existing IOVs.
  * This handles new VMAs created between Phase 1 and Phase 3.
