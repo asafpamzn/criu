@@ -267,6 +267,7 @@ int cr_lazy_pages_cow_phase2(bool daemon)
 	if (ret < 0)
 		pr_err("Phase 3 restore loop failed\n");
 	pr_warn("file = %s, line = %d\n",__FILE__, __LINE__);
+	sleep(30000);//TODO REMOVE
 err_disconnect:
 	/* Print page state statistics and cleanup */
 	stop_p3_receiver_connections();

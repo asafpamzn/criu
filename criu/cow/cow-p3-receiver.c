@@ -420,7 +420,7 @@ void stop_p3_receiver_connections(void)
 
 	for (i = 0; i < MAX_P3_RECEIVERS; i++) {
 		if (p3_receivers[i].thread) {
-			pr_debug("DEBUG_THREAD: Waiting for P3 receiver[%d] to join\n", i);
+			pr_warn("DEBUG_THREAD: Waiting for P3 receiver[%d] to join\n", i);
 			pthread_join(p3_receivers[i].thread, NULL);
 			pr_debug("DEBUG_THREAD: P3 receiver[%d] JOINED pages=%lu\n",
 			       i, p3_receivers[i].pages_received);
