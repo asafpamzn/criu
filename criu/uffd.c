@@ -1264,10 +1264,6 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 		       address, lpi->pid);
 	}
 
-	/* COW mode: handle full page fault flow */
-	if (opts.cow_dump)
-		return cow_handle_page_fault_full(lpi, address, uffd_zero, uffd_handle_pages);
-
 	if (is_page_queued(lpi, address))
 		return 0;
 

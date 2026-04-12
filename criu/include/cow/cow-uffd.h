@@ -122,18 +122,6 @@ extern int cow_handle_lazy_accept(struct list_head *lpis, int epollfd,
 extern void cow_set_phase3_active(bool active);
 extern bool cow_is_phase3_active(void);
 
-/* Handle page fault from buffer - returns 1 if served, 0 if not found, <0 on error */
-extern int cow_handle_page_fault_buffer(struct lazy_pages_info *lpi,
-					unsigned long long address);
-
-/*
- * Full COW page fault handler - consolidates all COW-specific logic.
- * Takes function pointers for uffd operations to avoid making them non-static.
- */
-extern int cow_handle_page_fault_full(struct lazy_pages_info *lpi,
-				      unsigned long long address,
-				      int (*do_zero)(struct lazy_pages_info *, __u64, unsigned long),
-				      int (*do_handle_pages)(struct lazy_pages_info *, __u64, unsigned long, unsigned));
 
 /*
  * COW-specific uffd_copy/uffd_zero error handling
@@ -158,12 +146,6 @@ extern int cow_uffd_check_zero_error(struct lazy_pages_info *lpi,
 				     __u64 address, unsigned long nr_pages,
 				     int saved_errno);
 
-/*
- * COW page fault handling (called from handle_page_fault when opts.cow_dump)
- * Returns: 0 = success, -1 = error
- */
-extern int cow_handle_page_fault(struct lazy_pages_info *lpi,
-				 unsigned long long address);
 
 /*
  * COW convergence IO complete - called when page arrives from convergence stream
@@ -204,10 +186,6 @@ extern void cow_handle_remove_event(unsigned long start, unsigned long len);
  */
 #define COW_PF_ZERO_FILL     2
 #define COW_PF_HANDLE_PAGES  3
-
-extern int cow_handle_page_fault_cow_mode(struct lazy_pages_info *lpi,
-					  unsigned long long address,
-					  unsigned long long *img_addr_out);
 
 /*
  * COW post-connect initialization in handle_lazy_accept.
