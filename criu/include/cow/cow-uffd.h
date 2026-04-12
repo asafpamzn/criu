@@ -117,11 +117,6 @@ extern void cow_cleanup_prebuffer(void);
 extern void *cow_get_prebuffer_buf(void);
 
 
-/* Convergence IO completion callback */
-extern int cow_convergence_io_complete(struct list_head *lpis,
-				       unsigned long vaddr,
-				       unsigned long nr_pages, void *buf);
-
 /* Handle lazy accept in COW mode */
 extern int cow_handle_lazy_accept(struct list_head *lpis, int epollfd,
 				  int client, bool phase3_active);

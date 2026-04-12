@@ -2194,7 +2194,6 @@ int cow_handle_page_fault_cow_mode(struct lazy_pages_info *lpi,
  * Called when a bulk page read completes in COW mode (without page server Phase 2/3).
  *
  * NOTE: In COW Phase 2/3 mode (opts.cow_dump && opts.use_page_server),
- * pages flow through prebuffer_io_complete() or convergence_io_complete() instead.
  * This callback is for COW mode without the page server phased approach.
  */
 int cow_uffd_io_complete_bulk(struct lazy_pages_info *lpi,

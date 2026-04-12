@@ -968,7 +968,6 @@ static int uffd_io_complete(struct page_read *pr, unsigned long img_addr, unsign
 /*
  * COW bulk mode io_complete callback.
  * Used when opts.cow_dump is true but NOT using Phase 2/3 mode.
- * In Phase 2/3 mode, pages flow through convergence_io_complete() or prebuffer_io_complete().
  */
 static int uffd_io_complete_bulk(struct page_read *pr, unsigned long vaddr, unsigned long nr)
 {
@@ -1581,13 +1580,6 @@ close_uffd:
 
 /* Pre-buffer and convergence infrastructure is in cow-uffd.c */
 static struct epoll_rfd lazy_listen_rfd;
-
-/* Convergence callback wrapper - delegates to cow-uffd.c */
-static int convergence_io_complete(unsigned long dst_id, unsigned long vaddr,
-				   unsigned long nr_pages, void *priv)
-{
-	return cow_convergence_copy_page(&lpis, vaddr, nr_pages, priv);
-}
 
 
 /*
