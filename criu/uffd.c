@@ -1661,6 +1661,38 @@ err:
  * - cow_is_all_pages_sent_received(), cow_set_all_pages_sent_received()
  */
 
+/*
+ * Unregister all VMAs from UFFD before process unfreezes.
+ * This ensures no page faults can occur after drain completes.
+ */
+static void cow_unregister_all_uffds(void)
+{
+	struct lazy_pages_info *lpi;
+	struct lazy_iov *iov;
+
+	list_for_each_entry(lpi, &lpis, l) {
+		if (lpi->exited || lpi->lpfd.fd < 0)
+			continue;
+
+		list_for_each_entry(iov, &lpi->iovs, l) {
+			struct uffdio_range unreg = {
+				.start = iov->start,
+				.len = iov->end - iov->start,
+			};
+
+			if (ioctl(lpi->lpfd.fd, UFFDIO_UNREGISTER, &unreg)) {
+				if (errno != ENOMEM) /* ENOMEM = process already gone */
+					lp_perror(lpi, "UFFDIO_UNREGISTER 0x%lx-0x%lx",
+						  iov->start, iov->end);
+			} else {
+				lp_debug(lpi, "Unregistered UFFD 0x%lx-0x%lx\n",
+					 iov->start, iov->end);
+			}
+		}
+	}
+
+	pr_info("All UFFD regions unregistered\n");
+}
 
 /*
  * COW Phase 3: Enter restore loop after pages are buffered and pstree loaded.
@@ -1743,6 +1775,9 @@ int cow_phase3_restore_loop(int ep_fd, struct epoll_event **events, int nr_fds)
 	pr_warn("DEBUG: Sleeping 100ms after drain to test timing...\n");
 	usleep(100000);  /* 100ms */
 	pr_warn("DEBUG: Sleep done, sending signal\n");
+
+	/* Unregister all UFFD regions before unfreezing process */
+	cow_unregister_all_uffds();
 
 	/*
 	 * Signal restore that drain is complete and it's safe to unfreeze.

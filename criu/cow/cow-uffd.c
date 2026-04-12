@@ -1628,6 +1628,9 @@ int cow_handle_page_fault_full(struct lazy_pages_info *lpi,
 			       int (*do_zero)(struct lazy_pages_info *, __u64, unsigned long),
 			       int (*do_handle_pages)(struct lazy_pages_info *, __u64, unsigned long, unsigned))
 {
+	pr_err("BUG: cow_handle_page_fault_full called - should be dead code!\n");
+	BUG();
+
 	unsigned long long img_addr = 0;
 	int ret;
 
@@ -1678,6 +1681,9 @@ int cow_handle_page_fault_full(struct lazy_pages_info *lpi,
 int cow_handle_page_fault_buffer(struct lazy_pages_info *lpi,
 				 unsigned long long address)
 {
+	pr_err("BUG: cow_handle_page_fault_buffer called - should be dead code!\n");
+	BUG();
+
 	void *data;
 	int ret;
 
@@ -1817,6 +1823,9 @@ void cow_uffd_copy_success(unsigned long address)
 int cow_handle_page_fault(struct lazy_pages_info *lpi,
 			  unsigned long long address)
 {
+	pr_err("BUG: cow_handle_page_fault called - should be dead code!\n");
+	BUG();
+
 	struct lazy_iov *iov;
 
 	/* Check if all pages have been sent */
@@ -1960,6 +1969,9 @@ int cow_handle_page_fault_cow_mode(struct lazy_pages_info *lpi,
 				   unsigned long long address,
 				   unsigned long long *img_addr_out)
 {
+	pr_err("BUG: cow_handle_page_fault_cow_mode called - should be dead code!\n");
+	BUG();
+
 	struct lazy_iov *iov;
 
 	/* Check if server is available for convergence requests */
