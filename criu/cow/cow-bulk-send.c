@@ -479,77 +479,99 @@ static void *p3_bulk_sender_thread(void *arg)
 
 	/* === Iteration 0: Bulk transfer === */
 	{
+		struct timespec bulk_start, bulk_end;
+		long bulk_elapsed_ms;
 		int vma_count = 0;
+
+		clock_gettime(CLOCK_MONOTONIC, &bulk_start);
 		pr_err("P3[%d]: Starting bulk transfer, scanning lazy_vmas\n", thread_id);
 		list_for_each_entry(lve, lazy_vmas, list) {
 			vma_count++;
 		}
 		pr_err("P3[%d]: Found %d VMAs in lazy_vmas list\n", thread_id, vma_count);
-	}
-	list_for_each_entry(lve, lazy_vmas, list) {
-		unsigned long my_start, my_end;
-		unsigned long vaddr;
-		unsigned long vma_size = lve->end - lve->start;
 
-		pr_info("P3[%d]: Checking VMA %lx-%lx (%lu KB) dst_id=%lu (my dst_id=%lu)\n",
-		       thread_id, lve->start, lve->end, vma_size / 1024,
-		       lve->dst_id, ctx->dst_id);
+		list_for_each_entry(lve, lazy_vmas, list) {
+			unsigned long my_start, my_end;
+			unsigned long vaddr;
+			unsigned long vma_size = lve->end - lve->start;
 
-		if (!get_thread_vma_range(ctx, lve, &my_start, &my_end)) {
-			pr_info("P3[%d]: -> Skipped by get_thread_vma_range\n", thread_id);
-			continue;
-		}
+			pr_info("P3[%d]: Checking VMA %lx-%lx (%lu KB) dst_id=%lu (my dst_id=%lu)\n",
+				thread_id, lve->start, lve->end, vma_size / 1024,
+				lve->dst_id, ctx->dst_id);
 
-		pr_info("P3[%d]: Bulk VMA %lx-%lx chunk %lx-%lx\n",
-			thread_id,
-			(unsigned long)lve->start, (unsigned long)lve->end,
-			my_start, my_end);
-
-		for (vaddr = my_start; vaddr < my_end;
-		     vaddr += COW_BATCH_PAGES * PAGE_SIZE) {
-			int batch_pages;
-			int sent;
-
-			batch_pages = (my_end - vaddr) / PAGE_SIZE;
-			if (batch_pages > COW_BATCH_PAGES)
-				batch_pages = COW_BATCH_PAGES;
-
-			sent = send_lazy_vma_pages_batch(
-				ctx->socket, lve, vaddr, batch_pages,
-				ctx->dst_id, ctx->source_pid);
-
-			if (sent < 0) {
-				pr_err("P3[%d]: Failed to send batch at %lx\n",
-				       thread_id, vaddr);
-				ctx->error = true;
-				goto out;
+			if (!get_thread_vma_range(ctx, lve, &my_start, &my_end)) {
+				pr_info("P3[%d]: -> Skipped by get_thread_vma_range\n", thread_id);
+				continue;
 			}
 
-			total_sent += sent;
+			pr_info("P3[%d]: Bulk VMA %lx-%lx chunk %lx-%lx\n",
+				thread_id,
+				(unsigned long)lve->start, (unsigned long)lve->end,
+				my_start, my_end);
+
+			for (vaddr = my_start; vaddr < my_end;
+			     vaddr += COW_BATCH_PAGES * PAGE_SIZE) {
+				int batch_pages;
+				int sent;
+
+				batch_pages = (my_end - vaddr) / PAGE_SIZE;
+				if (batch_pages > COW_BATCH_PAGES)
+					batch_pages = COW_BATCH_PAGES;
+
+				sent = send_lazy_vma_pages_batch(
+					ctx->socket, lve, vaddr, batch_pages,
+					ctx->dst_id, ctx->source_pid);
+
+				if (sent < 0) {
+					pr_err("P3[%d]: Failed to send batch at %lx\n",
+					       thread_id, vaddr);
+					ctx->error = true;
+					goto out;
+				}
+
+				total_sent += sent;
+			}
 		}
+
+		clock_gettime(CLOCK_MONOTONIC, &bulk_end);
+		bulk_elapsed_ms = (bulk_end.tv_sec - bulk_start.tv_sec) * 1000 +
+				  (bulk_end.tv_nsec - bulk_start.tv_nsec) / 1000000;
+		pr_err("P3[%d] TIMING: Bulk transfer done: %lu pages in %ld ms\n",
+		       thread_id, total_sent, bulk_elapsed_ms);
 	}
 
-	pr_err("P3[%d] bulk transfer done: %lu pages, starting dirty scan loop\n",
-		thread_id, total_sent);
-
 	/* === Iterations 1+: Dirty scan loop until convergence === */
-	while (!g_last_scan_flag) {
-		ctx->iteration++;
-		ctx->last_dirty_count = do_dirty_scan_and_send(ctx);
+	{
+		struct timespec loop_start, loop_end;
+		long loop_elapsed_ms;
+		unsigned long loop_total_dirty = 0;
 
-		ctx->below_threshold =
-			(ctx->last_dirty_count < DIRTY_CONVERGENCE_THRESHOLD) || (ctx->iteration > 3);
+		clock_gettime(CLOCK_MONOTONIC, &loop_start);
+		while (!g_last_scan_flag) {
+			ctx->iteration++;
+			ctx->last_dirty_count = do_dirty_scan_and_send(ctx);
 
-		pr_info("P3[%d] iter=%u dirty=%lu threshold=%s\n",
-		       thread_id, ctx->iteration, ctx->last_dirty_count,
-		       ctx->below_threshold ? "YES" : "NO");
+			ctx->below_threshold =
+				(ctx->last_dirty_count < DIRTY_CONVERGENCE_THRESHOLD) || (ctx->iteration > 3);
 
-		/*
-		 * Small sleep to avoid busy-looping when there are few dirty pages.
-		 * This gives the application time to dirty more pages.
-		 */
-		if (ctx->last_dirty_count < 100)
-			usleep(1000);  /* 1ms */
+			pr_info("P3[%d] iter=%u dirty=%lu threshold=%s\n",
+				thread_id, ctx->iteration, ctx->last_dirty_count,
+				ctx->below_threshold ? "YES" : "NO");
+
+			/*
+			 * Small sleep to avoid busy-looping when there are few dirty pages.
+			 * This gives the application time to dirty more pages.
+			 */
+			if (ctx->last_dirty_count < 100)
+				usleep(1000);  /* 1ms */
+
+			loop_total_dirty += ctx->last_dirty_count;
+		}
+		clock_gettime(CLOCK_MONOTONIC, &loop_end);
+		loop_elapsed_ms = (loop_end.tv_sec - loop_start.tv_sec) * 1000 +
+				  (loop_end.tv_nsec - loop_start.tv_nsec) / 1000000;
+		pr_err("P3[%d] TIMING: Dirty scan loop done: %u iterations, %lu dirty pages in %ld ms\n",
+		       thread_id, ctx->iteration, loop_total_dirty, loop_elapsed_ms);
 	}
 
 	/* === Final scan after freeze === */
