@@ -558,14 +558,25 @@ static void *p3_bulk_sender_thread(void *arg)
 				thread_id, ctx->iteration, ctx->last_dirty_count,
 				ctx->below_threshold ? "YES" : "NO");
 
-			/*
-			 * Small sleep to avoid busy-looping when there are few dirty pages.
-			 * This gives the application time to dirty more pages.
-			 */
-			if (ctx->last_dirty_count < 100)
-				usleep(1000);  /* 1ms */
-
 			loop_total_dirty += ctx->last_dirty_count;
+
+			/*
+			 * Thread 0 handles small VMAs - once below threshold, stop scanning
+			 * and just wait for final scan signal to avoid busy-looping.
+			 */
+			if (thread_id == 0 && ctx->below_threshold) {
+				pr_info("P3[0] below threshold, waiting for final scan signal\n");
+				while (!g_last_scan_flag)
+					usleep(10000);  /* 10ms poll */
+				break;
+			}
+
+			/*
+			 * Sleep to reduce CPU burn and kernel lock contention when
+			 * there's little dirty page activity or after initial iterations.
+			 */
+			if (ctx->last_dirty_count < 1000 || ctx->iteration > 3)
+				usleep(30000);  /* 30ms */
 		}
 		clock_gettime(CLOCK_MONOTONIC, &loop_end);
 		loop_elapsed_ms = (loop_end.tv_sec - loop_start.tv_sec) * 1000 +
