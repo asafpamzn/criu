@@ -136,27 +136,11 @@ extern int cow_create_iovs_for_new_ranges(struct list_head *lpis,
 					  unsigned long *dirty_ranges,
 					  unsigned int nr_dirty_ranges);
 
-/* Set dirty bitmap received and process pending ranges */
-extern void cow_process_dirty_bitmap(struct list_head *lpis,
-				     unsigned long *dirty_ranges,
-				     unsigned int nr_dirty_ranges);
 
-/* COW Phase 3 restore loop entry point */
-extern int cow_phase3_restore_loop_impl(struct list_head *lpis, int epollfd,
-					struct epoll_event **events, int nr_fds,
-					int (*handle_requests)(int, struct epoll_event **, int));
-
-/* COW mode initialization for cr_lazy_pages */
-extern int cow_lazy_pages_init(void);
-
-/* COW mode cleanup for cr_lazy_pages */
-extern void cow_lazy_pages_cleanup(void);
 
 /* Store pending dirty ranges (before restore connects) */
 extern void cow_store_pending_dirty_ranges(unsigned long *ranges, unsigned int nr);
 
-/* Get and clear pending dirty ranges */
-extern unsigned long *cow_get_pending_dirty_ranges(unsigned int *nr);
 
 /* Set/get phase3_active flag */
 extern void cow_set_phase3_active(bool active);
@@ -256,11 +240,6 @@ extern int cow_handle_page_fault_cow_mode(struct lazy_pages_info *lpi,
 extern int cow_handle_lazy_accept_post_connect(struct list_head *lpis,
 					       void (*switch_to_convergence)(void));
 
-/*
- * COW Phase 3 page request after restore connects.
- * Requests all pages for all alive tasks.
- */
-extern int cow_phase3_request_all_pages(void);
 
 /*
  * Set dirty bitmap received and process (wrapper for uffd.c).

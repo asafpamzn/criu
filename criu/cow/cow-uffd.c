@@ -1707,14 +1707,7 @@ void cow_store_pending_dirty_ranges(unsigned long *ranges, unsigned int nr)
 	pending_nr_dirty_ranges = nr;
 }
 
-unsigned long *cow_get_pending_dirty_ranges(unsigned int *nr)
-{
-	unsigned long *ranges = pending_dirty_ranges;
-	*nr = pending_nr_dirty_ranges;
-	pending_dirty_ranges = NULL;
-	pending_nr_dirty_ranges = 0;
-	return ranges;
-}
+
 
 /*
  * Switch async reader to convergence mode.
@@ -1810,70 +1803,10 @@ int cow_create_iovs_for_new_ranges(struct list_head *lpis,
 	return 0;
 }
 
-/*
- * Process dirty bitmap - create IOVs and enter convergence mode.
- * Called when dirty bitmap is received from primary.
- */
-void cow_process_dirty_bitmap(struct list_head *lpis,
-			      unsigned long *dirty_ranges,
-			      unsigned int nr_dirty_ranges)
-{
-	pr_info("Processing dirty bitmap (%u ranges)\n", nr_dirty_ranges);
 
-	cow_set_dirty_bitmap_received(true);
 
-	if (cow_is_restore_connected()) {
-		/* Restore already connected - process now */
-		if (cow_create_iovs_for_new_ranges(lpis, dirty_ranges, nr_dirty_ranges) < 0)
-			pr_warn("Failed to create IOVs for some new ranges\n");
 
-		xfree(dirty_ranges);
 
-		pr_info("Entering convergence mode\n");
-		cow_switch_to_convergence_callback();
-		cow_start_drain_thread(lpis);
-	} else {
-		/* Store for later processing when restore connects */
-		pr_info("Storing dirty ranges for later (%u ranges)\n", nr_dirty_ranges);
-		cow_store_pending_dirty_ranges(dirty_ranges, nr_dirty_ranges);
-	}
-}
-
-/*
- * COW mode initialization for cr_lazy_pages.
- * Initializes page buffer, trackers, etc.
- */
-int cow_lazy_pages_init(void)
-{
-	if (cow_page_buffer_init() < 0) {
-		pr_err("Failed to initialize page buffer\n");
-		return -1;
-	}
-
-	if (page_state_init())
-		pr_warn("Failed to initialize page state tracker (non-fatal)\n");
-
-	if (unmapped_tracker_init())
-		pr_warn("Failed to initialize unmapped tracker (non-fatal)\n");
-
-	if (pf_tracker_init())
-		pr_warn("Failed to init hung page tracker (non-fatal)\n");
-
-	return 0;
-}
-
-/*
- * COW mode cleanup for cr_lazy_pages.
- */
-void cow_lazy_pages_cleanup(void)
-{
-	cow_page_buffer_destroy();
-	pf_tracker_destroy();
-	page_state_verify_all_terminal();
-	page_state_destroy();
-	unmapped_tracker_destroy();
-	cow_cleanup_prebuffer();
-}
 
 /*
  * Full COW page fault handler - consolidates all COW-specific logic.
@@ -2411,38 +2344,5 @@ int cow_handle_lazy_accept_post_connect(struct list_head *lpis,
 	return 0;
 }
 
-/*
- * COW Phase 3 page request after restore connects.
- * Requests all pages for all alive tasks.
- *
- * Returns: 0 on success, -1 on error
- */
-int cow_phase3_request_all_pages(void)
-{
-	struct pstree_item *pi;
 
-	if (!cow_is_phase3_active())
-		return 0;
-
-	/*
-	 * Skip page requests if all pages have been sent - no page server
-	 * connection exists and all pages are already in the buffer.
-	 */
-	if (cow_is_all_pages_sent_received()) {
-		pr_info("All pages already buffered, skipping page requests\n");
-		return 0;
-	}
-
-	for_each_pstree_item(pi) {
-		if (task_alive(pi)) {
-			pr_info("Requesting all remote pages for pid=%d\n", vpid(pi));
-			if (request_all_remote_pages(vpid(pi)) < 0) {
-				pr_err("Failed to request pages for pid=%d\n", vpid(pi));
-				return -1;
-			}
-		}
-	}
-
-	return 0;
-}
 
