@@ -538,7 +538,7 @@ static void *p3_bulk_sender_thread(void *arg)
 		ctx->last_dirty_count = do_dirty_scan_and_send(ctx);
 
 		ctx->below_threshold =
-			(ctx->last_dirty_count < DIRTY_CONVERGENCE_THRESHOLD);
+			(ctx->last_dirty_count < DIRTY_CONVERGENCE_THRESHOLD) || (ctx->iteration > 3);
 
 		pr_info("P3[%d] iter=%u dirty=%lu threshold=%s\n",
 		       thread_id, ctx->iteration, ctx->last_dirty_count,
