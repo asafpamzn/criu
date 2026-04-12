@@ -662,12 +662,12 @@ int page_state_set_with_crc(unsigned long vaddr, enum page_state new_state,
 
 		/* Detect dirty page overwrites */
 		if (old_crc != 0 && old_crc != new_crc) {
-			pr_err("PAGE_CRC_CHANGE: 0x%lx old_crc=0x%08x new_crc=0x%08x "
+			pr_debug("PAGE_CRC_CHANGE: 0x%lx old_crc=0x%08x new_crc=0x%08x "
 			       "buffer_count=%u->%u state=%s (dirty page arrived)\n",
 			       vaddr, old_crc, new_crc, old_count, entry->buffer_count,
 			       page_state_name(entry->state));
 		} else if (old_crc != 0 && old_crc == new_crc && old_count > 0) {
-			pr_err("PAGE_CRC_SAME: 0x%lx crc=0x%08x buffer_count=%u->%u "
+			pr_debug("PAGE_CRC_SAME: 0x%lx crc=0x%08x buffer_count=%u->%u "
 			       "state=%s (same data re-buffered)\n",
 			       vaddr, new_crc, old_count, entry->buffer_count,
 			       page_state_name(entry->state));
