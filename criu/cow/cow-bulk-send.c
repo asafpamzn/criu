@@ -921,7 +921,7 @@ static void *p3_bulk_sender_thread(void *arg)
 
 			/* Periodic status logging */
 			if (regions_processed > 0 && regions_processed % 10000 == 0) {
-				pr_err("P3[%d] queue progress: processed=%lu, queue_size=%lu, scan_complete=%d\n",
+				pr_info("P3[%d] queue progress: processed=%lu, queue_size=%lu, scan_complete=%d\n",
 				       thread_id, regions_processed, spsc_size(my_queue->size),
 				       cow_is_scan_complete());
 			}
