@@ -8,7 +8,7 @@
 #define COW_BATCH_SIZE  (COW_BATCH_PAGES * PAGE_SIZE)  /* 256KB */
 
 /* Convergence threshold: freeze when scanner finds < 1M dirty pages */
-#define DIRTY_SCAN_FREEZE_THRESHOLD 1000000
+#define DIRTY_SCAN_FREEZE_THRESHOLD 300000
 
 /*
  * Dirty region entry - passed from scanner thread to sender threads via SPSC queue.
