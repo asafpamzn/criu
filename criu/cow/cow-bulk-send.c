@@ -91,7 +91,7 @@ static unsigned int g_nr_new_vma_ranges = 0;
  *   Scanner 0: first half of each VMA  → queues 0-9
  *   Scanner 1: second half of each VMA → queues 10-19
  */
-#define NUM_SCANNERS 2
+#define NUM_SCANNERS 4
 #define QUEUES_PER_SCANNER (NUM_P3_THREADS / NUM_SCANNERS)
 
 static struct sender_queue sender_queues[NUM_P3_THREADS];
@@ -224,23 +224,21 @@ static void *dirty_scanner_thread(void *arg)
 		iteration++;
 		clock_gettime(CLOCK_MONOTONIC, &iter_start);
 
-		/* Scan this scanner's half of each VMA */
+		/* Scan this scanner's portion of each VMA */
 		list_for_each_entry(lve, lazy_vmas, list) {
 			struct pm_scan_arg args;
 			long regs_len;
 			unsigned long vma_size = lve->end - lve->start;
-			unsigned long half_pages = (vma_size / PAGE_SIZE) / 2;
-			unsigned long midpoint = lve->start + (half_pages * PAGE_SIZE);
+			unsigned long total_pages = vma_size / PAGE_SIZE;
+			unsigned long pages_per_scanner = total_pages / NUM_SCANNERS;
 			unsigned long my_start, my_end;
 
 			/* Calculate this scanner's range (page-aligned) */
-			if (scanner_id == 0) {
-				my_start = lve->start;
-				my_end = midpoint;
-			} else {
-				my_start = midpoint;
-				my_end = lve->end;
-			}
+			my_start = lve->start + (scanner_id * pages_per_scanner * PAGE_SIZE);
+			if (scanner_id == NUM_SCANNERS - 1)
+				my_end = lve->end;  /* Last scanner gets remainder */
+			else
+				my_end = my_start + (pages_per_scanner * PAGE_SIZE);
 
 			/* Skip if range is too small */
 			if (my_end <= my_start)
@@ -374,17 +372,15 @@ static void *dirty_scanner_thread(void *arg)
 			struct pm_scan_arg args;
 			long regs_len;
 			unsigned long vma_size = lve->end - lve->start;
-			unsigned long half_pages = (vma_size / PAGE_SIZE) / 2;
-			unsigned long midpoint = lve->start + (half_pages * PAGE_SIZE);
+			unsigned long total_pages = vma_size / PAGE_SIZE;
+			unsigned long pages_per_scanner = total_pages / NUM_SCANNERS;
 			unsigned long my_start, my_end;
 
-			if (scanner_id == 0) {
-				my_start = lve->start;
-				my_end = midpoint;
-			} else {
-				my_start = midpoint;
+			my_start = lve->start + (scanner_id * pages_per_scanner * PAGE_SIZE);
+			if (scanner_id == NUM_SCANNERS - 1)
 				my_end = lve->end;
-			}
+			else
+				my_end = my_start + (pages_per_scanner * PAGE_SIZE);
 
 			if (my_end <= my_start)
 				continue;
