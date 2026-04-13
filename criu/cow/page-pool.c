@@ -232,7 +232,7 @@ void page_pool_put(void *page)
 
 	/* Last reference? munmap the entire chunk */
 	if (old_ref == 1) {
-		pr_info("Freeing 256MB chunk at %p (all pages returned)\n", hdr);
+		pr_err("PAGE_POOL: Freeing 256MB chunk at %p (all pages returned)\n", hdr);
 
 		/* Remove from tracking list */
 		pthread_spin_lock(&chunk_list_lock);
