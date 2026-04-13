@@ -29,6 +29,7 @@
 #include <pthread.h>
 #include <execinfo.h>
 #include <stdlib.h>
+#include <limits.h>
 
 #include "page.h"
 #include "cow/page-pool.h"
@@ -251,6 +252,12 @@ void page_pool_put(void *page)
 		}
 	}
 
+	/* Debug: log when chunk is getting close to being freed */
+	if (old_ref <= 1000 && old_ref > 1 && (old_ref == 1000 || old_ref == 500 || old_ref == 100 || old_ref == 10)) {
+		pr_err("PAGE_POOL_LOW: chunk=%p refcount_now=%d (close to free!)\n",
+		       hdr, old_ref - 1);
+	}
+
 	/* Last reference? munmap the entire chunk */
 	if (old_ref == 1) {
 		pr_err("PAGE_POOL: Freeing 256MB chunk at %p (all pages returned)\n", hdr);
@@ -294,4 +301,36 @@ void page_pool_destroy_all(void)
 	}
 
 	pr_warn("All page pools destroyed\n");
+}
+
+/* Debug: print chunk stats to see refcount distribution */
+void page_pool_dump_stats(void)
+{
+	int i, n;
+	int low_count = 0, mid_count = 0, high_count = 0;
+	int min_ref = INT_MAX, max_ref = 0;
+	unsigned long total_outstanding = 0;
+
+	if (!atomic_load(&global_init_done))
+		return;
+
+	pthread_spin_lock(&chunk_list_lock);
+	n = atomic_load(&nr_chunks);
+	for (i = 0; i < n; i++) {
+		if (all_chunks[i]) {
+			struct chunk_header *hdr = all_chunks[i];
+			int ref = atomic_load(&hdr->refcount);
+			total_outstanding += ref;
+			if (ref < min_ref) min_ref = ref;
+			if (ref > max_ref) max_ref = ref;
+			if (ref < 1000) low_count++;
+			else if (ref < 30000) mid_count++;
+			else high_count++;
+		}
+	}
+	pthread_spin_unlock(&chunk_list_lock);
+
+	pr_err("PAGE_POOL_STATS: chunks=%d outstanding=%lu | low(<1k)=%d mid(1k-30k)=%d high(>30k)=%d | min=%d max=%d\n",
+	       n, total_outstanding, low_count, mid_count, high_count,
+	       min_ref == INT_MAX ? 0 : min_ref, max_ref);
 }

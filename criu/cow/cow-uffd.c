@@ -269,11 +269,13 @@ static int cow_uffd_copy_and_track(int uffd, unsigned long vaddr, void *data,
 		__sync_fetch_and_add(&cow_buffer.nr_eagain, 1);
 		pr_err("COW_TRACE %s: 0x%lx EAGAIN, queuing for retry\n", caller, vaddr);
 		if (lpis) {
-			/* Drain mode - use drain EAGAIN queue */
-			if (cow_queue_drain_eagain_request(lpis, vaddr, data) == 0) {
-				if (data_owned)
-					*data_owned = true;
-			}
+			/* Drain mode - use drain EAGAIN queue.
+			 * cow_queue_eagain_request makes an xmalloc copy of the data,
+			 * so we must NOT set data_owned - the caller should still free
+			 * the original page pool buffer.
+			 */
+			cow_queue_drain_eagain_request(lpis, vaddr, data);
+			/* Note: data_owned stays false, so caller will page_pool_put(data) */
 		} else if (lpi) {
 			/* Normal mode - use regular EAGAIN queue */
 			pf_tracker_set_state(vaddr, PF_STATE_PENDING_EAGAIN);
@@ -765,6 +767,9 @@ static void *background_drain_worker(void *arg)
 								       thread_id, drained, cow_buffer.nr_pages);
 								last_progress_drained = drained;
 								last_progress_time = time(NULL);
+								/* Thread 0 dumps pool stats every 1M pages */
+								if (thread_id == 0 && drained % 1000000 < 100000)
+									page_pool_dump_stats();
 							}
 						}
 						if (data_owned)

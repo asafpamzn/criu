@@ -30,4 +30,7 @@ void page_pool_put(void *page);
 /* Cleanup all pools */
 void page_pool_destroy_all(void);
 
+/* Debug: print chunk stats */
+void page_pool_dump_stats(void);
+
 #endif /* __CR_PAGE_POOL_H__ */
