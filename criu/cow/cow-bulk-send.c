@@ -259,23 +259,29 @@ static void *dirty_scanner_thread(void *arg)
 
 		/*
 		 * Check convergence - signal freeze if < 1M dirty pages.
-		 * Scanner continues running until main thread actually freezes
-		 * and calls cow_signal_scanner_freeze().
+		 * Once below threshold, stop scanning and wait for freeze signal.
 		 */
-		if (total_dirty_pages < DIRTY_SCAN_FREEZE_THRESHOLD && !g_last_scan_flag) {
+		if (total_dirty_pages < DIRTY_SCAN_FREEZE_THRESHOLD) {
 			pr_err("Scanner: %lu pages < %d threshold, requesting freeze\n",
 			       total_dirty_pages, DIRTY_SCAN_FREEZE_THRESHOLD);
-			/* Signal main thread to freeze - it will call cow_signal_scanner_freeze() */
+			/* Signal main thread to freeze */
 			g_last_scan_flag = true;
-			/* Don't break - keep scanning until freeze signal arrives */
+			/* Stop scanning - wait for freeze signal, then do final scan */
+			break;
 		}
 
 		/* Brief sleep to let senders catch up */
 		usleep(1000);
 	}
 
-	/* Final scan after freeze */
-	if (__atomic_load_n(&g_scanner_freeze_signal, __ATOMIC_ACQUIRE)) {
+	/* Wait for freeze signal from main thread */
+	pr_err("Scanner: waiting for freeze signal...\n");
+	while (!__atomic_load_n(&g_scanner_freeze_signal, __ATOMIC_ACQUIRE)) {
+		usleep(1000);
+	}
+
+	/* Final scan after freeze - single scan captures all remaining dirty pages */
+	{
 		unsigned long final_dirty = 0;
 		unsigned int queue_idx = 0;
 		struct timespec fs_start, fs_end;
