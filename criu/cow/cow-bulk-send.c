@@ -189,12 +189,12 @@ static void *dirty_scanner_thread(void *arg)
 		unsigned int queue_idx = 0;
 		struct timespec iter_start, iter_end;
 
-		iteration++;
-		clock_gettime(CLOCK_MONOTONIC, &iter_start);
-
 		unsigned long scan_time_ns = 0;
 		unsigned long dist_time_ns = 0;
 		unsigned long num_regions = 0;
+
+		iteration++;
+		clock_gettime(CLOCK_MONOTONIC, &iter_start);
 
 		/* Scan ALL VMAs in single pass */
 		list_for_each_entry(lve, lazy_vmas, list) {
