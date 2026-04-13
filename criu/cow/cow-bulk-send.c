@@ -361,7 +361,9 @@ out:
 	}
 
 	/* Signal senders that scanning is complete */
+	pr_err("Scanner: setting g_scan_complete=true\n");
 	__atomic_store_n(&g_scan_complete, true, __ATOMIC_RELEASE);
+	pr_err("Scanner: g_scan_complete set, exiting\n");
 	return NULL;
 }
 
@@ -909,22 +911,37 @@ static void *p3_bulk_sender_thread(void *arg)
 		long loop_elapsed_ms;
 		unsigned long loop_total_pages = 0;
 		unsigned long regions_processed = 0;
+		unsigned long wait_count = 0;
 		struct sender_queue *my_queue = cow_get_sender_queue(thread_id);
 
 		clock_gettime(CLOCK_MONOTONIC, &loop_start);
-		pr_info("P3[%d] starting queue consumption\n", thread_id);
+		pr_err("P3[%d] starting queue consumption, queue=%p\n", thread_id, (void *)my_queue);
 
 		/* Consume dirty regions from queue until scanner completes */
 		while (!cow_is_scan_complete() || spsc_peek(my_queue->head)) {
 			struct dirty_region_entry *region;
 			int sent;
 
+			/* Periodic status logging */
+			if (regions_processed > 0 && regions_processed % 10000 == 0) {
+				pr_err("P3[%d] queue progress: processed=%lu, queue_size=%lu, scan_complete=%d\n",
+				       thread_id, regions_processed, spsc_size(my_queue->size),
+				       cow_is_scan_complete());
+			}
+
 			region = spsc_dequeue(my_queue->head, my_queue->size);
 			if (!region) {
 				/* Queue empty, brief wait */
+				wait_count++;
+				if (wait_count % 10000 == 0) {
+					pr_err("P3[%d] waiting: queue empty, scan_complete=%d, wait_count=%lu, peek=%d\n",
+					       thread_id, cow_is_scan_complete(), wait_count,
+					       spsc_peek(my_queue->head));
+				}
 				usleep(100);
 				continue;
 			}
+			wait_count = 0;
 
 			/* Send the dirty region */
 			sent = send_dirty_region(ctx, region);
@@ -934,6 +951,8 @@ static void *p3_bulk_sender_thread(void *arg)
 			}
 			xfree(region);
 		}
+		pr_err("P3[%d] exiting queue loop: scan_complete=%d, peek=%d\n",
+		       thread_id, cow_is_scan_complete(), spsc_peek(my_queue->head));
 
 		clock_gettime(CLOCK_MONOTONIC, &loop_end);
 		loop_elapsed_ms = (loop_end.tv_sec - loop_start.tv_sec) * 1000 +
