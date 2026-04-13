@@ -2977,16 +2977,7 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 	pr_err("TIMING: Phase 3 freeze ended - process frozen for %ld.%06ld seconds\n",
 	       freeze_delta.tv_sec, freeze_delta.tv_usec);
 
-	/* Close async uffd - moved outside freeze period */
-	{
-		struct timeval t_start, t_end, t_delta;
-		gettimeofday(&t_start, NULL);
-		cow_cleanup_async_uffd();
-		gettimeofday(&t_end, NULL);
-		timersub(&t_end, &t_start, &t_delta);
-		pr_err("TIMING: cow_cleanup_async_uffd took %ld.%06ld seconds (after unfreeze)\n",
-		       t_delta.tv_sec, t_delta.tv_usec);
-	}
+
 
 	/*
 	 * Signal completion to replica. Dirty pages were sent by P3 threads,
@@ -3006,6 +2997,17 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 
 	close_page_server_socket();
 	cow_set_phase(COW_PHASE_DONE);
+
+		/* Close async uffd - moved outside freeze period */
+	{
+		struct timeval t_start, t_end, t_delta;
+		gettimeofday(&t_start, NULL);
+		cow_cleanup_async_uffd();
+		gettimeofday(&t_end, NULL);
+		timersub(&t_end, &t_start, &t_delta);
+		pr_err("TIMING: cow_cleanup_async_uffd took %ld.%06ld seconds (after unfreeze)\n",
+		       t_delta.tv_sec, t_delta.tv_usec);
+	}
 	exit_code = 0;
 	goto finish;
 
