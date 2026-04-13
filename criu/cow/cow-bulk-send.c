@@ -192,6 +192,10 @@ static void *dirty_scanner_thread(void *arg)
 		iteration++;
 		clock_gettime(CLOCK_MONOTONIC, &iter_start);
 
+		unsigned long scan_time_ns = 0;
+		unsigned long dist_time_ns = 0;
+		unsigned long num_regions = 0;
+
 		/* Scan ALL VMAs in single pass */
 		list_for_each_entry(lve, lazy_vmas, list) {
 			struct pm_scan_arg args;
@@ -210,10 +214,16 @@ static void *dirty_scanner_thread(void *arg)
 			args.return_mask = PAGE_IS_WRITTEN;
 
 			do {
+				struct timespec t1, t2, t3;
 				int i;
 				args.start = args.walk_end;
 
+				clock_gettime(CLOCK_MONOTONIC, &t1);
 				regs_len = ioctl(g_scanner_pagemap_fd, PAGEMAP_SCAN, &args);
+				clock_gettime(CLOCK_MONOTONIC, &t2);
+				scan_time_ns += (t2.tv_sec - t1.tv_sec) * 1000000000UL +
+						(t2.tv_nsec - t1.tv_nsec);
+
 				if (regs_len < 0) {
 					pr_perror("Scanner: PAGEMAP_SCAN failed");
 					break;
@@ -221,6 +231,8 @@ static void *dirty_scanner_thread(void *arg)
 
 				if (regs_len == 0)
 					break;
+
+				num_regions += regs_len;
 
 				/* Distribute dirty regions to sender queues (round-robin) */
 				for (i = 0; i < regs_len; i++) {
@@ -246,6 +258,9 @@ static void *dirty_scanner_thread(void *arg)
 						     entry, struct dirty_region_spsc_node);
 					queue_idx = (queue_idx + 1) % NUM_P3_THREADS;
 				}
+				clock_gettime(CLOCK_MONOTONIC, &t3);
+				dist_time_ns += (t3.tv_sec - t2.tv_sec) * 1000000000UL +
+						(t3.tv_nsec - t2.tv_nsec);
 			} while (args.walk_end < lve->end);
 		}
 
@@ -253,8 +268,9 @@ static void *dirty_scanner_thread(void *arg)
 		{
 			long iter_ms = (iter_end.tv_sec - iter_start.tv_sec) * 1000 +
 				       (iter_end.tv_nsec - iter_start.tv_nsec) / 1000000;
-			pr_err("Scanner: iter=%u, %lu dirty pages distributed, %ld ms\n",
-			       iteration, total_dirty_pages, iter_ms);
+			pr_err("Scanner: iter=%u, %lu pages, %lu regions, scan=%lu ms, dist=%lu ms, total=%ld ms\n",
+			       iteration, total_dirty_pages, num_regions,
+			       scan_time_ns / 1000000, dist_time_ns / 1000000, iter_ms);
 		}
 
 		/*
@@ -904,11 +920,14 @@ static void *p3_bulk_sender_thread(void *arg)
 
 	/* === Phase 2: Consume dirty regions from scanner queue === */
 	{
-		struct timespec loop_start, loop_end;
+		struct timespec loop_start, loop_end, drain_start;
 		long loop_elapsed_ms;
 		unsigned long loop_total_pages = 0;
 		unsigned long regions_processed = 0;
 		unsigned long wait_count = 0;
+		unsigned long drain_regions = 0;
+		unsigned long drain_pages = 0;
+		bool drain_started = false;
 		struct sender_queue *my_queue = cow_get_sender_queue(thread_id);
 
 		clock_gettime(CLOCK_MONOTONIC, &loop_start);
@@ -918,6 +937,14 @@ static void *p3_bulk_sender_thread(void *arg)
 		while (!cow_is_scan_complete() || spsc_peek(my_queue->head)) {
 			struct dirty_region_entry *region;
 			int sent;
+
+			/* Track when we start draining after scan_complete */
+			if (!drain_started && cow_is_scan_complete()) {
+				drain_started = true;
+				clock_gettime(CLOCK_MONOTONIC, &drain_start);
+				pr_err("P3[%d] scan complete, draining queue (size=%lu)\n",
+				       thread_id, spsc_size(my_queue->size));
+			}
 
 			/* Periodic status logging */
 			if (regions_processed > 0 && regions_processed % 10000 == 0) {
@@ -945,6 +972,10 @@ static void *p3_bulk_sender_thread(void *arg)
 			if (sent > 0) {
 				loop_total_pages += sent;
 				regions_processed++;
+				if (drain_started) {
+					drain_regions++;
+					drain_pages += sent;
+				}
 			}
 			xfree(region);
 		}
@@ -954,6 +985,13 @@ static void *p3_bulk_sender_thread(void *arg)
 		clock_gettime(CLOCK_MONOTONIC, &loop_end);
 		loop_elapsed_ms = (loop_end.tv_sec - loop_start.tv_sec) * 1000 +
 				  (loop_end.tv_nsec - loop_start.tv_nsec) / 1000000;
+
+		if (drain_started) {
+			long drain_ms = (loop_end.tv_sec - drain_start.tv_sec) * 1000 +
+					(loop_end.tv_nsec - drain_start.tv_nsec) / 1000000;
+			pr_err("P3[%d] TIMING: Drain after scan_complete: %lu regions, %lu pages in %ld ms\n",
+			       thread_id, drain_regions, drain_pages, drain_ms);
+		}
 		pr_err("P3[%d] TIMING: Queue consumption done: %lu regions, %lu pages in %ld ms\n",
 		       thread_id, regions_processed, loop_total_pages, loop_elapsed_ms);
 
