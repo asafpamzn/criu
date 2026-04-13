@@ -389,11 +389,7 @@ void cow_wait_scanner_thread(void)
 		scanner_thread_handle = 0;
 		pr_info("Scanner thread joined\n");
 	}
-
-	/* Drain any remaining entries from queues */
-	for (int i = 0; i < NUM_P3_THREADS; i++) {
-		spsc_drain(sender_queues[i].head, free_dirty_region_entry);
-	}
+	/* Senders drain their own queues during normal exit */
 }
 
 void cow_set_new_vma_ranges(unsigned long *ranges, unsigned int nr_ranges)
