@@ -315,8 +315,10 @@ static void *dirty_scanner_thread(void *arg)
 		g_scanners_iter_done++;
 		if (g_scanners_iter_done == NUM_SCANNERS) {
 			/* Last scanner to finish - calculate total and reset */
+			int s;
+
 			g_total_dirty_pages = 0;
-			for (int s = 0; s < NUM_SCANNERS; s++)
+			for (s = 0; s < NUM_SCANNERS; s++)
 				g_total_dirty_pages += scanners[s].dirty_count;
 			g_scanners_iter_done = 0;
 			pthread_cond_broadcast(&g_scanner_cond);
@@ -438,10 +440,13 @@ static void *dirty_scanner_thread(void *arg)
 		g_scanners_iter_done++;
 		if (g_scanners_iter_done == NUM_SCANNERS) {
 			unsigned long total_final = 0;
-			for (int s = 0; s < NUM_SCANNERS; s++)
+			long fs_ms;
+			int s;
+
+			for (s = 0; s < NUM_SCANNERS; s++)
 				total_final += scanners[s].dirty_count;
-			long fs_ms = (fs_end.tv_sec - fs_start.tv_sec) * 1000 +
-				     (fs_end.tv_nsec - fs_start.tv_nsec) / 1000000;
+			fs_ms = (fs_end.tv_sec - fs_start.tv_sec) * 1000 +
+				(fs_end.tv_nsec - fs_start.tv_nsec) / 1000000;
 			pr_err("Scanner: final scan done, %lu dirty pages, %ld ms\n",
 			       total_final, fs_ms);
 			g_scanners_iter_done = 0;
@@ -476,7 +481,9 @@ out:
 	pthread_mutex_lock(&g_scanner_mutex);
 	{
 		bool all_done = true;
-		for (int s = 0; s < NUM_SCANNERS; s++) {
+		int s;
+
+		for (s = 0; s < NUM_SCANNERS; s++) {
 			if (!scanners[s].finished) {
 				all_done = false;
 				break;
