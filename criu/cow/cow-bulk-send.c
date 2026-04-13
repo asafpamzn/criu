@@ -229,10 +229,11 @@ static void *dirty_scanner_thread(void *arg)
 			struct pm_scan_arg args;
 			long regs_len;
 			unsigned long vma_size = lve->end - lve->start;
-			unsigned long midpoint = lve->start + (vma_size / 2);
+			unsigned long half_pages = (vma_size / PAGE_SIZE) / 2;
+			unsigned long midpoint = lve->start + (half_pages * PAGE_SIZE);
 			unsigned long my_start, my_end;
 
-			/* Calculate this scanner's range */
+			/* Calculate this scanner's range (page-aligned) */
 			if (scanner_id == 0) {
 				my_start = lve->start;
 				my_end = midpoint;
@@ -373,7 +374,8 @@ static void *dirty_scanner_thread(void *arg)
 			struct pm_scan_arg args;
 			long regs_len;
 			unsigned long vma_size = lve->end - lve->start;
-			unsigned long midpoint = lve->start + (vma_size / 2);
+			unsigned long half_pages = (vma_size / PAGE_SIZE) / 2;
+			unsigned long midpoint = lve->start + (half_pages * PAGE_SIZE);
 			unsigned long my_start, my_end;
 
 			if (scanner_id == 0) {
