@@ -137,11 +137,6 @@ void cow_signal_scanner_freeze(void)
 	__sync_synchronize();
 }
 
-static void free_dirty_region_entry(struct dirty_region_entry *entry)
-{
-	xfree(entry);
-}
-
 /*
  * Scanner thread - single thread does all PAGEMAP_SCAN to minimize TLB flushes.
  * Distributes dirty regions to sender threads via SPSC queues (round-robin).
