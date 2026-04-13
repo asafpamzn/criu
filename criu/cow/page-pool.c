@@ -64,6 +64,8 @@ static void *all_chunks[MAX_CHUNKS];
 static atomic_int nr_chunks;
 static pthread_spinlock_t chunk_list_lock;  /* Only for chunk tracking */
 static atomic_bool global_init_done;
+static atomic_ulong total_put_count;  /* Debug: total page_pool_put calls */
+static atomic_ulong total_alloc_count;  /* Debug: total pages allocated */
 
 /* Allocate a new 256MB aligned chunk */
 static void *alloc_chunk(void)
@@ -110,8 +112,8 @@ static void *alloc_chunk(void)
 	}
 	pthread_spin_unlock(&chunk_list_lock);
 
-	pr_info("Allocated 256MB chunk at %p (total: %d chunks)\n",
-		chunk, atomic_load(&nr_chunks));
+	pr_err("PAGE_POOL: Allocated 256MB chunk at %p (total: %d chunks)\n",
+	       chunk, atomic_load(&nr_chunks));
 
 	return chunk;
 }
@@ -205,6 +207,16 @@ void *page_pool_get_chunk(int thread_id, int *out_nr_pages)
 	pool->next_page += ALLOC_BATCH;
 	atomic_fetch_add(&((struct chunk_header *)pool->current_chunk)->refcount, ALLOC_BATCH);
 
+	/* Debug: track total allocations */
+	{
+		unsigned long alloc_cnt = atomic_fetch_add(&total_alloc_count, ALLOC_BATCH) + ALLOC_BATCH;
+		unsigned long put_cnt = atomic_load(&total_put_count);
+		if (alloc_cnt % 1000000 < ALLOC_BATCH) {
+			pr_err("PAGE_POOL_ALLOC: total_alloc=%lu total_put=%lu diff=%lu\n",
+			       alloc_cnt, put_cnt, alloc_cnt - put_cnt);
+		}
+	}
+
 	*out_nr_pages = ALLOC_BATCH;
 
 	return batch_start;
@@ -229,6 +241,15 @@ void page_pool_put(void *page)
 
 	/* Atomic decrement */
 	old_ref = atomic_fetch_sub(&hdr->refcount, 1);
+
+	/* Debug: periodically log put progress */
+	{
+		unsigned long put_cnt = atomic_fetch_add(&total_put_count, 1) + 1;
+		if (put_cnt % 1000000 == 0) {
+			pr_err("PAGE_POOL_PUT: total=%lu page=%p chunk=%p refcount_was=%d\n",
+			       put_cnt, page, hdr, old_ref);
+		}
+	}
 
 	/* Last reference? munmap the entire chunk */
 	if (old_ref == 1) {
