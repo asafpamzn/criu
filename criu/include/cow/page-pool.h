@@ -33,4 +33,10 @@ void page_pool_destroy_all(void);
 /* Debug: print chunk stats */
 void page_pool_dump_stats(void);
 
+/* Get chunk ID from data pointer (for chunk-ordered drain) */
+int page_pool_get_chunk_id(void *page);
+
+/* Get number of allocated chunks */
+int page_pool_get_nr_chunks(void);
+
 #endif /* __CR_PAGE_POOL_H__ */

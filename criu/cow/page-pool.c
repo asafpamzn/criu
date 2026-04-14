@@ -334,3 +334,45 @@ void page_pool_dump_stats(void)
 	       n, total_outstanding, low_count, mid_count, high_count,
 	       min_ref == INT_MAX ? 0 : min_ref, max_ref);
 }
+
+/*
+ * Get chunk ID from a page data pointer.
+ * Returns chunk index (0 to nr_chunks-1) or -1 if not found.
+ * Used by drain to group pages by chunk for ordered freeing.
+ */
+int page_pool_get_chunk_id(void *page)
+{
+	struct chunk_header *hdr;
+	int i, n;
+
+	if (!page || !atomic_load(&global_init_done))
+		return -1;
+
+	/* Calculate chunk base from page address */
+	hdr = (struct chunk_header *)((unsigned long)page & CHUNK_ALIGN_MASK);
+
+	/* Validate self-pointer */
+	if (hdr->base != hdr)
+		return -1;
+
+	/* Find chunk index in tracking array */
+	pthread_spin_lock(&chunk_list_lock);
+	n = atomic_load(&nr_chunks);
+	for (i = 0; i < n; i++) {
+		if (all_chunks[i] == hdr) {
+			pthread_spin_unlock(&chunk_list_lock);
+			return i;
+		}
+	}
+	pthread_spin_unlock(&chunk_list_lock);
+
+	return -1;
+}
+
+/* Get current number of allocated chunks */
+int page_pool_get_nr_chunks(void)
+{
+	if (!atomic_load(&global_init_done))
+		return 0;
+	return atomic_load(&nr_chunks);
+}
