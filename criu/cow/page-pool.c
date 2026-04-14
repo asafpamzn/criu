@@ -213,7 +213,7 @@ void *page_pool_get_chunk(int thread_id, int *out_nr_pages)
 		unsigned long alloc_cnt = atomic_fetch_add(&total_alloc_count, ALLOC_BATCH) + ALLOC_BATCH;
 		unsigned long put_cnt = atomic_load(&total_put_count);
 		if (alloc_cnt % 1000000 < ALLOC_BATCH) {
-			pr_err("PAGE_POOL_ALLOC: total_alloc=%lu total_put=%lu diff=%lu\n",
+			pr_info("PAGE_POOL_ALLOC: total_alloc=%lu total_put=%lu diff=%lu\n",
 			       alloc_cnt, put_cnt, alloc_cnt - put_cnt);
 		}
 	}
@@ -247,20 +247,20 @@ void page_pool_put(void *page)
 	{
 		unsigned long put_cnt = atomic_fetch_add(&total_put_count, 1) + 1;
 		if (put_cnt % 1000000 == 0) {
-			pr_err("PAGE_POOL_PUT: total=%lu page=%p chunk=%p refcount_was=%d\n",
+			pr_info("PAGE_POOL_PUT: total=%lu page=%p chunk=%p refcount_was=%d\n",
 			       put_cnt, page, hdr, old_ref);
 		}
 	}
 
 	/* Debug: log when chunk is getting close to being freed */
 	if (old_ref <= 1000 && old_ref > 1 && (old_ref == 1000 || old_ref == 500 || old_ref == 100 || old_ref == 10)) {
-		pr_err("PAGE_POOL_LOW: chunk=%p refcount_now=%d (close to free!)\n",
+		pr_info("PAGE_POOL_LOW: chunk=%p refcount_now=%d (close to free!)\n",
 		       hdr, old_ref - 1);
 	}
 
 	/* Last reference? munmap the entire chunk */
 	if (old_ref == 1) {
-		pr_err("PAGE_POOL: Freeing 256MB chunk at %p (all pages returned)\n", hdr);
+		pr_info("PAGE_POOL: Freeing 256MB chunk at %p (all pages returned)\n", hdr);
 
 		/* Remove from tracking list */
 		pthread_spin_lock(&chunk_list_lock);
