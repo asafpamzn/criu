@@ -100,6 +100,7 @@ obj-y			+= cow/cow-page-xfer.o
 obj-y			+= cow/cow-p3-receiver.o
 obj-y			+= cow/cow-unified-thread.o
 obj-y			+= cow/cow-bulk-recv.o
+obj-y			+= cow/cow-compare.o
 obj-y			+= config.o
 obj-y			+= servicefd.o
 obj-y			+= pie-util-vdso.o

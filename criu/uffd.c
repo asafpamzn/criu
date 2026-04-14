@@ -49,6 +49,7 @@
 #include "uffd-internal.h"
 #include "cow/unmapped-tracker.h"
 #include "cow/page-pool.h"
+#include "cow/cow-compare.h"
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "uffd: "
@@ -1763,14 +1764,41 @@ int cow_phase3_restore_loop(int ep_fd, struct epoll_event **events, int nr_fds)
 
 	pr_warn("Drain complete, buffer empty\n");
 
-	/*
-	 * DEBUG: Add small delay after drain completes to test timing hypothesis.
-	 * If this fixes the crash, the issue is a race between drain completion
-	 * and process unfreeze (e.g., TLB flush, kernel page table updates).
-	 */
-	pr_warn("DEBUG: Sleeping 100ms after drain to test timing...\n");
-	usleep(100000);  /* 100ms */
-	pr_warn("DEBUG: Sleep done, sending signal\n");
+	/* DEBUG: Process comparison with primary */
+	if (opts.cow_dump && opts.addr) {
+		int compare_sk;
+		struct lazy_pages_info *first_lpi;
+		pid_t target_pid = 0;
+
+		/* Get the first LPI's PID as the target */
+		if (!list_empty(&lpis)) {
+			first_lpi = list_first_entry(&lpis, struct lazy_pages_info, l);
+			target_pid = first_lpi->pid;
+		}
+
+		if (target_pid > 0) {
+			pr_err("COMPARE: REPLICA connecting to primary for comparison (PID %d)\n",
+			       target_pid);
+
+			if (cow_compare_connect(opts.addr, &compare_sk) == 0) {
+				int result = cow_compare_receive_and_verify(compare_sk, target_pid);
+				close(compare_sk);
+
+				if (result != 0) {
+					pr_err("COMPARE: DIFFERENCES FOUND - see logs above\n");
+					/* Pause for investigation */
+					pr_err("COMPARE: Touch /tmp/continue_replica to proceed\n");
+					while (access("/tmp/continue_replica", F_OK) != 0)
+						sleep(1);
+					unlink("/tmp/continue_replica");
+				} else {
+					pr_err("COMPARE: Processes are IDENTICAL - proceeding\n");
+				}
+			}
+		} else {
+			pr_warn("COMPARE: No LPI found, skipping comparison\n");
+		}
+	}
 
 	/* Unregister all UFFD regions before unfreezing process */
 	cow_unregister_all_uffds();

@@ -36,9 +36,6 @@
 /* Number of background drain threads */
 #define COW_NUM_DRAIN_THREADS		10
 
-/* Number of fault worker threads */
-#define COW_FAULT_WORKERS		4
-
 /* Maximum threads for page pool */
 #define COW_MAX_THREADS			32
 
