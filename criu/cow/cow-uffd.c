@@ -916,6 +916,12 @@ static void *background_drain_worker(void *arg)
 		 * to buckets outside our range.
 		 */
 		if (!made_progress && cow_buffer.nr_pages > 0) {
+			static atomic_int wait_log_count = 0;
+			int log_count = atomic_fetch_add(&wait_log_count, 1);
+			if (log_count < 50 || log_count % 1000 == 0) {
+				pr_err("DRAIN_WAIT: thread=%d chunks=[%d,%d) no_progress, remaining=%lu, waiting...\n",
+				       thread_id, start_chunk, end_chunk, cow_buffer.nr_pages);
+			}
 			usleep(100);  /* 100us yield */
 		}
 	}
@@ -937,6 +943,34 @@ static void *background_drain_worker(void *arg)
 		pr_err("DRAIN_PROGRESS: ALL_DONE total=%lu applied=%lu discarded=%lu eagain=%lu remaining=%lu\n",
 		       atomic_load(&total_drained), cow_buffer.nr_applied,
 		       cow_buffer.nr_discarded, cow_buffer.nr_eagain, cow_buffer.nr_pages);
+
+		/* Debug: check what remains in chunk_index vs hash table (limited scan) */
+		if (cow_buffer.nr_pages > 0) {
+			unsigned long in_chunks = 0, in_hash = 0;
+			int i, samples = 0;
+			struct page_buffer_node *node;
+
+			/* Count nodes in chunk_index (fast - only 512 entries) */
+			for (i = 0; i < MAX_POOL_CHUNKS; i++) {
+				int count = atomic_load(&chunk_index[i].page_count);
+				in_chunks += count;
+			}
+
+			/* Sample hash table - check first 10000 buckets only */
+			for (i = 0; i < 10000 && i < PAGE_BUFFER_HASH_SIZE; i++) {
+				hlist_for_each_entry(node, &cow_buffer.hash_table[i], hash) {
+					in_hash += node->count;
+					if (samples < 5) {
+						pr_err("DRAIN_REMAIN_SAMPLE: hash[%d] chunk_id=%d count=%d\n",
+						       i, node->chunk_id, node->count);
+						samples++;
+					}
+				}
+			}
+			/* Extrapolate: hash has 1M buckets, we sampled 10k */
+			pr_err("DRAIN_REMAIN: chunk_index_nodes=%lu hash_sample(10k)=%lu (extrapolated=%lu) nr_pages=%lu\n",
+			       in_chunks, in_hash, in_hash * 100, cow_buffer.nr_pages);
+		}
 	}
 
 	return NULL;
@@ -973,6 +1007,36 @@ int cow_start_drain_thread(struct list_head *lpis)
 
 	pr_err("DRAIN_PROGRESS: chunk-ordered drain: total_chunks=%d chunks_per_thread=%d\n",
 	       total_chunks, chunks_per_thread);
+
+	/* Debug: log page count per chunk to see distribution (limited output) */
+	{
+		unsigned long total_in_chunks = 0;
+		int chunks_with_pages = 0;
+		int max_chunk_pages = 0, max_chunk_id = -1;
+		int min_chunk_pages = INT_MAX, min_chunk_id = -1;
+
+		for (i = 0; i < total_chunks; i++) {
+			int count = atomic_load(&chunk_index[i].page_count);
+			total_in_chunks += count;
+			if (count > 0) {
+				chunks_with_pages++;
+				if (count > max_chunk_pages) {
+					max_chunk_pages = count;
+					max_chunk_id = i;
+				}
+				if (count < min_chunk_pages) {
+					min_chunk_pages = count;
+					min_chunk_id = i;
+				}
+			}
+		}
+		pr_err("DRAIN_DEBUG: chunks_with_pages=%d total_in_index=%lu buffer=%lu diff=%ld\n",
+		       chunks_with_pages, total_in_chunks, cow_buffer.nr_pages,
+		       (long)cow_buffer.nr_pages - (long)total_in_chunks);
+		pr_err("DRAIN_DEBUG: max_chunk[%d]=%d min_chunk[%d]=%d\n",
+		       max_chunk_id, max_chunk_pages,
+		       min_chunk_id, min_chunk_pages == INT_MAX ? 0 : min_chunk_pages);
+	}
 
 	for (i = 0; i < NUM_DRAIN_THREADS; i++) {
 		drain_args[i].thread_id = i;
