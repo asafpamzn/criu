@@ -2259,7 +2259,7 @@ static int cr_dump_finish(int ret)
 	if (opts.cow_dump && cow_get_phase() == COW_PHASE_DONE) {
 		InventoryEntry he = INVENTORY_ENTRY__INIT;
 
-		pr_info("COW: Writing inventory and signaling replica (all data flushed)\n");
+		pr_err("COW: Writing inventory and signaling replica (ret=%d before inventory)\n", ret);
 
 		/* Set up inventory entry */
 		he.has_pre_dump_mode = false;
@@ -2273,15 +2273,19 @@ static int cr_dump_finish(int ret)
 			pr_err("COW: Failed to write inventory\n");
 			ret = -1;
 		}
+		pr_err("COW: write_img_inventory done (ret=%d)\n", ret);
 
-		/* Signal replica that inventory is ready */
+		/* Signal replica that inventory is ready and wait for ACK */
+		pr_err("COW: About to send inventory ready signal (ret=%d, sk=%d)\n", ret, get_page_server_sk());
 		if (!ret && send_inventory_ready_signal()) {
 			pr_err("COW: Failed to send inventory ready signal\n");
 			ret = -1;
 		}
-
-		/* Close page server socket AFTER inventory signal sent */
-		close_page_server_socket();
+		if (!ret && wait_for_inventory_ready_ack(get_page_server_sk())) {
+			pr_err("COW: Failed to receive inventory ready ACK\n");
+			ret = -1;
+		}
+		pr_err("COW: After inventory signal+ACK (ret=%d)\n", ret);
 
 		/* DEBUG: Process comparison with replica (BOTH FROZEN) */
 		{
@@ -2291,7 +2295,7 @@ static int cr_dump_finish(int ret)
 			pr_err("COMPARE: PRIMARY waiting for replica connection (PID %d FROZEN)\n",
 			       target_pid);
 
-			if (cow_compare_listen(&compare_sk) == 0) {
+			if (cow_compare_listen(&compare_sk, 120) == 0) {
 				cow_compare_send_state(compare_sk, target_pid);
 				close(compare_sk);
 			}
@@ -2299,8 +2303,11 @@ static int cr_dump_finish(int ret)
 		}
 
 		/* NOW unfreeze - after comparison */
-		pr_info("COW: Unfreezing process\n");
+		pr_err("COW: Unfreezing process\n");
 		pstree_switch_state(root_item, TASK_ALIVE);
+
+		/* Close page server socket AFTER unfreeze */
+		close_page_server_socket();
 
 		goto out_release_cow;
 	}

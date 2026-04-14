@@ -34,6 +34,7 @@ unsigned long g_compress_compressed_bytes = 0;
 /* COW state flags for phased migration */
 static bool bulk_stream_done = false;
 static bool all_pages_sent_ack_received = false;
+static bool inventory_ready_ack_received = false;
 
 bool page_server_bulk_stream_done(void)
 {
@@ -60,7 +61,62 @@ bool is_all_pages_sent_ack_received(void)
 	return all_pages_sent_ack_received;
 }
 
+void set_inventory_ready_ack_received(void)
+{
+	inventory_ready_ack_received = true;
+}
 
+bool is_inventory_ready_ack_received(void)
+{
+	return inventory_ready_ack_received;
+}
+
+/*
+ * Wait for inventory_ready ACK from replica.
+ * Called by primary after sending PS_IOV_INVENTORY_READY.
+ */
+int wait_for_inventory_ready_ack(int sk)
+{
+	struct page_server_iov pi;
+
+	pr_err("Waiting for inventory_ready ACK from replica...\n");
+	if (page_server_recv(sk, &pi, sizeof(pi), MSG_WAITALL) != sizeof(pi)) {
+		pr_perror("Failed to receive inventory_ready ACK");
+		return -1;
+	}
+
+	if (decode_ps_cmd(pi.cmd) != PS_IOV_INVENTORY_READY_ACK) {
+		pr_err("Expected inventory_ready ACK, got cmd=%u\n", decode_ps_cmd(pi.cmd));
+		return -1;
+	}
+
+	pr_err("Received inventory_ready ACK from replica\n");
+	set_inventory_ready_ack_received();
+	return 0;
+}
+
+/*
+ * Send inventory_ready ACK to primary (COW phased migration).
+ * Called by replica after receiving PS_IOV_INVENTORY_READY and loading pstree.
+ */
+int send_inventory_ready_ack(void)
+{
+	struct page_server_iov pi = {
+		.cmd = PS_IOV_INVENTORY_READY_ACK,
+		.nr_pages = 0,
+		.vaddr = 0,
+		.dst_id = 0,
+	};
+	int sk = get_page_server_sk();
+
+	if (sk < 0) {
+		pr_err("No page server socket for inventory_ready ACK\n");
+		return -1;
+	}
+
+	pr_err("Sending inventory_ready ACK to primary (sk=%d)\n", sk);
+	return send_psi(sk, &pi);
+}
 
 /*
  * Wait for all_pages_sent ACK from replica.
@@ -425,6 +481,17 @@ int cow_handle_protocol_cmd(u32 cmd, struct page_server_iov *pi, int sk,
 		 */
 		pr_info("Received all_pages_sent ACK from replica\n");
 		set_all_pages_sent_ack_received();
+		*ret_val = 0;
+		*flushed = true;
+		return 0;
+
+	case PS_IOV_INVENTORY_READY_ACK:
+		/*
+		 * Replica acknowledges inventory_ready signal received.
+		 * Primary can now close the socket.
+		 */
+		pr_err("Received inventory_ready ACK from replica\n");
+		set_inventory_ready_ack_received();
 		*ret_val = 0;
 		*flushed = true;
 		return 0;
