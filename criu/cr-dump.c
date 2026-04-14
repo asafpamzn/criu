@@ -2959,7 +2959,38 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 	/* Free new VMA ranges after P3 threads are done using them */
 	cow_free_new_vma_ranges();
 
-	/* Unfreeze process - dirty pages already sent by P3 threads */
+	/*
+	 * Signal completion to replica BEFORE unfreezing.
+	 * This allows replica to drain while PRIMARY is still frozen.
+	 */
+	{
+		int sk = get_page_server_sk();
+		pr_err("get_page_server_sk = %d\n",  sk);
+		if (sk >= 0) {
+			pr_info("Sending all_pages_sent signal to replica (PRIMARY still frozen)\n");
+			if (send_all_pages_sent_signal(sk) < 0)
+				pr_warn("Failed to send all_pages_sent signal\n");
+			if (wait_for_all_pages_sent_ack(sk) < 0)
+				pr_warn("Failed to receive all_pages_sent ACK\n");
+		}
+	}
+
+	/* DEBUG: Process comparison with replica (BOTH FROZEN) */
+	{
+		int compare_sk;
+		pid_t target_pid = root_item->pid->real;
+
+		pr_err("COMPARE: PRIMARY waiting for replica connection (PID %d FROZEN)\n",
+		       target_pid);
+
+		if (cow_compare_listen(&compare_sk) == 0) {
+			cow_compare_send_state(compare_sk, target_pid);
+			close(compare_sk);
+		}
+		pr_err("COMPARE: PRIMARY comparison done, now unfreezing\n");
+	}
+
+	/* Unfreeze process - after comparison */
 	{
 		struct timeval t_start, t_end, t_delta, t_elapsed;
 		gettimeofday(&t_start, NULL);
@@ -2977,39 +3008,6 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 	timersub(&freeze_end, &freeze_start, &freeze_delta);
 	pr_err("TIMING: Phase 3 freeze ended - process frozen for %ld.%06ld seconds\n",
 	       freeze_delta.tv_sec, freeze_delta.tv_usec);
-
-
-
-	/*
-	 * Signal completion to replica. Dirty pages were sent by P3 threads,
-	 * so replica can zero-fill any remaining faults.
-	 */
-	{
-		int sk = get_page_server_sk();
-		pr_err("get_page_server_sk = %d\n",  sk);
-		if (sk >= 0) {
-			pr_info("Sending all_pages_sent signal to replica\n");
-			if (send_all_pages_sent_signal(sk) < 0)
-				pr_warn("Failed to send all_pages_sent signal\n");
-			if (wait_for_all_pages_sent_ack(sk) < 0)
-				pr_warn("Failed to receive all_pages_sent ACK\n");
-		}
-	}
-
-	/* DEBUG: Process comparison with replica (after drain completes) */
-	{
-		int compare_sk;
-		pid_t target_pid = root_item->pid->real;
-
-		pr_err("COMPARE: PRIMARY waiting for replica connection (PID %d)\n",
-		       target_pid);
-
-		if (cow_compare_listen(&compare_sk) == 0) {
-			cow_compare_send_state(compare_sk, target_pid);
-			close(compare_sk);
-		}
-		pr_err("COMPARE: PRIMARY comparison done, continuing\n");
-	}
 
 	close_page_server_socket();
 	cow_set_phase(COW_PHASE_DONE);
