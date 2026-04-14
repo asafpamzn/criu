@@ -34,7 +34,7 @@
 #define COW_NUM_SCANNERS		4
 
 /* Number of background drain threads */
-#define COW_NUM_DRAIN_THREADS		20
+#define COW_NUM_DRAIN_THREADS		10
 
 /* Number of fault worker threads */
 #define COW_FAULT_WORKERS		4
