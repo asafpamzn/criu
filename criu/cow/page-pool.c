@@ -45,7 +45,7 @@
 #define ALLOC_BATCH      64                        /* 64 pages = 256KB per allocation */
 #define PAGES_PER_CHUNK  (CHUNK_SIZE / PAGE_SIZE)  /* 65536 pages */
 #define MAX_THREADS      32
-#define MAX_CHUNKS       512  /* 512 * 256MB = 128GB max */
+#define MAX_CHUNKS       2048  /* 2048 * 256MB = 512GB max */
 
 /* Chunk header - stored at start of each 256MB region (uses page 0) */
 struct chunk_header {
@@ -110,6 +110,16 @@ static void *alloc_chunk(void)
 	if (idx < MAX_CHUNKS) {
 		all_chunks[idx] = chunk;
 		atomic_fetch_add(&nr_chunks, 1);
+	} else {
+		/*
+		 * Hit MAX_CHUNKS limit! Chunk is allocated but NOT tracked.
+		 * page_pool_get_chunk_id() will return -1 for pages from this chunk,
+		 * causing them to be skipped by chunk-ordered drain (fallback handles them).
+		 * Consider increasing MAX_CHUNKS if this happens.
+		 */
+		pr_err("PAGE_POOL: WARNING: Hit MAX_CHUNKS limit (%d)! "
+		       "Chunk at %p NOT TRACKED - will use fallback drain\n",
+		       MAX_CHUNKS, chunk);
 	}
 	pthread_spin_unlock(&chunk_list_lock);
 

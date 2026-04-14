@@ -78,7 +78,7 @@ static struct {
  * Allows draining pages grouped by their page pool chunk, so chunks
  * can be freed progressively instead of all at the end.
  */
-#define MAX_POOL_CHUNKS 512
+#define MAX_POOL_CHUNKS 2048  /* Must match MAX_CHUNKS in page-pool.c */
 
 struct chunk_drain_entry {
 	struct list_head pages;		/* List of page_buffer_nodes in this chunk */
