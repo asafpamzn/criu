@@ -1293,6 +1293,16 @@ void cow_wait_p3_threads(void)
 		}
 	}
 
+	/* Close P3 sockets so replica receivers get EOF */
+	for (i = 0; i < COW_NUM_P3_THREADS; i++) {
+		if (p3_threads[i].socket >= 0) {
+			pr_debug("DEBUG_THREAD: Closing P3 sender[%d] socket=%d\n",
+				i, p3_threads[i].socket);
+			close(p3_threads[i].socket);
+			p3_threads[i].socket = -1;
+		}
+	}
+
 	p3_total_pages_sent = total;
 	p3_threads_active = 0;
 

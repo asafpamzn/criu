@@ -156,7 +156,7 @@ static void *p3_receiver_thread_func(void *arg)
 	unsigned long pages = 0;
 	int ret = 0;
 
-	pr_info("P3 receiver[%d] started on socket %d\n", ctx->thread_id, ctx->socket);
+	pr_err("P3 receiver[%d] started on socket %d\n", ctx->thread_id, ctx->socket);
 	pr_debug("DEBUG_THREAD: P3 receiver[%d] STARTED socket=%d\n",
 	       ctx->thread_id, ctx->socket);
 
@@ -193,7 +193,7 @@ out:
 	ctx->pages_received = pages;
 	ctx->active = false;
 	__sync_fetch_and_sub(&p3_receivers_active, 1);
-	pr_info("P3 receiver[%d] done: %lu pages\n", ctx->thread_id, pages);
+	pr_err("P3 receiver[%d] done: %lu pages\n", ctx->thread_id, pages);
 	pr_debug("DEBUG_THREAD: P3 receiver[%d] TERMINATED pages=%lu\n", ctx->thread_id, pages);
 	return NULL;
 }
