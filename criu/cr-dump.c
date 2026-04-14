@@ -2247,12 +2247,37 @@ static int cr_dump_finish(int ret)
 	}
 
 	/*
-	 * COW phased dump path: if cow_get_phase() == COW_PHASE_DONE, everything
-	 * was already handled in cr_dump_tasks_cow_phased (dirty pages sent during
-	 * freeze, process already unfrozen). Skip to cleanup.
+	 * COW phased dump path: inventory write, signal, and unfreeze happen here
+	 * AFTER all data is collected and flushed to NFS.
 	 */
 	if (opts.cow_dump && cow_get_phase() == COW_PHASE_DONE) {
-		pr_info("COW phased dump complete, skipping to cleanup\n");
+		InventoryEntry he = INVENTORY_ENTRY__INIT;
+
+		pr_info("COW: Writing inventory and signaling replica (all data flushed)\n");
+
+		/* Set up inventory entry */
+		he.has_pre_dump_mode = false;
+		if (found_uprobes_vma()) {
+			he.has_allow_uprobes = true;
+			he.allow_uprobes = true;
+		}
+
+		/* Write inventory - all image data is now on NFS */
+		if (write_img_inventory(&he)) {
+			pr_err("COW: Failed to write inventory\n");
+			ret = -1;
+		}
+
+		/* Signal replica that inventory is ready */
+		if (!ret && send_inventory_ready_signal()) {
+			pr_err("COW: Failed to send inventory ready signal\n");
+			ret = -1;
+		}
+
+		/* NOW unfreeze - after inventory is ready */
+		pr_info("COW: Unfreezing process\n");
+		pstree_switch_state(root_item, TASK_ALIVE);
+
 		goto out_release_cow;
 	}
 
@@ -2897,49 +2922,11 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 	pr_err("PHASE 3 SKELETON DUMP COMPLETE\n");
 
 	/*
-	 * Write inventory now so replica can load pstree.
-	 * This must happen BEFORE sending dirty bitmap.
-	 */
-	he.has_pre_dump_mode = false;
-	if (found_uprobes_vma()) {
-		he.has_allow_uprobes = true;
-		he.allow_uprobes = true;
-	}
-	{
-		struct timeval t_start, t_end, t_delta, t_elapsed;
-		gettimeofday(&t_start, NULL);
-		timersub(&t_start, &freeze_start, &t_elapsed);
-		pr_warn("TIMING @%ld.%06ld: write_img_inventory starting\n",
-		       t_elapsed.tv_sec, t_elapsed.tv_usec);
-		if (write_img_inventory(&he))
-			goto err;
-		gettimeofday(&t_end, NULL);
-		timersub(&t_end, &t_start, &t_delta);
-		pr_err("TIMING: write_img_inventory took %ld.%06ld seconds\n",
-		       t_delta.tv_sec, t_delta.tv_usec);
-	}
-
-	/* Signal replica that inventory.img is ready */
-	{
-		struct timeval t_start, t_end, t_delta, t_elapsed;
-		gettimeofday(&t_start, NULL);
-		timersub(&t_start, &freeze_start, &t_elapsed);
-		pr_warn("TIMING @%ld.%06ld: send_inventory_ready_signal starting\n",
-		       t_elapsed.tv_sec, t_elapsed.tv_usec);
-		ret = send_inventory_ready_signal();
-		gettimeofday(&t_end, NULL);
-		timersub(&t_end, &t_start, &t_delta);
-		pr_err("TIMING: send_inventory_ready_signal took %ld.%06ld seconds\n",
-		       t_delta.tv_sec, t_delta.tv_usec);
-	}
-	if (ret) {
-		pr_err("Failed to send inventory ready signal\n");
-		goto err;
-	}
-
-	/*
 	 * Wait for P3 threads to complete their final scan (process is frozen,
 	 * last_scan flag was set above). Threads will send any remaining dirty pages.
+	 *
+	 * NOTE: Inventory write and signal moved to cr_dump_finish() - they happen
+	 * AFTER all data is collected and flushed, right before unfreeze.
 	 */
 	pr_err("=== Waiting for P3 threads final scan ===\n");
 	{
@@ -2983,45 +2970,23 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 		pr_err("COMPARE: PRIMARY waiting for replica connection (PID %d FROZEN)\n",
 		       target_pid);
 
-		if (cow_compare_listen(&compare_sk) == 0) {
+		if (cow_compare_listen(&compare_sk, 120) == 0) {
 			cow_compare_send_state(compare_sk, target_pid);
 			close(compare_sk);
 		}
-		pr_err("COMPARE: PRIMARY comparison done, now unfreezing\n");
+		pr_err("COMPARE: PRIMARY comparison done\n");
 	}
-
-	/* Unfreeze process - after comparison */
-	{
-		struct timeval t_start, t_end, t_delta, t_elapsed;
-		gettimeofday(&t_start, NULL);
-		timersub(&t_start, &freeze_start, &t_elapsed);
-		pr_warn("TIMING @%ld.%06ld: pstree_switch_state starting\n",
-		       t_elapsed.tv_sec, t_elapsed.tv_usec);
-		pstree_switch_state(root_item, TASK_ALIVE);
-		gettimeofday(&t_end, NULL);
-		timersub(&t_end, &t_start, &t_delta);
-		pr_err("TIMING: pstree_switch_state took %ld.%06ld seconds\n",
-		       t_delta.tv_sec, t_delta.tv_usec);
-	}
-
-	gettimeofday(&freeze_end, NULL);
-	timersub(&freeze_end, &freeze_start, &freeze_delta);
-	pr_err("TIMING: Phase 3 freeze ended - process frozen for %ld.%06ld seconds\n",
-	       freeze_delta.tv_sec, freeze_delta.tv_usec);
 
 	close_page_server_socket();
 	cow_set_phase(COW_PHASE_DONE);
 
-		/* Close async uffd - moved outside freeze period */
-	{
-		struct timeval t_start, t_end, t_delta;
-		gettimeofday(&t_start, NULL);
-		cow_cleanup_async_uffd();
-		gettimeofday(&t_end, NULL);
-		timersub(&t_end, &t_start, &t_delta);
-		pr_err("TIMING: cow_cleanup_async_uffd took %ld.%06ld seconds (after unfreeze)\n",
-		       t_delta.tv_sec, t_delta.tv_usec);
-	}
+	/* Close async uffd */
+	cow_cleanup_async_uffd();
+
+	/*
+	 * Inventory write, signal, and unfreeze are handled in cr_dump_finish()
+	 * AFTER glob_imgset is closed and all buffers are flushed.
+	 */
 	exit_code = 0;
 	goto finish;
 
