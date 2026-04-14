@@ -439,7 +439,7 @@ int cow_page_buffer_add(unsigned long vaddr, void *data, int thread_id, bool noc
 			}
 		}
 		/* Found node with space - add new entry */
-		if (node->count < PAGE_NODE_ENTRIES) {
+		if (node->count < COW_PAGE_NODE_ENTRIES) {
 			node->entries[node->count].vaddr = vaddr;
 			node->entries[node->count].data = page_data;
 			node->count++;
@@ -708,7 +708,7 @@ void cow_page_buffer_readd(unsigned long vaddr, void *data)
 
 	/* Try to find space in existing node */
 	hlist_for_each_entry(node, &cow_buffer.hash_table[hash], hash) {
-		if (node->count < PAGE_NODE_ENTRIES) {
+		if (node->count < COW_PAGE_NODE_ENTRIES) {
 			node->entries[node->count].vaddr = vaddr;
 			node->entries[node->count].data = data;
 			node->count++;
