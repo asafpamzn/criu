@@ -20,6 +20,7 @@
 #include "criu-log.h"
 #include "page-xfer.h"
 #include "cow/cow-page-xfer.h"
+#include "cow/cow-conf.h"
 #include "cow/cow-bulk-send.h"
 #include "cr_options.h"
 #include "tls.h"
@@ -30,12 +31,11 @@
 #undef LOG_PREFIX
 #define LOG_PREFIX "cow-p3-recv: "
 
-/* Use same thread count as sender (from cow-bulk-send.h) */
-#define MAX_P3_RECEIVERS NUM_P3_THREADS
+/* Use same thread count as sender (COW_NUM_P3_THREADS in cow-conf.h) */
+#define MAX_P3_RECEIVERS COW_NUM_P3_THREADS
 
-/* Max batch size for P3 transfer */
-#define P3_MAX_BATCH_PAGES 64
-#define P3_DECOMPRESS_BUF_SIZE (P3_MAX_BATCH_PAGES * PAGE_SIZE)
+/* Max batch size for P3 transfer (COW_BATCH_PAGES in cow-conf.h) */
+#define P3_DECOMPRESS_BUF_SIZE (COW_BATCH_PAGES * PAGE_SIZE)
 #define P3_COMPRESS_BUF_SIZE LZ4_compressBound(P3_DECOMPRESS_BUF_SIZE)
 
 struct p3_receiver_ctx {
@@ -81,7 +81,7 @@ static int p3_receive_and_buffer(struct p3_receiver_ctx *ctx)
 	}
 
 	nr_pages = pi.nr_pages;
-	if (nr_pages <= 0 || nr_pages > 64) {
+	if (nr_pages <= 0 || nr_pages > COW_BATCH_PAGES) {
 		pr_err("P3 receive: invalid nr_pages %d\n", nr_pages);
 		return -1;
 	}
@@ -177,7 +177,7 @@ static void *p3_receiver_thread_func(void *arg)
 	/* Receive pages until socket closes */
 	while ((ret = p3_receive_and_buffer(ctx)) > 0) {
 		pages += ret;
-		if (pages % 1000 == 0 && pages > 0)
+		if (pages % COW_LOG_SAMPLE_1K == 0 && pages > 0)
 			pr_debug("DEBUG_THREAD: P3 receiver[%d] progress: %lu pages received\n",
 			       ctx->thread_id, pages);
 	}

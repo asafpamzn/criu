@@ -33,6 +33,7 @@
 #include "parasite.h"
 #include "atomic-bitmap.h"
 #include "cow/mpsc-queue.h"
+#include "cow/cow-conf.h"
 #include "cow/cow-bulk-send.h"
 
 #undef LOG_PREFIX
@@ -48,7 +49,7 @@ struct cow_tracked_vma {
 DECLARE_MPSC_NODE(cow_page, struct cow_page_queue_entry);
 struct cow_page_queue {
 	struct cow_page_mpsc_node *head;
-	char _pad[64 - sizeof(struct cow_page_mpsc_node *)];
+	char _pad[COW_CACHE_LINE_SIZE - sizeof(struct cow_page_mpsc_node *)];
 	struct cow_page_mpsc_node *tail;
 	unsigned long size;
 };
@@ -72,8 +73,8 @@ struct cow_dump_info {
 /*
  * Applying UFFD write-protect over a large address space can dominate the
  * initial stall.  We apply it in parallel from the CRIU process.
+ * COW_WP_CHUNK_SIZE is now defined in cow-conf.h
  */
-#define COW_WP_CHUNK_SIZE	(64UL * 1024 * 1024)
 
 struct cow_wp_range {
 	unsigned long start;
@@ -280,14 +281,9 @@ void cow_set_dst_id(u64 dst_id)
 static int g_monitor_eventfd = -1;
 static struct cow_page_queue_entry *g_putback_list = NULL;
 
-/* Per-worker page buffer pool — avoids malloc(PAGE_SIZE) on the hot path */
-#define COW_PAGE_POOL_SIZE	256	/* 256 x 4 KB = 1 MB per worker */
-#define COW_FAULT_WORKERS	4
-
-/* Pre-read window: 8 pages before + faulting page + 7 pages after = 16 pages = 64KB */
-#define COW_PREREAD_BEFORE	8
-#define COW_PREREAD_AFTER	7
-#define COW_PREREAD_TOTAL	(COW_PREREAD_BEFORE + 1 + COW_PREREAD_AFTER)
+/* Per-worker page buffer pool — avoids malloc(PAGE_SIZE) on the hot path
+ * COW_PAGE_POOL_SIZE, COW_FAULT_WORKERS, COW_PREREAD_* now in cow-conf.h
+ */
 
 struct cow_fault_worker {
 	pthread_t thread;
@@ -735,7 +731,7 @@ int cow_scan_dirty_pages(unsigned long **dirty_ranges,
 		.start = 0,
 		.end = 0,
 		.walk_end = 0,
-		.vec_len = 1000,
+		.vec_len = COW_PAGEMAP_SCAN_VEC_LEN,
 		.max_pages = 0,
 		.category_anyof_mask = PAGE_IS_WRITTEN,
 		.return_mask = PAGE_IS_WRITTEN | PAGE_IS_WPALLOWED,
@@ -808,7 +804,7 @@ int cow_scan_dirty_pages(unsigned long **dirty_ranges,
 				/* Grow ranges array if needed */
 				if (nr_ranges >= ranges_capacity) {
 					unsigned int new_cap = ranges_capacity ?
-							       ranges_capacity * 2 : 64;
+							       ranges_capacity * 2 : COW_INITIAL_RANGES_CAPACITY;
 					unsigned long *new_ranges;
 
 					new_ranges = xrealloc(ranges,
@@ -1186,8 +1182,8 @@ void cow_cleanup_async_uffd(void)
 			}
 
 			/* Yield to let target process run between chunks */
-			if ((i + 1) % 10 == 0)
-				usleep(1000);  /* 1ms every 10 VMAs */
+			if ((i + 1) % COW_UFFD_UNREGISTER_YIELD == 0)
+				usleep(COW_USLEEP_1MS);
 		}
 	}
 

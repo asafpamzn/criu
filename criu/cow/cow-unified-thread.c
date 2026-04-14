@@ -28,6 +28,7 @@
 #include "cow/cow-dump.h"
 #include "cow/cow-bulk-send.h"
 #include "cow/cow-mem.h"
+#include "cow/cow-conf.h"
 #include "cow/spsc-queue.h"
 #include "xmalloc.h"
 #include "atomic-bitmap.h"
@@ -54,7 +55,7 @@ struct page_request_entry {
 DECLARE_SPSC_NODE(page_request, struct page_request_entry);
 
 static struct page_request_spsc_node *page_request_head;
-static char _page_req_pad[128 - sizeof(struct page_request_spsc_node *)] __attribute__((unused));
+static char _page_req_pad[COW_SPSC_PADDING - sizeof(struct page_request_spsc_node *)] __attribute__((unused));
 static struct page_request_spsc_node *page_request_tail;
 static unsigned long page_request_queue_size;
 static bool page_request_queue_initialized = false;

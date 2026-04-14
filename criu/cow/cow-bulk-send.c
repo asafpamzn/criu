@@ -38,9 +38,6 @@
 #undef LOG_PREFIX
 #define LOG_PREFIX "cow-bulk: "
 
-#define COW_BATCH_PAGES 64
-#define COW_BATCH_SIZE  (COW_BATCH_PAGES * PAGE_SIZE)
-
 /*
  * Protocol structs, constants, and helpers are now in page-xfer.h:
  * - struct page_server_iov
@@ -48,11 +45,10 @@
  * - page_server_send() (replaces __send)
  *
  * COW-specific protocol defines (PS_IOV_ADD_F_COMPRESS, etc.) are in cow-page-xfer.h
+ * COW configuration constants (COW_BATCH_PAGES, etc.) are in cow-conf.h
  */
 
-/* NUM_P3_THREADS is defined in cow-bulk-send.h */
-#define NUM_P3_SPLITTER_THREADS (NUM_P3_THREADS - 1)  /* Threads 1-(N-1) split large VMAs */
-#define MIN_VMA_SIZE_FOR_SPLIT (256 * 1024)  /* 256KB threshold */
+#define NUM_P3_SPLITTER_THREADS (COW_NUM_P3_THREADS - 1)  /* Threads 1-(N-1) split large VMAs */
 
 /* Per-thread state */
 struct p3_thread_ctx {
@@ -72,7 +68,7 @@ struct p3_thread_ctx {
 	unsigned int iteration;          /* 0=bulk, 1+=dirty scan */
 };
 
-static struct p3_thread_ctx p3_threads[NUM_P3_THREADS];
+static struct p3_thread_ctx p3_threads[COW_NUM_P3_THREADS];
 static volatile int p3_threads_active = 0;
 static unsigned long p3_total_pages_sent = 0;
 
@@ -90,11 +86,12 @@ static unsigned int g_nr_new_vma_ranges = 0;
  * Each scanner handles half of each VMA and distributes to half the queues.
  *   Scanner 0: first half of each VMA  → queues 0-9
  *   Scanner 1: second half of each VMA → queues 10-19
+ *
+ * COW_NUM_SCANNERS and COW_NUM_P3_THREADS are now COW_NUM_SCANNERS and COW_NUM_P3_THREADS in cow-conf.h
  */
-#define NUM_SCANNERS 4
-#define QUEUES_PER_SCANNER (NUM_P3_THREADS / NUM_SCANNERS)
+#define QUEUES_PER_SCANNER (COW_NUM_P3_THREADS / COW_NUM_SCANNERS)
 
-static struct sender_queue sender_queues[NUM_P3_THREADS];
+static struct sender_queue sender_queues[COW_NUM_P3_THREADS];
 static volatile bool g_scan_complete = false;
 static volatile bool g_scanner_freeze_signal = false;
 static pid_t g_scanner_source_pid;
@@ -108,7 +105,7 @@ struct scanner_ctx {
 	volatile bool iter_done;   /* Set when iteration complete */
 	volatile bool finished;    /* Set when scanner thread exits */
 };
-static struct scanner_ctx scanners[NUM_SCANNERS];
+static struct scanner_ctx scanners[COW_NUM_SCANNERS];
 
 /* Synchronization: scanners coordinate on iteration and freeze */
 static volatile int g_scanners_iter_done = 0;  /* Count of scanners done with iteration */
@@ -124,7 +121,7 @@ int cow_init_sender_queues(void)
 {
 	int i;
 
-	for (i = 0; i < NUM_P3_THREADS; i++) {
+	for (i = 0; i < COW_NUM_P3_THREADS; i++) {
 		if (spsc_init(sender_queues[i].head, sender_queues[i].tail,
 			      sender_queues[i].size,
 			      struct dirty_region_spsc_node)) {
@@ -134,13 +131,13 @@ int cow_init_sender_queues(void)
 	}
 	g_scan_complete = false;
 	g_scanner_freeze_signal = false;
-	pr_info("Initialized %d sender queues\n", NUM_P3_THREADS);
+	pr_info("Initialized %d sender queues\n", COW_NUM_P3_THREADS);
 	return 0;
 }
 
 struct sender_queue *cow_get_sender_queue(int thread_id)
 {
-	if (thread_id < 0 || thread_id >= NUM_P3_THREADS)
+	if (thread_id < 0 || thread_id >= COW_NUM_P3_THREADS)
 		return NULL;
 	return &sender_queues[thread_id];
 }
@@ -170,7 +167,7 @@ static void *dirty_scanner_thread(void *arg)
 	struct list_head *lazy_vmas;
 	struct lazy_vma_entry *lve;
 	struct page_region *regs;
-	const int max_regs = 1000;
+	const int max_regs = COW_PAGEMAP_SCAN_VEC_LEN;
 	unsigned int iteration = 0;
 	char pagemap_path[64];
 	struct timespec t_start, t_end;
@@ -189,7 +186,7 @@ static void *dirty_scanner_thread(void *arg)
 	       __atomic_load_n(&g_num_sender_threads, __ATOMIC_ACQUIRE)) {
 		if (__atomic_load_n(&g_scanner_freeze_signal, __ATOMIC_ACQUIRE))
 			goto out;
-		usleep(10000);
+		usleep(COW_USLEEP_10MS);
 	}
 	if (scanner_id == 0) {
 		pr_err("Scanner: all sender threads completed bulk transfer, starting dirty scan\n");
@@ -230,12 +227,12 @@ static void *dirty_scanner_thread(void *arg)
 			long regs_len;
 			unsigned long vma_size = lve->end - lve->start;
 			unsigned long total_pages = vma_size / PAGE_SIZE;
-			unsigned long pages_per_scanner = total_pages / NUM_SCANNERS;
+			unsigned long pages_per_scanner = total_pages / COW_NUM_SCANNERS;
 			unsigned long my_start, my_end;
 
 			/* Calculate this scanner's range (page-aligned) */
 			my_start = lve->start + (scanner_id * pages_per_scanner * PAGE_SIZE);
-			if (scanner_id == NUM_SCANNERS - 1)
+			if (scanner_id == COW_NUM_SCANNERS - 1)
 				my_end = lve->end;  /* Last scanner gets remainder */
 			else
 				my_end = my_start + (pages_per_scanner * PAGE_SIZE);
@@ -312,12 +309,12 @@ static void *dirty_scanner_thread(void *arg)
 		/* Synchronize with other scanner - wait for both to complete iteration */
 		pthread_mutex_lock(&g_scanner_mutex);
 		g_scanners_iter_done++;
-		if (g_scanners_iter_done == NUM_SCANNERS) {
+		if (g_scanners_iter_done == COW_NUM_SCANNERS) {
 			/* Last scanner to finish - calculate total and reset */
 			int s;
 
 			g_total_dirty_pages = 0;
-			for (s = 0; s < NUM_SCANNERS; s++)
+			for (s = 0; s < COW_NUM_SCANNERS; s++)
 				g_total_dirty_pages += scanners[s].dirty_count;
 			g_scanners_iter_done = 0;
 			pthread_cond_broadcast(&g_scanner_cond);
@@ -346,7 +343,7 @@ static void *dirty_scanner_thread(void *arg)
 			break;
 		}
 
-		usleep(1000);
+		usleep(COW_USLEEP_1MS);
 	}
 
 	/* Wait for freeze signal from main thread */
@@ -354,7 +351,7 @@ static void *dirty_scanner_thread(void *arg)
 		pr_err("Scanner: waiting for freeze signal...\n");
 	}
 	while (!__atomic_load_n(&g_scanner_freeze_signal, __ATOMIC_ACQUIRE)) {
-		usleep(1000);
+		usleep(COW_USLEEP_1MS);
 	}
 
 	/* Final scan after freeze - each scanner handles its half */
@@ -373,11 +370,11 @@ static void *dirty_scanner_thread(void *arg)
 			long regs_len;
 			unsigned long vma_size = lve->end - lve->start;
 			unsigned long total_pages = vma_size / PAGE_SIZE;
-			unsigned long pages_per_scanner = total_pages / NUM_SCANNERS;
+			unsigned long pages_per_scanner = total_pages / COW_NUM_SCANNERS;
 			unsigned long my_start, my_end;
 
 			my_start = lve->start + (scanner_id * pages_per_scanner * PAGE_SIZE);
-			if (scanner_id == NUM_SCANNERS - 1)
+			if (scanner_id == COW_NUM_SCANNERS - 1)
 				my_end = lve->end;
 			else
 				my_end = my_start + (pages_per_scanner * PAGE_SIZE);
@@ -436,12 +433,12 @@ static void *dirty_scanner_thread(void *arg)
 		/* Synchronize final scan completion */
 		pthread_mutex_lock(&g_scanner_mutex);
 		g_scanners_iter_done++;
-		if (g_scanners_iter_done == NUM_SCANNERS) {
+		if (g_scanners_iter_done == COW_NUM_SCANNERS) {
 			unsigned long total_final = 0;
 			long fs_ms;
 			int s;
 
-			for (s = 0; s < NUM_SCANNERS; s++)
+			for (s = 0; s < COW_NUM_SCANNERS; s++)
 				total_final += scanners[s].dirty_count;
 			fs_ms = (fs_end.tv_sec - fs_start.tv_sec) * 1000 +
 				(fs_end.tv_nsec - fs_start.tv_nsec) / 1000000;
@@ -481,7 +478,7 @@ out:
 		bool all_done = true;
 		int s;
 
-		for (s = 0; s < NUM_SCANNERS; s++) {
+		for (s = 0; s < COW_NUM_SCANNERS; s++) {
 			if (!scanners[s].finished) {
 				all_done = false;
 				break;
@@ -508,7 +505,7 @@ int cow_start_scanner_thread(pid_t source_pid)
 	g_total_dirty_pages = 0;
 
 	/* Initialize and start dual scanners */
-	for (i = 0; i < NUM_SCANNERS; i++) {
+	for (i = 0; i < COW_NUM_SCANNERS; i++) {
 		scanners[i].id = i;
 		scanners[i].pagemap_fd = -1;
 		scanners[i].dirty_count = 0;
@@ -522,7 +519,7 @@ int cow_start_scanner_thread(pid_t source_pid)
 		}
 	}
 
-	pr_info("Started %d scanner threads for pid %d\n", NUM_SCANNERS, source_pid);
+	pr_info("Started %d scanner threads for pid %d\n", COW_NUM_SCANNERS, source_pid);
 	return 0;
 }
 
@@ -530,7 +527,7 @@ void cow_wait_scanner_thread(void)
 {
 	int i;
 
-	for (i = 0; i < NUM_SCANNERS; i++) {
+	for (i = 0; i < COW_NUM_SCANNERS; i++) {
 		if (scanners[i].thread) {
 			pthread_join(scanners[i].thread, NULL);
 			scanners[i].thread = 0;
@@ -764,7 +761,7 @@ static bool get_thread_vma_range(struct p3_thread_ctx *ctx,
 
 		*out_start = lve->start + (thread_id - 1) * chunk_size;
 
-		if (thread_id == NUM_P3_THREADS - 1)
+		if (thread_id == COW_NUM_P3_THREADS - 1)
 			*out_end = lve->end;
 		else
 			*out_end = *out_start + chunk_size;
@@ -785,7 +782,7 @@ static unsigned long do_dirty_scan_and_send(struct p3_thread_ctx *ctx)
 	struct page_region *regs = NULL;
 	unsigned long total_dirty = 0;
 	int thread_id = ctx->thread_id;
-	const int max_regs = 1000;
+	const int max_regs = COW_PAGEMAP_SCAN_VEC_LEN;
 
 	regs = xmalloc(max_regs * sizeof(struct page_region));
 	if (!regs) {
@@ -886,7 +883,7 @@ static unsigned long send_new_vma_pages(struct p3_thread_ctx *ctx)
 		return 0;
 
 	/* Split ranges among threads */
-	ranges_per_thread = (g_nr_new_vma_ranges + NUM_P3_THREADS - 1) / NUM_P3_THREADS;
+	ranges_per_thread = (g_nr_new_vma_ranges + COW_NUM_P3_THREADS - 1) / COW_NUM_P3_THREADS;
 	my_start_idx = thread_id * ranges_per_thread;
 	my_end_idx = my_start_idx + ranges_per_thread;
 	if (my_end_idx > g_nr_new_vma_ranges)
@@ -955,7 +952,7 @@ static unsigned long send_new_vma_pages(struct p3_thread_ctx *ctx)
 
 /*
  * P3 bulk sender thread - sends regular pages in batches.
- * Each thread handles 1/NUM_P3_THREADS of each VMA's address range.
+ * Each thread handles 1/COW_NUM_P3_THREADS of each VMA's address range.
  * After bulk transfer, transitions to iterative dirty scanning until convergence.
  */
 static void *p3_bulk_sender_thread(void *arg)
@@ -1078,7 +1075,7 @@ static void *p3_bulk_sender_thread(void *arg)
 			}
 
 			/* Periodic status logging */
-			if (regions_processed > 0 && regions_processed % 10000 == 0) {
+			if (regions_processed > 0 && regions_processed % COW_LOG_SAMPLE_10K == 0) {
 				pr_info("P3[%d] queue progress: processed=%lu, queue_size=%lu, scan_complete=%d\n",
 				       thread_id, regions_processed, spsc_size(my_queue->size),
 				       cow_is_scan_complete());
@@ -1088,12 +1085,12 @@ static void *p3_bulk_sender_thread(void *arg)
 			if (!region) {
 				/* Queue empty, brief wait */
 				wait_count++;
-				if (wait_count % 10000 == 0) {
+				if (wait_count % COW_LOG_SAMPLE_10K == 0) {
 					pr_err("P3[%d] waiting: queue empty, scan_complete=%d, wait_count=%lu, peek=%d\n",
 					       thread_id, cow_is_scan_complete(), wait_count,
 					       spsc_peek(my_queue->head));
 				}
-				usleep(100);
+				usleep(COW_USLEEP_100US);
 				continue;
 			}
 			wait_count = 0;
@@ -1151,7 +1148,7 @@ static void *p3_bulk_sender_thread(void *arg)
 			if (thread_id == 0 && ctx->below_threshold) {
 				pr_info("P3[0] below threshold, waiting for final scan signal\n");
 				while (!g_last_scan_flag)
-					usleep(10000);  /* 10ms poll */
+					usleep(COW_USLEEP_10MS);
 				break;
 			}
 
@@ -1159,8 +1156,8 @@ static void *p3_bulk_sender_thread(void *arg)
 			 * Sleep to reduce CPU burn and kernel lock contention when
 			 * there's little dirty page activity or after initial iterations.
 			 */
-			if (ctx->last_dirty_count < 1000 || ctx->iteration > 3)
-				usleep(30000);  /* 30ms */
+			if (ctx->last_dirty_count < COW_LOW_DIRTY_THRESHOLD || ctx->iteration > COW_MAX_DIRTY_ITERATIONS)
+				usleep(COW_USLEEP_CONVERGENCE);
 		}
 	}
 
@@ -1224,7 +1221,7 @@ int cow_start_p3_threads(int *sockets, int num_sockets, u64 dst_id, pid_t source
 	}
 
 	/* Calculate number of threads to start (before starting scanner) */
-	threads_to_start = num_sockets < NUM_P3_THREADS ? num_sockets : NUM_P3_THREADS;
+	threads_to_start = num_sockets < COW_NUM_P3_THREADS ? num_sockets : COW_NUM_P3_THREADS;
 	g_num_sender_threads = threads_to_start;
 
 	/* Start scanner thread */
@@ -1283,7 +1280,7 @@ void cow_wait_p3_threads(void)
 	cow_wait_scanner_thread();
 
 	/* Then wait for sender threads */
-	for (i = 0; i < NUM_P3_THREADS; i++) {
+	for (i = 0; i < COW_NUM_P3_THREADS; i++) {
 		if (p3_threads[i].thread) {
 			pr_debug("DEBUG_THREAD: Waiting for P3 sender[%d] to join\n", i);
 			pthread_join(p3_threads[i].thread, NULL);
@@ -1324,7 +1321,7 @@ unsigned long cow_p3_pages_sent(void)
 
 int cow_get_num_p3_threads(void)
 {
-	return NUM_P3_THREADS;
+	return COW_NUM_P3_THREADS;
 }
 
 /*

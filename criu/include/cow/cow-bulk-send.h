@@ -3,12 +3,7 @@
 
 #include "int.h"
 #include "cow/spsc-queue.h"
-
-#define COW_BATCH_PAGES 64
-#define COW_BATCH_SIZE  (COW_BATCH_PAGES * PAGE_SIZE)  /* 256KB */
-
-/* Convergence threshold: freeze when scanner finds < 1M dirty pages */
-#define DIRTY_SCAN_FREEZE_THRESHOLD 300000
+#include "cow/cow-conf.h"
 
 /*
  * Dirty region entry - passed from scanner thread to sender threads via SPSC queue.
@@ -30,11 +25,11 @@ DECLARE_SPSC_NODE(dirty_region, struct dirty_region_entry);
  */
 struct sender_queue {
 	struct dirty_region_spsc_node *head;
-	char _pad1[64 - sizeof(struct dirty_region_spsc_node *)];
+	char _pad1[COW_CACHE_LINE_SIZE - sizeof(struct dirty_region_spsc_node *)];
 	struct dirty_region_spsc_node *tail;
-	char _pad2[64 - sizeof(struct dirty_region_spsc_node *)];
+	char _pad2[COW_CACHE_LINE_SIZE - sizeof(struct dirty_region_spsc_node *)];
 	unsigned long size;
-	char _pad3[64 - sizeof(unsigned long)];
+	char _pad3[COW_CACHE_LINE_SIZE - sizeof(unsigned long)];
 };
 
 /*
@@ -45,11 +40,7 @@ int send_pages_batch_compressed(int sk, const void *data,
 				int nr_pages, u64 dst_id,
 				unsigned long base_vaddr);
 
-/* Number of parallel P3 threads for bulk transfer + dirty scan */
-#define NUM_P3_THREADS 20
-
-/* Dirty page convergence threshold (per-thread) - legacy, replaced by DIRTY_SCAN_FREEZE_THRESHOLD */
-#define DIRTY_CONVERGENCE_THRESHOLD 50000
+/* NUM_P3_THREADS, DIRTY_CONVERGENCE_THRESHOLD now in cow-conf.h */
 
 /*
  * Initialize sender queues (one per thread).
@@ -121,7 +112,7 @@ int cow_get_num_p3_threads(void);
 
 /*
  * Check if all P3 threads are below dirty page convergence threshold.
- * Returns true only when ALL active threads report < DIRTY_CONVERGENCE_THRESHOLD.
+ * Returns true only when ALL active threads report < COW_DIRTY_CONVERGENCE_THRESHOLD.
  */
 bool cow_all_threads_below_threshold(void);
 

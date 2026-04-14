@@ -36,27 +36,13 @@
  */
 #define PHASE4_POOL_ID 0
 
-#define PAGE_BUFFER_HASH_BITS 20
-#define PAGE_BUFFER_HASH_SIZE (1 << PAGE_BUFFER_HASH_BITS)  /* 1M buckets */
-
-/*
- * Fine-grained locking: 8K locks, each covering 128 buckets.
- * Allows 10 threads to operate with minimal contention.
- */
-#define NUM_HASH_LOCKS 8192
-#define BUCKETS_PER_LOCK 128  /* 1M / 8K = 128 buckets per lock */
-
-/*
- * Unrolled linked list node - holds up to 32 entries per node.
- * Gives ~32x better cache locality during traversal vs single-entry nodes.
- */
-#define PAGE_NODE_ENTRIES 32
+/* Hash table and locking constants now in cow-conf.h */
 
 struct page_buffer_node {
 	struct {
 		unsigned long vaddr;
 		void *data;
-	} entries[PAGE_NODE_ENTRIES];
+	} entries[COW_PAGE_NODE_ENTRIES];
 	int count;			/* Number of valid entries in this node */
 	struct hlist_node hash;
 	struct list_head chunk_list;	/* Link in chunk's page list for ordered drain */
@@ -78,7 +64,7 @@ static struct {
  * Allows draining pages grouped by their page pool chunk, so chunks
  * can be freed progressively instead of all at the end.
  */
-#define MAX_POOL_CHUNKS 2048  /* Must match MAX_CHUNKS in page-pool.c */
+/* COW_MAX_POOL_CHUNKS now defined as COW_MAX_POOL_CHUNKS in cow-conf.h */
 
 struct chunk_drain_entry {
 	struct list_head pages;		/* List of page_buffer_nodes in this chunk */
@@ -86,26 +72,26 @@ struct chunk_drain_entry {
 	atomic_int page_count;		/* Number of pages in this chunk's list */
 };
 
-static struct chunk_drain_entry chunk_index[MAX_POOL_CHUNKS];
+static struct chunk_drain_entry chunk_index[COW_MAX_POOL_CHUNKS];
 static atomic_bool chunk_index_initialized = false;
 static atomic_int nr_active_chunks = 0;
 
 /* Fine-grained locks: 8K locks for 1M buckets */
-static pthread_spinlock_t hash_locks[NUM_HASH_LOCKS];
+static pthread_spinlock_t hash_locks[COW_NUM_HASH_LOCKS];
 
 /* Global lock for counters (nr_pages, nr_applied, etc.) */
 static pthread_spinlock_t counter_lock;
 
 static inline int lock_index(unsigned int hash)
 {
-	return hash / BUCKETS_PER_LOCK;
+	return hash / COW_BUCKETS_PER_LOCK;
 }
 
 /*
  * Multithreaded drain configuration.
  * Each thread handles a range of chunks for parallel draining.
+ * COW_NUM_DRAIN_THREADS now defined as COW_COW_NUM_DRAIN_THREADS in cow-conf.h
  */
-#define NUM_DRAIN_THREADS 10
 
 struct drain_thread_args {
 	int thread_id;
@@ -113,8 +99,8 @@ struct drain_thread_args {
 	int end_chunk;
 };
 
-static pthread_t drain_threads[NUM_DRAIN_THREADS];
-static struct drain_thread_args drain_args[NUM_DRAIN_THREADS];
+static pthread_t drain_threads[COW_NUM_DRAIN_THREADS];
+static struct drain_thread_args drain_args[COW_NUM_DRAIN_THREADS];
 static atomic_bool drain_thread_stop = false;
 static atomic_int drain_threads_active = 0;
 static struct list_head *drain_lpis = NULL;  /* lpis list for EAGAIN handling */
@@ -124,7 +110,7 @@ static int max_drain_chunks = 0;  /* Total chunks to drain */
 
 static inline unsigned int page_buffer_hash(unsigned long vaddr)
 {
-	return (vaddr >> PAGE_SHIFT) & (PAGE_BUFFER_HASH_SIZE - 1);
+	return (vaddr >> PAGE_SHIFT) & (COW_PAGE_BUFFER_HASH_SIZE - 1);
 }
 
 /*
@@ -236,14 +222,6 @@ static int cow_uffd_copy_and_track(int uffd, unsigned long vaddr, void *data,
 	if (data_owned)
 		*data_owned = false;
 
-	/* Debug: sample UFFDIO_COPY addresses and data every 1M copies */
-	if (atomic_fetch_add(&copy_log_count, 1) % 1000000 == 0) {
-		unsigned long *p = (unsigned long *)data;
-		unsigned long first8 = p[0];
-		unsigned long is_zeros = (p[0] == 0 && p[1] == 0 && p[2] == 0 && p[3] == 0);
-		pr_err("DRAIN_COPY_SAMPLE: vaddr=0x%lx uffd=%d caller=%s count=%lu first8=0x%lx zeros=%lu\n",
-		       vaddr, uffd, caller, atomic_load(&copy_log_count), first8, is_zeros);
-	}
 
 	res = cow_uffd_copy_pages(uffd, vaddr, data, nr_pages, NULL);
 
@@ -325,23 +303,23 @@ int cow_page_buffer_init(void)
 	if (cow_buffer.initialized)
 		return 0;
 
-	cow_buffer.hash_table = xmalloc(PAGE_BUFFER_HASH_SIZE *
+	cow_buffer.hash_table = xmalloc(COW_PAGE_BUFFER_HASH_SIZE *
 					sizeof(struct hlist_head));
 	if (!cow_buffer.hash_table)
 		return -1;
 
-	for (i = 0; i < PAGE_BUFFER_HASH_SIZE; i++)
+	for (i = 0; i < COW_PAGE_BUFFER_HASH_SIZE; i++)
 		INIT_HLIST_HEAD(&cow_buffer.hash_table[i]);
 
 	/* Initialize 8K fine-grained locks */
-	for (i = 0; i < NUM_HASH_LOCKS; i++)
+	for (i = 0; i < COW_NUM_HASH_LOCKS; i++)
 		pthread_spin_init(&hash_locks[i], PTHREAD_PROCESS_PRIVATE);
 
 	/* Initialize counter lock */
 	pthread_spin_init(&counter_lock, PTHREAD_PROCESS_PRIVATE);
 
 	/* Initialize chunk drain index */
-	for (i = 0; i < MAX_POOL_CHUNKS; i++) {
+	for (i = 0; i < COW_MAX_POOL_CHUNKS; i++) {
 		INIT_LIST_HEAD(&chunk_index[i].pages);
 		pthread_spin_init(&chunk_index[i].lock, PTHREAD_PROCESS_PRIVATE);
 		atomic_init(&chunk_index[i].page_count, 0);
@@ -356,7 +334,7 @@ int cow_page_buffer_init(void)
 	cow_buffer.initialized = true;
 
 	pr_info("COW page buffer initialized (buckets=%d, locks=%d, chunk_slots=%d)\n",
-		PAGE_BUFFER_HASH_SIZE, NUM_HASH_LOCKS, MAX_POOL_CHUNKS);
+		COW_PAGE_BUFFER_HASH_SIZE, COW_NUM_HASH_LOCKS, COW_MAX_POOL_CHUNKS);
 	return 0;
 }
 
@@ -494,7 +472,7 @@ int cow_page_buffer_add(unsigned long vaddr, void *data, int thread_id, bool noc
 	if (node->chunk_id < 0) {
 		static atomic_int bad_chunk_count = 0;
 		int count = atomic_fetch_add(&bad_chunk_count, 1);
-		if (count < 10 || count % 100000 == 0) {
+		if (count < 10 || count % COW_LOG_SAMPLE_100K == 0) {
 			pr_err("CHUNK_ID_MISSING: page_data=%p vaddr=0x%lx count=%d "
 			       "(page not in page pool tracking)\n",
 			       page_data, vaddr, count + 1);
@@ -507,7 +485,7 @@ int cow_page_buffer_add(unsigned long vaddr, void *data, int thread_id, bool noc
 	pthread_spin_unlock(&hash_locks[lock_idx]);
 
 	/* Add to chunk index for chunk-ordered drain */
-	if (node->chunk_id >= 0 && node->chunk_id < MAX_POOL_CHUNKS) {
+	if (node->chunk_id >= 0 && node->chunk_id < COW_MAX_POOL_CHUNKS) {
 		int cur_max = 0;
 		pthread_spin_lock(&chunk_index[node->chunk_id].lock);
 		list_add_tail(&node->chunk_list, &chunk_index[node->chunk_id].pages);
@@ -559,7 +537,7 @@ void *cow_page_buffer_lookup_and_remove(unsigned long vaddr)
 					hlist_del(&node->hash);
 					pthread_spin_unlock(&hash_locks[lock_idx]);
 					/* Also remove from chunk list */
-					if (chunk_id >= 0 && chunk_id < MAX_POOL_CHUNKS) {
+					if (chunk_id >= 0 && chunk_id < COW_MAX_POOL_CHUNKS) {
 						pthread_spin_lock(&chunk_index[chunk_id].lock);
 						list_del(&node->chunk_list);
 						atomic_fetch_sub(&chunk_index[chunk_id].page_count, 1);
@@ -598,7 +576,7 @@ void cow_page_buffer_destroy(void)
 	cow_stop_drain_thread();
 	pr_warn("file = %s, line = %d\n",__FILE__, __LINE__);
 	/* Lock all buckets and destroy contents */
-	for (i = 0; i < PAGE_BUFFER_HASH_SIZE; i++) {
+	for (i = 0; i < COW_PAGE_BUFFER_HASH_SIZE; i++) {
 		int lock_idx = lock_index(i);
 		pthread_spin_lock(&hash_locks[lock_idx]);
 		hlist_for_each_entry_safe(node, tmp,
@@ -616,12 +594,12 @@ void cow_page_buffer_destroy(void)
 	cow_buffer.initialized = false;
 	pr_warn("file = %s, line = %d\n",__FILE__, __LINE__);
 	/* Destroy all fine-grained locks */
-	for (i = 0; i < NUM_HASH_LOCKS; i++)
+	for (i = 0; i < COW_NUM_HASH_LOCKS; i++)
 		pthread_spin_destroy(&hash_locks[i]);
 	pthread_spin_destroy(&counter_lock);
 
 	/* Clean up chunk index */
-	for (i = 0; i < MAX_POOL_CHUNKS; i++) {
+	for (i = 0; i < COW_MAX_POOL_CHUNKS; i++) {
 		pthread_spin_destroy(&chunk_index[i].lock);
 		INIT_LIST_HEAD(&chunk_index[i].pages);
 	}
@@ -686,7 +664,7 @@ void cow_page_buffer_remove_range(unsigned long start, unsigned long len)
 						hlist_del(&node->hash);
 						pthread_spin_unlock(&hash_locks[lock_index(hash)]);
 						/* Also remove from chunk list */
-						if (chunk_id >= 0 && chunk_id < MAX_POOL_CHUNKS) {
+						if (chunk_id >= 0 && chunk_id < COW_MAX_POOL_CHUNKS) {
 							pthread_spin_lock(&chunk_index[chunk_id].lock);
 							list_del(&node->chunk_list);
 							atomic_fetch_sub(&chunk_index[chunk_id].page_count, 1);
@@ -763,7 +741,7 @@ void cow_page_buffer_readd(unsigned long vaddr, void *data)
 	pthread_spin_unlock(&hash_locks[lock_idx]);
 
 	/* Add to chunk index for chunk-ordered drain */
-	if (node->chunk_id >= 0 && node->chunk_id < MAX_POOL_CHUNKS) {
+	if (node->chunk_id >= 0 && node->chunk_id < COW_MAX_POOL_CHUNKS) {
 		pthread_spin_lock(&chunk_index[node->chunk_id].lock);
 		list_add_tail(&node->chunk_list, &chunk_index[node->chunk_id].pages);
 		atomic_fetch_add(&chunk_index[node->chunk_id].page_count, 1);
@@ -792,7 +770,7 @@ static void drain_orphaned_pages_from_hash(void)
 	pr_err("DRAIN_FALLBACK: Starting hash-table scan for %lu orphaned pages\n",
 	       cow_buffer.nr_pages);
 
-	for (bucket = 0; bucket < PAGE_BUFFER_HASH_SIZE && cow_buffer.nr_pages > 0; bucket++) {
+	for (bucket = 0; bucket < COW_PAGE_BUFFER_HASH_SIZE && cow_buffer.nr_pages > 0; bucket++) {
 		int lock_idx = lock_index(bucket);
 
 		pthread_spin_lock(&hash_locks[lock_idx]);
@@ -898,7 +876,7 @@ static void *background_drain_worker(void *arg)
 		chunk_id = atomic_fetch_add(&next_drain_chunk, 1);
 		if (chunk_id >= max_drain_chunks) {
 			/* No more chunks to process - exit work loop */
-			pr_err("DRAIN_PROGRESS: thread=%d no more chunks (chunk_id=%d >= max=%d), drained=%lu\n",
+			pr_info("DRAIN_PROGRESS: thread=%d no more chunks (chunk_id=%d >= max=%d), drained=%lu\n",
 			       thread_id, chunk_id, max_drain_chunks, drained);
 			break;
 		}
@@ -952,14 +930,14 @@ static void *background_drain_worker(void *arg)
 							drained++;
 							chunk_drained++;
 							/* Log progress every 100k pages or 10 seconds */
-							if (drained - last_progress_drained >= 100000 ||
-							    time(NULL) - last_progress_time >= 10) {
-								pr_err("DRAIN_PROGRESS: thread=%d drained=%lu chunk=%d remaining=%lu\n",
+							if (drained - last_progress_drained >= COW_LOG_SAMPLE_100K ||
+							    time(NULL) - last_progress_time >= COW_DRAIN_PROGRESS_SEC) {
+								pr_info("DRAIN_PROGRESS: thread=%d drained=%lu chunk=%d remaining=%lu\n",
 								       thread_id, drained, chunk_id, cow_buffer.nr_pages);
 								last_progress_drained = drained;
 								last_progress_time = time(NULL);
 								/* Thread 0 dumps pool stats every 1M pages */
-								if (thread_id == 0 && drained % 1000000 < 100000)
+								if (thread_id == 0 && drained % COW_LOG_SAMPLE_1M < COW_LOG_SAMPLE_100K)
 									page_pool_dump_stats();
 							}
 						}
@@ -1034,13 +1012,13 @@ static void *background_drain_worker(void *arg)
 			struct page_buffer_node *node;
 
 			/* Count nodes in chunk_index (fast - only 512 entries) */
-			for (i = 0; i < MAX_POOL_CHUNKS; i++) {
+			for (i = 0; i < COW_MAX_POOL_CHUNKS; i++) {
 				int count = atomic_load(&chunk_index[i].page_count);
 				in_chunks += count;
 			}
 
 			/* Sample hash table - check first 10000 buckets only */
-			for (i = 0; i < 10000 && i < PAGE_BUFFER_HASH_SIZE; i++) {
+			for (i = 0; i < 10000 && i < COW_PAGE_BUFFER_HASH_SIZE; i++) {
 				hlist_for_each_entry(node, &cow_buffer.hash_table[i], hash) {
 					in_hash += node->count;
 					if (samples < 5) {
@@ -1087,51 +1065,22 @@ int cow_start_drain_thread(struct list_head *lpis)
 	if (total_chunks == 0)
 		total_chunks = page_pool_get_nr_chunks();
 	if (total_chunks == 0)
-		total_chunks = MAX_POOL_CHUNKS;  /* Fallback: scan all slots */
+		total_chunks = COW_MAX_POOL_CHUNKS;  /* Fallback: scan all slots */
 
 	/* Divide chunks evenly among threads */
-	chunks_per_thread = (total_chunks + NUM_DRAIN_THREADS - 1) / NUM_DRAIN_THREADS;
+	chunks_per_thread = (total_chunks + COW_NUM_DRAIN_THREADS - 1) / COW_NUM_DRAIN_THREADS;
 	if (chunks_per_thread < 1)
 		chunks_per_thread = 1;
 
-	pr_err("DRAIN_PROGRESS: chunk-ordered drain: total_chunks=%d chunks_per_thread=%d\n",
+	pr_info("DRAIN_PROGRESS: chunk-ordered drain: total_chunks=%d chunks_per_thread=%d\n",
 	       total_chunks, chunks_per_thread);
 
-	/* Debug: log page count per chunk to see distribution (limited output) */
-	{
-		unsigned long total_in_chunks = 0;
-		int chunks_with_pages = 0;
-		int max_chunk_pages = 0, max_chunk_id = -1;
-		int min_chunk_pages = INT_MAX, min_chunk_id = -1;
-
-		for (i = 0; i < total_chunks; i++) {
-			int count = atomic_load(&chunk_index[i].page_count);
-			total_in_chunks += count;
-			if (count > 0) {
-				chunks_with_pages++;
-				if (count > max_chunk_pages) {
-					max_chunk_pages = count;
-					max_chunk_id = i;
-				}
-				if (count < min_chunk_pages) {
-					min_chunk_pages = count;
-					min_chunk_id = i;
-				}
-			}
-		}
-		pr_err("DRAIN_DEBUG: chunks_with_pages=%d total_in_index=%lu buffer=%lu diff=%ld\n",
-		       chunks_with_pages, total_in_chunks, cow_buffer.nr_pages,
-		       (long)cow_buffer.nr_pages - (long)total_in_chunks);
-		pr_err("DRAIN_DEBUG: max_chunk[%d]=%d min_chunk[%d]=%d\n",
-		       max_chunk_id, max_chunk_pages,
-		       min_chunk_id, min_chunk_pages == INT_MAX ? 0 : min_chunk_pages);
-	}
-
+	
 	/* Initialize work-stealing globals */
 	atomic_store(&next_drain_chunk, 0);
 	max_drain_chunks = total_chunks;
 
-	for (i = 0; i < NUM_DRAIN_THREADS; i++) {
+	for (i = 0; i < COW_NUM_DRAIN_THREADS; i++) {
 		drain_args[i].thread_id = i;
 		/* start/end_chunk unused with work-stealing, but set for debug logging */
 		drain_args[i].start_chunk = 0;
@@ -1152,7 +1101,7 @@ int cow_start_drain_thread(struct list_head *lpis)
 	}
 
 	pr_err("DRAIN_PROGRESS: STARTING %d/%d drain threads (work-stealing), buffered=%lu total_chunks=%d\n",
-	       created, NUM_DRAIN_THREADS, cow_buffer.nr_pages, total_chunks);
+	       created, COW_NUM_DRAIN_THREADS, cow_buffer.nr_pages, total_chunks);
 
 	return 0;
 }
@@ -1167,7 +1116,7 @@ void cow_stop_drain_thread(void)
 	atomic_store(&drain_thread_stop, true);
 
 	/* Join all threads */
-	for (i = 0; i < NUM_DRAIN_THREADS; i++) {
+	for (i = 0; i < COW_NUM_DRAIN_THREADS; i++) {
 		if (drain_threads[i]) {
 			pthread_join(drain_threads[i], NULL);
 			drain_threads[i] = 0;

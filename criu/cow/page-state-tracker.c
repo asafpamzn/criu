@@ -15,6 +15,7 @@
 #include "common/list.h"
 #include "common/bug.h"
 #include "util.h"
+#include "cow/cow-conf.h"
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "page-state: "
@@ -24,12 +25,8 @@
  * Uses hash table for O(1) lookup with millions of pages.
  * Thread-safe: uses per-bucket spinlocks for fine-grained locking.
  * Stores full history of state changes with timestamps for debugging.
+ * Hash table configuration constants are in cow-conf.h.
  */
-
-#define PAGE_STATE_HASH_BITS 18
-#define PAGE_STATE_HASH_SIZE (1 << PAGE_STATE_HASH_BITS)
-#define PAGE_STATE_MAX       10
-#define PAGE_STATE_HISTORY_SIZE 16  /* Max history entries per page */
 
 struct page_state_history {
 	enum page_state state;
@@ -42,7 +39,7 @@ struct page_state_entry {
 	struct timespec last_change;
 	struct hlist_node hash;
 	/* History of state changes */
-	struct page_state_history history[PAGE_STATE_HISTORY_SIZE];
+	struct page_state_history history[COW_PAGE_STATE_HISTORY_SIZE];
 	int history_count;
 	/* CRC tracking for debugging dirty page races */
 	u32 last_crc;           /* CRC of page data when last buffered */
@@ -59,7 +56,7 @@ static struct {
 	/* Statistics protected by dedicated lock (less contention) */
 	pthread_spinlock_t stats_lock;
 	unsigned long total_pages;
-	unsigned long transitions[PAGE_STATE_MAX][PAGE_STATE_MAX];
+	unsigned long transitions[COW_PAGE_STATE_MAX][COW_PAGE_STATE_MAX];
 	unsigned long illegal_transitions;
 	bool initialized;
 } g_page_state = { .initialized = false };
@@ -79,14 +76,14 @@ static const char *state_names[] = {
 
 const char *page_state_name(enum page_state state)
 {
-	if (state >= PAGE_STATE_MAX)
+	if (state >= COW_PAGE_STATE_MAX)
 		return "INVALID";
 	return state_names[state];
 }
 
 static inline unsigned int page_state_hash(unsigned long vaddr)
 {
-	return (vaddr >> PAGE_SHIFT) & (PAGE_STATE_HASH_SIZE - 1);
+	return (vaddr >> PAGE_SHIFT) & (COW_PAGE_STATE_HASH_SIZE - 1);
 }
 
 /*
@@ -186,12 +183,12 @@ int page_state_init(void)
 	if (g_page_state.initialized)
 		return 0;
 
-	g_page_state.buckets = xmalloc(PAGE_STATE_HASH_SIZE *
+	g_page_state.buckets = xmalloc(COW_PAGE_STATE_HASH_SIZE *
 				       sizeof(struct page_state_bucket));
 	if (!g_page_state.buckets)
 		return -1;
 
-	for (i = 0; i < PAGE_STATE_HASH_SIZE; i++) {
+	for (i = 0; i < COW_PAGE_STATE_HASH_SIZE; i++) {
 		INIT_HLIST_HEAD(&g_page_state.buckets[i].head);
 		pthread_spin_init(&g_page_state.buckets[i].lock,
 				  PTHREAD_PROCESS_PRIVATE);
@@ -204,7 +201,7 @@ int page_state_init(void)
 	g_page_state.initialized = true;
 
 	pr_info("Page state tracker initialized (hash size=%d, per-bucket locks)\n",
-		PAGE_STATE_HASH_SIZE);
+		COW_PAGE_STATE_HASH_SIZE);
 	return 0;
 }
 
@@ -228,13 +225,13 @@ static void page_state_add_history(struct page_state_entry *entry,
 {
 	int idx;
 
-	if (entry->history_count < PAGE_STATE_HISTORY_SIZE) {
+	if (entry->history_count < COW_PAGE_STATE_HISTORY_SIZE) {
 		idx = entry->history_count++;
 	} else {
 		/* History full - shift left and add at end */
 		memmove(&entry->history[0], &entry->history[1],
-			(PAGE_STATE_HISTORY_SIZE - 1) * sizeof(entry->history[0]));
-		idx = PAGE_STATE_HISTORY_SIZE - 1;
+			(COW_PAGE_STATE_HISTORY_SIZE - 1) * sizeof(entry->history[0]));
+		idx = COW_PAGE_STATE_HISTORY_SIZE - 1;
 	}
 
 	entry->history[idx].state = state;
@@ -534,9 +531,9 @@ void page_state_mark_dirty_ranges(unsigned long *ranges, unsigned int nr_ranges)
 void page_state_print_stats(void)
 {
 	int i, j;
-	unsigned long state_counts[PAGE_STATE_MAX] = {0};
+	unsigned long state_counts[COW_PAGE_STATE_MAX] = {0};
 	unsigned long total_pages, illegal_transitions;
-	unsigned long transitions[PAGE_STATE_MAX][PAGE_STATE_MAX];
+	unsigned long transitions[COW_PAGE_STATE_MAX][COW_PAGE_STATE_MAX];
 	struct page_state_entry *entry;
 
 	if (!g_page_state.initialized) {
@@ -552,10 +549,10 @@ void page_state_print_stats(void)
 	pthread_spin_unlock(&g_page_state.stats_lock);
 
 	/* Count pages in each state - lock one bucket at a time */
-	for (i = 0; i < PAGE_STATE_HASH_SIZE; i++) {
+	for (i = 0; i < COW_PAGE_STATE_HASH_SIZE; i++) {
 		pthread_spin_lock(&g_page_state.buckets[i].lock);
 		hlist_for_each_entry(entry, &g_page_state.buckets[i].head, hash) {
-			if (entry->state < PAGE_STATE_MAX)
+			if (entry->state < COW_PAGE_STATE_MAX)
 				state_counts[entry->state]++;
 		}
 		pthread_spin_unlock(&g_page_state.buckets[i].lock);
@@ -566,14 +563,14 @@ void page_state_print_stats(void)
 	pr_info("Illegal transitions: %lu\n", illegal_transitions);
 
 	pr_info("Current state counts:\n");
-	for (i = 0; i < PAGE_STATE_MAX; i++) {
+	for (i = 0; i < COW_PAGE_STATE_MAX; i++) {
 		if (state_counts[i] > 0)
 			pr_info("  %s: %lu\n", state_names[i], state_counts[i]);
 	}
 
 	pr_info("State transitions:\n");
-	for (i = 0; i < PAGE_STATE_MAX; i++) {
-		for (j = 0; j < PAGE_STATE_MAX; j++) {
+	for (i = 0; i < COW_PAGE_STATE_MAX; i++) {
+		for (j = 0; j < COW_PAGE_STATE_MAX; j++) {
 			if (transitions[i][j] > 0) {
 				pr_info("  %s -> %s: %lu\n",
 					state_names[i], state_names[j],
@@ -600,7 +597,7 @@ int page_state_verify_all_terminal(void)
 	if (!g_page_state.initialized)
 		return 0;
 
-	for (i = 0; i < PAGE_STATE_HASH_SIZE; i++) {
+	for (i = 0; i < COW_PAGE_STATE_HASH_SIZE; i++) {
 		pthread_spin_lock(&g_page_state.buckets[i].lock);
 		hlist_for_each_entry(entry, &g_page_state.buckets[i].head, hash) {
 			/* Terminal states: COPIED, DISCARDED, UNMAPPED */
@@ -792,7 +789,7 @@ void page_state_destroy(void)
 	/* Print final stats before destroying */
 	page_state_print_stats();
 
-	for (i = 0; i < PAGE_STATE_HASH_SIZE; i++) {
+	for (i = 0; i < COW_PAGE_STATE_HASH_SIZE; i++) {
 		pthread_spin_lock(&g_page_state.buckets[i].lock);
 		hlist_for_each_entry_safe(entry, tmp,
 					  &g_page_state.buckets[i].head, hash) {

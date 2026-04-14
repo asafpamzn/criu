@@ -3,6 +3,7 @@
 #include <string.h>
 
 #include "cow/unmapped-tracker.h"
+#include "cow/cow-conf.h"
 #include "int.h"
 #include "page.h"
 #include "criu-log.h"
@@ -15,15 +16,10 @@
 /*
  * Hash table to track unmapped pages.
  * Smaller than page buffer since unmapped ranges are typically fewer.
+ * Configuration constants (COW_COW_NUM_UNMAPPED_LOCKS, etc.) are in cow-conf.h.
  */
 #define UNMAPPED_HASH_BITS 16
 #define UNMAPPED_HASH_SIZE (1 << UNMAPPED_HASH_BITS)  /* 64K buckets */
-
-/*
- * Fine-grained locking: 512 locks, each covering 128 buckets.
- */
-#define NUM_UNMAPPED_LOCKS 512
-#define BUCKETS_PER_LOCK   128
 
 /*
  * Unrolled list node - holds multiple entries per node for cache efficiency.
@@ -38,7 +34,7 @@ struct unmapped_node {
 
 static struct {
 	struct hlist_head *hash_table;
-	pthread_spinlock_t locks[NUM_UNMAPPED_LOCKS];
+	pthread_spinlock_t locks[COW_NUM_UNMAPPED_LOCKS];
 	unsigned long nr_pages;
 	bool initialized;
 } g_unmapped = { .initialized = false };
@@ -50,7 +46,7 @@ static inline unsigned int unmapped_hash(unsigned long vaddr)
 
 static inline int lock_index(unsigned int hash)
 {
-	return hash / BUCKETS_PER_LOCK;
+	return hash / COW_UNMAPPED_BUCKETS_PER_LOCK;
 }
 
 int unmapped_tracker_init(void)
@@ -68,7 +64,7 @@ int unmapped_tracker_init(void)
 	for (i = 0; i < UNMAPPED_HASH_SIZE; i++)
 		INIT_HLIST_HEAD(&g_unmapped.hash_table[i]);
 
-	for (i = 0; i < NUM_UNMAPPED_LOCKS; i++)
+	for (i = 0; i < COW_NUM_UNMAPPED_LOCKS; i++)
 		pthread_spin_init(&g_unmapped.locks[i], PTHREAD_PROCESS_PRIVATE);
 
 	g_unmapped.nr_pages = 0;
@@ -100,7 +96,7 @@ void unmapped_tracker_destroy(void)
 		pthread_spin_unlock(&g_unmapped.locks[lock_idx]);
 	}
 
-	for (i = 0; i < NUM_UNMAPPED_LOCKS; i++)
+	for (i = 0; i < COW_NUM_UNMAPPED_LOCKS; i++)
 		pthread_spin_destroy(&g_unmapped.locks[i]);
 
 	xfree(g_unmapped.hash_table);
