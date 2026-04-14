@@ -495,13 +495,14 @@ int cow_page_buffer_add(unsigned long vaddr, void *data, int thread_id, bool noc
 
 	/* Add to chunk index for chunk-ordered drain */
 	if (node->chunk_id >= 0 && node->chunk_id < MAX_POOL_CHUNKS) {
+		int cur_max = 0;
 		pthread_spin_lock(&chunk_index[node->chunk_id].lock);
 		list_add_tail(&node->chunk_list, &chunk_index[node->chunk_id].pages);
 		atomic_fetch_add(&chunk_index[node->chunk_id].page_count, 1);
 		pthread_spin_unlock(&chunk_index[node->chunk_id].lock);
 
 		/* Track max chunk ID seen for drain distribution */
-		int cur_max = atomic_load(&nr_active_chunks);
+		cur_max = atomic_load(&nr_active_chunks);
 		while (node->chunk_id >= cur_max) {
 			if (atomic_compare_exchange_weak(&nr_active_chunks, &cur_max, node->chunk_id + 1))
 				break;
