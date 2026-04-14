@@ -707,7 +707,7 @@ static void *unified_page_server_thread(void *arg)
 
 			if (!is_convergence_mode() && source_pid != 0) {
 				int num_threads = cow_get_num_p3_threads();
-				int p3_sockets[NUM_P3_THREADS];
+				int p3_sockets[COW_NUM_P3_THREADS];
 				int num_sockets = 0;
 
 				num_sockets = accept_p3_connections(p3_sockets, num_threads, 5000);

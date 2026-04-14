@@ -40,7 +40,6 @@ int send_pages_batch_compressed(int sk, const void *data,
 				int nr_pages, u64 dst_id,
 				unsigned long base_vaddr);
 
-/* NUM_P3_THREADS, DIRTY_CONVERGENCE_THRESHOLD now in cow-conf.h */
 
 /*
  * Initialize sender queues (one per thread).
