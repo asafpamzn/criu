@@ -2274,7 +2274,22 @@ static int cr_dump_finish(int ret)
 			ret = -1;
 		}
 
-		/* NOW unfreeze - after inventory is ready */
+		/* DEBUG: Process comparison with replica (BOTH FROZEN) */
+		{
+			int compare_sk;
+			pid_t target_pid = root_item->pid->real;
+
+			pr_err("COMPARE: PRIMARY waiting for replica connection (PID %d FROZEN)\n",
+			       target_pid);
+
+			if (cow_compare_listen(&compare_sk, 120) == 0) {
+				cow_compare_send_state(compare_sk, target_pid);
+				close(compare_sk);
+			}
+			pr_err("COMPARE: PRIMARY comparison done\n");
+		}
+
+		/* NOW unfreeze - after comparison */
 		pr_info("COW: Unfreezing process\n");
 		pstree_switch_state(root_item, TASK_ALIVE);
 
@@ -2960,21 +2975,6 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 			if (wait_for_all_pages_sent_ack(sk) < 0)
 				pr_warn("Failed to receive all_pages_sent ACK\n");
 		}
-	}
-
-	/* DEBUG: Process comparison with replica (BOTH FROZEN) */
-	{
-		int compare_sk;
-		pid_t target_pid = root_item->pid->real;
-
-		pr_err("COMPARE: PRIMARY waiting for replica connection (PID %d FROZEN)\n",
-		       target_pid);
-
-		if (cow_compare_listen(&compare_sk, 120) == 0) {
-			cow_compare_send_state(compare_sk, target_pid);
-			close(compare_sk);
-		}
-		pr_err("COMPARE: PRIMARY comparison done\n");
 	}
 
 	close_page_server_socket();
