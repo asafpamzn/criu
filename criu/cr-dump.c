@@ -2287,6 +2287,23 @@ static int cr_dump_finish(int ret)
 		}
 		pr_err("COW: After inventory signal+ACK (ret=%d)\n", ret);
 
+		/* NOW send all_pages_sent - after inventory ready so replica receives in order */
+		{
+			int sk = get_page_server_sk();
+			if (!ret && sk >= 0) {
+				pr_info("Sending all_pages_sent signal (after inventory ready)\n");
+				if (send_all_pages_sent_signal(sk) < 0) {
+					pr_err("COW: Failed to send all_pages_sent signal\n");
+					ret = -1;
+				}
+				if (!ret && wait_for_all_pages_sent_ack(sk) < 0) {
+					pr_err("COW: Failed to receive all_pages_sent ACK\n");
+					ret = -1;
+				}
+			}
+		}
+		pr_err("COW: After all_pages_sent signal+ACK (ret=%d)\n", ret);
+
 		/* DEBUG: Process comparison with replica (BOTH FROZEN) */
 		{
 			int compare_sk;
@@ -2978,20 +2995,9 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 	cow_free_new_vma_ranges();
 
 	/*
-	 * Signal completion to replica BEFORE unfreezing.
-	 * This allows replica to drain while PRIMARY is still frozen.
+	 * all_pages_sent signal is now sent in cr_dump_finish() AFTER
+	 * inventory_ready signal, so replica receives them in correct order.
 	 */
-	{
-		int sk = get_page_server_sk();
-		pr_err("get_page_server_sk = %d\n",  sk);
-		if (sk >= 0) {
-			pr_info("Sending all_pages_sent signal to replica (PRIMARY still frozen)\n");
-			if (send_all_pages_sent_signal(sk) < 0)
-				pr_warn("Failed to send all_pages_sent signal\n");
-			if (wait_for_all_pages_sent_ack(sk) < 0)
-				pr_warn("Failed to receive all_pages_sent ACK\n");
-		}
-	}
 
 	cow_set_phase(COW_PHASE_DONE);
 
