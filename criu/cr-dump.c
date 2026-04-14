@@ -2956,21 +2956,6 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 	}
 	pr_err("P3 threads completed: %lu total pages sent\n", cow_p3_pages_sent());
 
-	/* DEBUG: Process comparison with replica */
-	{
-		int compare_sk;
-		pid_t target_pid = root_item->pid->real;
-
-		pr_err("COMPARE: PRIMARY waiting for replica connection (PID %d frozen)\n",
-		       target_pid);
-
-		if (cow_compare_listen(&compare_sk) == 0) {
-			cow_compare_send_state(compare_sk, target_pid);
-			close(compare_sk);
-		}
-		pr_err("COMPARE: PRIMARY comparison done, continuing\n");
-	}
-
 	/* Free new VMA ranges after P3 threads are done using them */
 	cow_free_new_vma_ranges();
 
@@ -3009,6 +2994,21 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 			if (wait_for_all_pages_sent_ack(sk) < 0)
 				pr_warn("Failed to receive all_pages_sent ACK\n");
 		}
+	}
+
+	/* DEBUG: Process comparison with replica (after drain completes) */
+	{
+		int compare_sk;
+		pid_t target_pid = root_item->pid->real;
+
+		pr_err("COMPARE: PRIMARY waiting for replica connection (PID %d)\n",
+		       target_pid);
+
+		if (cow_compare_listen(&compare_sk) == 0) {
+			cow_compare_send_state(compare_sk, target_pid);
+			close(compare_sk);
+		}
+		pr_err("COMPARE: PRIMARY comparison done, continuing\n");
 	}
 
 	close_page_server_socket();
