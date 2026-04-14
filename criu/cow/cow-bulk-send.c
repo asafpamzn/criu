@@ -334,10 +334,10 @@ static void *dirty_scanner_thread(void *arg)
 		}
 
 		/* Check convergence - both scanners check the combined total */
-		if (g_total_dirty_pages < DIRTY_SCAN_FREEZE_THRESHOLD) {
+		if (g_total_dirty_pages < COW_DIRTY_SCAN_FREEZE_THRESHOLD) {
 			if (scanner_id == 0) {
 				pr_err("Scanner: %lu pages < %d threshold, requesting freeze\n",
-				       g_total_dirty_pages, DIRTY_SCAN_FREEZE_THRESHOLD);
+				       g_total_dirty_pages, COW_DIRTY_SCAN_FREEZE_THRESHOLD);
 				g_last_scan_flag = true;
 			}
 			break;
@@ -745,7 +745,7 @@ static bool get_thread_vma_range(struct p3_thread_ctx *ctx,
 	if (lve->dst_id != ctx->dst_id)
 		return false;
 
-	if (vma_size < MIN_VMA_SIZE_FOR_SPLIT) {
+	if (vma_size < COW_MIN_VMA_SIZE_FOR_SPLIT) {
 		/* Small VMAs (< 256KB) - only thread 0 handles them */
 		if (thread_id != 0)
 			return false;
@@ -1135,7 +1135,7 @@ static void *p3_bulk_sender_thread(void *arg)
 			ctx->last_dirty_count = do_dirty_scan_and_send(ctx);
 
 			ctx->below_threshold =
-				(ctx->last_dirty_count < DIRTY_CONVERGENCE_THRESHOLD) || (ctx->iteration > 3);
+				(ctx->last_dirty_count < COW_DIRTY_CONVERGENCE_THRESHOLD) || (ctx->iteration > 3);
 
 			pr_info("P3[%d] iter=%u dirty=%lu threshold=%s\n",
 				thread_id, ctx->iteration, ctx->last_dirty_count,
