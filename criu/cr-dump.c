@@ -2190,8 +2190,14 @@ static int cr_dump_finish(int ret)
 {
 	int post_dump_ret = 0;
 
-	if (disconnect_from_page_server())
-		ret = -1;
+	/*
+	 * For COW mode, don't disconnect yet - we need the socket open
+	 * to send inventory_ready_signal. It will be closed later.
+	 */
+	if (!(opts.cow_dump && cow_get_phase() == COW_PHASE_DONE)) {
+		if (disconnect_from_page_server())
+			ret = -1;
+	}
 
 	pr_err("DEBUG: Closing glob_imgset\n");
 	close_cr_imgset(&glob_imgset);
@@ -2274,6 +2280,9 @@ static int cr_dump_finish(int ret)
 			ret = -1;
 		}
 
+		/* Close page server socket AFTER inventory signal sent */
+		close_page_server_socket();
+
 		/* DEBUG: Process comparison with replica (BOTH FROZEN) */
 		{
 			int compare_sk;
@@ -2282,7 +2291,7 @@ static int cr_dump_finish(int ret)
 			pr_err("COMPARE: PRIMARY waiting for replica connection (PID %d FROZEN)\n",
 			       target_pid);
 
-			if (cow_compare_listen(&compare_sk) == 0) {
+			if (cow_compare_listen(&compare_sk, 120) == 0) {
 				cow_compare_send_state(compare_sk, target_pid);
 				close(compare_sk);
 			}
@@ -2977,7 +2986,6 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 		}
 	}
 
-	close_page_server_socket();
 	cow_set_phase(COW_PHASE_DONE);
 
 	/* Close async uffd */
@@ -2986,6 +2994,7 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 	/*
 	 * Inventory write, signal, and unfreeze are handled in cr_dump_finish()
 	 * AFTER glob_imgset is closed and all buffers are flushed.
+	 * NOTE: page server socket stays open until after inventory signal is sent.
 	 */
 	exit_code = 0;
 	goto finish;
