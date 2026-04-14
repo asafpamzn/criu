@@ -119,6 +119,8 @@ static atomic_bool drain_thread_stop = false;
 static atomic_int drain_threads_active = 0;
 static struct list_head *drain_lpis = NULL;  /* lpis list for EAGAIN handling */
 static atomic_ulong total_drained = 0;  /* Total pages drained across all threads */
+static atomic_int next_drain_chunk = 0;  /* Work-stealing: next chunk to process */
+static int max_drain_chunks = 0;  /* Total chunks to drain */
 
 static inline unsigned int page_buffer_hash(unsigned long vaddr)
 {
@@ -784,8 +786,6 @@ static void *background_drain_worker(void *arg)
 	unsigned long last_progress_drained = 0;
 	time_t last_progress_time = 0;
 	int thread_id = args->thread_id;
-	int start_chunk = args->start_chunk;
-	int end_chunk = args->end_chunk;
 	int chunk_id;
 	char thread_name[16];
 
@@ -793,17 +793,21 @@ static void *background_drain_worker(void *arg)
 	snprintf(thread_name, sizeof(thread_name), "cow-drain-%d", thread_id);
 	pthread_setname_np(pthread_self(), thread_name);
 
-	pr_err("DRAIN_PROGRESS: thread=%d STARTED chunks=[%d,%d) buffered=%lu\n",
-	       thread_id, start_chunk, end_chunk, cow_buffer.nr_pages);
+	pr_err("DRAIN_PROGRESS: thread=%d STARTED (work-stealing mode) buffered=%lu\n",
+	       thread_id, cow_buffer.nr_pages);
 	last_progress_time = time(NULL);
 
 	while (!atomic_load(&drain_thread_stop) && cow_buffer.nr_pages > 0) {
-		bool made_progress = false;
+		/* Work-stealing: atomically grab next chunk */
+		chunk_id = atomic_fetch_add(&next_drain_chunk, 1);
+		if (chunk_id >= max_drain_chunks) {
+			/* No more chunks to process - exit work loop */
+			pr_err("DRAIN_PROGRESS: thread=%d no more chunks (chunk_id=%d >= max=%d), drained=%lu\n",
+			       thread_id, chunk_id, max_drain_chunks, drained);
+			break;
+		}
 
-		/* Iterate through assigned chunks */
-		for (chunk_id = start_chunk;
-		     chunk_id < end_chunk && !atomic_load(&drain_thread_stop);
-		     chunk_id++) {
+		{
 			unsigned long chunk_drained = 0;
 
 			pthread_spin_lock(&chunk_index[chunk_id].lock);
@@ -819,7 +823,6 @@ static void *background_drain_worker(void *arg)
 					bool free_data = true;
 
 					node->count--;
-					made_progress = true;
 
 					/* Track: removed from buffer, about to copy */
 					page_state_set(vaddr, PAGE_STATE_DRAIN_PENDING);
@@ -907,22 +910,6 @@ static void *background_drain_worker(void *arg)
 				pr_err("DRAIN_CHUNK_DONE: thread=%d chunk=%d drained=%lu\n",
 				       thread_id, chunk_id, chunk_drained);
 			}
-		}
-
-		/*
-		 * If no progress made in this pass and buffer not empty,
-		 * yield to let other threads or page receivers work.
-		 * This prevents busy-spinning when pages are being added
-		 * to buckets outside our range.
-		 */
-		if (!made_progress && cow_buffer.nr_pages > 0) {
-			static atomic_int wait_log_count = 0;
-			int log_count = atomic_fetch_add(&wait_log_count, 1);
-			if (log_count < 50 || log_count % 1000 == 0) {
-				pr_err("DRAIN_WAIT: thread=%d chunks=[%d,%d) no_progress, remaining=%lu, waiting...\n",
-				       thread_id, start_chunk, end_chunk, cow_buffer.nr_pages);
-			}
-			usleep(100);  /* 100us yield */
 		}
 	}
 
@@ -1038,16 +1025,15 @@ int cow_start_drain_thread(struct list_head *lpis)
 		       min_chunk_id, min_chunk_pages == INT_MAX ? 0 : min_chunk_pages);
 	}
 
+	/* Initialize work-stealing globals */
+	atomic_store(&next_drain_chunk, 0);
+	max_drain_chunks = total_chunks;
+
 	for (i = 0; i < NUM_DRAIN_THREADS; i++) {
 		drain_args[i].thread_id = i;
-		drain_args[i].start_chunk = i * chunks_per_thread;
-		drain_args[i].end_chunk = (i + 1) * chunks_per_thread;
-		if (drain_args[i].end_chunk > total_chunks)
-			drain_args[i].end_chunk = total_chunks;
-
-		/* Skip threads with no chunks to process */
-		if (drain_args[i].start_chunk >= total_chunks)
-			continue;
+		/* start/end_chunk unused with work-stealing, but set for debug logging */
+		drain_args[i].start_chunk = 0;
+		drain_args[i].end_chunk = total_chunks;
 
 		if (pthread_create(&drain_threads[i], NULL,
 				   background_drain_worker, &drain_args[i])) {
@@ -1063,7 +1049,7 @@ int cow_start_drain_thread(struct list_head *lpis)
 		return -1;
 	}
 
-	pr_err("DRAIN_PROGRESS: STARTING %d/%d drain threads (chunk-ordered), buffered=%lu total_chunks=%d\n",
+	pr_err("DRAIN_PROGRESS: STARTING %d/%d drain threads (work-stealing), buffered=%lu total_chunks=%d\n",
 	       created, NUM_DRAIN_THREADS, cow_buffer.nr_pages, total_chunks);
 
 	return 0;
