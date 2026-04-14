@@ -2282,7 +2282,7 @@ static int cr_dump_finish(int ret)
 			pr_err("COMPARE: PRIMARY waiting for replica connection (PID %d FROZEN)\n",
 			       target_pid);
 
-			if (cow_compare_listen(&compare_sk, 120) == 0) {
+			if (cow_compare_listen(&compare_sk) == 0) {
 				cow_compare_send_state(compare_sk, target_pid);
 				close(compare_sk);
 			}
