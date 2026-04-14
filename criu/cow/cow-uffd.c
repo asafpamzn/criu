@@ -215,8 +215,7 @@ static int cow_uffd_copy_and_track(int uffd, unsigned long vaddr, void *data,
 				   unsigned int flags,
 				   const char *caller,
 				   bool *data_owned)
-{
-	static atomic_ulong copy_log_count = 0;
+{	
 	enum cow_copy_result res;
 
 	if (data_owned)
