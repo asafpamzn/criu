@@ -490,6 +490,17 @@ int cow_page_buffer_add(unsigned long vaddr, void *data, int thread_id, bool noc
 	/* Get chunk ID for this page's data for chunk-ordered drain */
 	node->chunk_id = page_pool_get_chunk_id(page_data);
 
+	/* Debug: track pages with missing chunk_id for investigation */
+	if (node->chunk_id < 0) {
+		static atomic_int bad_chunk_count = 0;
+		int count = atomic_fetch_add(&bad_chunk_count, 1);
+		if (count < 10 || count % 100000 == 0) {
+			pr_err("CHUNK_ID_MISSING: page_data=%p vaddr=0x%lx count=%d "
+			       "(page not in page pool tracking)\n",
+			       page_data, vaddr, count + 1);
+		}
+	}
+
 	pthread_spin_lock(&hash_locks[lock_idx]);
 	hlist_add_head(&node->hash, &cow_buffer.hash_table[hash]);
 	page_state_set_with_crc(vaddr, PAGE_STATE_IN_BUFFER, page_data);
@@ -765,6 +776,91 @@ void cow_page_buffer_readd(unsigned long vaddr, void *data)
 }
 
 /*
+ * Fallback drain for orphaned pages (chunk_id=-1).
+ * These pages were added to hash table but NOT to chunk_index because
+ * page_pool_get_chunk_id() returned -1. The chunk-ordered drain misses them.
+ * This function iterates the hash table directly to drain any remaining pages.
+ */
+static void drain_orphaned_pages_from_hash(void)
+{
+	struct page_buffer_node *node;
+	struct hlist_node *tmp;
+	unsigned long drained = 0, discarded = 0;
+	unsigned long last_log_count = 0;
+	int bucket;
+
+	pr_err("DRAIN_FALLBACK: Starting hash-table scan for %lu orphaned pages\n",
+	       cow_buffer.nr_pages);
+
+	for (bucket = 0; bucket < PAGE_BUFFER_HASH_SIZE && cow_buffer.nr_pages > 0; bucket++) {
+		int lock_idx = lock_index(bucket);
+
+		pthread_spin_lock(&hash_locks[lock_idx]);
+		hlist_for_each_entry_safe(node, tmp, &cow_buffer.hash_table[bucket], hash) {
+			while (node->count > 0) {
+				int idx = node->count - 1;
+				unsigned long vaddr = node->entries[idx].vaddr;
+				void *data = node->entries[idx].data;
+				int uffd;
+				bool data_owned = false;
+
+				node->count--;
+				pthread_spin_unlock(&hash_locks[lock_idx]);
+				__sync_fetch_and_sub(&cow_buffer.nr_pages, 1);
+
+				/* Track state change */
+				page_state_set(vaddr, PAGE_STATE_DRAIN_PENDING);
+
+				/* Find uffd and copy page */
+				uffd = cow_get_uffd_for_vaddr(drain_lpis, vaddr);
+				if (uffd >= 0) {
+					int ret = cow_uffd_copy_and_track(uffd, vaddr, data, 1,
+									 NULL, drain_lpis,
+									 COW_TRACK_STRICT,
+									 "FALLBACK", &data_owned);
+					if (ret > 0)
+						drained++;
+					else
+						discarded++;
+				} else {
+					__sync_fetch_and_add(&cow_buffer.nr_discarded, 1);
+					discarded++;
+					if (!unmapped_tracker_is_unmapped(vaddr) &&
+					    page_state_get(vaddr) != PAGE_STATE_DIRTY)
+						page_state_set(vaddr, PAGE_STATE_DISCARDED);
+				}
+
+				if (!data_owned)
+					page_pool_put(data);
+
+				/* Progress logging every 1M pages */
+				if ((drained + discarded) - last_log_count >= 1000000) {
+					pr_err("DRAIN_FALLBACK: drained=%lu discarded=%lu remaining=%lu\n",
+					       drained, discarded, cow_buffer.nr_pages);
+					last_log_count = drained + discarded;
+				}
+
+				pthread_spin_lock(&hash_locks[lock_idx]);
+			}
+
+			/* Remove empty node from hash table */
+			if (node->count == 0) {
+				hlist_del(&node->hash);
+				/*
+				 * Note: chunk_list is self-referential (INIT_LIST_HEAD) for
+				 * nodes with chunk_id=-1, so no list_del needed.
+				 */
+				xfree(node);
+			}
+		}
+		pthread_spin_unlock(&hash_locks[lock_idx]);
+	}
+
+	pr_err("DRAIN_FALLBACK: DONE drained=%lu discarded=%lu remaining=%lu\n",
+	       drained, discarded, cow_buffer.nr_pages);
+}
+
+/*
  * Background drain worker thread - proactively UFFDIO_COPY pages
  * from buffer to reduce future page faults and free memory.
  *
@@ -957,6 +1053,12 @@ static void *background_drain_worker(void *arg)
 			/* Extrapolate: hash has 1M buckets, we sampled 10k */
 			pr_err("DRAIN_REMAIN: chunk_index_nodes=%lu hash_sample(10k)=%lu (extrapolated=%lu) nr_pages=%lu\n",
 			       in_chunks, in_hash, in_hash * 100, cow_buffer.nr_pages);
+
+			/*
+			 * Orphaned pages with chunk_id=-1 were never added to chunk_index,
+			 * so chunk-ordered drain missed them. Fall back to hash iteration.
+			 */
+			drain_orphaned_pages_from_hash();
 		}
 	}
 
