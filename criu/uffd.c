@@ -1260,16 +1260,21 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 
 	lp_err(lpi, "#PF at 0x%llx\n", address);
 
-	/* Debug: detect page faults during drain or after drain */
+	/*
+	 * COW mode: Just log page faults, don't try to handle them.
+	 * Page server is closed, so we can't fetch pages anyway.
+	 * The process is frozen, so these faults shouldn't block anything.
+	 */
 	if (opts.cow_dump) {
 		if (cow_drain_thread_running()) {
 			pr_err("PAGE_FAULT_DURING_DRAIN: vaddr=0x%llx pid=%d\n",
 			       address, lpi->pid);
-			return 0;
 		} else {
 			pr_err("PAGE_FAULT_POST_DRAIN: vaddr=0x%llx pid=%d\n",
 			       address, lpi->pid);
 		}
+		/* Just log, don't handle - return success to avoid epoll error */
+		return 0;
 	}
 
 	if (is_page_queued(lpi, address))
