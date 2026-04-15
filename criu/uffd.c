@@ -1260,10 +1260,15 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 
 	lp_debug(lpi, "#PF at 0x%llx\n", address);
 
-	/* Debug: detect page faults during drain */
-	if (cow_drain_thread_running()) {
-		pr_err("PAGE_FAULT_DURING_DRAIN: vaddr=0x%llx pid=%d\n",
-		       address, lpi->pid);
+	/* Debug: detect page faults during drain or after drain */
+	if (opts.cow_dump) {
+		if (cow_drain_thread_running()) {
+			pr_err("PAGE_FAULT_DURING_DRAIN: vaddr=0x%llx pid=%d\n",
+			       address, lpi->pid);
+		} else {
+			pr_err("PAGE_FAULT_POST_DRAIN: vaddr=0x%llx pid=%d\n",
+			       address, lpi->pid);
+		}
 	}
 
 	if (is_page_queued(lpi, address))
@@ -1324,6 +1329,12 @@ static int handle_uffd_event(struct epoll_rfd *lpfd)
 	} else if (ret != sizeof(msg)) {
 		lp_err(lpi, "Can't read uffd message: short read");
 		return -1;
+	}
+
+	/* Log UFFD events in COW mode for debugging */
+	if (opts.cow_dump) {
+		pr_warn("UFFD_EVENT: pid=%d event=%u (0x12=PAGEFAULT)\n",
+			lpi->pid, msg.event);
 	}
 
 	switch (msg.event) {
@@ -1600,22 +1611,28 @@ static int handle_lazy_accept(struct epoll_rfd *rfd)
 	}
 
 	/* Set up lpi for each task (reads uffd from restore) */
-	for (i = 0; i < task_entries->nr_tasks; i++) {
-		struct lazy_pages_info *lpi = NULL;
+	{
+		int uffd_count = 0;
+		for (i = 0; i < task_entries->nr_tasks; i++) {
+			struct lazy_pages_info *lpi = NULL;
 
-		if (ud_open(client, &lpi))
-			goto err;
-		if (lpi == NULL)
-			continue;
-		/*
-		 * COW mode with all pages buffered: skip adding UFFD to epoll.
-		 * We drain from buffer, no page fault handling needed.
-		 * Process stays frozen until drain completes.
-		 */
-		if (opts.cow_dump && cow_is_all_pages_sent_received())
-			continue;
-		if (epoll_add_rfd(epollfd, &lpi->lpfd))
-			goto err;
+			if (ud_open(client, &lpi))
+				goto err;
+			if (lpi == NULL)
+				continue;
+			/*
+			 * Always add UFFD to epoll, even in COW mode.
+			 * Page faults can still occur (e.g., during comparison)
+			 * and need to be handled by serving from buffer.
+			 */
+			if (epoll_add_rfd(epollfd, &lpi->lpfd))
+				goto err;
+
+			pr_warn("UFFD_REGISTERED: pid=%d uffd_fd=%d - page fault handler active\n",
+				lpi->pid, lpi->lpfd.fd);
+			uffd_count++;
+		}
+		pr_warn("UFFD_SUMMARY: Registered %d UFFD handlers for page faults\n", uffd_count);
 	}
 
 	/* Set up restore-finished notification socket */
@@ -1753,13 +1770,26 @@ int cow_phase3_restore_loop(int ep_fd, struct epoll_event **events, int nr_fds)
 	pr_warn("Restore connected, waiting for drain to complete (%lu pages)\n",
 		cow_page_buffer_count());
 
-	/* Wait for drain thread to finish copying all pages */
+	/*
+	 * Wait for drain thread to finish copying all pages.
+	 * Poll epoll to handle any page faults that might occur.
+	 * Even though process is frozen, page faults can happen during
+	 * comparison or other operations.
+	 */
 	while (cow_drain_thread_running() || cow_page_buffer_count() > 0) {
-		usleep(10000);  /* 10ms poll */
+		/* Poll epoll with 10ms timeout to handle page faults */
+		ret = epoll_run_rfds(epollfd, *events, nr_fds, 10);
+		if (ret < 0) {
+			pr_err("epoll failed during drain wait\n");
+			return -1;
+		}
+
 		/* Handle any EAGAIN retries */
 		if (!cow_is_eagain_queue_empty()) {
-			/* Process EAGAIN queue - drain thread handles this */
-			continue;
+			if (cow_process_eagain_requests()) {
+				pr_err("EAGAIN processing failed during drain\n");
+				return -1;
+			}
 		}
 	}
 
