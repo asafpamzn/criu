@@ -16,6 +16,41 @@
 #define __CR_COW_CONF_H__
 
 /* ================================================================
+ * SECTION 0: Compile-time Feature Flags
+ * ================================================================
+ * These flags enable/disable optional COW features at compile time.
+ * Uncomment to enable, comment out to disable.
+ */
+
+/*
+ * CONFIG_PAGE_STATE_TRACKER - Enable page state tracking for debugging.
+ * Tracks all state transitions and validates them to detect bugs.
+ * Adds overhead, use only for debugging.
+ */
+// #define CONFIG_PAGE_STATE_TRACKER
+
+/*
+ * CONFIG_HUNG_PAGE_TRACKER - Enable hung page detection.
+ * Tracks pages that take too long to be processed.
+ * Adds overhead, use only for debugging.
+ */
+// #define CONFIG_HUNG_PAGE_TRACKER
+
+/*
+ * CONFIG_COW_COMPARE - Enable process comparison during COW dump.
+ * When enabled, PRIMARY and REPLICA compare process state after freeze.
+ * Useful for debugging memory divergence issues.
+ */
+#define CONFIG_COW_COMPARE
+
+/*
+ * CONFIG_COW_WAIT_REPLICA_TOUCH - Wait for touch file before proceeding.
+ * When enabled, PRIMARY waits for /tmp/continue_replica file to exist
+ * before unfreezing. Useful for manual debugging/inspection.
+ */
+// #define CONFIG_COW_WAIT_REPLICA_TOUCH
+
+/* ================================================================
  * SECTION 1: Batch Transfer Configuration
  * ================================================================ */
 

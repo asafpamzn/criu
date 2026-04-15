@@ -169,13 +169,13 @@ int cow_compare_send_state(int sk, pid_t pid)
 	void *page_buf;
 	int total_pages = 0, sent_hashes = 0;
 
-	pr_info("COMPARE: Starting state send for PID %d\n", pid);
+	pr_warn("COMPARE: Starting state send for PID %d\n", pid);
 
 	/* Step 1: Read and send VMA list */
 	if (read_process_vmas(pid, &vmas, &nr_vmas) < 0)
 		return -1;
 
-	pr_info("COMPARE: Sending %d VMAs\n", nr_vmas);
+	pr_warn("COMPARE: Sending %d VMAs\n", nr_vmas);
 
 	for (i = 0; i < nr_vmas; i++) {
 		hdr.type = MSG_VMA_LIST;
@@ -194,7 +194,7 @@ int cow_compare_send_state(int sk, pid_t pid)
 	hdr.len = 0;
 	send(sk, &hdr, sizeof(hdr), 0);
 
-	pr_info("COMPARE: Sent %d VMAs, now sending hashes for %d pages\n",
+	pr_warn("COMPARE: Sent %d VMAs, now sending hashes for %d pages\n",
 		nr_vmas, total_pages);
 
 	/* Step 2: Send page hashes for each VMA */
@@ -238,7 +238,7 @@ int cow_compare_send_state(int sk, pid_t pid)
 	xfree(page_buf);
 	xfree(vmas);
 
-	pr_info("COMPARE: Sent %d page hashes, waiting for comparison result\n",
+	pr_warn("COMPARE: Sent %d page hashes, waiting for comparison result\n",
 		sent_hashes);
 
 	/* Wait for done message */
@@ -262,7 +262,7 @@ int cow_compare_receive_and_verify(int sk, pid_t pid)
 	void *page_buf;
 	int i, j;
 
-	pr_info("COMPARE: Starting state comparison for local PID %d\n", pid);
+	pr_warn("COMPARE: Starting state comparison for local PID %d\n", pid);
 
 	/* Read local VMAs */
 	if (read_process_vmas(pid, &local_vmas, &local_nr_vmas) < 0)
@@ -290,7 +290,7 @@ int cow_compare_receive_and_verify(int sk, pid_t pid)
 		}
 	}
 
-	pr_info("COMPARE: Received %d remote VMAs, local has %d\n",
+	pr_warn("COMPARE: Received %d remote VMAs, local has %d\n",
 		remote_nr_vmas, local_nr_vmas);
 
 	/* Compare VMA lists */
@@ -318,7 +318,7 @@ int cow_compare_receive_and_verify(int sk, pid_t pid)
 		}
 	}
 
-	pr_info("COMPARE: VMA comparison done, %d differences\n", vma_diffs);
+	pr_warn("COMPARE: VMA comparison done, %d differences\n", vma_diffs);
 
 	/* Step 2: Receive and compare page hashes */
 	page_buf = xmalloc(PAGE_SIZE);
@@ -355,7 +355,7 @@ int cow_compare_receive_and_verify(int sk, pid_t pid)
 			}
 
 			if (pages_checked % 100000 == 0)
-				pr_info("COMPARE: Checked %d pages, %d diffs so far\n",
+				pr_warn("COMPARE: Checked %d pages, %d diffs so far\n",
 					pages_checked, page_diffs);
 		}
 	}

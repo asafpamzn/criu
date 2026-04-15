@@ -3,13 +3,7 @@
 
 #include <stdbool.h>
 #include "int.h"
-
-/*
- * Compile-time flag to enable/disable page state tracking.
- * When disabled, all functions become no-ops for zero overhead.
- * Define CONFIG_PAGE_STATE_TRACKER to enable.
- */
-// #define CONFIG_PAGE_STATE_TRACKER
+#include "cow/cow-conf.h"  /* CONFIG_PAGE_STATE_TRACKER */
 
 /*
  * Comprehensive page state tracking for COW lazy restore debugging.

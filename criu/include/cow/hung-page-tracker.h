@@ -3,13 +3,7 @@
 
 #include <stdbool.h>
 #include "int.h"
-
-/*
- * Compile-time flag to enable/disable hung page tracking.
- * When disabled, all functions become no-ops for zero overhead.
- * Define CONFIG_HUNG_PAGE_TRACKER to enable.
- */
-// #define CONFIG_HUNG_PAGE_TRACKER
+#include "cow/cow-conf.h"  /* CONFIG_HUNG_PAGE_TRACKER */
 
 /*
  * Hung page (page fault) tracker for debugging slow/stuck page requests.

@@ -65,6 +65,7 @@
 #include "stats.h"
 #include "mem.h"
 #include "page-pipe.h"
+#include "cow/cow-conf.h"
 #include "cow/cow-dump.h"
 #include "cow/cow-page-xfer.h"
 #include "cow/cow-bulk-send.h"
@@ -2288,7 +2289,17 @@ static int cr_dump_finish(int ret)
 		}
 		pr_err("COW: After all_pages_sent signal+ACK (ret=%d)\n", ret);
 
-		/* DEBUG: Process comparison with replica (BOTH FROZEN) */
+#ifdef CONFIG_COW_WAIT_REPLICA_TOUCH
+		/* Wait for touch file before proceeding (debugging aid) */
+		pr_err("COW: Waiting for /tmp/continue_replica touch file...\n");
+		while (access("/tmp/continue_replica", F_OK) != 0)
+			sleep(1);
+		unlink("/tmp/continue_replica");
+		pr_err("COW: Touch file received, continuing\n");
+#endif
+
+#ifdef CONFIG_COW_COMPARE
+		/* Process comparison with replica (BOTH FROZEN) */
 		{
 			int compare_sk;
 			pid_t target_pid = root_item->pid->real;
@@ -2302,6 +2313,7 @@ static int cr_dump_finish(int ret)
 			}
 			pr_err("COMPARE: PRIMARY comparison done\n");
 		}
+#endif
 
 		/* NOW unfreeze - after comparison */
 		pr_err("COW: Unfreezing process\n");
