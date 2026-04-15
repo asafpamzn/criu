@@ -3010,6 +3010,5 @@ err:
 	if (parent_ie)
 		inventory_entry__free_unpacked(parent_ie, NULL);
 
-finish:
 	return cr_dump_finish(exit_code);
 }
