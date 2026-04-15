@@ -46,6 +46,9 @@
 struct chunk_header {
 	atomic_int refcount;      /* Pages still in use */
 	atomic_int max_allocated; /* High-water mark of pages allocated */
+	atomic_int total_allocated; /* Debug: total pages ever allocated from this chunk */
+	atomic_int total_freed;     /* Debug: total pages ever freed to this chunk */
+	int chunk_idx;              /* Debug: index in all_chunks array (-1 if untracked) */
 	void *base;               /* Self-pointer for validation */
 };
 
@@ -67,6 +70,7 @@ static atomic_ulong total_alloc_calls; /* Debug: total page_pool_get_chunk calls
 static atomic_int total_chunks_freed;  /* Debug: total chunks freed (refcount→0) */
 static atomic_bool drain_started;     /* Debug: set when drain begins */
 static atomic_ulong puts_before_drain; /* Debug: page_pool_put calls before drain */
+static atomic_int untracked_chunks;    /* Debug: chunks allocated after hitting limit */
 
 /* Allocate a new 256MB aligned chunk */
 static void *alloc_chunk(void)
@@ -103,6 +107,9 @@ static void *alloc_chunk(void)
 	hdr = (struct chunk_header *)chunk;
 	atomic_init(&hdr->refcount, 0);      /* Incremented on each allocation */
 	atomic_init(&hdr->max_allocated, 1); /* Start at 1 (header page) */
+	atomic_init(&hdr->total_allocated, 0);
+	atomic_init(&hdr->total_freed, 0);
+	hdr->chunk_idx = -1;  /* Will be set if tracked */
 	hdr->base = chunk;
 
 	/* Track for cleanup */
@@ -110,6 +117,7 @@ static void *alloc_chunk(void)
 	idx = atomic_load(&nr_chunks);
 	if (idx < COW_MAX_POOL_CHUNKS) {
 		all_chunks[idx] = chunk;
+		hdr->chunk_idx = idx;
 		atomic_fetch_add(&nr_chunks, 1);
 	} else {
 		/* Count NULL slots to see if chunks were freed */
@@ -118,9 +126,11 @@ static void *alloc_chunk(void)
 			if (all_chunks[i] == NULL)
 				null_slots++;
 		}
+		atomic_fetch_add(&untracked_chunks, 1);
 		pr_err("PAGE_POOL: WARNING: Hit limit (%d)! "
-		       "null_slots=%d total_freed=%d total_alloc=%lu total_put=%lu alloc_calls=%lu\n",
+		       "null_slots=%d total_freed=%d untracked=%d total_alloc=%lu total_put=%lu alloc_calls=%lu\n",
 		       COW_MAX_POOL_CHUNKS, null_slots, atomic_load(&total_chunks_freed),
+		       atomic_load(&untracked_chunks),
 		       atomic_load(&total_alloc_count), atomic_load(&total_put_count),
 		       atomic_load(&total_alloc_calls));
 	}
@@ -184,7 +194,15 @@ void *page_pool_get(int thread_id)
 	/* Lock-free allocation: just bump the pointer */
 	page = (char *)pool->current_chunk + (pool->next_page * PAGE_SIZE);
 	pool->next_page++;
-	atomic_fetch_add(&((struct chunk_header *)pool->current_chunk)->refcount, 1);
+
+	{
+		struct chunk_header *hdr = (struct chunk_header *)pool->current_chunk;
+		atomic_fetch_add(&hdr->refcount, 1);
+		atomic_fetch_add(&hdr->total_allocated, 1);
+	}
+
+	/* Debug: track single-page allocations */
+	atomic_fetch_add(&total_alloc_count, 1);
 
 	return page;
 }
@@ -227,6 +245,7 @@ void *page_pool_get_chunk(int thread_id, int *out_nr_pages)
 		int old_max;
 
 		atomic_fetch_add(&hdr->refcount, COW_ALLOC_BATCH);
+		atomic_fetch_add(&hdr->total_allocated, COW_ALLOC_BATCH);
 
 		/* Atomically update max_allocated if we've allocated more */
 		do {
@@ -275,36 +294,56 @@ void page_pool_put(void *page)
 		BUG();
 	}
 
-	/* Atomic decrement */
+	/* Atomic decrement and track per-chunk frees */
 	old_ref = atomic_fetch_sub(&hdr->refcount, 1);
+	atomic_fetch_add(&hdr->total_freed, 1);
 
 	/* Debug: periodically log put progress */
 	{
 		unsigned long put_cnt = atomic_fetch_add(&total_put_count, 1) + 1;
 		if (put_cnt % COW_LOG_SAMPLE_1M == 0) {
-			pr_info("PAGE_POOL_PUT: total=%lu page=%p chunk=%p refcount_was=%d\n",
-			       put_cnt, page, hdr, old_ref);
+			pr_err("PAGE_POOL_PUT: total=%lu page=%p chunk=%p[%d] refcount_was=%d "
+			       "chunk_alloc=%d chunk_freed=%d\n",
+			       put_cnt, page, hdr, hdr->chunk_idx, old_ref,
+			       atomic_load(&hdr->total_allocated),
+			       atomic_load(&hdr->total_freed));
 		}
 	}
 
 	/* Debug: log when chunk is getting close to being freed */
 	if (old_ref <= COW_REFCOUNT_LOW && old_ref > 1 &&
 	    (old_ref == COW_REFCOUNT_LOW || old_ref == 500 || old_ref == 100 || old_ref == 10)) {
-		pr_info("PAGE_POOL_LOW: chunk=%p refcount_now=%d (close to free!)\n",
-		       hdr, old_ref - 1);
+		pr_err("PAGE_POOL_LOW: chunk=%p[%d] refcount_now=%d alloc=%d freed=%d\n",
+		       hdr, hdr->chunk_idx, old_ref - 1,
+		       atomic_load(&hdr->total_allocated),
+		       atomic_load(&hdr->total_freed));
 	}
 
 	/* Last reference? munmap the entire chunk */
 	if (old_ref == 1) {
-		atomic_fetch_add(&total_chunks_freed, 1) + 1;		
+		int freed_count = atomic_fetch_add(&total_chunks_freed, 1) + 1;
+		int chunk_idx = hdr->chunk_idx;
+		int total_alloc = atomic_load(&hdr->total_allocated);
+		int total_free = atomic_load(&hdr->total_freed);
+
+		pr_err("PAGE_POOL_FREE: chunk=%p[%d] freed_count=%d alloc=%d freed=%d "
+		       "(should match: %s)\n",
+		       hdr, chunk_idx, freed_count, total_alloc, total_free,
+		       total_alloc == total_free ? "YES" : "NO - LEAK!");
 
 		/* Remove from tracking list */
 		pthread_spin_lock(&chunk_list_lock);
-		for (int i = 0; i < atomic_load(&nr_chunks); i++) {
-			if (all_chunks[i] == hdr) {
-				all_chunks[i] = NULL;
-				break;
+		if (chunk_idx >= 0 && chunk_idx < COW_MAX_POOL_CHUNKS) {
+			if (all_chunks[chunk_idx] == hdr) {
+				all_chunks[chunk_idx] = NULL;
+			} else {
+				pr_err("PAGE_POOL_FREE: WARNING chunk[%d] mismatch! "
+				       "expected=%p actual=%p\n",
+				       chunk_idx, hdr, all_chunks[chunk_idx]);
 			}
+		} else {
+			pr_err("PAGE_POOL_FREE: chunk=%p was untracked (idx=%d)\n",
+			       hdr, chunk_idx);
 		}
 		pthread_spin_unlock(&chunk_list_lock);
 
@@ -345,7 +384,10 @@ void page_pool_dump_stats(void)
 	int i, n;
 	int low_count = 0, mid_count = 0, high_count = 0;
 	int min_ref = INT_MAX, max_ref = 0;
+	int null_slots = 0;
 	unsigned long total_outstanding = 0;
+	unsigned long total_ever_allocated = 0;
+	unsigned long total_ever_freed = 0;
 
 	if (!atomic_load(&global_init_done))
 		return;
@@ -357,18 +399,30 @@ void page_pool_dump_stats(void)
 			struct chunk_header *hdr = all_chunks[i];
 			int ref = atomic_load(&hdr->refcount);
 			total_outstanding += ref;
+			total_ever_allocated += atomic_load(&hdr->total_allocated);
+			total_ever_freed += atomic_load(&hdr->total_freed);
 			if (ref < min_ref) min_ref = ref;
 			if (ref > max_ref) max_ref = ref;
 			if (ref < COW_REFCOUNT_LOW) low_count++;
 			else if (ref < COW_REFCOUNT_MID) mid_count++;
 			else high_count++;
+		} else {
+			null_slots++;
 		}
 	}
 	pthread_spin_unlock(&chunk_list_lock);
 
-	pr_err("PAGE_POOL_STATS: chunks=%d outstanding=%lu | low(<1k)=%d mid(1k-30k)=%d high(>30k)=%d | min=%d max=%d\n",
-	       n, total_outstanding, low_count, mid_count, high_count,
+	pr_err("PAGE_POOL_STATS: chunks=%d (null=%d freed=%d untracked=%d) outstanding=%lu | "
+	       "low(<1k)=%d mid(1k-30k)=%d high(>30k)=%d | min=%d max=%d\n",
+	       n, null_slots, atomic_load(&total_chunks_freed), atomic_load(&untracked_chunks),
+	       total_outstanding, low_count, mid_count, high_count,
 	       min_ref == INT_MAX ? 0 : min_ref, max_ref);
+	pr_err("PAGE_POOL_STATS: global_alloc=%lu global_put=%lu diff=%lu | "
+	       "chunk_alloc=%lu chunk_freed=%lu diff=%lu\n",
+	       atomic_load(&total_alloc_count), atomic_load(&total_put_count),
+	       atomic_load(&total_alloc_count) - atomic_load(&total_put_count),
+	       total_ever_allocated, total_ever_freed,
+	       total_ever_allocated - total_ever_freed);
 }
 
 /* Debug: show chunk utilization (how full each chunk got) */
@@ -457,4 +511,88 @@ int page_pool_get_nr_chunks(void)
 	if (!atomic_load(&global_init_done))
 		return 0;
 	return atomic_load(&nr_chunks);
+}
+
+/*
+ * Debug: Dump detailed info for chunks that still have outstanding refs.
+ * Shows which chunks are blocking memory release.
+ */
+void page_pool_dump_blocking_chunks(int max_to_show)
+{
+	int i, n, shown = 0;
+	int total_blocking = 0;
+	unsigned long blocking_pages = 0;
+
+	if (!atomic_load(&global_init_done))
+		return;
+
+	pr_err("PAGE_POOL_BLOCKING: Scanning for chunks with outstanding refs...\n");
+
+	pthread_spin_lock(&chunk_list_lock);
+	n = atomic_load(&nr_chunks);
+	for (i = 0; i < n && shown < max_to_show; i++) {
+		if (all_chunks[i]) {
+			struct chunk_header *hdr = all_chunks[i];
+			int ref = atomic_load(&hdr->refcount);
+			int alloc = atomic_load(&hdr->total_allocated);
+			int freed = atomic_load(&hdr->total_freed);
+
+			if (ref > 0) {
+				total_blocking++;
+				blocking_pages += ref;
+
+				if (shown < max_to_show) {
+					pr_err("  BLOCKING[%d]: chunk=%p idx=%d ref=%d "
+					       "alloc=%d freed=%d delta=%d\n",
+					       shown, hdr, hdr->chunk_idx, ref,
+					       alloc, freed, alloc - freed);
+					shown++;
+				}
+			}
+		}
+	}
+	pthread_spin_unlock(&chunk_list_lock);
+
+	pr_err("PAGE_POOL_BLOCKING: total_blocking=%d blocking_pages=%lu "
+	       "(%.1f GB stuck)\n",
+	       total_blocking, blocking_pages,
+	       (float)(blocking_pages * 4096) / (1024 * 1024 * 1024));
+}
+
+/*
+ * Debug: Get summary of current memory state.
+ * Returns outstanding page count via pointer, returns chunk count.
+ */
+int page_pool_get_memory_state(unsigned long *outstanding_pages,
+			       unsigned long *total_allocated,
+			       unsigned long *total_freed)
+{
+	int i, n;
+	int active_chunks = 0;
+	unsigned long outstanding = 0, alloc = 0, freed = 0;
+
+	if (!atomic_load(&global_init_done)) {
+		*outstanding_pages = 0;
+		*total_allocated = 0;
+		*total_freed = 0;
+		return 0;
+	}
+
+	pthread_spin_lock(&chunk_list_lock);
+	n = atomic_load(&nr_chunks);
+	for (i = 0; i < n; i++) {
+		if (all_chunks[i]) {
+			struct chunk_header *hdr = all_chunks[i];
+			outstanding += atomic_load(&hdr->refcount);
+			alloc += atomic_load(&hdr->total_allocated);
+			freed += atomic_load(&hdr->total_freed);
+			active_chunks++;
+		}
+	}
+	pthread_spin_unlock(&chunk_list_lock);
+
+	*outstanding_pages = outstanding;
+	*total_allocated = alloc;
+	*total_freed = freed;
+	return active_chunks;
 }
