@@ -1099,6 +1099,9 @@ int cow_start_drain_thread(struct list_head *lpis)
 		return -1;
 	}
 
+	/* Mark drain started and report any puts that happened before */
+	page_pool_mark_drain_started();
+
 	pr_err("DRAIN_PROGRESS: STARTING %d/%d drain threads (work-stealing), buffered=%lu total_chunks=%d\n",
 	       created, COW_NUM_DRAIN_THREADS, cow_buffer.nr_pages, total_chunks);
 

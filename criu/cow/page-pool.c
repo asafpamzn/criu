@@ -64,6 +64,8 @@ static atomic_bool global_init_done;
 static atomic_ulong total_put_count;  /* Debug: total page_pool_put calls */
 static atomic_ulong total_alloc_count;  /* Debug: total pages allocated */
 static atomic_int total_chunks_freed;  /* Debug: total chunks freed (refcount→0) */
+static atomic_bool drain_started;     /* Debug: set when drain begins */
+static atomic_ulong puts_before_drain; /* Debug: page_pool_put calls before drain */
 
 /* Allocate a new 256MB aligned chunk */
 static void *alloc_chunk(void)
@@ -254,6 +256,10 @@ void page_pool_put(void *page)
 	if (!page)
 		return;
 
+	/* Track puts before drain started */
+	if (!atomic_load(&drain_started))
+		atomic_fetch_add(&puts_before_drain, 1);
+
 	/* Calculate chunk base from page address (256MB aligned) */
 	hdr = (struct chunk_header *)((unsigned long)page & COW_CHUNK_ALIGN_MASK);
 
@@ -396,6 +402,14 @@ void page_pool_dump_utilization(void)
 	       n, total_allocated, total_capacity,
 	       total_capacity > 0 ? (float)total_allocated / total_capacity * 100 : 0,
 	       full_chunks, partial_chunks, empty_chunks);
+}
+
+/* Mark drain as started and report puts before drain */
+void page_pool_mark_drain_started(void)
+{
+	atomic_store(&drain_started, true);
+	pr_err("PAGE_POOL: Drain started, puts_before_drain=%lu total_alloc=%lu\n",
+	       atomic_load(&puts_before_drain), atomic_load(&total_alloc_count));
 }
 
 /*

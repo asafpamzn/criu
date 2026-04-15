@@ -36,6 +36,9 @@ void page_pool_dump_stats(void);
 /* Debug: print chunk utilization (how full each chunk got) */
 void page_pool_dump_utilization(void);
 
+/* Debug: mark drain started and report puts before drain */
+void page_pool_mark_drain_started(void);
+
 /* Get chunk ID from data pointer (for chunk-ordered drain) */
 int page_pool_get_chunk_id(void *page);
 
