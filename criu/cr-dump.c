@@ -2253,27 +2253,11 @@ static int cr_dump_finish(int ret)
 	}
 
 	/*
-	 * COW phased dump path: inventory write, signal, and unfreeze happen here
-	 * AFTER all data is collected and flushed to NFS.
+	 * COW phased dump path: signal replica and unfreeze.
+	 * Inventory was already written in cr_dump_tasks_cow_phased().
 	 */
 	if (opts.cow_dump && cow_get_phase() == COW_PHASE_DONE) {
-		InventoryEntry he = INVENTORY_ENTRY__INIT;
-
-		pr_err("COW: Writing inventory and signaling replica (ret=%d before inventory)\n", ret);
-
-		/* Set up inventory entry */
-		he.has_pre_dump_mode = false;
-		if (found_uprobes_vma()) {
-			he.has_allow_uprobes = true;
-			he.allow_uprobes = true;
-		}
-
-		/* Write inventory - all image data is now on NFS */
-		if (write_img_inventory(&he)) {
-			pr_err("COW: Failed to write inventory\n");
-			ret = -1;
-		}
-		pr_err("COW: write_img_inventory done (ret=%d)\n", ret);
+		pr_err("COW: Signaling replica (ret=%d)\n", ret);
 
 		/* Signal replica that inventory is ready and wait for ACK */
 		pr_err("COW: About to send inventory ready signal (ret=%d, sk=%d)\n", ret, get_page_server_sk());
@@ -3004,13 +2988,15 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 	/* Close async uffd */
 	cow_cleanup_async_uffd();
 
-	/*
-	 * Inventory write, signal, and unfreeze are handled in cr_dump_finish()
-	 * AFTER glob_imgset is closed and all buffers are flushed.
-	 * NOTE: page server socket stays open until after inventory signal is sent.
-	 */
-	exit_code = 0;
-	goto finish;
+	/* Set up inventory fields and write - like standard path */
+	he.has_pre_dump_mode = false;
+	if (found_uprobes_vma()) {
+		he.has_allow_uprobes = true;
+		he.allow_uprobes = true;
+	}
+
+	exit_code = write_img_inventory(&he);
+	goto err;
 
 err_refreeze:
 	/*
