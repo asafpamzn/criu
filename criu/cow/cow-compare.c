@@ -213,10 +213,11 @@ static uint32_t crc32_page(const void *data, size_t len)
 }
 
 /* Read page content from /proc/PID/mem */
-static int read_page(pid_t pid, uint64_t vaddr, void *buf)
+static int read_page(pid_t pid, uint64_t vaddr, void *buf, bool log_errors)
 {
+	static int fail_logged = 0;
 	char path[64];
-	int fd, ret;
+	int fd, ret, save_errno;
 
 	snprintf(path, sizeof(path), "/proc/%d/mem", pid);
 	fd = open(path, O_RDONLY);
@@ -224,13 +225,26 @@ static int read_page(pid_t pid, uint64_t vaddr, void *buf)
 		return -1;
 
 	if (lseek(fd, vaddr, SEEK_SET) < 0) {
+		save_errno = errno;
 		close(fd);
+		if (log_errors && fail_logged++ < 20)
+			pr_err("read_page 0x%016lx lseek failed: errno=%d (%s)\n",
+			       (unsigned long)vaddr, save_errno, strerror(save_errno));
 		return -1;
 	}
 
 	ret = read(fd, buf, PAGE_SIZE);
+	save_errno = errno;
 	close(fd);
-	return (ret == PAGE_SIZE) ? 0 : -1;
+
+	if (ret != PAGE_SIZE) {
+		if (log_errors && fail_logged++ < 20)
+			pr_err("read_page 0x%016lx read failed: ret=%d errno=%d (%s)\n",
+			       (unsigned long)vaddr, ret, save_errno, strerror(save_errno));
+		return -1;
+	}
+
+	return 0;
 }
 #endif
 
@@ -290,7 +304,7 @@ int cow_compare_send_state(int sk, pid_t pid)
 		for (addr = vmas[i].start; addr < vmas[i].end; addr += PAGE_SIZE) {
 			struct page_hash_info phi;
 
-			if (read_page(pid, addr, page_buf) < 0) {
+			if (read_page(pid, addr, page_buf, false) < 0) {
 				/* Unreadable page - send hash of 0 */
 				phi.vaddr = addr;
 				phi.crc32 = 0;
@@ -542,7 +556,7 @@ int cow_compare_receive_and_verify(int sk, pid_t pid)
 			pages_checked++;
 
 			/* Read local page and compute hash */
-			if (read_page(pid, remote_phi.vaddr, page_buf) < 0) {
+			if (read_page(pid, remote_phi.vaddr, page_buf, true) < 0) {
 				local_crc = 0;
 			} else {
 				local_crc = crc32_page(page_buf, PAGE_SIZE);
