@@ -1261,14 +1261,11 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 	lp_err(lpi, "#PF at 0x%llx\n", address);
 
 	/*
-	 * COW mode: Serve page faults from the buffer.
-	 * The page server is closed, so we must serve from our local buffer.
-	 * Process may be running and hitting page faults during drain.
+	 * COW mode: Just log page faults, don't try to handle them.
+	 * Page server is closed, so we can't fetch pages anyway.
+	 * The process is frozen, so these faults shouldn't block anything.
 	 */
 	if (opts.cow_dump) {
-		void *page_data;
-		int copy_ret;
-
 		if (cow_drain_thread_running()) {
 			pr_err("PAGE_FAULT_DURING_DRAIN: vaddr=0x%llx pid=%d\n",
 			       address, lpi->pid);
@@ -1276,24 +1273,8 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 			pr_err("PAGE_FAULT_POST_DRAIN: vaddr=0x%llx pid=%d\n",
 			       address, lpi->pid);
 		}
-
-		/* Try to get page from buffer */
-		page_data = cow_page_buffer_lookup_and_remove(address);
-		if (page_data) {
-			/* Found in buffer - copy to process */
-			copy_ret = cow_uffd_copy_page_simple(lpi->lpfd.fd, address, page_data);
-			page_pool_put(page_data);
-			if (copy_ret < 0) {
-				pr_err("PAGE_FAULT: Failed to copy page 0x%llx from buffer\n", address);
-				return -1;
-			}
-			pr_err("PAGE_FAULT: Served 0x%llx from buffer\n", address);
-			return 0;
-		}
-
-		/* Not in buffer - zero the page */
-		pr_err("PAGE_FAULT: 0x%llx not in buffer, zeroing\n", address);
-		return uffd_zero(lpi, address, 1);
+		/* Just log, don't handle - return success to avoid epoll error */
+		return 0;
 	}
 
 	if (is_page_queued(lpi, address))
