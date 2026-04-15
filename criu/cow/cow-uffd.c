@@ -980,7 +980,7 @@ static void *background_drain_worker(void *arg)
 
 			/* Log when we finish draining a chunk */
 			if (chunk_drained > 0) {
-				pr_err("DRAIN_CHUNK_DONE: thread=%d chunk=%d drained=%lu\n",
+				pr_debug("DRAIN_CHUNK_DONE: thread=%d chunk=%d drained=%lu\n",
 				       thread_id, chunk_id, chunk_drained);
 			}
 		}

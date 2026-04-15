@@ -118,7 +118,7 @@ static void *alloc_chunk(void)
 	}
 	pthread_spin_unlock(&chunk_list_lock);
 
-	pr_err("PAGE_POOL: Allocated 256MB chunk at %p (total: %d chunks)\n",
+	pr_debug("PAGE_POOL: Allocated 256MB chunk at %p (total: %d chunks)\n",
 	       chunk, atomic_load(&nr_chunks));
 
 	return chunk;

@@ -87,15 +87,15 @@
  * ================================================================ */
 
 /* Chunk sizes for page pool */
-#define COW_CHUNK_SIZE			(256UL * 1024 * 1024)  /* 256MB per chunk */
+#define COW_CHUNK_SIZE			(64UL * 1024 * 1024)   /* 64MB per chunk */
 #define COW_CHUNK_ALIGN			COW_CHUNK_SIZE
 #define COW_CHUNK_ALIGN_MASK		(~(COW_CHUNK_ALIGN - 1))
 
 /* Allocation batching */
 #define COW_ALLOC_BATCH			64  /* Pages per allocation batch (256KB) */
 
-/* Maximum chunks (2048 * 256MB = 512GB max memory) */
-#define COW_MAX_POOL_CHUNKS		2048
+/* Maximum chunks (8192 * 64MB = 512GB max memory) */
+#define COW_MAX_POOL_CHUNKS		8192
 
 /* Per-worker page pool size */
 #define COW_PAGE_POOL_SIZE		256  /* 256 x 4KB = 1MB per worker */

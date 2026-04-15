@@ -156,10 +156,6 @@ int pb_write_one(struct cr_img *img, void *obj, int type)
 	iov[1].iov_base = buf;
 	iov[1].iov_len = size;
 
-	if (type == PB_FILE) {
-		pr_err("DEBUG: pb_write_one to files.img, size=%d\n", size);
-	}
-
 	ret = bwritev(&img->_x, iov, 2);
 	if (ret != size + sizeof(size)) {
 		pr_perror("Can't write %d bytes", (int)(size + sizeof(size)));
