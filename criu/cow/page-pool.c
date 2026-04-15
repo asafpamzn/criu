@@ -44,8 +44,9 @@
 
 /* Chunk header - stored at start of each 256MB region (uses page 0) */
 struct chunk_header {
-	atomic_int refcount;     /* Pages still in use */
-	void *base;              /* Self-pointer for validation */
+	atomic_int refcount;      /* Pages still in use */
+	atomic_int max_allocated; /* High-water mark of pages allocated */
+	void *base;               /* Self-pointer for validation */
 };
 
 /* Per-thread pool state */
@@ -96,7 +97,8 @@ static void *alloc_chunk(void)
 
 	/* Initialize header (page 0) */
 	hdr = (struct chunk_header *)chunk;
-	atomic_init(&hdr->refcount, 0);  /* Incremented on each allocation */
+	atomic_init(&hdr->refcount, 0);      /* Incremented on each allocation */
+	atomic_init(&hdr->max_allocated, 1); /* Start at 1 (header page) */
 	hdr->base = chunk;
 
 	/* Track for cleanup */
@@ -211,7 +213,22 @@ void *page_pool_get_chunk(int thread_id, int *out_nr_pages)
 	/* Allocate COW_ALLOC_BATCH contiguous pages */
 	batch_start = (char *)pool->current_chunk + (pool->next_page * PAGE_SIZE);
 	pool->next_page += COW_ALLOC_BATCH;
-	atomic_fetch_add(&((struct chunk_header *)pool->current_chunk)->refcount, COW_ALLOC_BATCH);
+
+	/* Update refcount and max_allocated */
+	{
+		struct chunk_header *hdr = (struct chunk_header *)pool->current_chunk;
+		int current_alloc = pool->next_page;
+		int old_max;
+
+		atomic_fetch_add(&hdr->refcount, COW_ALLOC_BATCH);
+
+		/* Atomically update max_allocated if we've allocated more */
+		do {
+			old_max = atomic_load(&hdr->max_allocated);
+			if (current_alloc <= old_max)
+				break;
+		} while (!atomic_compare_exchange_weak(&hdr->max_allocated, &old_max, current_alloc));
+	}
 
 	/* Debug: track total allocations */
 	{
@@ -339,6 +356,44 @@ void page_pool_dump_stats(void)
 	pr_err("PAGE_POOL_STATS: chunks=%d outstanding=%lu | low(<1k)=%d mid(1k-30k)=%d high(>30k)=%d | min=%d max=%d\n",
 	       n, total_outstanding, low_count, mid_count, high_count,
 	       min_ref == INT_MAX ? 0 : min_ref, max_ref);
+}
+
+/* Debug: show chunk utilization (how full each chunk got) */
+void page_pool_dump_utilization(void)
+{
+	int i, n;
+	unsigned long total_allocated = 0, total_capacity = 0;
+	int full_chunks = 0, partial_chunks = 0, empty_chunks = 0;
+	int capacity = COW_PAGES_PER_CHUNK - 1;  /* minus header page */
+
+	if (!atomic_load(&global_init_done))
+		return;
+
+	pthread_spin_lock(&chunk_list_lock);
+	n = atomic_load(&nr_chunks);
+	for (i = 0; i < n; i++) {
+		if (all_chunks[i]) {
+			struct chunk_header *hdr = all_chunks[i];
+			int allocated = atomic_load(&hdr->max_allocated);
+			total_allocated += allocated;
+			total_capacity += capacity;
+
+			/* Categorize by utilization */
+			if (allocated > capacity * 9 / 10)
+				full_chunks++;
+			else if (allocated > capacity / 10)
+				partial_chunks++;
+			else
+				empty_chunks++;
+		}
+	}
+	pthread_spin_unlock(&chunk_list_lock);
+
+	pr_err("PAGE_POOL_UTILIZATION: chunks=%d allocated=%lu capacity=%lu (%.1f%%) | "
+	       "full(>90%%)=%d partial=%d empty(<10%%)=%d\n",
+	       n, total_allocated, total_capacity,
+	       total_capacity > 0 ? (float)total_allocated / total_capacity * 100 : 0,
+	       full_chunks, partial_chunks, empty_chunks);
 }
 
 /*

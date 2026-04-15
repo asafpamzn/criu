@@ -1843,6 +1843,9 @@ int cow_phase3_restore_loop(int ep_fd, struct epoll_event **events, int nr_fds)
 
 	pr_warn("Drain complete, buffer empty\n");
 
+	/* Debug: show page pool utilization */
+	page_pool_dump_utilization();
+
 	/* DEBUG: Process comparison with primary */
 	if (opts.cow_dump && opts.addr) {
 		int compare_sk;
