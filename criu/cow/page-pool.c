@@ -296,7 +296,7 @@ void page_pool_put(void *page)
 
 	/* Last reference? munmap the entire chunk */
 	if (old_ref == 1) {
-		int freed_count = atomic_fetch_add(&total_chunks_freed, 1) + 1;		
+		atomic_fetch_add(&total_chunks_freed, 1) + 1;		
 
 		/* Remove from tracking list */
 		pthread_spin_lock(&chunk_list_lock);
