@@ -1258,7 +1258,7 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 	/* Align requested address to the next page boundary */
 	address = msg->arg.pagefault.address & ~(page_size() - 1);
 
-	lp_debug(lpi, "#PF at 0x%llx\n", address);
+	lp_err(lpi, "#PF at 0x%llx\n", address);
 
 	/* Debug: detect page faults during drain or after drain */
 	if (opts.cow_dump) {
