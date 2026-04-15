@@ -53,6 +53,12 @@ struct vma_info {
 	uint32_t flags;     /* MAP_PRIVATE | MAP_SHARED etc */
 	uint64_t pgoff;
 	char name[64];      /* Truncated pathname */
+	/* smaps fields for debugging missing VMAs */
+	uint64_t rss;       /* Resident Set Size in KB */
+	uint64_t pss;       /* Proportional Set Size in KB */
+	uint64_t anonymous; /* Anonymous memory in KB */
+	uint64_t swap;      /* Swap in KB */
+	char vmflags[64];   /* VmFlags string */
 };
 
 struct page_hash_info {
@@ -113,12 +119,79 @@ static int read_process_vmas(pid_t pid, struct vma_info **out_vmas, int *out_cou
 		v->pgoff = pgoff;
 		strncpy(v->name, name, sizeof(v->name) - 1);
 		v->name[sizeof(v->name) - 1] = '\0';
+		/* Initialize smaps fields */
+		v->rss = 0;
+		v->pss = 0;
+		v->anonymous = 0;
+		v->swap = 0;
+		v->vmflags[0] = '\0';
 	}
 
 	fclose(f);
 	*out_vmas = vmas;
 	*out_count = count;
 	return 0;
+}
+
+/* Read smaps data for VMAs to help debug missing regions */
+static void read_vma_smaps(pid_t pid, struct vma_info *vmas, int count)
+{
+	char path[64];
+	FILE *f;
+	char line[512];
+	int cur_vma = -1;
+
+	snprintf(path, sizeof(path), "/proc/%d/smaps", pid);
+	f = fopen(path, "r");
+	if (!f)
+		return;
+
+	while (fgets(line, sizeof(line), f)) {
+		unsigned long start, end;
+		char perms[8];
+		int i;
+
+		/* Check if this is a VMA header line (address range) */
+		if (sscanf(line, "%lx-%lx %4s", &start, &end, perms) == 3) {
+			/* Find matching VMA in our list */
+			cur_vma = -1;
+			for (i = 0; i < count; i++) {
+				if (vmas[i].start == start) {
+					cur_vma = i;
+					break;
+				}
+			}
+			continue;
+		}
+
+		/* Parse smaps fields for current VMA */
+		if (cur_vma >= 0) {
+			unsigned long val;
+			char key[32];
+
+			if (sscanf(line, "%31[^:]: %lu kB", key, &val) == 2) {
+				if (strcmp(key, "Rss") == 0)
+					vmas[cur_vma].rss = val;
+				else if (strcmp(key, "Pss") == 0)
+					vmas[cur_vma].pss = val;
+				else if (strcmp(key, "Anonymous") == 0)
+					vmas[cur_vma].anonymous = val;
+				else if (strcmp(key, "Swap") == 0)
+					vmas[cur_vma].swap = val;
+			} else if (strncmp(line, "VmFlags:", 8) == 0) {
+				/* Copy VmFlags line (trim "VmFlags: " prefix and newline) */
+				char *flags = line + 9;
+				char *nl = strchr(flags, '\n');
+				if (nl)
+					*nl = '\0';
+				strncpy(vmas[cur_vma].vmflags, flags,
+					sizeof(vmas[cur_vma].vmflags) - 1);
+				vmas[cur_vma].vmflags[sizeof(vmas[cur_vma].vmflags) - 1] = '\0';
+			}
+		}
+	}
+
+	fclose(f);
 }
 
 /* Simple CRC32 for page comparison */
@@ -174,6 +247,9 @@ int cow_compare_send_state(int sk, pid_t pid)
 	/* Step 1: Read and send VMA list */
 	if (read_process_vmas(pid, &vmas, &nr_vmas) < 0)
 		return -1;
+
+	/* Read smaps data for debugging missing VMAs */
+	read_vma_smaps(pid, vmas, nr_vmas);
 
 	pr_warn("COMPARE: Sending %d VMAs\n", nr_vmas);
 
@@ -314,6 +390,16 @@ int cow_compare_receive_and_verify(int sk, pid_t pid)
 			pr_err("COMPARE_DIFF: VMA 0x%lx-0x%lx exists on PRIMARY but not REPLICA\n",
 			       (unsigned long)remote_vmas[i].start,
 			       (unsigned long)remote_vmas[i].end);
+			pr_err("  name=%s size=%luKB\n",
+			       remote_vmas[i].name[0] ? remote_vmas[i].name : "(anon)",
+			       (unsigned long)(remote_vmas[i].end - remote_vmas[i].start) / 1024);
+			pr_err("  smaps: rss=%luKB pss=%luKB anon=%luKB swap=%luKB\n",
+			       (unsigned long)remote_vmas[i].rss,
+			       (unsigned long)remote_vmas[i].pss,
+			       (unsigned long)remote_vmas[i].anonymous,
+			       (unsigned long)remote_vmas[i].swap);
+			pr_err("  vmflags: %s\n",
+			       remote_vmas[i].vmflags[0] ? remote_vmas[i].vmflags : "(none)");
 			vma_diffs++;
 		}
 	}
