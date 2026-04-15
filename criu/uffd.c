@@ -1265,6 +1265,7 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 		if (cow_drain_thread_running()) {
 			pr_err("PAGE_FAULT_DURING_DRAIN: vaddr=0x%llx pid=%d\n",
 			       address, lpi->pid);
+			return 0;
 		} else {
 			pr_err("PAGE_FAULT_POST_DRAIN: vaddr=0x%llx pid=%d\n",
 			       address, lpi->pid);
@@ -1759,6 +1760,7 @@ int cow_phase3_restore_loop(int ep_fd, struct epoll_event **events, int nr_fds)
 
 	/* Wait for restore to connect - single epoll iteration */
 	while (!cow_is_restore_connected()) {
+		pr_warn("WAITING_FOR_RESTORE: polling epoll (timeout=1000ms)...\n");
 		ret = epoll_run_rfds(epollfd, *events, nr_fds, 1000);
 		if (ret < 0) {
 			pr_err("epoll failed waiting for restore\n");
