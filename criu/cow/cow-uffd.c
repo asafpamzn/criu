@@ -2104,6 +2104,24 @@ int cow_handle_lazy_accept_post_connect(struct list_head *lpis,
 	 * anymore since all pages are in the buffer.
 	 */
 	if (cow_is_all_pages_sent_received()) {
+		/* Debug: check if target process is frozen */
+		struct lazy_pages_info *lpi;
+		list_for_each_entry(lpi, lpis, l) {
+			char path[64], state[256];
+			FILE *f;
+			snprintf(path, sizeof(path), "/proc/%d/status", lpi->pid);
+			f = fopen(path, "r");
+			if (f) {
+				while (fgets(state, sizeof(state), f)) {
+					if (strncmp(state, "State:", 6) == 0) {
+						pr_err("DRAIN_DEBUG: PID %d %s", lpi->pid, state);
+						break;
+					}
+				}
+				fclose(f);
+			}
+		}
+
 		pr_info("All pages sent, starting drain thread\n");
 		/* Don't call switch_to_convergence - no page server connection */
 		cow_start_drain_thread(lpis);
