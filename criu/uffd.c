@@ -1262,14 +1262,40 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 	lp_err(lpi, "#PF at 0x%llx\n", address);
 
 	/*
-	 * COW mode: Log page faults with details for debugging.
-	 * Page faults during restorer execution block the process.
+	 * COW mode: Serve page faults from the buffer.
+	 * This can happen during restorer execution (e.g., rseq setup) or after sigreturn.
+	 * We must resolve the fault or the process will block.
 	 */
 	if (opts.cow_dump) {
-		pr_err("PAGE_FAULT_COW: vaddr=0x%llx pid=%d drain_running=%d buffer_count=%lu\n",
-		       address, lpi->pid, cow_drain_thread_running(), cow_page_buffer_count());
-		/* Return 0 to avoid epoll error - but fault is NOT resolved! */
-		return 0;
+		void *page_data;
+		struct uffdio_copy uffdio_copy;
+
+		pr_err("PAGE_FAULT_COW: vaddr=0x%llx pid=%d drain_running=%d\n",
+		       address, lpi->pid, cow_drain_thread_running());
+
+		/* Try to get page from buffer */
+		page_data = cow_page_buffer_lookup_and_remove(address);
+		if (page_data) {
+			/* Found in buffer - copy to process */
+			uffdio_copy.dst = address;
+			uffdio_copy.src = (unsigned long)page_data;
+			uffdio_copy.len = PAGE_SIZE;
+			uffdio_copy.mode = 0;
+			uffdio_copy.copy = 0;
+
+			if (ioctl(lpi->lpfd.fd, UFFDIO_COPY, &uffdio_copy) < 0) {
+				pr_perror("PAGE_FAULT: UFFDIO_COPY failed for 0x%llx", address);
+				page_pool_put(page_data);
+				return -1;
+			}
+			page_pool_put(page_data);
+			pr_err("PAGE_FAULT: Served 0x%llx from buffer\n", address);
+			return 0;
+		}
+
+		/* Not in buffer - zero the page */
+		pr_err("PAGE_FAULT: 0x%llx not in buffer, zeroing\n", address);
+		return uffd_zero(lpi, address, 1);
 	}
 
 	if (is_page_queued(lpi, address))
