@@ -63,6 +63,7 @@ static pthread_spinlock_t chunk_list_lock;  /* Only for chunk tracking */
 static atomic_bool global_init_done;
 static atomic_ulong total_put_count;  /* Debug: total page_pool_put calls */
 static atomic_ulong total_alloc_count;  /* Debug: total pages allocated */
+static atomic_ulong total_alloc_calls; /* Debug: total page_pool_get_chunk calls */
 static atomic_int total_chunks_freed;  /* Debug: total chunks freed (refcount→0) */
 static atomic_bool drain_started;     /* Debug: set when drain begins */
 static atomic_ulong puts_before_drain; /* Debug: page_pool_put calls before drain */
@@ -118,8 +119,10 @@ static void *alloc_chunk(void)
 				null_slots++;
 		}
 		pr_err("PAGE_POOL: WARNING: Hit limit (%d)! "
-		       "null_slots=%d total_freed=%d\n",
-		       COW_MAX_POOL_CHUNKS, null_slots, atomic_load(&total_chunks_freed));
+		       "null_slots=%d total_freed=%d total_alloc=%lu total_put=%lu alloc_calls=%lu\n",
+		       COW_MAX_POOL_CHUNKS, null_slots, atomic_load(&total_chunks_freed),
+		       atomic_load(&total_alloc_count), atomic_load(&total_put_count),
+		       atomic_load(&total_alloc_calls));
 	}
 	pthread_spin_unlock(&chunk_list_lock);
 
@@ -244,6 +247,9 @@ void *page_pool_get_chunk(int thread_id, int *out_nr_pages)
 	}
 
 	*out_nr_pages = COW_ALLOC_BATCH;
+
+	/* Debug: track allocation calls */
+	atomic_fetch_add(&total_alloc_calls, 1);
 
 	return batch_start;
 }

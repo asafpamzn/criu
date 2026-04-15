@@ -347,7 +347,7 @@ int cow_page_buffer_add(unsigned long vaddr, void *data, int thread_id, bool noc
 	struct page_buffer_node *node;
 	unsigned int hash;
 	enum page_state state;
-	void *page_data;
+	void *page_data = NULL;
 	int lock_idx;
 	int i;
 
@@ -374,18 +374,15 @@ int cow_page_buffer_add(unsigned long vaddr, void *data, int thread_id, bool noc
 	lock_idx = lock_index(hash);
 
 	/*
-	 * First pass: check if page already exists.
-	 * If so, memcpy directly into existing buffer (no allocation).
+	 * Hold the lock for the entire operation to avoid race conditions
+	 * where two threads could add duplicate entries for the same vaddr.
 	 */
 	pthread_spin_lock(&hash_locks[lock_idx]);
 
+	/* Check if page already exists - if so, overwrite in place */
 	hlist_for_each_entry(node, &cow_buffer.hash_table[hash], hash) {
 		for (i = 0; i < node->count; i++) {
 			if (node->entries[i].vaddr == vaddr) {
-				/*
-				 * Page exists - memcpy directly into existing buffer.
-				 * No allocation needed, no freeing old data.
-				 */
 				memcpy(node->entries[i].data, data, PAGE_SIZE);
 				page_state_set_with_crc(vaddr, PAGE_STATE_IN_BUFFER, data);
 				pthread_spin_unlock(&hash_locks[lock_idx]);
@@ -395,49 +392,27 @@ int cow_page_buffer_add(unsigned long vaddr, void *data, int thread_id, bool noc
 		}
 	}
 
-	pthread_spin_unlock(&hash_locks[lock_idx]);
-
-	/*
-	 * Page doesn't exist - now allocate (if not nocopy).
-	 * Allocation is done outside lock for better concurrency.
-	 */
+	/* Page doesn't exist - allocate buffer for it */
 	if (nocopy) {
-		/* Take ownership of data pointer directly (from page_pool_get_chunk) */
 		page_data = data;
 	} else {
 		if (thread_id < 0) {
+			pthread_spin_unlock(&hash_locks[lock_idx]);
 			pr_err("BUG: cow_page_buffer_add called with invalid thread_id %d\n",
 			       thread_id);
 			BUG();
 		}
 		page_data = page_pool_get(thread_id);
 		if (!page_data) {
+			pthread_spin_unlock(&hash_locks[lock_idx]);
 			pr_err("BUG: page_pool_get failed for thread %d\n", thread_id);
 			BUG();
 		}
 		memcpy(page_data, data, PAGE_SIZE);
 	}
 
-	/*
-	 * Second pass: add to existing node or create new one.
-	 * Re-check under lock since state may have changed.
-	 */
-	pthread_spin_lock(&hash_locks[lock_idx]);
-
-	/* Re-check for duplicate (another thread may have added it) */
+	/* Try to add to existing node with space */
 	hlist_for_each_entry(node, &cow_buffer.hash_table[hash], hash) {
-		for (i = 0; i < node->count; i++) {
-			if (node->entries[i].vaddr == vaddr) {
-				/* Race: page was added by another thread, overwrite */
-				memcpy(node->entries[i].data, data, PAGE_SIZE);
-				page_state_set_with_crc(vaddr, PAGE_STATE_IN_BUFFER, data);
-				pthread_spin_unlock(&hash_locks[lock_idx]);
-				/* Free our allocation since we didn't use it */
-				page_pool_put(page_data);
-				return 0;
-			}
-		}
-		/* Found node with space - add new entry */
 		if (node->count < COW_PAGE_NODE_ENTRIES) {
 			node->entries[node->count].vaddr = vaddr;
 			node->entries[node->count].data = page_data;
@@ -449,12 +424,12 @@ int cow_page_buffer_add(unsigned long vaddr, void *data, int thread_id, bool noc
 		}
 	}
 
-	pthread_spin_unlock(&hash_locks[lock_idx]);
-
-	/* Need new node - allocate outside lock */
+	/* Need new node */
 	node = xmalloc(sizeof(*node));
 	if (!node) {
-		page_pool_put(page_data);
+		pthread_spin_unlock(&hash_locks[lock_idx]);
+		if (!nocopy)
+			page_pool_put(page_data);
 		return -1;
 	}
 
@@ -463,29 +438,25 @@ int cow_page_buffer_add(unsigned long vaddr, void *data, int thread_id, bool noc
 	node->count = 1;
 	INIT_HLIST_NODE(&node->hash);
 	INIT_LIST_HEAD(&node->chunk_list);
-
-	/* Get chunk ID for this page's data for chunk-ordered drain */
 	node->chunk_id = page_pool_get_chunk_id(page_data);
 
-	/* Debug: track pages with missing chunk_id for investigation */
+	/* Debug: track pages with missing chunk_id */
 	if (node->chunk_id < 0) {
 		static atomic_int bad_chunk_count = 0;
 		int count = atomic_fetch_add(&bad_chunk_count, 1);
 		if (count < 10 || count % COW_LOG_SAMPLE_100K == 0) {
-			pr_err("CHUNK_ID_MISSING: page_data=%p vaddr=0x%lx count=%d "
-			       "(page not in page pool tracking)\n",
+			pr_err("CHUNK_ID_MISSING: page_data=%p vaddr=0x%lx count=%d\n",
 			       page_data, vaddr, count + 1);
 		}
 	}
 
-	pthread_spin_lock(&hash_locks[lock_idx]);
 	hlist_add_head(&node->hash, &cow_buffer.hash_table[hash]);
 	page_state_set_with_crc(vaddr, PAGE_STATE_IN_BUFFER, page_data);
 	pthread_spin_unlock(&hash_locks[lock_idx]);
 
 	/* Add to chunk index for chunk-ordered drain */
 	if (node->chunk_id >= 0 && node->chunk_id < COW_MAX_POOL_CHUNKS) {
-		int cur_max = 0;
+		int cur_max;
 		pthread_spin_lock(&chunk_index[node->chunk_id].lock);
 		list_add_tail(&node->chunk_list, &chunk_index[node->chunk_id].pages);
 		atomic_fetch_add(&chunk_index[node->chunk_id].page_count, 1);
