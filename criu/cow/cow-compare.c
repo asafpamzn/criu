@@ -27,6 +27,7 @@
 #include "criu-log.h"
 #include "page.h"
 #include "xmalloc.h"
+#include "cow/cow-conf.h"
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "cow-compare: "
@@ -239,8 +240,10 @@ int cow_compare_send_state(int sk, pid_t pid)
 	struct vma_info *vmas;
 	int nr_vmas, i;
 	struct compare_msg_hdr hdr;
+#ifdef CONFIG_COW_COMPARE_PAGES
 	void *page_buf;
 	int total_pages = 0, sent_hashes = 0;
+#endif
 
 	pr_warn("COMPARE: Starting state send for PID %d\n", pid);
 
@@ -262,7 +265,9 @@ int cow_compare_send_state(int sk, pid_t pid)
 			xfree(vmas);
 			return -1;
 		}
+#ifdef CONFIG_COW_COMPARE_PAGES
 		total_pages += (vmas[i].end - vmas[i].start) / PAGE_SIZE;
+#endif
 	}
 
 	/* End of VMA list */
@@ -270,6 +275,7 @@ int cow_compare_send_state(int sk, pid_t pid)
 	hdr.len = 0;
 	send(sk, &hdr, sizeof(hdr), 0);
 
+#ifdef CONFIG_COW_COMPARE_PAGES
 	pr_warn("COMPARE: Sent %d VMAs, now sending hashes for %d pages\n",
 		nr_vmas, total_pages);
 
@@ -312,10 +318,14 @@ int cow_compare_send_state(int sk, pid_t pid)
 	send(sk, &hdr, sizeof(hdr), 0);
 
 	xfree(page_buf);
-	xfree(vmas);
 
 	pr_warn("COMPARE: Sent %d page hashes, waiting for comparison result\n",
 		sent_hashes);
+#else
+	pr_warn("COMPARE: Sent %d VMAs (page comparison disabled)\n", nr_vmas);
+#endif
+
+	xfree(vmas);
 
 	/* Wait for done message */
 	if (recv(sk, &hdr, sizeof(hdr), MSG_WAITALL) == sizeof(hdr) &&
@@ -334,8 +344,11 @@ int cow_compare_receive_and_verify(int sk, pid_t pid)
 	struct compare_msg_hdr hdr;
 	struct vma_info *local_vmas, *remote_vmas = NULL;
 	int local_nr_vmas, remote_nr_vmas = 0, remote_capacity = 256;
-	int vma_diffs = 0, page_diffs = 0, pages_checked = 0, replica_only = 0;
+	int vma_diffs = 0, replica_only = 0;
+#ifdef CONFIG_COW_COMPARE_PAGES
+	int page_diffs = 0, pages_checked = 0;
 	void *page_buf;
+#endif
 	int i, j;
 
 	pr_warn("COMPARE: Starting state comparison for local PID %d\n", pid);
@@ -439,6 +452,7 @@ int cow_compare_receive_and_verify(int sk, pid_t pid)
 	pr_warn("COMPARE: VMA comparison done, %d PRIMARY-only, %d REPLICA-only\n",
 		vma_diffs, replica_only);
 
+#ifdef CONFIG_COW_COMPARE_PAGES
 	/* Step 2: Receive and compare page hashes */
 	page_buf = xmalloc(PAGE_SIZE);
 
@@ -480,18 +494,29 @@ int cow_compare_receive_and_verify(int sk, pid_t pid)
 	}
 
 	xfree(page_buf);
+#endif
+
 	xfree(local_vmas);
 	xfree(remote_vmas);
 
+#ifdef CONFIG_COW_COMPARE_PAGES
 	pr_err("COMPARE_RESULT: Checked %d pages, found %d PRIMARY-only VMAs, %d REPLICA-only VMAs, %d page diffs\n",
 	       pages_checked, vma_diffs, replica_only, page_diffs);
+#else
+	pr_err("COMPARE_RESULT: Found %d PRIMARY-only VMAs, %d REPLICA-only VMAs (page comparison disabled)\n",
+	       vma_diffs, replica_only);
+#endif
 
 	/* Send done message */
 	hdr.type = MSG_COMPARE_DONE;
 	hdr.len = 0;
 	send(sk, &hdr, sizeof(hdr), 0);
 
+#ifdef CONFIG_COW_COMPARE_PAGES
 	return (vma_diffs == 0 && replica_only == 0 && page_diffs == 0) ? 0 : 1;
+#else
+	return (vma_diffs == 0 && replica_only == 0) ? 0 : 1;
+#endif
 }
 
 /*

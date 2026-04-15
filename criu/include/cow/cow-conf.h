@@ -44,6 +44,14 @@
 #define CONFIG_COW_COMPARE
 
 /*
+ * CONFIG_COW_COMPARE_PAGES - Enable page hash comparison (slow).
+ * When enabled, PRIMARY sends page hashes and REPLICA compares them.
+ * This is very slow for large processes. Disable to only compare VMAs.
+ * Requires CONFIG_COW_COMPARE to be enabled.
+ */
+// #define CONFIG_COW_COMPARE_PAGES
+
+/*
  * CONFIG_COW_WAIT_REPLICA_TOUCH - Wait for touch file before proceeding.
  * When enabled, PRIMARY waits for /tmp/continue_replica file to exist
  * before unfreezing. Useful for manual debugging/inspection.
