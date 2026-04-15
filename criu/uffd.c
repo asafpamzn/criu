@@ -1262,19 +1262,13 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 	lp_err(lpi, "#PF at 0x%llx\n", address);
 
 	/*
-	 * COW mode: Just log page faults, don't try to handle them.
-	 * Page server is closed, so we can't fetch pages anyway.
-	 * The process is frozen, so these faults shouldn't block anything.
+	 * COW mode: Log page faults with details for debugging.
+	 * Page faults during restorer execution block the process.
 	 */
 	if (opts.cow_dump) {
-		if (cow_drain_thread_running()) {
-			pr_err("PAGE_FAULT_DURING_DRAIN: vaddr=0x%llx pid=%d\n",
-			       address, lpi->pid);
-		} else {
-			pr_err("PAGE_FAULT_POST_DRAIN: vaddr=0x%llx pid=%d\n",
-			       address, lpi->pid);
-		}
-		/* Just log, don't handle - return success to avoid epoll error */
+		pr_err("PAGE_FAULT_COW: vaddr=0x%llx pid=%d drain_running=%d buffer_count=%lu\n",
+		       address, lpi->pid, cow_drain_thread_running(), cow_page_buffer_count());
+		/* Return 0 to avoid epoll error - but fault is NOT resolved! */
 		return 0;
 	}
 
