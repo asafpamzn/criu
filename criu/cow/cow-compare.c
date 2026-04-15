@@ -387,7 +387,14 @@ int cow_compare_receive_and_verify(int sk, pid_t pid)
 	pr_warn("COMPARE: Received %d remote VMAs, local has %d\n",
 		remote_nr_vmas, local_nr_vmas);
 
-	/* Compare VMA lists */
+	/*
+	 * Skip CRIU restorer artifacts - VMAs below this threshold are typically
+	 * CRIU's restorer code, /dev/zero mappings, or vdso. Real application
+	 * VMAs are at much higher addresses.
+	 */
+#define CRIU_ARTIFACT_THRESHOLD 0x10000000UL  /* 256MB */
+
+	/* Compare VMA lists (exact boundary match) */
 	for (i = 0; i < remote_nr_vmas; i++) {
 		bool found = false;
 
@@ -405,7 +412,7 @@ int cow_compare_receive_and_verify(int sk, pid_t pid)
 			}
 		}
 		if (!found) {
-			pr_err("COMPARE_DIFF: VMA 0x%lx-0x%lx exists on PRIMARY but not REPLICA\n",
+			pr_err("COMPARE_DIFF: VMA 0x%016lx-0x%016lx exists on PRIMARY but not REPLICA\n",
 			       (unsigned long)remote_vmas[i].start,
 			       (unsigned long)remote_vmas[i].end);
 			pr_err("  name=%s size=%luKB\n",
@@ -426,6 +433,14 @@ int cow_compare_receive_and_verify(int sk, pid_t pid)
 	for (j = 0; j < local_nr_vmas; j++) {
 		bool found = false;
 
+		/* Skip CRIU artifacts (low addresses, vdso, etc.) */
+		if (local_vmas[j].start < CRIU_ARTIFACT_THRESHOLD ||
+		    strstr(local_vmas[j].name, "[vdso]") ||
+		    strstr(local_vmas[j].name, "[vvar]") ||
+		    strstr(local_vmas[j].name, "/dev/zero")) {
+			continue;
+		}
+
 		for (i = 0; i < remote_nr_vmas; i++) {
 			if (local_vmas[j].start == remote_vmas[i].start &&
 			    local_vmas[j].end == remote_vmas[i].end) {
@@ -434,7 +449,7 @@ int cow_compare_receive_and_verify(int sk, pid_t pid)
 			}
 		}
 		if (!found) {
-			pr_err("COMPARE_DIFF: VMA 0x%lx-0x%lx exists on REPLICA but not PRIMARY\n",
+			pr_err("COMPARE_DIFF: VMA 0x%016lx-0x%016lx exists on REPLICA but not PRIMARY\n",
 			       (unsigned long)local_vmas[j].start,
 			       (unsigned long)local_vmas[j].end);
 			pr_err("  name=%s size=%luKB\n",
@@ -451,8 +466,62 @@ int cow_compare_receive_and_verify(int sk, pid_t pid)
 		}
 	}
 
-	pr_warn("COMPARE: VMA comparison done, %d PRIMARY-only, %d REPLICA-only\n",
+	pr_warn("COMPARE: Exact boundary comparison: %d PRIMARY-only, %d REPLICA-only\n",
 		vma_diffs, replica_only);
+
+	/*
+	 * Coverage check: verify all PRIMARY memory ranges are covered by REPLICA VMAs.
+	 * This catches cases where VMAs are merged/split but memory coverage is the same.
+	 */
+	{
+		int uncovered_ranges = 0;
+		uint64_t total_uncovered = 0;
+
+		for (i = 0; i < remote_nr_vmas; i++) {
+			uint64_t addr = remote_vmas[i].start;
+			uint64_t end = remote_vmas[i].end;
+
+			while (addr < end) {
+				bool covered = false;
+				uint64_t next_check = end;
+
+				/* Find a local VMA that covers this address */
+				for (j = 0; j < local_nr_vmas; j++) {
+					if (local_vmas[j].start <= addr && addr < local_vmas[j].end) {
+						covered = true;
+						/* Move to end of this local VMA or end of remote VMA */
+						next_check = (local_vmas[j].end < end) ? local_vmas[j].end : end;
+						break;
+					}
+				}
+
+				if (!covered) {
+					/* Find next local VMA start to determine gap size */
+					uint64_t gap_end = end;
+					for (j = 0; j < local_nr_vmas; j++) {
+						if (local_vmas[j].start > addr && local_vmas[j].start < gap_end)
+							gap_end = local_vmas[j].start;
+					}
+					if (uncovered_ranges < 10) {
+						pr_err("COVERAGE_GAP: PRIMARY 0x%016lx-0x%016lx not covered by REPLICA\n",
+						       (unsigned long)addr, (unsigned long)gap_end);
+					}
+					uncovered_ranges++;
+					total_uncovered += gap_end - addr;
+					next_check = gap_end;
+				}
+
+				addr = next_check;
+			}
+		}
+
+		if (uncovered_ranges > 0) {
+			pr_err("COVERAGE_RESULT: %d PRIMARY ranges (%lu KB) NOT covered by REPLICA\n",
+			       uncovered_ranges, (unsigned long)(total_uncovered / 1024));
+		} else {
+			pr_warn("COVERAGE_RESULT: All PRIMARY memory ranges are covered by REPLICA (VMA merging OK)\n");
+		}
+	}
 
 #ifdef CONFIG_COW_COMPARE_PAGES
 	/* Step 2: Receive and compare page hashes */
