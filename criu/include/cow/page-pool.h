@@ -24,6 +24,9 @@ void *page_pool_get(int thread_id);
 /* Get contiguous chunk for direct decompression (returns first page after header) */
 void *page_pool_get_chunk(int thread_id, int *out_nr_pages);
 
+/* Get exactly nr_pages contiguous pages (more efficient when exact count is known) */
+void *page_pool_get_pages(int thread_id, int nr_pages);
+
 /* Return a page - any thread can call (atomic refcount) */
 void page_pool_put(void *page);
 

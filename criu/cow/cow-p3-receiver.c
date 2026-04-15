@@ -68,7 +68,6 @@ static int p3_receive_and_buffer(struct p3_receiver_ctx *ctx)
 	int sk = ctx->socket;
 	int nr_pages, i, ret = -1;
 	int decomp_ret;
-	int chunk_nr_pages;
 	char *chunk_buf;
 
 	/* Receive header */
@@ -104,17 +103,18 @@ static int p3_receive_and_buffer(struct p3_receiver_ctx *ctx)
 	}
 
 	/*
-	 * Get a contiguous chunk from page pool for direct decompression.
-	 * This eliminates the double-copy (decompress -> temp buf -> page pool).
+	 * Get exactly nr_pages from page pool for direct decompression.
+	 * Using page_pool_get_pages() instead of page_pool_get_chunk() to
+	 * allocate only what we need, avoiding wasted pages that would need
+	 * to be freed immediately.
 	 */
-	chunk_buf = page_pool_get_chunk(ctx->thread_id, &chunk_nr_pages);
-	if (!chunk_buf || chunk_nr_pages < nr_pages) {
-		pr_err("P3 receive: failed to get chunk (need %d, got %d)\n",
-		       nr_pages, chunk_nr_pages);
+	chunk_buf = page_pool_get_pages(ctx->thread_id, nr_pages);
+	if (!chunk_buf) {
+		pr_err("P3 receive: failed to get %d pages from pool\n", nr_pages);
 		return -1;
 	}
 
-	/* Decompress directly into page pool chunk */
+	/* Decompress directly into page pool pages */
 	decomp_ret = LZ4_decompress_safe(compressed_buf, chunk_buf,
 					 compressed_size, nr_pages * PAGE_SIZE);
 	if (decomp_ret <= 0 || decomp_ret % PAGE_SIZE != 0) {
@@ -133,19 +133,12 @@ static int p3_receive_and_buffer(struct p3_receiver_ctx *ctx)
 		unsigned long vaddr = pi.vaddr + i * PAGE_SIZE;
 		if (cow_page_buffer_add(vaddr, chunk_buf + i * PAGE_SIZE, ctx->thread_id, true) < 0) {
 			pr_err("P3 receive: failed to buffer page at 0x%lx\n", vaddr);
-			/* Free remaining used pages */
+			/* Free remaining pages on error */
 			for (; i < nr_pages; i++)
-				page_pool_put(chunk_buf + i * PAGE_SIZE);
-			/* Free unused chunk pages */
-			for (i = nr_pages; i < chunk_nr_pages; i++)
 				page_pool_put(chunk_buf + i * PAGE_SIZE);
 			return -1;
 		}
 	}
-
-	/* Free unused pages from the chunk (if nr_pages < chunk_nr_pages) */
-	for (i = nr_pages; i < chunk_nr_pages; i++)
-		page_pool_put(chunk_buf + i * PAGE_SIZE);
 
 	return nr_pages;
 }

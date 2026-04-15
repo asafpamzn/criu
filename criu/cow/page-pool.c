@@ -120,19 +120,30 @@ static void *alloc_chunk(void)
 		hdr->chunk_idx = idx;
 		atomic_fetch_add(&nr_chunks, 1);
 	} else {
-		/* Count NULL slots to see if chunks were freed */
-		int null_slots = 0;
+		/*
+		 * Hit limit - try to reuse a NULL slot from a freed chunk.
+		 * This fixes the bug where freed chunk slots were never reused.
+		 */
+		int reused_slot = -1;
 		for (int i = 0; i < COW_MAX_POOL_CHUNKS; i++) {
-			if (all_chunks[i] == NULL)
-				null_slots++;
+			if (all_chunks[i] == NULL) {
+				all_chunks[i] = chunk;
+				hdr->chunk_idx = i;
+				reused_slot = i;
+				pr_debug("PAGE_POOL: Reused NULL slot %d for new chunk %p\n",
+				       i, chunk);
+				break;
+			}
 		}
-		atomic_fetch_add(&untracked_chunks, 1);
-		pr_err("PAGE_POOL: WARNING: Hit limit (%d)! "
-		       "null_slots=%d total_freed=%d untracked=%d total_alloc=%lu total_put=%lu alloc_calls=%lu\n",
-		       COW_MAX_POOL_CHUNKS, null_slots, atomic_load(&total_chunks_freed),
-		       atomic_load(&untracked_chunks),
-		       atomic_load(&total_alloc_count), atomic_load(&total_put_count),
-		       atomic_load(&total_alloc_calls));
+		if (reused_slot < 0) {
+			/* No NULL slots available - truly out of space */
+			atomic_fetch_add(&untracked_chunks, 1);
+			pr_err("PAGE_POOL: WARNING: Hit limit (%d) with no NULL slots! "
+			       "total_freed=%d untracked=%d total_alloc=%lu total_put=%lu\n",
+			       COW_MAX_POOL_CHUNKS, atomic_load(&total_chunks_freed),
+			       atomic_load(&untracked_chunks),
+			       atomic_load(&total_alloc_count), atomic_load(&total_put_count));
+		}
 	}
 	pthread_spin_unlock(&chunk_list_lock);
 
@@ -271,6 +282,65 @@ void *page_pool_get_chunk(int thread_id, int *out_nr_pages)
 	atomic_fetch_add(&total_alloc_calls, 1);
 
 	return batch_start;
+}
+
+/*
+ * Get exactly nr_pages contiguous pages for direct decompression.
+ * More efficient than page_pool_get_chunk() when exact count is known,
+ * as it doesn't waste pages that would need to be freed immediately.
+ *
+ * Returns pointer to first page of the allocation, or NULL on failure.
+ * Each page must be freed individually with page_pool_put().
+ */
+void *page_pool_get_pages(int thread_id, int nr_pages)
+{
+	struct thread_pool *pool;
+	void *pages_start;
+
+	if (thread_id < 0 || thread_id >= COW_MAX_THREADS)
+		return NULL;
+
+	if (nr_pages <= 0 || nr_pages > COW_PAGES_PER_CHUNK - 1)
+		return NULL;
+
+	pool = &pools[thread_id];
+
+	if (!pool->initialized)
+		return NULL;
+
+	/* Need new chunk if not enough pages left */
+	if (pool->next_page + nr_pages > COW_PAGES_PER_CHUNK) {
+		pool->current_chunk = alloc_chunk();
+		if (!pool->current_chunk)
+			return NULL;
+		pool->next_page = 1;  /* Skip header page */
+	}
+
+	/* Allocate exactly nr_pages contiguous pages */
+	pages_start = (char *)pool->current_chunk + (pool->next_page * PAGE_SIZE);
+	pool->next_page += nr_pages;
+
+	/* Update refcount and max_allocated */
+	{
+		struct chunk_header *hdr = (struct chunk_header *)pool->current_chunk;
+		int current_alloc = pool->next_page;
+		int old_max;
+
+		atomic_fetch_add(&hdr->refcount, nr_pages);
+		atomic_fetch_add(&hdr->total_allocated, nr_pages);
+
+		/* Atomically update max_allocated if we've allocated more */
+		do {
+			old_max = atomic_load(&hdr->max_allocated);
+			if (current_alloc <= old_max)
+				break;
+		} while (!atomic_compare_exchange_weak(&hdr->max_allocated, &old_max, current_alloc));
+	}
+
+	/* Debug: track total allocations */
+	atomic_fetch_add(&total_alloc_count, nr_pages);
+
+	return pages_start;
 }
 
 void page_pool_put(void *page)
