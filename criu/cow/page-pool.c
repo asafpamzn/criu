@@ -63,6 +63,7 @@ static pthread_spinlock_t chunk_list_lock;  /* Only for chunk tracking */
 static atomic_bool global_init_done;
 static atomic_ulong total_put_count;  /* Debug: total page_pool_put calls */
 static atomic_ulong total_alloc_count;  /* Debug: total pages allocated */
+static atomic_int total_chunks_freed;  /* Debug: total chunks freed (refcount→0) */
 
 /* Allocate a new 256MB aligned chunk */
 static void *alloc_chunk(void)
@@ -108,15 +109,15 @@ static void *alloc_chunk(void)
 		all_chunks[idx] = chunk;
 		atomic_fetch_add(&nr_chunks, 1);
 	} else {
-		/*
-		 * Hit COW_MAX_POOL_CHUNKS limit! Chunk is allocated but NOT tracked.
-		 * page_pool_get_chunk_id() will return -1 for pages from this chunk,
-		 * causing them to be skipped by chunk-ordered drain (fallback handles them).
-		 * Consider increasing COW_MAX_POOL_CHUNKS if this happens.
-		 */
-		pr_err("PAGE_POOL: WARNING: Hit COW_MAX_POOL_CHUNKS limit (%d)! "
-		       "Chunk at %p NOT TRACKED - will use fallback drain\n",
-		       COW_MAX_POOL_CHUNKS, chunk);
+		/* Count NULL slots to see if chunks were freed */
+		int null_slots = 0;
+		for (int i = 0; i < COW_MAX_POOL_CHUNKS; i++) {
+			if (all_chunks[i] == NULL)
+				null_slots++;
+		}
+		pr_err("PAGE_POOL: WARNING: Hit limit (%d)! "
+		       "null_slots=%d total_freed=%d\n",
+		       COW_MAX_POOL_CHUNKS, null_slots, atomic_load(&total_chunks_freed));
 	}
 	pthread_spin_unlock(&chunk_list_lock);
 
@@ -283,7 +284,8 @@ void page_pool_put(void *page)
 
 	/* Last reference? munmap the entire chunk */
 	if (old_ref == 1) {
-		pr_info("PAGE_POOL: Freeing 256MB chunk at %p (all pages returned)\n", hdr);
+		int freed_count = atomic_fetch_add(&total_chunks_freed, 1) + 1;
+		pr_info("PAGE_POOL: Freeing chunk at %p (total_freed=%d)\n", hdr, freed_count);
 
 		/* Remove from tracking list */
 		pthread_spin_lock(&chunk_list_lock);
