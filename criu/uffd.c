@@ -1847,6 +1847,7 @@ int cow_phase3_restore_loop(int ep_fd, struct epoll_event **events, int nr_fds)
 	page_pool_dump_utilization();
 
 	/* DEBUG: Process comparison with primary */
+#ifdef CONFIG_COW_COMPARE
 	if (opts.cow_dump && opts.addr) {
 		int compare_sk;
 		struct lazy_pages_info *first_lpi;
@@ -1883,7 +1884,7 @@ int cow_phase3_restore_loop(int ep_fd, struct epoll_event **events, int nr_fds)
 			pr_warn("COMPARE: No LPI found, skipping comparison\n");
 		}
 	}
-
+#endif //CONFIG_COW_COMPARE
 	/* Unregister all UFFD regions before unfreezing process */
 	cow_unregister_all_uffds();
 
