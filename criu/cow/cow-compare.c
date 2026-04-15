@@ -334,7 +334,7 @@ int cow_compare_receive_and_verify(int sk, pid_t pid)
 	struct compare_msg_hdr hdr;
 	struct vma_info *local_vmas, *remote_vmas = NULL;
 	int local_nr_vmas, remote_nr_vmas = 0, remote_capacity = 256;
-	int vma_diffs = 0, page_diffs = 0, pages_checked = 0;
+	int vma_diffs = 0, page_diffs = 0, pages_checked = 0, replica_only = 0;
 	void *page_buf;
 	int i, j;
 
@@ -343,6 +343,9 @@ int cow_compare_receive_and_verify(int sk, pid_t pid)
 	/* Read local VMAs */
 	if (read_process_vmas(pid, &local_vmas, &local_nr_vmas) < 0)
 		return -1;
+
+	/* Read smaps for local VMAs too (for debugging) */
+	read_vma_smaps(pid, local_vmas, local_nr_vmas);
 
 	remote_vmas = xmalloc(remote_capacity * sizeof(*remote_vmas));
 
@@ -404,7 +407,37 @@ int cow_compare_receive_and_verify(int sk, pid_t pid)
 		}
 	}
 
-	pr_warn("COMPARE: VMA comparison done, %d differences\n", vma_diffs);
+	/* Reverse comparison: check for VMAs on REPLICA that don't exist on PRIMARY */
+	for (j = 0; j < local_nr_vmas; j++) {
+		bool found = false;
+
+		for (i = 0; i < remote_nr_vmas; i++) {
+			if (local_vmas[j].start == remote_vmas[i].start &&
+			    local_vmas[j].end == remote_vmas[i].end) {
+				found = true;
+				break;
+			}
+		}
+		if (!found) {
+			pr_err("COMPARE_DIFF: VMA 0x%lx-0x%lx exists on REPLICA but not PRIMARY\n",
+			       (unsigned long)local_vmas[j].start,
+			       (unsigned long)local_vmas[j].end);
+			pr_err("  name=%s size=%luKB\n",
+			       local_vmas[j].name[0] ? local_vmas[j].name : "(anon)",
+			       (unsigned long)(local_vmas[j].end - local_vmas[j].start) / 1024);
+			pr_err("  smaps: rss=%luKB pss=%luKB anon=%luKB swap=%luKB\n",
+			       (unsigned long)local_vmas[j].rss,
+			       (unsigned long)local_vmas[j].pss,
+			       (unsigned long)local_vmas[j].anonymous,
+			       (unsigned long)local_vmas[j].swap);
+			pr_err("  vmflags: %s\n",
+			       local_vmas[j].vmflags[0] ? local_vmas[j].vmflags : "(none)");
+			replica_only++;
+		}
+	}
+
+	pr_warn("COMPARE: VMA comparison done, %d PRIMARY-only, %d REPLICA-only\n",
+		vma_diffs, replica_only);
 
 	/* Step 2: Receive and compare page hashes */
 	page_buf = xmalloc(PAGE_SIZE);
@@ -450,15 +483,15 @@ int cow_compare_receive_and_verify(int sk, pid_t pid)
 	xfree(local_vmas);
 	xfree(remote_vmas);
 
-	pr_err("COMPARE_RESULT: Checked %d pages, found %d VMA diffs, %d page diffs\n",
-	       pages_checked, vma_diffs, page_diffs);
+	pr_err("COMPARE_RESULT: Checked %d pages, found %d PRIMARY-only VMAs, %d REPLICA-only VMAs, %d page diffs\n",
+	       pages_checked, vma_diffs, replica_only, page_diffs);
 
 	/* Send done message */
 	hdr.type = MSG_COMPARE_DONE;
 	hdr.len = 0;
 	send(sk, &hdr, sizeof(hdr), 0);
 
-	return (vma_diffs == 0 && page_diffs == 0) ? 0 : 1;
+	return (vma_diffs == 0 && replica_only == 0 && page_diffs == 0) ? 0 : 1;
 }
 
 /*
