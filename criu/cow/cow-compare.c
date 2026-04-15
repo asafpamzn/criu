@@ -195,6 +195,7 @@ static void read_vma_smaps(pid_t pid, struct vma_info *vmas, int count)
 	fclose(f);
 }
 
+#ifdef CONFIG_COW_COMPARE_PAGES
 /* Simple CRC32 for page comparison */
 static uint32_t crc32_page(const void *data, size_t len)
 {
@@ -231,6 +232,7 @@ static int read_page(pid_t pid, uint64_t vaddr, void *buf)
 	close(fd);
 	return (ret == PAGE_SIZE) ? 0 : -1;
 }
+#endif
 
 /*
  * PRIMARY side: Send process state to replica for comparison
