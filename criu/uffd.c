@@ -62,6 +62,7 @@
 
 #define LAZY_PAGES_RESTORE_FINISHED 0x52535446 /* ReSTore Finished */
 #define LAZY_PAGES_DRAIN_COMPLETE   0x44524E43 /* DRaiN Complete (COW mode) */
+#define LAZY_PAGES_TASKS_FROZEN     0x54534B46 /* TaSKs Frozen (COW mode) */
 
 /*
  * Background transfer parameters.
@@ -1468,12 +1469,21 @@ int lazy_pages_finish_restore(void)
 	}
 
 	/*
-	 * COW mode: Wait for lazy-pages to signal drain complete before
-	 * allowing restore to unfreeze the process. This ensures all
-	 * pages are copied to process memory while it's still frozen.
+	 * COW mode: Signal lazy-pages that tasks are frozen (catch_tasks done),
+	 * then wait for drain to complete before unfreezing.
 	 */
 	if (opts.cow_dump) {
+		uint32_t tasks_frozen = LAZY_PAGES_TASKS_FROZEN;
 		uint32_t drain_signal;
+
+		pr_info("COW mode: Sending TASKS_FROZEN signal to lazy-pages\n");
+		ret = send(fd, &tasks_frozen, sizeof(tasks_frozen), 0);
+		if (ret != sizeof(tasks_frozen)) {
+			pr_perror("Failed sending TASKS_FROZEN signal");
+			close(fd);
+			return -1;
+		}
+
 		pr_info("COW mode: Waiting for drain complete signal...\n");
 		ret = recv(fd, &drain_signal, sizeof(drain_signal), MSG_WAITALL);
 		if (ret != sizeof(drain_signal)) {
@@ -1533,14 +1543,26 @@ static int lazy_sk_read_event(struct epoll_rfd *rfd)
 		return -1;
 	}
 
-	if (fin != LAZY_PAGES_RESTORE_FINISHED) {
-		pr_err("Unexpected response: %x\n", fin);
-		return -1;
+	if (fin == LAZY_PAGES_RESTORE_FINISHED) {
+		restore_finished = true;
+		return 1;
 	}
 
-	restore_finished = true;
+	/*
+	 * COW mode: TASKS_FROZEN signal means restore has caught all tasks
+	 * via PTRACE_INTERRUPT. Now it's safe to start drain - tasks are frozen.
+	 */
+	if (fin == LAZY_PAGES_TASKS_FROZEN && opts.cow_dump) {
+		pr_warn("COW: Received TASKS_FROZEN signal, starting drain\n");
+		if (cow_handle_lazy_accept_post_connect(&lpis, NULL) < 0) {
+			pr_err("Failed to start drain after TASKS_FROZEN\n");
+			return -1;
+		}
+		return 0;
+	}
 
-	return 1;
+	pr_err("Unexpected response: %x\n", fin);
+	return -1;
 }
 
 static int lazy_sk_hangup_event(struct epoll_rfd *rfd)
@@ -1654,19 +1676,18 @@ static int handle_lazy_accept(struct epoll_rfd *rfd)
 
 	/*
 	 * Keep buffering ON — handle_page_fault() will serve from buffer.
-	 * Start background drain thread to proactively apply buffered pages.
+	 * In COW mode, drain will start when we receive TASKS_FROZEN signal
+	 * from restore (after catch_tasks() completes).
 	 */
 	cow_set_restore_connected(true);
 
 	pr_info("criu restore setup complete, %lu pages buffered\n",
 		cow_page_buffer_count());
 
-	/* COW mode: start drain thread (all pages already in buffer) */
-	if (opts.cow_dump) {
-		if (cow_handle_lazy_accept_post_connect(&lpis, NULL) < 0)
-			goto err;
-		/* No page requests needed - all pages are buffered */
-	}
+	/*
+	 * COW mode: Don't start drain here - tasks are still running!
+	 * Drain will start when lazy_sk_read_event receives TASKS_FROZEN.
+	 */
 
 	return 0;
 
