@@ -1534,6 +1534,10 @@ static int pre_dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie
 		goto err;
 	}
 
+	if (opts.cow_dump)
+		pr_err("COW PHASE 1: Collected %lu VMAs for pid %d\n",
+		       (unsigned long)vmas.nr, pid);
+
 	ret = -1;
 	parasite_ctl = parasite_infect_seized(pid, item, &vmas);
 	if (!parasite_ctl) {
@@ -2289,15 +2293,6 @@ static int cr_dump_finish(int ret)
 		}
 		pr_err("COW: After all_pages_sent signal+ACK (ret=%d)\n", ret);
 
-#ifdef CONFIG_COW_WAIT_REPLICA_TOUCH
-		/* Wait for touch file before proceeding (debugging aid) */
-		pr_err("COW: Waiting for /tmp/continue_replica touch file...\n");
-		while (access("/tmp/continue_replica", F_OK) != 0)
-			sleep(1);
-		unlink("/tmp/continue_replica");
-		pr_err("COW: Touch file received, continuing\n");
-#endif
-
 #ifdef CONFIG_COW_COMPARE
 		/* Process comparison with replica (BOTH FROZEN) */
 		{
@@ -2823,6 +2818,9 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 			goto err;
 		}
 
+		pr_err("COW PHASE 3: Collected %lu VMAs for pid %d (compare with Phase 1 count)\n",
+		       (unsigned long)phase3_vmas.nr, root_item->pid->real);
+
 		gettimeofday(&t_start, NULL);
 		ret = cow_detect_new_vmas(&phase3_vmas, &new_vma_ranges, &nr_new_vma_ranges);
 		gettimeofday(&t_end, NULL);
@@ -2837,13 +2835,17 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 		}
 
 		if (nr_new_vma_ranges > 0) {
-			pr_info("Found %u new VMA regions since Phase 1\n",
+			pr_err("COW PHASE 3: Found %u new VMA regions since Phase 1!\n",
 				nr_new_vma_ranges);
+			pr_err("COW PHASE 3: These VMAs were created while process ran during Phase 2.\n");
+			pr_err("COW PHASE 3: Their PAGE DATA will be sent, but VMA METADATA is missing from dump.\n");
+			pr_err("COW PHASE 3: REPLICA will NOT have these VMAs - expect comparison differences!\n");
 
 			/* Pass new VMA ranges to P3 threads for sending during final scan */
 			cow_set_new_vma_ranges(new_vma_ranges, nr_new_vma_ranges);
 			/* Don't free - P3 threads will use it */
 		} else {
+			pr_err("COW PHASE 3: No new VMAs detected - VMA count unchanged since Phase 1.\n");
 			xfree(new_vma_ranges);
 		}
 	}

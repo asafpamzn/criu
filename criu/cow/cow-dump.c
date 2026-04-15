@@ -1077,7 +1077,21 @@ int cow_detect_new_vmas(struct vm_area_list *vmas,
 	*new_ranges = ranges;
 	*nr_new_ranges = nr_ranges;
 
-	pr_info("Detected %u new VMA regions\n", nr_ranges);
+	pr_err("COW NEW VMAs: Detected %u new VMA regions since Phase 1\n", nr_ranges);
+
+	/* Log details of each new VMA range */
+	if (nr_ranges > 0) {
+		unsigned int i;
+		pr_err("COW NEW VMAs: These VMAs exist on PRIMARY but were created AFTER Phase 1 dump:\n");
+		for (i = 0; i < nr_ranges; i++) {
+			unsigned long start = ranges[i * 2];
+			unsigned long len = ranges[i * 2 + 1];
+			pr_err("  NEW VMA [%u]: 0x%lx-0x%lx (size=%luKB)\n",
+			       i, start, start + len, len / 1024);
+		}
+		pr_err("COW NEW VMAs: WARNING - These VMAs will NOT exist on REPLICA!\n");
+		pr_err("COW NEW VMAs: The VMA metadata was not re-dumped after Phase 1.\n");
+	}
 
 	/* Extend tracked_vmas so fault handler can find new regions */
 	if (cow_extend_tracked_vmas(ranges, nr_ranges))

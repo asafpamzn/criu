@@ -43,6 +43,7 @@
 #include "util.h"
 #include "namespaces.h"
 #include "pagemap.h"
+#include "cow/cow-conf.h"
 #include "cow/pf-tracker.h"
 #include "cow/cow-lazy-pages.h"
 #include "cow/cow-uffd.h"
@@ -1786,11 +1787,13 @@ int cow_phase3_restore_loop(int ep_fd, struct epoll_event **events, int nr_fds)
 
 				if (result != 0) {
 					pr_err("COMPARE: DIFFERENCES FOUND - see logs above\n");
+#ifdef CONFIG_COW_WAIT_REPLICA_TOUCH
 					/* Pause for investigation */
 					pr_err("COMPARE: Touch /tmp/continue_replica to proceed\n");
 					while (access("/tmp/continue_replica", F_OK) != 0)
 						sleep(1);
 					unlink("/tmp/continue_replica");
+#endif
 				} else {
 					pr_err("COMPARE: Processes are IDENTICAL - proceeding\n");
 				}
