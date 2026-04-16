@@ -666,71 +666,6 @@ void cow_page_buffer_readd(unsigned long vaddr, void *data)
 }
 
 /*
- * Fallback drain for orphaned pages (chunk_id=-1).
- * These pages were added to hash table but NOT to chunk_index because
- * page_pool_get_chunk_id() returned -1. The chunk-ordered drain misses them.
- * This function iterates the hash table directly to drain any remaining pages.
- */
-static void drain_orphaned_pages_from_hash(void)
-{
-	struct page_buffer_node *node;
-	struct hlist_node *tmp;
-	unsigned long drained = 0, discarded = 0;
-	int bucket;
-
-	pr_info("Fallback drain: scanning hash-table for %lu orphaned pages\n",
-		cow_buffer.nr_pages);
-
-	for (bucket = 0; bucket < COW_PAGE_BUFFER_HASH_SIZE && cow_buffer.nr_pages > 0; bucket++) {
-		int lock_idx = lock_index(bucket);
-
-		pthread_spin_lock(&hash_locks[lock_idx]);
-		hlist_for_each_entry_safe(node, tmp, &cow_buffer.hash_table[bucket], hash) {
-			while (node->count > 0) {
-				int idx = node->count - 1;
-				unsigned long vaddr = node->entries[idx].vaddr;
-				void *data = node->entries[idx].data;
-				int uffd, ret;
-				bool data_owned = false;
-
-				node->count--;
-				pthread_spin_unlock(&hash_locks[lock_idx]);
-				__sync_fetch_and_sub(&cow_buffer.nr_pages, 1);
-
-				page_state_set(vaddr, PAGE_STATE_DRAIN_PENDING);
-
-				uffd = cow_get_uffd_for_vaddr(drain_lpis, vaddr);
-				BUG_ON(uffd < 0);
-
-				ret = cow_uffd_copy_and_track(uffd, vaddr, data, 1,
-							     NULL, drain_lpis,
-							     COW_TRACK_STRICT,
-							     "FALLBACK", &data_owned);
-				if (ret > 0)
-					drained++;
-				else
-					discarded++;
-
-				if (!data_owned)
-					page_pool_put(data);
-
-				pthread_spin_lock(&hash_locks[lock_idx]);
-			}
-
-			/* Remove empty node from hash table */
-			if (node->count == 0) {
-				hlist_del(&node->hash);
-				xfree(node);
-			}
-		}
-		pthread_spin_unlock(&hash_locks[lock_idx]);
-	}
-
-	pr_info("Fallback drain done: drained=%lu discarded=%lu remaining=%lu\n",
-		drained, discarded, cow_buffer.nr_pages);
-}
-
-/*
  * Background drain worker thread - proactively UFFDIO_COPY pages
  * from buffer to reduce future page faults and free memory.
  *
@@ -864,12 +799,8 @@ static void *background_drain_worker(void *arg)
 		       atomic_load(&total_drained), cow_buffer.nr_applied,
 		       cow_buffer.nr_discarded, cow_buffer.nr_eagain, cow_buffer.nr_pages);
 
-		/*
-		 * Orphaned pages with chunk_id=-1 were never added to chunk_index,
-		 * so chunk-ordered drain missed them. Fall back to hash iteration.
-		 */
-		if (cow_buffer.nr_pages > 0)
-			drain_orphaned_pages_from_hash();
+		/* All pages should be drained - orphaned pages are a bug */
+		BUG_ON(cow_buffer.nr_pages > 0);
 	}
 
 	return NULL;
