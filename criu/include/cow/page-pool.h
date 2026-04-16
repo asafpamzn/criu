@@ -48,12 +48,4 @@ int page_pool_get_chunk_id(void *page);
 /* Get number of allocated chunks */
 int page_pool_get_nr_chunks(void);
 
-/* Debug: dump info about chunks blocking memory release */
-void page_pool_dump_blocking_chunks(int max_to_show);
-
-/* Debug: get current memory state */
-int page_pool_get_memory_state(unsigned long *outstanding_pages,
-			       unsigned long *total_allocated,
-			       unsigned long *total_freed);
-
 #endif /* __CR_PAGE_POOL_H__ */
