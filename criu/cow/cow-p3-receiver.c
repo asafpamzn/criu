@@ -27,6 +27,7 @@
 #include "cow/page-pool.h"
 #include "cow/cow-uffd.h"
 #include "util.h"
+#include "common/bug.h"
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "cow-p3-recv: "
@@ -44,7 +45,6 @@ struct p3_receiver_ctx {
 	int socket;
 	unsigned long pages_received;
 	volatile bool active;
-	volatile bool error;
 	/* Pre-allocated buffers to avoid malloc/mprotect contention */
 	char *compressed_buf;
 	char *decompressed_buf;
@@ -109,10 +109,7 @@ static int p3_receive_and_buffer(struct p3_receiver_ctx *ctx)
 	 * to be freed immediately.
 	 */
 	chunk_buf = page_pool_get_pages(ctx->thread_id, nr_pages);
-	if (!chunk_buf) {
-		pr_err("P3 receive: failed to get %d pages from pool\n", nr_pages);
-		return -1;
-	}
+	BUG_ON(!chunk_buf);
 
 	/* Decompress directly into page pool pages */
 	decomp_ret = LZ4_decompress_safe(compressed_buf, chunk_buf,
@@ -149,45 +146,24 @@ static void *p3_receiver_thread_func(void *arg)
 	unsigned long pages = 0;
 	int ret = 0;
 
-	pr_err("P3 receiver[%d] started on socket %d\n", ctx->thread_id, ctx->socket);
-	pr_debug("DEBUG_THREAD: P3 receiver[%d] STARTED socket=%d\n",
-	       ctx->thread_id, ctx->socket);
+	pr_info("P3 receiver[%d] started on socket %d\n", ctx->thread_id, ctx->socket);
 
 	/* Initialize per-thread page pool for lock-free allocation */
-	if (cow_page_buffer_thread_init(ctx->thread_id) < 0) {
-		pr_err("P3 receiver[%d]: page pool init failed\n", ctx->thread_id);
-		ctx->error = true;
-		goto out;
-	}
+	BUG_ON(cow_page_buffer_thread_init(ctx->thread_id) < 0);
 
 	/* Initialize TLS if enabled */
-	if (tls_x509_init(ctx->socket, true)) {
-		pr_err("P3 receiver[%d]: TLS init failed\n", ctx->thread_id);
-		ctx->error = true;
-		goto out;
-	}
+	BUG_ON(tls_x509_init(ctx->socket, true));
 
 	/* Receive pages until socket closes */
-	while ((ret = p3_receive_and_buffer(ctx)) > 0) {
+	while ((ret = p3_receive_and_buffer(ctx)) > 0)
 		pages += ret;
-		if (pages % COW_LOG_SAMPLE_1K == 0 && pages > 0)
-			pr_debug("DEBUG_THREAD: P3 receiver[%d] progress: %lu pages received\n",
-			       ctx->thread_id, pages);
-	}
 
-	if (ret < 0) {
-		pr_err("P3 receiver[%d]: error receiving pages\n", ctx->thread_id);
-		ctx->error = true;
-	}
+	BUG_ON(ret < 0);
 
-out:
-	pr_debug("DEBUG_THREAD: P3 receiver[%d] CLOSING socket=%d pages_received=%lu ret=%d\n",
-	       ctx->thread_id, ctx->socket, pages, ret);
 	ctx->pages_received = pages;
 	ctx->active = false;
 	__sync_fetch_and_sub(&p3_receivers_active, 1);
-	pr_err("P3 receiver[%d] done: %lu pages\n", ctx->thread_id, pages);
-	pr_debug("DEBUG_THREAD: P3 receiver[%d] TERMINATED pages=%lu\n", ctx->thread_id, pages);
+	pr_info("P3 receiver[%d] done: %lu pages\n", ctx->thread_id, pages);
 	return NULL;
 }
 
@@ -206,10 +182,7 @@ int accept_p3_connections(int *sockets, int max_connections, int timeout_ms)
 	socklen_t clen;
 	int elapsed_ms = 0;
 
-	if (listen_sk < 0) {
-		pr_err("accept_p3_connections: no listening socket\n");
-		return 0;
-	}
+	BUG_ON(listen_sk < 0);
 
 	pr_info("Waiting for up to %d P3 connections (timeout=%dms)\n",
 		max_connections, timeout_ms);
@@ -230,15 +203,11 @@ int accept_p3_connections(int *sockets, int max_connections, int timeout_ms)
 			if (errno == EAGAIN || errno == EWOULDBLOCK)
 				continue;
 			pr_perror("accept_p3_connections: accept failed");
-			break;
+			BUG();
 		}
 
 		/* Initialize TLS if enabled */
-		if (tls_x509_init(sk, true)) {
-			pr_err("accept_p3_connections: TLS init failed for socket %d\n", num_accepted);
-			close(sk);
-			continue;
-		}
+		BUG_ON(tls_x509_init(sk, true));
 
 		sockets[num_accepted] = sk;
 		num_accepted++;
@@ -286,7 +255,7 @@ void stop_p3_acceptor_thread(void)
 	}
 
 	close_listen_socket();
-	pr_info("P3 receivers stopped: %lu total pages\n", total_pages);
+	pr_info("P3 acceptor stopped: %lu total pages\n", total_pages);
 }
 
 /*
@@ -302,25 +271,16 @@ static int connect_p3_sockets(int *sockets, int num_requested)
 
 	for (i = 0; i < num_requested; i++) {
 		int sk = setup_tcp_client(opts.addr);
-		if (sk < 0) {
-			pr_err("Failed to create P3 socket %d/%d\n", i, num_requested);
-			break;
-		}
+		BUG_ON(sk < 0);
 
 		/* Initialize TLS if enabled */
-		if (tls_x509_init(sk, false)) {
-			close(sk);
-			pr_err("TLS init failed for P3 socket %d\n", i);
-			break;
-		}
+		BUG_ON(tls_x509_init(sk, false));
 
 		sockets[i] = sk;
 		num_created++;
-		pr_debug("Created P3 socket %d: fd=%d\n", i, sk);
 	}
 
-	pr_info("Created %d/%d P3 sockets for parallel transfer\n",
-		num_created, num_requested);
+	pr_info("Created %d P3 sockets for parallel transfer\n", num_created);
 	return num_created;
 }
 
@@ -341,7 +301,7 @@ void close_p3_sockets(int *sockets, int num_sockets)
 /*
  * REPLICA side: Create P3 connections to PRIMARY and start receiver threads.
  * Called during lazy-pages startup to enable parallel page reception.
- * Returns number of receiver threads started, 0 on error.
+ * Returns number of receiver threads started, 0 if page server not configured.
  */
 int start_p3_receiver_connections(int num_connections)
 {
@@ -353,10 +313,8 @@ int start_p3_receiver_connections(int num_connections)
 
 	/* Create connections to PRIMARY */
 	num_sockets = connect_p3_sockets(p3_sockets, num_connections);
-	if (num_sockets == 0) {
-		pr_warn("No P3 connections created, parallel receive disabled\n");
+	if (num_sockets == 0)
 		return 0;
-	}
 
 	/* Start receiver thread for each connection */
 	for (i = 0; i < num_sockets; i++) {
@@ -364,7 +322,6 @@ int start_p3_receiver_connections(int num_connections)
 		p3_receivers[i].socket = p3_sockets[i];
 		p3_receivers[i].pages_received = 0;
 		p3_receivers[i].active = true;
-		p3_receivers[i].error = false;
 
 		/* Pre-allocate buffers to avoid malloc/mprotect contention */
 		p3_receivers[i].compressed_buf = mmap(NULL, P3_COMPRESS_BUF_SIZE,
@@ -373,32 +330,16 @@ int start_p3_receiver_connections(int num_connections)
 		p3_receivers[i].decompressed_buf = mmap(NULL, P3_DECOMPRESS_BUF_SIZE,
 							PROT_READ | PROT_WRITE,
 							MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-		if (p3_receivers[i].compressed_buf == MAP_FAILED ||
-		    p3_receivers[i].decompressed_buf == MAP_FAILED) {
-			pr_perror("Failed to allocate P3 receiver buffers");
-			close(p3_sockets[i]);
-			p3_receivers[i].socket = -1;
-			continue;
-		}
+		BUG_ON(p3_receivers[i].compressed_buf == MAP_FAILED);
+		BUG_ON(p3_receivers[i].decompressed_buf == MAP_FAILED);
 
 		__sync_fetch_and_add(&p3_receivers_active, 1);
 
-		if (pthread_create(&p3_receivers[i].thread, NULL,
-				   p3_receiver_thread_func, &p3_receivers[i])) {
-			pr_perror("Failed to create P3 receiver thread %d", i);
-			close(p3_sockets[i]);
-			munmap(p3_receivers[i].compressed_buf, P3_COMPRESS_BUF_SIZE);
-			munmap(p3_receivers[i].decompressed_buf, P3_DECOMPRESS_BUF_SIZE);
-			p3_receivers[i].active = false;
-			p3_receivers[i].socket = -1;
-			p3_receivers[i].compressed_buf = NULL;
-			p3_receivers[i].decompressed_buf = NULL;
-			__sync_fetch_and_sub(&p3_receivers_active, 1);
-		}
+		BUG_ON(pthread_create(&p3_receivers[i].thread, NULL,
+				      p3_receiver_thread_func, &p3_receivers[i]));
 	}
 
-	pr_info("Started %d P3 receiver threads for parallel transfer\n",
-		p3_receivers_active);
+	pr_info("Started %d P3 receiver threads\n", p3_receivers_active);
 	return p3_receivers_active;
 }
 
@@ -413,14 +354,9 @@ void stop_p3_receiver_connections(void)
 
 	for (i = 0; i < MAX_P3_RECEIVERS; i++) {
 		if (p3_receivers[i].thread) {
-			pr_warn("DEBUG_THREAD: Waiting for P3 receiver[%d] to join\n", i);
 			pthread_join(p3_receivers[i].thread, NULL);
-			pr_debug("DEBUG_THREAD: P3 receiver[%d] JOINED pages=%lu\n",
-			       i, p3_receivers[i].pages_received);
 			total_pages += p3_receivers[i].pages_received;
 			if (p3_receivers[i].socket >= 0) {
-				pr_debug("DEBUG_THREAD: P3 receiver[%d] closing socket=%d\n",
-				       i, p3_receivers[i].socket);
 				close(p3_receivers[i].socket);
 				p3_receivers[i].socket = -1;
 			}
@@ -438,6 +374,5 @@ void stop_p3_receiver_connections(void)
 	}
 
 	p3_receivers_active = 0;
-	pr_debug("DEBUG_THREAD: All P3 receivers stopped: %lu total pages\n", total_pages);
-	pr_info("P3 receiver connections stopped: %lu total pages received\n", total_pages);
+	pr_info("P3 receivers stopped: %lu total pages\n", total_pages);
 }
