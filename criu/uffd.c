@@ -858,8 +858,16 @@ static int uffd_copy(struct lazy_pages_info *lpi, __u64 address, unsigned long *
 {
 	struct uffdio_copy uffdio_copy;
 	unsigned long len = *nr_pages * page_size();
-	int ret;
 
+	/* COW mode: use unified copy with full tracking */
+	if (opts.cow_dump) {
+		int ret = cow_uffd_copy(lpi->lpfd.fd, address, lpi->buf, *nr_pages,
+					lpi, NULL, 0, "uffd_copy");
+		/* cow_uffd_copy returns 1=success, 0=soft-handled, -1=error */
+		return ret < 0 ? -1 : 0;
+	}
+
+	/* Non-COW mode: original implementation */
 	uffdio_copy.dst = address;
 	uffdio_copy.src = (unsigned long)lpi->buf;
 	uffdio_copy.len = len;
@@ -869,40 +877,19 @@ static int uffd_copy(struct lazy_pages_info *lpi, __u64 address, unsigned long *
 	lp_debug(lpi, "uffd_copy: 0x%llx/%ld\n", uffdio_copy.dst, len);
 
 	if (ioctl(lpi->lpfd.fd, UFFDIO_COPY, &uffdio_copy) == -1) {
-		int err = errno;
-
-		/* COW mode: use helper for EAGAIN/EEXIST handling */
-		if (opts.cow_dump && (ret = cow_uffd_check_copy_error(lpi, address, *nr_pages,
-						lpi->buf, err, uffdio_copy.copy)) <= 0)
-			return ret;
-
-		/* Non-COW mode or unhandled error */
 		if (uffd_check_op_error(lpi, "copy", nr_pages, uffdio_copy.copy))
 			return -1;
 		return 0;
 	}
 
 	if (uffdio_copy.copy < 0) {
-		int err = -uffdio_copy.copy;
-		errno = err;
-
-		/* COW mode: use helper for EAGAIN/EEXIST handling */
-		if (opts.cow_dump && (ret = cow_uffd_check_copy_error(lpi, address, *nr_pages,
-						lpi->buf, err, uffdio_copy.copy)) <= 0)
-			return ret;
-
-		/* Non-COW mode or unhandled error */
+		errno = -uffdio_copy.copy;
 		if (uffd_check_op_error(lpi, "copy", nr_pages, uffdio_copy.copy))
 			return -1;
 		return 0;
 	}
 
 	lpi->copied_pages += *nr_pages;
-
-	/* COW mode: track success */
-	if (opts.cow_dump)
-		cow_uffd_copy_success(address);
-
 	return 0;
 }
 
@@ -980,7 +967,6 @@ static int uffd_zero(struct lazy_pages_info *lpi, __u64 address, unsigned long n
 {
 	struct uffdio_zeropage uffdio_zeropage;
 	unsigned long len = page_size() * nr_pages;
-	int ret;
 
 	uffdio_zeropage.range.start = address;
 	uffdio_zeropage.range.len = len;
@@ -991,11 +977,12 @@ static int uffd_zero(struct lazy_pages_info *lpi, __u64 address, unsigned long n
 	if (ioctl(lpi->lpfd.fd, UFFDIO_ZEROPAGE, &uffdio_zeropage) == -1) {
 		int err = errno;
 
-		/* COW mode: use helper for EAGAIN handling */
-		if (opts.cow_dump && (ret = cow_uffd_check_zero_error(lpi, address, nr_pages, err)) <= 0)
-			return ret;
+		/* COW mode: queue EAGAIN for retry */
+		if (opts.cow_dump && err == EAGAIN) {
+			cow_queue_eagain_request(lpi, address, nr_pages, NULL, "zero");
+			return 0;
+		}
 
-		/* Non-COW mode or unhandled error */
 		if (uffd_check_op_error(lpi, "zero", &nr_pages, uffdio_zeropage.zeropage))
 			return -1;
 		return 0;
@@ -1006,9 +993,11 @@ static int uffd_zero(struct lazy_pages_info *lpi, __u64 address, unsigned long n
 		int err = -uffdio_zeropage.zeropage;
 		errno = err;
 
-		/* COW mode: use helper for EAGAIN handling */
-		if (opts.cow_dump && (ret = cow_uffd_check_zero_error(lpi, address, nr_pages, err)) <= 0)
-			return ret;
+		/* COW mode: queue EAGAIN for retry */
+		if (opts.cow_dump && err == EAGAIN) {
+			cow_queue_eagain_request(lpi, address, nr_pages, NULL, "zero");
+			return 0;
+		}
 
 		if (uffd_check_op_error(lpi, "zero", &nr_pages, uffdio_zeropage.zeropage))
 			return -1;

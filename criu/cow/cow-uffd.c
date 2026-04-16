@@ -179,11 +179,7 @@ static enum cow_copy_result cow_uffd_copy_pages(int uffd, unsigned long dst,
 	return COW_COPY_OK;
 }
 
-/*
- * Flags for cow_uffd_copy_and_track()
- */
-#define COW_TRACK_STRICT    (1 << 0)  /* BUG() on EEXIST/ERROR (drain mode) */
-#define COW_TRACK_RETRY     (1 << 1)  /* Retry mode: no buffer stats, return -EAGAIN */
+/* COW_TRACK_* flags are defined in cow-uffd.h */
 
 /*
  * Unified UFFDIO_COPY with full tracking.
@@ -197,7 +193,6 @@ static enum cow_copy_result cow_uffd_copy_pages(int uffd, unsigned long dst,
  * @lpis: list of lpis for drain EAGAIN queue (NULL if lpi provided)
  * @flags: COW_TRACK_* flags
  * @caller: caller name for debug messages
- * @data_owned: output - set to true if data ownership transferred (EAGAIN drain mode)
  *
  * Returns:
  *   1 - success (page copied)
@@ -205,19 +200,14 @@ static enum cow_copy_result cow_uffd_copy_pages(int uffd, unsigned long dst,
  *  -1 - error
  *  -EAGAIN - kernel busy (only with COW_TRACK_RETRY flag)
  */
-static int cow_uffd_copy_and_track(int uffd, unsigned long vaddr, void *data,
-				   unsigned long nr_pages,
-				   struct lazy_pages_info *lpi,
-				   struct list_head *lpis,
-				   unsigned int flags,
-				   const char *caller,
-				   bool *data_owned)
-{	
+int cow_uffd_copy(int uffd, unsigned long vaddr, void *data,
+		  unsigned long nr_pages,
+		  struct lazy_pages_info *lpi,
+		  struct list_head *lpis,
+		  unsigned int flags,
+		  const char *caller)
+{
 	enum cow_copy_result res;
-
-	if (data_owned)
-		*data_owned = false;
-
 
 	res = cow_uffd_copy_pages(uffd, vaddr, data, nr_pages, NULL);
 
@@ -258,15 +248,10 @@ static int cow_uffd_copy_and_track(int uffd, unsigned long vaddr, void *data,
 			return -EAGAIN;
 		__sync_fetch_and_add(&cow_buffer.nr_eagain, 1);
 		if (lpis) {
-			/* Drain mode - use drain EAGAIN queue.
-			 * cow_queue_eagain_request makes an xmalloc copy of the data,
-			 * so we must NOT set data_owned - the caller should still free
-			 * the original page pool buffer.
-			 */
+			/* Drain mode - queue copies data, caller frees original */
 			cow_queue_drain_eagain_request(lpis, vaddr, data);
-			/* Note: data_owned stays false, so caller will page_pool_put(data) */
 		} else if (lpi) {
-			/* Normal mode - use regular EAGAIN queue */
+			/* Normal mode - queue copies data */
 			pf_tracker_set_state(vaddr, PF_STATE_PENDING_EAGAIN);
 			cow_queue_eagain_request(lpi, vaddr, nr_pages, data, caller);
 		}
@@ -738,13 +723,11 @@ static void *background_drain_worker(void *arg)
 					BUG_ON(uffd < 0);
 
 					{
-						bool data_owned = false;
 						int ret;
 
-						ret = cow_uffd_copy_and_track(uffd, vaddr, data, 1,
-									     NULL, drain_lpis,
-									     COW_TRACK_STRICT,
-									     "DRAIN", &data_owned);
+						ret = cow_uffd_copy(uffd, vaddr, data, 1,
+								    NULL, drain_lpis,
+								    COW_TRACK_STRICT, "DRAIN");
 						if (ret > 0) {
 							drained++;
 							chunk_drained++;
@@ -757,8 +740,6 @@ static void *background_drain_worker(void *arg)
 								last_progress_time = time(NULL);
 							}
 						}
-						if (data_owned)
-							free_data = false;
 					}
 
 					if (free_data)
@@ -1231,11 +1212,11 @@ static int retry_uffd_copy(struct uffd_eagain_request *req)
 {
 	int ret;
 
-	ret = cow_uffd_copy_and_track(req->lpi->lpfd.fd, req->address,
-				      req->buf, req->nr_pages,
-				      req->lpi, NULL,
-				      COW_TRACK_RETRY | COW_TRACK_STRICT,
-				      "EAGAIN_RETRY", NULL);
+	ret = cow_uffd_copy(req->lpi->lpfd.fd, req->address,
+			    req->buf, req->nr_pages,
+			    req->lpi, NULL,
+			    COW_TRACK_RETRY | COW_TRACK_STRICT,
+			    "EAGAIN_RETRY");
 	if (ret == 1) {
 		lp_debug(req->lpi, "EAGAIN copy retry succeeded for 0x%llx\n", req->address);
 		return 0;
@@ -1510,103 +1491,6 @@ int cow_setup_prebuffer_reader(void)
 
 
 /*
- * Handle UFFDIO_COPY errors in COW mode.
- * Returns:
- *   1 - error handled (EAGAIN queued, EEXIST ignored), caller should return 0
- *   0 - continue with normal error handling
- *  -1 - fatal error, caller should return -1
- */
-int cow_uffd_handle_copy_error(struct lazy_pages_info *lpi,
-			       __u64 address, unsigned long nr_pages,
-			       void *buf, int saved_errno, long copy_result)
-{
-	/* EAGAIN: queue for retry instead of blocking */
-	if (saved_errno == EAGAIN) {
-		pf_tracker_set_state(address, PF_STATE_PENDING_EAGAIN);
-		return cow_queue_eagain_request(lpi, address, nr_pages, buf, "copy");
-	}
-
-	/* EEXIST: duplicate copy - this is a coordination bug */
-	if (saved_errno == EEXIST) {
-		lp_err(lpi, "BUG: UFFDIO_COPY EEXIST at 0x%llx - duplicate copy!\n",
-		       (unsigned long long)address);
-		page_state_print_history(address);
-		return -1;
-	}
-
-	/* Log errors for debugging */
-	lp_err(lpi, "UFFDIO_COPY error at 0x%llx: errno=%d copy=%ld\n",
-	       (unsigned long long)address, saved_errno, copy_result);
-	page_state_print_history(address);
-
-	/* Mark as discarded unless it's unmapped or dirty */
-	if (!unmapped_tracker_is_unmapped(address) &&
-	    page_state_get(address) != PAGE_STATE_DIRTY)
-		page_state_set(address, PAGE_STATE_DISCARDED);
-
-	return 0;  /* Let caller continue with normal error handling */
-}
-
-/*
- * COW mode wrapper for uffd_copy error handling.
- * Combines error check + return logic into single call.
- * Returns: -1 = fatal, 0 = handled (caller returns 0), 1 = not handled
- */
-int cow_uffd_check_copy_error(struct lazy_pages_info *lpi,
-			      __u64 address, unsigned long nr_pages,
-			      void *buf, int saved_errno, long copy_result)
-{
-	int ret = cow_uffd_handle_copy_error(lpi, address, nr_pages,
-					     buf, saved_errno, copy_result);
-	if (ret != 0)
-		return ret < 0 ? -1 : 0;  /* Fatal or handled */
-	return 1;  /* Not handled - continue with normal error path */
-}
-
-/*
- * Handle UFFDIO_ZEROPAGE errors in COW mode.
- * Returns:
- *   1 - error handled (EAGAIN queued)
- *   0 - continue with normal error handling
- *  -1 - fatal error
- */
-int cow_uffd_handle_zero_error(struct lazy_pages_info *lpi,
-			       __u64 address, unsigned long nr_pages,
-			       int saved_errno)
-{
-	/* EAGAIN: queue for retry */
-	if (saved_errno == EAGAIN)
-		return cow_queue_eagain_request(lpi, address, nr_pages, NULL, "zero");
-
-	return 0;  /* Let caller continue with normal error handling */
-}
-
-/*
- * COW mode wrapper for uffd_zero error handling (combines check + return).
- * Returns: -1 = fatal, 0 = handled (caller returns 0), 1 = not handled
- */
-int cow_uffd_check_zero_error(struct lazy_pages_info *lpi,
-			      __u64 address, unsigned long nr_pages,
-			      int saved_errno)
-{
-	int ret = cow_uffd_handle_zero_error(lpi, address, nr_pages, saved_errno);
-	if (ret != 0)
-		return ret < 0 ? -1 : 0;  /* Fatal or handled */
-	return 1;  /* Not handled - continue with normal error path */
-}
-
-/*
- * Track successful UFFDIO_COPY in COW mode.
- */
-void cow_uffd_copy_success(unsigned long address)
-{
-	pf_tracker_set_state(address, PF_STATE_COMPLETED);
-	page_state_set(address, PAGE_STATE_COPIED);
-}
-
-
-
-/*
  * Remove buffered pages before urgent copy.
  * Called from uffd_io_complete to prevent EEXIST when drain thread
  * tries to copy the same page later.
@@ -1693,8 +1577,8 @@ int cow_uffd_io_complete_bulk(struct lazy_pages_info *lpi,
 	if (!pages)
 		return 0;
 
-	ret = cow_uffd_copy_and_track(lpi->lpfd.fd, vaddr, lpi->buf, pages,
-				      lpi, NULL, 0, "BULK_IO", NULL);
+	ret = cow_uffd_copy(lpi->lpfd.fd, vaddr, lpi->buf, pages,
+			    lpi, NULL, 0, "BULK_IO");
 
 	/* Only record timing for successful copies */
 	if (ret > 0) {

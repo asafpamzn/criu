@@ -118,27 +118,30 @@ extern bool cow_is_phase3_active(void);
 
 
 /*
- * COW-specific uffd_copy/uffd_zero error handling
- * Returns: 0 = continue/success, -1 = fatal error, 1 = handled (queued EAGAIN)
+ * COW_TRACK_* flags for cow_uffd_copy()
  */
-extern int cow_uffd_handle_copy_error(struct lazy_pages_info *lpi,
-				      __u64 address, unsigned long nr_pages,
-				      void *buf, int saved_errno, long copy_result);
-extern int cow_uffd_handle_zero_error(struct lazy_pages_info *lpi,
-				      __u64 address, unsigned long nr_pages,
-				      int saved_errno);
-extern void cow_uffd_copy_success(unsigned long address);
+#define COW_TRACK_STRICT    (1 << 0)  /* BUG() on EEXIST/ERROR (drain mode) */
+#define COW_TRACK_RETRY     (1 << 1)  /* Retry mode: no buffer stats, return -EAGAIN */
 
 /*
- * COW mode wrappers for uffd error handling (combines check + return).
- * Returns: -1 = fatal, 0 = handled (caller returns 0), 1 = not handled
+ * Unified UFFDIO_COPY with full tracking for COW mode.
+ * Handles buffer stats, page state, unmapped tracker, and EAGAIN queue.
+ *
+ * Returns:
+ *   1 - success (page copied)
+ *   0 - soft handled (ENOENT unmapped, EAGAIN queued, EEXIST already done)
+ *  -1 - error
+ *  -EAGAIN - kernel busy (only with COW_TRACK_RETRY flag)
  */
-extern int cow_uffd_check_copy_error(struct lazy_pages_info *lpi,
-				     __u64 address, unsigned long nr_pages,
-				     void *buf, int saved_errno, long copy_result);
-extern int cow_uffd_check_zero_error(struct lazy_pages_info *lpi,
-				     __u64 address, unsigned long nr_pages,
-				     int saved_errno);
+extern int cow_uffd_copy(int uffd, unsigned long vaddr, void *data,
+			 unsigned long nr_pages, struct lazy_pages_info *lpi,
+			 struct list_head *lpis, unsigned int flags,
+			 const char *caller);
+
+/*
+ * Queue EAGAIN for zero operation (simpler than full cow_uffd_copy path).
+ * Called directly from uffd_zero() for EAGAIN handling.
+ */
 
 
 /*
