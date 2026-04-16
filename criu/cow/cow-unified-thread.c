@@ -92,11 +92,6 @@ void cow_add_page_request(unsigned long vaddr, unsigned long nr_pages, int sk, u
 			    entry, struct page_request_spsc_node));
 }
 
-static struct page_request_entry *get_next_page_request(void)
-{
-	return spsc_dequeue(page_request_head, page_request_queue_size);
-}
-
 bool cow_has_page_requests(void)
 {
 	return spsc_peek(page_request_head);
