@@ -98,6 +98,10 @@ static volatile bool g_scan_complete = false;
 static volatile bool g_scanner_freeze_signal = false;
 static pid_t g_scanner_source_pid;
 
+/* DEBUG_PERF: Per-queue distribution stats */
+static atomic_ulong queue_pages_dist[COW_NUM_P3_THREADS];
+static atomic_ulong queue_regions_dist[COW_NUM_P3_THREADS];
+
 /* Dual scanner state */
 struct scanner_ctx {
 	int id;                    /* Scanner ID: 0 or 1 */
@@ -359,6 +363,8 @@ static void *dirty_scanner_thread(void *arg)
 					spsc_enqueue(sender_queues[queue_idx].tail,
 						     sender_queues[queue_idx].size,
 						     entry, struct dirty_region_spsc_node);
+					atomic_fetch_add(&queue_pages_dist[queue_idx], pages);
+					atomic_fetch_add(&queue_regions_dist[queue_idx], 1);
 					queue_idx = queue_base + ((queue_idx - queue_base + 1) % QUEUES_PER_SCANNER);
 				}
 				clock_gettime(CLOCK_MONOTONIC, &t3);
@@ -472,8 +478,10 @@ static void *dirty_scanner_thread(void *arg)
 
 				for (i = 0; i < regs_len; i++) {
 					struct dirty_region_entry *entry;
+					unsigned long pages;
 
-					final_dirty += (regs[i].end - regs[i].start) / PAGE_SIZE;
+					pages = (regs[i].end - regs[i].start) / PAGE_SIZE;
+					final_dirty += pages;
 
 					entry = xmalloc(sizeof(*entry));
 					BUG_ON(!entry);
@@ -485,6 +493,8 @@ static void *dirty_scanner_thread(void *arg)
 					spsc_enqueue(sender_queues[queue_idx].tail,
 						     sender_queues[queue_idx].size,
 						     entry, struct dirty_region_spsc_node);
+					atomic_fetch_add(&queue_pages_dist[queue_idx], pages);
+					atomic_fetch_add(&queue_regions_dist[queue_idx], 1);
 					queue_idx = queue_base + ((queue_idx - queue_base + 1) % QUEUES_PER_SCANNER);
 				}
 			} while (args.walk_end < my_end);
@@ -549,7 +559,29 @@ out:
 			}
 		}
 		if (all_done) {
+			int q;
+			unsigned long total_pages = 0, min_pages = ULONG_MAX, max_pages = 0;
+
 			pr_err("Scanner: all scanners done, setting g_scan_complete=true\n");
+
+			/* DEBUG_PERF: Print queue distribution summary */
+			for (q = 0; q < COW_NUM_P3_THREADS; q++) {
+				unsigned long qp = atomic_load(&queue_pages_dist[q]);
+				total_pages += qp;
+				if (qp < min_pages) min_pages = qp;
+				if (qp > max_pages) max_pages = qp;
+			}
+			pr_warn("DEBUG_PERF: Queue distribution: total=%lu min=%lu max=%lu imbalance=%.1fx\n",
+			       total_pages, min_pages, max_pages,
+			       min_pages > 0 ? (double)max_pages / min_pages : 0.0);
+			for (q = 0; q < COW_NUM_P3_THREADS; q++) {
+				pr_warn("DEBUG_PERF: Q[%02d] pages=%lu regions=%lu avg_pages_per_region=%.1f\n",
+				       q, atomic_load(&queue_pages_dist[q]),
+				       atomic_load(&queue_regions_dist[q]),
+				       atomic_load(&queue_regions_dist[q]) > 0 ?
+				       (double)atomic_load(&queue_pages_dist[q]) / atomic_load(&queue_regions_dist[q]) : 0.0);
+			}
+
 			__atomic_store_n(&g_scan_complete, true, __ATOMIC_RELEASE);
 		}
 	}
@@ -567,6 +599,12 @@ int cow_start_scanner_thread(pid_t source_pid)
 	g_scanner_freeze_signal = false;
 	g_scanners_iter_done = 0;
 	g_total_dirty_pages = 0;
+
+	/* Reset DEBUG_PERF counters */
+	for (i = 0; i < COW_NUM_P3_THREADS; i++) {
+		atomic_store(&queue_pages_dist[i], 0);
+		atomic_store(&queue_regions_dist[i], 0);
+	}
 
 	/* Initialize and start dual scanners */
 	for (i = 0; i < COW_NUM_SCANNERS; i++) {
