@@ -104,6 +104,7 @@ static struct list_head *drain_lpis = NULL;  /* lpis list for EAGAIN handling */
 static atomic_ulong total_drained = 0;  /* Total pages drained across all threads */
 static atomic_int next_drain_chunk = 0;  /* Work-stealing: next chunk to process */
 static int max_drain_chunks = 0;  /* Total chunks to drain */
+static struct timespec drain_start_time;  /* For TIMING prefix debug */
 
 static inline unsigned int page_buffer_hash(unsigned long vaddr)
 {
@@ -839,6 +840,9 @@ int cow_start_drain_thread(struct list_head *lpis)
 	/* Mark drain started and report any puts that happened before */
 	page_pool_mark_drain_started();
 
+	/* Record start time for TIMING debug */
+	clock_gettime(CLOCK_MONOTONIC, &drain_start_time);
+
 	pr_info("Started %d drain threads, buffered=%lu total_chunks=%d\n",
 	       created, cow_buffer.nr_pages, total_chunks);
 
@@ -847,6 +851,8 @@ int cow_start_drain_thread(struct list_head *lpis)
 
 void cow_stop_drain_thread(void)
 {
+	struct timespec drain_end_time;
+	unsigned long elapsed_ms;
 	int i;
 
 	if (atomic_load(&drain_threads_active) == 0)
@@ -861,6 +867,12 @@ void cow_stop_drain_thread(void)
 			drain_threads[i] = 0;
 		}
 	}
+
+	/* Calculate and print drain duration */
+	clock_gettime(CLOCK_MONOTONIC, &drain_end_time);
+	elapsed_ms = (drain_end_time.tv_sec - drain_start_time.tv_sec) * 1000 +
+		     (drain_end_time.tv_nsec - drain_start_time.tv_nsec) / 1000000;
+	pr_warn("TIMING: drain took %lu ms\n", elapsed_ms);
 
 	/* Reset state for potential restart */
 	atomic_store(&drain_threads_active, 0);
