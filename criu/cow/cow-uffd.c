@@ -756,6 +756,9 @@ static void *background_drain_worker(void *arg)
 	struct page_buffer_node *node, *tmp_node;
 	unsigned long drained = 0;
 	unsigned long last_progress_drained = 0;
+	unsigned long batches = 0;
+	unsigned long batches_gt1 = 0;
+	int max_batch = 0;
 	time_t last_progress_time = 0;
 	int thread_id = args->thread_id;
 	int chunk_id;
@@ -797,6 +800,11 @@ static void *background_drain_worker(void *arg)
 					if (copied > 0) {
 						drained += copied;
 						chunk_drained += copied;
+						batches++;
+						if (batch.count > 1)
+							batches_gt1++;
+						if (batch.count > max_batch)
+							max_batch = batch.count;
 
 						/* Log progress every 100k pages or 10 seconds */
 						if (drained - last_progress_drained >= COW_LOG_SAMPLE_100K ||
@@ -837,7 +845,9 @@ static void *background_drain_worker(void *arg)
 	/* Update global statistics */
 	atomic_fetch_add(&total_drained, drained);
 
-	pr_info("Drain thread %d finished: drained=%lu\n", thread_id, drained);
+	pr_info("Drain thread %d finished: drained=%lu batches=%lu batches_gt1=%lu max_batch=%d avg=%.1f\n",
+	       thread_id, drained, batches, batches_gt1, max_batch,
+	       batches > 0 ? (double)drained / batches : 0.0);
 
 	/* Decrement active thread count */
 	if (atomic_fetch_sub(&drain_threads_active, 1) == 1) {
