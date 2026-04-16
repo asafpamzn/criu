@@ -57,9 +57,6 @@ extern int send_inventory_ready_ack(void);
  * - stop_p3_receiver_connections()
  */
 
-/* COW page send functions */
-extern int send_page_compressed(int sk, const void *data, u64 dst_id, unsigned long vaddr);
-extern int send_page_uncompressed(int sk, const void *data, u64 dst_id, unsigned long vaddr);
 
 /* P3 parallel receiver functions (cow-p3-receiver.c) */
 extern int accept_p3_connections(int *sockets, int max_connections, int timeout_ms);
@@ -83,9 +80,5 @@ extern int cow_write_lazy_vmas_before(struct page_xfer *xfer, unsigned long befo
 extern int cow_handle_protocol_cmd(u32 cmd, struct page_server_iov *pi, int sk,
 				   int *ret_val, bool *flushed, bool *bulk_ack);
 
-/* COW compressed page receiver (server-side) */
-extern int cow_receive_compressed_pages(int sk, struct page_server_iov *pi,
-					int write_fd, int read_fd,
-					struct page_xfer *lxfer);
 
 #endif /* __CR_COW_PAGE_XFER_H__ */

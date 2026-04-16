@@ -199,11 +199,6 @@ int send_psi(int sk, struct page_server_iov *pi)
 	return send_psi_flags(sk, pi, 0);
 }
 
-/*
- * COW page functions (send_page_compressed, send_page_uncompressed,
- * send_all_pages_sent_ack, send_inventory_ready_signal) are now in cow-page-xfer.c
- */
-
 static void tcp_cork(int sk, bool on)
 {
 	int val = on ? 1 : 0;
@@ -1155,14 +1150,11 @@ static int prep_loc_xfer(struct page_server_iov *pi)
 		return 0;
 }
 
-static int page_server_add(int sk, struct page_server_iov *pi, u32 flags, bool compressed)
+static int page_server_add(int sk, struct page_server_iov *pi, u32 flags)
 {
 	size_t len;
 	struct page_xfer *lxfer = &cxfer.loc_xfer;
 	struct iovec iov;
-
-	pr_err("Adding %" PRIx64 " - %" PRIx64 " (compressed=%d)\n",
-		 pi->vaddr, pi->vaddr + pi->nr_pages * PAGE_SIZE, compressed);
 
 	if (prep_loc_xfer(pi))
 		return -1;
@@ -1173,12 +1165,6 @@ static int page_server_add(int sk, struct page_server_iov *pi, u32 flags, bool c
 
 	if (!(flags & PE_PRESENT))
 		return 0;
-
-	/* COW mode: handle compressed pages */
-	if (compressed)
-		return cow_receive_compressed_pages(sk, pi, cxfer.p[1], cxfer.p[0], lxfer);
-
-	/* Handle uncompressed data - original splice-based path */
 	len = iov.iov_len;
 	while (len > 0) {
 		ssize_t chunk;
@@ -1347,18 +1333,16 @@ static int page_server_serve(int sk)
 			ret = page_server_check_parent(sk, &pi);
 			break;
 		case PS_IOV_ADD_F_COMPRESS:
+			/* Compressed pages go through cow-bulk-recv.c */
+			BUG();
 		case PS_IOV_ADD_F:
 		case PS_IOV_ADD_F_PF:
 		case PS_IOV_ADD:
 		case PS_IOV_HOLE: {
 			u32 flags;
 			if (cmd == PS_IOV_ADD_F_PF)
-			{
 				cmd = PS_IOV_ADD_F;
-				pr_err("PS_IOV_ADD_F_PF %" PRIx64 " - %" PRIx64 "\n",
-		 				pi.vaddr, pi.vaddr + pi.nr_pages * PAGE_SIZE);				
-			}
-			if (likely(cmd == PS_IOV_ADD_F || cmd == PS_IOV_ADD_F_COMPRESS)) {
+			if (likely(cmd == PS_IOV_ADD_F)) {
 				flags = decode_ps_flags(pi.cmd);
 			} else if (cmd == PS_IOV_ADD) {
 				flags = PE_PRESENT;
@@ -1366,7 +1350,7 @@ static int page_server_serve(int sk)
 				flags = PE_PARENT;
 			}
 
-			ret = page_server_add(sk, &pi, flags, cmd == PS_IOV_ADD_F_COMPRESS);
+			ret = page_server_add(sk, &pi, flags);
 			break;
 			}
 		case PS_IOV_CLOSE:

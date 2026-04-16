@@ -10,7 +10,6 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <string.h>
-#include <lz4.h>
 
 #include "cow/cow-page-xfer.h"
 #include "page-xfer.h"
@@ -194,66 +193,6 @@ int send_inventory_ready_signal(void)
 
 
 /*
- * Send a page with LZ4 compression.
- * Protocol: header (PS_IOV_ADD_F_COMPRESS) + compressed_size (4 bytes) + compressed_data
- * Optimized: single buffer, single send() syscall
- */
-int send_page_compressed(int sk, const void *data, u64 dst_id, unsigned long vaddr)
-{
-	/* Buffer layout: [header][compressed_size][compressed_data] */
-	char send_buf[sizeof(struct page_server_iov) + sizeof(int) + LZ4_compressBound(PAGE_SIZE)];
-	struct page_server_iov *pi = (struct page_server_iov *)send_buf;
-	int *compressed_size = (int *)(send_buf + sizeof(*pi));
-	char *compressed_data = send_buf + sizeof(*pi) + sizeof(int);
-	int total_len;
-	int ret;
-
-	/* 1. Compress directly into send buffer (no memcpy!) */
-	*compressed_size = LZ4_compress_default(data, compressed_data, PAGE_SIZE,
-						LZ4_compressBound(PAGE_SIZE));
-	BUG_ON(*compressed_size <= 0);
-
-	/* Track compression statistics */
-	g_compress_uncompressed_bytes += PAGE_SIZE;
-	g_compress_compressed_bytes += *compressed_size;
-
-	/* 2. Fill in header (after compression so we know it succeeded) */
-	pi->cmd = encode_ps_cmd(PS_IOV_ADD_F_COMPRESS, PE_PRESENT);
-	pi->nr_pages = 1;
-	pi->vaddr = vaddr;
-	pi->dst_id = dst_id;
-
-	/* 3. Single send: header + size + compressed data */
-	total_len = sizeof(*pi) + sizeof(int) + *compressed_size;
-	ret = page_server_send(sk, send_buf, total_len, 0);
-	BUG_ON(ret != total_len);
-
-	return 0;
-}
-
-int send_page_uncompressed(int sk, const void *data, u64 dst_id, unsigned long vaddr)
-{
-	char send_buf[sizeof(struct page_server_iov) + PAGE_SIZE];
-	struct page_server_iov *pi = (struct page_server_iov *)send_buf;
-	void *payload = send_buf + sizeof(*pi);
-	int total_len;
-	int ret;
-
-	memcpy(payload, data, PAGE_SIZE);
-
-	pi->cmd = encode_ps_cmd(PS_IOV_ADD_F, PE_PRESENT);
-	pi->nr_pages = 1;
-	pi->vaddr = vaddr;
-	pi->dst_id = dst_id;
-
-	total_len = sizeof(*pi) + PAGE_SIZE;
-	ret = page_server_send(sk, send_buf, total_len, 0);
-	BUG_ON(ret != total_len);
-
-	return 0;
-}
-
-/*
  * Request all pages from primary in batch mode.
  * COW-specific: used for bulk page transfer.
  */
@@ -400,45 +339,3 @@ int cow_handle_protocol_cmd(u32 cmd, struct page_server_iov *pi, int sk,
 	}
 }
 
-/*
- * Receive and decompress compressed pages from dump client.
- * Called by page_server_add() when PS_IOV_ADD_F_COMPRESS is received.
- *
- * Protocol: For each page, receive [compressed_size (4 bytes)][compressed_data]
- * Decompress and write to pipe, then call write_pages to store in image.
- */
-int cow_receive_compressed_pages(int sk, struct page_server_iov *pi,
-				 int write_fd, int read_fd,
-				 struct page_xfer *lxfer)
-{
-	unsigned long pages_left = pi->nr_pages;
-
-	while (pages_left > 0) {
-		int compressed_size;
-		char compressed_buf[LZ4_compressBound(PAGE_SIZE)];
-		char decompressed[PAGE_SIZE];
-		int decomp_ret;
-
-		/* Receive compressed size */
-		BUG_ON(page_server_recv(sk, &compressed_size, sizeof(compressed_size),
-					MSG_WAITALL) != sizeof(compressed_size));
-		BUG_ON(compressed_size <= 0 || compressed_size > LZ4_compressBound(PAGE_SIZE));
-
-		/* Receive compressed data */
-		BUG_ON(page_server_recv(sk, compressed_buf, compressed_size,
-					MSG_WAITALL) != compressed_size);
-
-		/* Decompress */
-		decomp_ret = LZ4_decompress_safe(compressed_buf, decompressed,
-						 compressed_size, PAGE_SIZE);
-		BUG_ON(decomp_ret != PAGE_SIZE);
-
-		/* Write decompressed page data to pipe and then to image */
-		BUG_ON(write(write_fd, decompressed, PAGE_SIZE) != PAGE_SIZE);
-		BUG_ON(lxfer->write_pages(lxfer, read_fd, PAGE_SIZE));
-
-		pages_left--;
-	}
-
-	return 0;
-}
