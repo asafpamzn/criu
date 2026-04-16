@@ -777,12 +777,21 @@ static void *background_drain_worker(void *arg)
 
 	/* Decrement active thread count */
 	if (atomic_fetch_sub(&drain_threads_active, 1) == 1) {
+		struct timespec drain_end_time;
+		unsigned long elapsed_ms;
+
 		/*
 		 * Last thread to exit. Add full memory barrier to ensure all
 		 * UFFDIO_COPY writes are visible before signaling drain complete.
 		 * This is critical on ARM where memory ordering is weaker.
 		 */
 		atomic_thread_fence(memory_order_seq_cst);
+
+		/* Calculate and print drain duration */
+		clock_gettime(CLOCK_MONOTONIC, &drain_end_time);
+		elapsed_ms = (drain_end_time.tv_sec - drain_start_time.tv_sec) * 1000 +
+			     (drain_end_time.tv_nsec - drain_start_time.tv_nsec) / 1000000;
+		pr_warn("TIMING: drain took %lu ms\n", elapsed_ms);
 
 		pr_info("Drain complete: total=%lu applied=%lu discarded=%lu eagain=%lu remaining=%lu\n",
 		       atomic_load(&total_drained), cow_buffer.nr_applied,
@@ -851,8 +860,6 @@ int cow_start_drain_thread(struct list_head *lpis)
 
 void cow_stop_drain_thread(void)
 {
-	struct timespec drain_end_time;
-	unsigned long elapsed_ms;
 	int i;
 
 	if (atomic_load(&drain_threads_active) == 0)
@@ -867,12 +874,6 @@ void cow_stop_drain_thread(void)
 			drain_threads[i] = 0;
 		}
 	}
-
-	/* Calculate and print drain duration */
-	clock_gettime(CLOCK_MONOTONIC, &drain_end_time);
-	elapsed_ms = (drain_end_time.tv_sec - drain_start_time.tv_sec) * 1000 +
-		     (drain_end_time.tv_nsec - drain_start_time.tv_nsec) / 1000000;
-	pr_warn("TIMING: drain took %lu ms\n", elapsed_ms);
 
 	/* Reset state for potential restart */
 	atomic_store(&drain_threads_active, 0);
