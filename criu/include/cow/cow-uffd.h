@@ -142,15 +142,6 @@ extern int cow_uffd_check_zero_error(struct lazy_pages_info *lpi,
 
 
 /*
- * COW convergence IO complete - called when page arrives from convergence stream
- * Finds lpi for vaddr and copies page data.
- * Returns: 0 = success, -1 = error
- */
-extern int cow_convergence_copy_page(struct list_head *lpis,
-				     unsigned long vaddr,
-				     unsigned long nr_pages, void *buf);
-
-/*
  * COW bulk IO complete callback
  * This is the io_complete callback for COW mode page reads.
  */
@@ -184,8 +175,7 @@ extern void cow_handle_remove_event(unsigned long start, unsigned long len);
 /*
  * COW post-connect initialization in handle_lazy_accept.
  */
-extern int cow_handle_lazy_accept_post_connect(struct list_head *lpis,
-					       void (*switch_to_convergence)(void));
+extern int cow_handle_lazy_accept_post_connect(struct list_head *lpis);
 
 
 

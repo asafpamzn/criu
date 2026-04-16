@@ -78,6 +78,9 @@ static atomic_int nr_active_chunks = 0;
 /* Fine-grained locks: 8K locks for 1M buckets */
 static pthread_spinlock_t hash_locks[COW_NUM_HASH_LOCKS];
 
+/* Pre-buffer for Phase 4 dirty pages (allocated in cow_setup_prebuffer_reader) */
+static void *prebuffer_buf = NULL;
+
 static inline int lock_index(unsigned int hash)
 {
 	return hash / COW_BUCKETS_PER_LOCK;
@@ -91,8 +94,6 @@ static inline int lock_index(unsigned int hash)
 
 struct drain_thread_args {
 	int thread_id;
-	int start_chunk;
-	int end_chunk;
 };
 
 static pthread_t drain_threads[COW_NUM_DRAIN_THREADS];
@@ -530,6 +531,12 @@ void cow_page_buffer_destroy(void)
 
 	/* Destroy all page pools last */
 	page_pool_destroy_all();
+
+	/* Free prebuffer if allocated */
+	if (prebuffer_buf) {
+		xfree(prebuffer_buf);
+		prebuffer_buf = NULL;
+	}
 }
 
 /*
@@ -841,8 +848,6 @@ int cow_start_drain_thread(struct list_head *lpis)
 
 	for (i = 0; i < COW_NUM_DRAIN_THREADS; i++) {
 		drain_args[i].thread_id = i;
-		drain_args[i].start_chunk = 0;
-		drain_args[i].end_chunk = total_chunks;
 
 		BUG_ON(pthread_create(&drain_threads[i], NULL,
 				      background_drain_worker, &drain_args[i]));
@@ -1176,17 +1181,10 @@ int cow_queue_eagain_request(struct lazy_pages_info *lpi, __u64 address,
  */
 int cow_queue_drain_eagain_request(struct list_head *lpis, unsigned long vaddr, void *data)
 {
-	struct lazy_pages_info *lpi;
+	struct lazy_pages_info *lpi = cow_find_lpi_for_vaddr(lpis, vaddr);
 
-	list_for_each_entry(lpi, lpis, l) {
-		if (lpi->exited || lpi->lpfd.fd < 0)
-			continue;
-		if (!cow_find_iov(lpi, vaddr))
-			continue;
-
-		/* Found the lpi - queue the request (page_state set inside on success) */
+	if (lpi)
 		return cow_queue_eagain_request(lpi, vaddr, 1, data, "drain");
-	}
 
 	/* No matching lpi - this is a bug */
 	pr_err("BUG: No lpi found for drain EAGAIN at 0x%lx\n", vaddr);
@@ -1406,8 +1404,12 @@ void cow_set_all_pages_sent_received(void)
 	cow_all_pages_sent_received = true;
 }
 
-/* Return uffd for a given vaddr (for background drain thread) */
-int cow_get_uffd_for_vaddr(struct list_head *lpis, unsigned long vaddr)
+/*
+ * Find the lpi that owns a given vaddr.
+ * Returns NULL if no matching lpi found (page unmapped or process exited).
+ */
+static struct lazy_pages_info *cow_find_lpi_for_vaddr(struct list_head *lpis,
+						      unsigned long vaddr)
 {
 	struct lazy_pages_info *lpi;
 
@@ -1415,10 +1417,17 @@ int cow_get_uffd_for_vaddr(struct list_head *lpis, unsigned long vaddr)
 		if (lpi->exited || lpi->lpfd.fd < 0)
 			continue;
 		if (cow_find_iov(lpi, vaddr))
-			return lpi->lpfd.fd;
+			return lpi;
 	}
 
-	return -1;
+	return NULL;
+}
+
+/* Return uffd for a given vaddr (for background drain thread) */
+int cow_get_uffd_for_vaddr(struct list_head *lpis, unsigned long vaddr)
+{
+	struct lazy_pages_info *lpi = cow_find_lpi_for_vaddr(lpis, vaddr);
+	return lpi ? lpi->lpfd.fd : -1;
 }
 
 /*
@@ -1431,8 +1440,7 @@ int cow_get_uffd_for_vaddr(struct list_head *lpis, unsigned long vaddr)
  * in the hash table until the uffd is available.
  */
 
-/* Pre-buffer state */
-static void *prebuffer_buf = NULL;
+/* Pre-buffer state (prebuffer_buf declared at top of file for destroy access) */
 static bool phase3_active_flag = false;
 
 
@@ -1598,43 +1606,6 @@ void cow_uffd_copy_success(unsigned long address)
 
 
 /*
- * Copy page data for convergence callback.
- * Finds the lpi that owns the vaddr and does UFFDIO_COPY.
- *
- * Returns: 0 on success, -1 on error
- */
-int cow_convergence_copy_page(struct list_head *lpis,
-			      unsigned long vaddr,
-			      unsigned long nr_pages, void *buf)
-{
-	struct lazy_pages_info *lpi;
-
-	list_for_each_entry(lpi, lpis, l) {
-		int ret;
-
-		if (lpi->exited || lpi->lpfd.fd < 0)
-			continue;
-		if (!cow_find_iov(lpi, vaddr))
-			continue;
-
-		/* Found the lpi - copy buffer to lpi->buf and do UFFDIO_COPY */
-		memcpy(lpi->buf, buf, nr_pages * PAGE_SIZE);
-
-		ret = cow_uffd_copy_and_track(lpi->lpfd.fd, vaddr, lpi->buf, nr_pages,
-					      lpi, NULL, COW_TRACK_STRICT,
-					      "CONVERGENCE", NULL);
-
-		lp_debug(lpi, "Convergence copy %lu pages at 0x%lx ret=%d\n", nr_pages, vaddr, ret);
-
-		/* Return 0 for success or soft-handled (ENOENT/EAGAIN), -1 for error */
-		return ret >= 0 ? 0 : -1;
-	}
-
-	/* No matching lpi - page was unmapped */
-	return 1;
-}
-
-/*
  * Remove buffered pages before urgent copy.
  * Called from uffd_io_complete to prevent EEXIST when drain thread
  * tries to copy the same page later.
@@ -1647,12 +1618,9 @@ void cow_uffd_remove_buffered_pages(unsigned long addr, unsigned long nr)
 		unsigned long page_addr = addr + i * PAGE_SIZE;
 		void *buffered = cow_page_buffer_lookup_and_remove(page_addr);
 
-		if (buffered) {
-			page_state_set(page_addr, PAGE_STATE_URGENT_PENDING);
+		page_state_set(page_addr, PAGE_STATE_URGENT_PENDING);
+		if (buffered)
 			page_pool_put(buffered);
-		} else {
-			page_state_set(page_addr, PAGE_STATE_URGENT_PENDING);
-		}
 	}
 }
 
@@ -1749,8 +1717,7 @@ int cow_uffd_io_complete_bulk(struct lazy_pages_info *lpi,
  *
  * Returns: 0 on success, -1 on error
  */
-int cow_handle_lazy_accept_post_connect(struct list_head *lpis,
-					void (*switch_to_convergence)(void))
+int cow_handle_lazy_accept_post_connect(struct list_head *lpis)
 {
 	/*
 	 * Start drain thread if all pages have been sent.

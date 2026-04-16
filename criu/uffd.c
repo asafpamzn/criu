@@ -1572,7 +1572,7 @@ static int lazy_sk_read_event(struct epoll_rfd *rfd)
 	 */
 	if (fin == LAZY_PAGES_TASKS_FROZEN && opts.cow_dump) {
 		pr_warn("COW: Received TASKS_FROZEN signal, starting drain\n");
-		if (cow_handle_lazy_accept_post_connect(&lpis, NULL) < 0) {
+		if (cow_handle_lazy_accept_post_connect(&lpis) < 0) {
 			pr_err("Failed to start drain after TASKS_FROZEN\n");
 			return -1;
 		}
