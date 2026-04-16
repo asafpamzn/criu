@@ -1173,6 +1173,24 @@ int cow_queue_eagain_request(struct lazy_pages_info *lpi, __u64 address,
 	pr_debug("Queued EAGAIN request 0x%llx (op=%s)\n", address, op_name);
 	return 0;
 }
+/*
+ * Find the lpi that owns a given vaddr.
+ * Returns NULL if no matching lpi found (page unmapped or process exited).
+ */
+static struct lazy_pages_info *cow_find_lpi_for_vaddr(struct list_head *lpis,
+						      unsigned long vaddr)
+{
+	struct lazy_pages_info *lpi;
+
+	list_for_each_entry(lpi, lpis, l) {
+		if (lpi->exited || lpi->lpfd.fd < 0)
+			continue;
+		if (cow_find_iov(lpi, vaddr))
+			return lpi;
+	}
+
+	return NULL;
+}
 
 /*
  * Queue an EAGAIN request from drain thread context.
@@ -1404,24 +1422,7 @@ void cow_set_all_pages_sent_received(void)
 	cow_all_pages_sent_received = true;
 }
 
-/*
- * Find the lpi that owns a given vaddr.
- * Returns NULL if no matching lpi found (page unmapped or process exited).
- */
-static struct lazy_pages_info *cow_find_lpi_for_vaddr(struct list_head *lpis,
-						      unsigned long vaddr)
-{
-	struct lazy_pages_info *lpi;
 
-	list_for_each_entry(lpi, lpis, l) {
-		if (lpi->exited || lpi->lpfd.fd < 0)
-			continue;
-		if (cow_find_iov(lpi, vaddr))
-			return lpi;
-	}
-
-	return NULL;
-}
 
 /* Return uffd for a given vaddr (for background drain thread) */
 int cow_get_uffd_for_vaddr(struct list_head *lpis, unsigned long vaddr)
