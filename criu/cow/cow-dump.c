@@ -35,6 +35,7 @@
 #include "cow/mpsc-queue.h"
 #include "cow/cow-conf.h"
 #include "cow/cow-bulk-send.h"
+#include "common/bug.h"
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "cow-dump: "
@@ -62,7 +63,6 @@ struct cow_dump_info {
 	int uffd_async;        /* WP_ASYNC uffd fd (kept for cleanup) */
 	int uffd_sync;         /* Pre-created WP_SYNC uffd (via parasite) */
 	unsigned long total_pages;
-	unsigned long iteration;
 	unsigned int nr_tracked_vmas;
 	struct cow_tracked_vma *tracked_vmas;
 	enum cow_dump_phase phase;  /* Current phase */
@@ -152,8 +152,7 @@ static struct cow_wp_range *cow_wp_build_ranges(struct cow_dump_info *cdi,
 
 	*nr_ranges = nr;
 	ranges = xmalloc(nr * sizeof(*ranges));
-	if (!ranges)
-		return NULL;
+	BUG_ON(!ranges);
 
 	for (i = 0; i < cdi->nr_tracked_vmas; i++) {
 		start = cdi->tracked_vmas[i].start;
@@ -199,10 +198,7 @@ static int cow_apply_writeprotect(struct cow_dump_info *cdi)
 	nr_threads = cow_wp_nr_threads(nr_ranges);
 	threads = xmalloc(nr_threads * sizeof(*threads));
 	jobs = xzalloc(nr_threads * sizeof(*jobs));
-	if (!threads || !jobs) {
-		ret = -1;
-		goto out;
-	}
+	BUG_ON(!threads || !jobs);
 
 	per = (nr_ranges + nr_threads - 1) / nr_threads;
 	for (i = 0; i < nr_threads; i++) {
@@ -360,8 +356,7 @@ static int cow_register_vmas(struct cow_dump_info *cdi,
 	}
 
 	tvmas = xzalloc(sizeof(*tvmas) * nr_eligible);
-	if (!tvmas)
-		return -1;
+	BUG_ON(!tvmas);
 
 	i = 0;
 	list_for_each_entry(vma, &vma_area_list->h, list) {
@@ -605,8 +600,7 @@ int cow_dump_init_async(struct pstree_item *item,
 	}
 
 	cdi = xzalloc(sizeof(*cdi));
-	if (!cdi)
-		return -1;
+	BUG_ON(!cdi);
 
 	cdi->source_pid = item->pid->real;
 	cdi->dst_id = vpid(item);
@@ -754,8 +748,7 @@ int cow_scan_dirty_pages(unsigned long **dirty_ranges,
 	}
 
 	regs = xmalloc(args.vec_len * sizeof(struct page_region));
-	if (!regs)
-		goto out;
+	BUG_ON(!regs);
 	args.vec = (u64)(unsigned long)regs;
 
 	/* Scan each tracked VMA for dirty pages */
@@ -809,8 +802,7 @@ int cow_scan_dirty_pages(unsigned long **dirty_ranges,
 
 					new_ranges = xrealloc(ranges,
 							      new_cap * 2 * sizeof(unsigned long));
-					if (!new_ranges)
-						goto out;
+					BUG_ON(!new_ranges);
 					ranges = new_ranges;
 					ranges_capacity = new_cap;
 				}
@@ -911,8 +903,7 @@ static int cow_region_subtract(unsigned long start, unsigned long end,
 
 				new_ranges = xrealloc(*ranges,
 						      new_cap * 2 * sizeof(unsigned long));
-				if (!new_ranges)
-					return -1;
+				BUG_ON(!new_ranges);
 				*ranges = new_ranges;
 				*capacity = new_cap;
 			}
@@ -940,8 +931,7 @@ add_region:
 
 			new_ranges = xrealloc(*ranges,
 					      new_cap * 2 * sizeof(unsigned long));
-			if (!new_ranges)
-				return -1;
+			BUG_ON(!new_ranges);
 			*ranges = new_ranges;
 			*capacity = new_cap;
 		}
@@ -985,11 +975,7 @@ static int cow_extend_tracked_vmas(unsigned long *ranges, unsigned int nr_ranges
 	new_total = cdi->nr_tracked_vmas + nr_ranges;
 	new_tracked = xrealloc(cdi->tracked_vmas,
 			       new_total * sizeof(*new_tracked));
-	if (!new_tracked) {
-		pr_err("Failed to extend tracked_vmas for %u new regions\n",
-		       nr_ranges);
-		return -1;
-	}
+	BUG_ON(!new_tracked);
 
 	/* Append new regions (ranges are [start, len] pairs) */
 	for (i = 0; i < nr_ranges; i++) {
@@ -1129,8 +1115,7 @@ int cow_merge_dirty_ranges(unsigned long *dirty_ranges, unsigned int nr_dirty,
 		return 0;
 
 	merged = xmalloc(total * 2 * sizeof(unsigned long));
-	if (!merged)
-		return -1;
+	BUG_ON(!merged);
 
 	/* Copy dirty ranges */
 	for (i = 0; i < nr_dirty; i++) {
@@ -1275,8 +1260,7 @@ int cow_dump_dirty_pages(unsigned long *dirty_ranges, unsigned int nr_dirty_rang
 				break;
 
 			buffer = xmalloc(batch_pages * PAGE_SIZE);
-			if (!buffer)
-				return -1;
+			BUG_ON(!buffer);
 
 			/* Read pages from source process */
 			local_iov.iov_base = buffer;
