@@ -809,7 +809,7 @@ static void *background_drain_worker(void *arg)
 						/* Log progress every 100k pages or 10 seconds */
 						if (drained - last_progress_drained >= COW_LOG_SAMPLE_100K ||
 						    time(NULL) - last_progress_time >= COW_DRAIN_PROGRESS_SEC) {
-							pr_info("Drain thread %d: drained=%lu chunk=%d remaining=%lu batch=%d\n",
+							pr_warn("Drain thread %d: drained=%lu chunk=%d remaining=%lu batch=%d\n",
 							       thread_id, drained, chunk_id, cow_buffer.nr_pages, batch.count);
 							last_progress_drained = drained;
 							last_progress_time = time(NULL);
