@@ -22,7 +22,6 @@ extern void cow_mem_init_lazy_vmas(void);
 extern void free_global_lazy_vmas(void);
 
 /* Lazy VMA lookup functions */
-extern struct lazy_vma_entry *find_lazy_vma_for_addr(unsigned long vaddr, u64 dst_id);
 extern struct lazy_vma_entry *find_lazy_vma_by_addr(unsigned long vaddr);
 extern unsigned long count_lazy_vma_pages(u64 dst_id);
 extern int add_lazy_vma_for_new_region(unsigned long start, unsigned long len,
@@ -32,9 +31,6 @@ extern int add_lazy_vma_for_new_region(unsigned long start, unsigned long len,
 extern int cow_mem_add_lazy_vma(struct vma_area *vma, unsigned long nr_pages,
 				u64 dst_id, pid_t source_pid);
 
-/* COW convergence mode - Phase 3 dirty page handling */
-extern bool is_convergence_mode(void);
-extern unsigned long get_convergence_dirty_pages(void);
 
 
 

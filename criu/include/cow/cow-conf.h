@@ -82,6 +82,9 @@
 /* Maximum threads for page pool */
 #define COW_MAX_THREADS			32
 
+/* Maximum epoll fds for COW lazy-pages */
+#define COW_MAX_EPOLL_FDS		128
+
 /* ================================================================
  * SECTION 3: Memory Pool Configuration
  * ================================================================ */

@@ -32,6 +32,7 @@
 #include "cow/unmapped-tracker.h"
 #include "rst_info.h"
 #include "cow/cow-lazy-pages.h"
+#include "cow/cow-conf.h"
 #include "common/bug.h"
 
 #undef LOG_PREFIX
@@ -173,8 +174,8 @@ int cr_lazy_pages_cow_phase2(bool daemon)
 		/* Child continues */
 	}
 
-	/* 4. Set up epoll - page server + restore socket + margin */
-	nr_fds = 8;
+	/* 4. Set up epoll with fixed large buffer */
+	nr_fds = COW_MAX_EPOLL_FDS;
 	epollfd = epoll_prepare(nr_fds, &events);
 	if (epollfd < 0)
 		goto err_tasks;
@@ -208,7 +209,7 @@ int cr_lazy_pages_cow_phase2(bool daemon)
 		pr_info("P3 parallel receiver enabled\n");
 	}
 
-	pr_err("Waiting to receive pages from primary...\n");
+	pr_info("Waiting to receive pages from primary...\n");
 
 	/* 8. Phase 2 event loop - buffer pages until dirty bitmap arrives */
 	ret = cow_phase2_handle_pages(epollfd, events, nr_fds);
@@ -217,7 +218,7 @@ int cr_lazy_pages_cow_phase2(bool daemon)
 		goto err_disconnect;
 	}
 
-	pr_err("=== REPLICA PHASE 5: Starting restore ===\n");
+	pr_info("=== REPLICA PHASE 5: Starting restore ===\n");
 
 	/*
 	 * All pages received, primary closed connection.
@@ -245,10 +246,10 @@ int cr_lazy_pages_cow_phase2(bool daemon)
 	pr_info("Pstree loaded, ready to accept restore connection\n");
 
 	/*
-	 * Recalculate nr_fds now that pstree is loaded.
-	 * We need: task uffd fds + page server + lazy socket + margin
+	 * Verify nr_fds fits in our fixed buffer.
+	 * Fds: task uffd (nr_tasks) + lazy_listen + lazy_client = nr_tasks + 2
 	 */
-	nr_fds = task_entries->nr_tasks + 4;
+	BUG_ON(task_entries->nr_tasks + 2 > COW_MAX_EPOLL_FDS);
 
 	/*
 	 * Phase 3 continues in the normal lazy-pages flow.

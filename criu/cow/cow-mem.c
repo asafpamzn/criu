@@ -35,29 +35,6 @@ struct list_head *get_global_lazy_vmas(void)
 	return &global_lazy_vmas;
 }
 
-/* Find lazy VMA entry for given address and dst_id (exported for page-xfer.c) */
-struct lazy_vma_entry *find_lazy_vma_for_addr(unsigned long vaddr, u64 dst_id)
-{
-	struct lazy_vma_entry *lve;
-
-	/* Ensure lock is initialized (pthread_once guarantees single init) */
-	cow_mem_init_lazy_vmas();
-
-	pthread_spin_lock(&lazy_vmas_lock);
-
-	list_for_each_entry(lve, &global_lazy_vmas, list) {
-		if (vaddr >= lve->start &&
-		    vaddr < lve->end &&
-		    lve->dst_id == dst_id) {
-			pthread_spin_unlock(&lazy_vmas_lock);
-			return lve;
-		}
-	}
-	pthread_spin_unlock(&lazy_vmas_lock);
-
-	pr_err("Lazy VMA not found for vaddr=0x%lx dst_id=%lu\n", vaddr, dst_id);
-	return NULL;
-}
 
 /* Find lazy VMA entry by address only (no dst_id filter) */
 struct lazy_vma_entry *find_lazy_vma_by_addr(unsigned long vaddr)
@@ -195,21 +172,6 @@ unsigned long count_lazy_vma_pages(u64 dst_id)
 
 	return total_pages;
 }
-
-/* Convergence mode state */
-static bool g_convergence_mode = false;
-static unsigned long g_convergence_dirty_pages = 0;
-
-bool is_convergence_mode(void)
-{
-	return g_convergence_mode;
-}
-
-unsigned long get_convergence_dirty_pages(void)
-{
-	return g_convergence_dirty_pages;
-}
-
 
 
 /* Cleanup function for global lazy VMA list */
