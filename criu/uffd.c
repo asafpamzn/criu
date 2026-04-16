@@ -572,8 +572,6 @@ static int drop_iovs(struct lazy_pages_info *lpi, unsigned long addr, unsigned l
 	return 0;
 }
 
-/* cow_dump_lazy_iov_list() is in cow-uffd.c */
-
 static struct lazy_iov *extract_range(struct lazy_iov *iov, unsigned long start, unsigned long end)
 {
 	/* move the IOV tail into a new IOV */

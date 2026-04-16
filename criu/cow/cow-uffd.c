@@ -51,7 +51,6 @@ struct page_buffer_node {
 
 static struct {
 	struct hlist_head *hash_table;
-	unsigned long max_bucket_depth;	/* Max pages in any bucket */
 	unsigned long nr_pages;
 	unsigned long nr_applied;
 	unsigned long nr_discarded;
@@ -78,9 +77,6 @@ static atomic_int nr_active_chunks = 0;
 
 /* Fine-grained locks: 8K locks for 1M buckets */
 static pthread_spinlock_t hash_locks[COW_NUM_HASH_LOCKS];
-
-/* Global lock for counters (nr_pages, nr_applied, etc.) */
-static pthread_spinlock_t counter_lock;
 
 static inline int lock_index(unsigned int hash)
 {
@@ -237,7 +233,6 @@ static int cow_uffd_copy_and_track(int uffd, unsigned long vaddr, void *data,
 	case COW_COPY_EEXIST:
 		if (!(flags & COW_TRACK_RETRY))
 			__sync_fetch_and_add(&cow_buffer.nr_discarded, 1);
-		pr_err("COW_TRACE %s: 0x%lx EEXIST (already copied)\n", caller, vaddr);
 		if (!unmapped_tracker_is_unmapped(vaddr) &&
 		    page_state_get(vaddr) != PAGE_STATE_DIRTY)
 			page_state_set(vaddr, PAGE_STATE_DISCARDED);
@@ -251,7 +246,6 @@ static int cow_uffd_copy_and_track(int uffd, unsigned long vaddr, void *data,
 	case COW_COPY_ENOENT:
 		if (!(flags & COW_TRACK_RETRY))
 			__sync_fetch_and_add(&cow_buffer.nr_discarded, 1);
-		pr_err("COW_TRACE %s: 0x%lx ENOENT (VMA unmapped)\n", caller, vaddr);
 		if (!unmapped_tracker_is_unmapped(vaddr)) {
 			page_state_set(vaddr, PAGE_STATE_DISCARDED);
 			unmapped_tracker_mark_range(vaddr, nr_pages * PAGE_SIZE);
@@ -259,13 +253,9 @@ static int cow_uffd_copy_and_track(int uffd, unsigned long vaddr, void *data,
 		return 0;
 
 	case COW_COPY_EAGAIN:
-		if (flags & COW_TRACK_RETRY) {
-			/* Retry mode - return -EAGAIN, don't queue */
-			pr_err("COW_TRACE %s: 0x%lx EAGAIN (retry mode)\n", caller, vaddr);
+		if (flags & COW_TRACK_RETRY)
 			return -EAGAIN;
-		}
 		__sync_fetch_and_add(&cow_buffer.nr_eagain, 1);
-		pr_err("COW_TRACE %s: 0x%lx EAGAIN, queuing for retry\n", caller, vaddr);
 		if (lpis) {
 			/* Drain mode - use drain EAGAIN queue.
 			 * cow_queue_eagain_request makes an xmalloc copy of the data,
@@ -282,17 +272,11 @@ static int cow_uffd_copy_and_track(int uffd, unsigned long vaddr, void *data,
 		return 0;
 
 	case COW_COPY_ERROR:
-		pr_err("COW_TRACE %s: 0x%lx FAILED errno=%d\n", caller, vaddr, errno);
+		pr_err("%s: 0x%lx FAILED errno=%d\n", caller, vaddr, errno);
 		page_state_print_history(vaddr);
-		if (!unmapped_tracker_is_unmapped(vaddr) &&
-		    page_state_get(vaddr) != PAGE_STATE_DIRTY)
-			page_state_set(vaddr, PAGE_STATE_DISCARDED);
-		
 		BUG();
-		return -1;
 	}
 
-	return -1;  /* unreachable */
 }
 
 int cow_page_buffer_init(void)
@@ -304,8 +288,7 @@ int cow_page_buffer_init(void)
 
 	cow_buffer.hash_table = xmalloc(COW_PAGE_BUFFER_HASH_SIZE *
 					sizeof(struct hlist_head));
-	if (!cow_buffer.hash_table)
-		return -1;
+	BUG_ON(!cow_buffer.hash_table);
 
 	for (i = 0; i < COW_PAGE_BUFFER_HASH_SIZE; i++)
 		INIT_HLIST_HEAD(&cow_buffer.hash_table[i]);
@@ -313,9 +296,6 @@ int cow_page_buffer_init(void)
 	/* Initialize 8K fine-grained locks */
 	for (i = 0; i < COW_NUM_HASH_LOCKS; i++)
 		pthread_spin_init(&hash_locks[i], PTHREAD_PROCESS_PRIVATE);
-
-	/* Initialize counter lock */
-	pthread_spin_init(&counter_lock, PTHREAD_PROCESS_PRIVATE);
 
 	/* Initialize chunk drain index */
 	for (i = 0; i < COW_MAX_POOL_CHUNKS; i++) {
@@ -329,7 +309,6 @@ int cow_page_buffer_init(void)
 	cow_buffer.nr_applied = 0;
 	cow_buffer.nr_discarded = 0;
 	cow_buffer.nr_eagain = 0;
-	cow_buffer.max_bucket_depth = 0;
 	cow_buffer.initialized = true;
 
 	pr_info("COW page buffer initialized (buckets=%d, locks=%d, chunk_slots=%d)\n",
@@ -351,8 +330,7 @@ int cow_page_buffer_add(unsigned long vaddr, void *data, int thread_id, bool noc
 	int lock_idx;
 	int i;
 
-	if (!cow_buffer.initialized)
-		return -1;
+	BUG_ON(!cow_buffer.initialized);
 
 	/*
 	 * Server rule: each page is sent only once, unless dirty (re-sent with
@@ -363,10 +341,10 @@ int cow_page_buffer_add(unsigned long vaddr, void *data, int thread_id, bool noc
 	 */
 	state = page_state_get(vaddr);
 	if (state == PAGE_STATE_COPIED || state == PAGE_STATE_DISCARDED) {
-		pr_err("COW_TRACE ADD_ERROR: 0x%lx already %s - server sent duplicate!\n",
+		pr_err("0x%lx already %s - server sent duplicate!\n",
 		       vaddr, page_state_name(state));
 		page_state_print_history(vaddr);
-		BUG();  /* Protocol violation - stop immediately */
+		BUG();
 	}
 	/* PAGE_STATE_DIRTY and PAGE_STATE_IN_BUFFER are OK */
 
@@ -386,7 +364,6 @@ int cow_page_buffer_add(unsigned long vaddr, void *data, int thread_id, bool noc
 				memcpy(node->entries[i].data, data, PAGE_SIZE);
 				page_state_set_with_crc(vaddr, PAGE_STATE_IN_BUFFER, data);
 				pthread_spin_unlock(&hash_locks[lock_idx]);
-				pr_debug("COW_TRACE OVERWRITE: 0x%lx\n", vaddr);
 				return 0;
 			}
 		}
@@ -396,18 +373,9 @@ int cow_page_buffer_add(unsigned long vaddr, void *data, int thread_id, bool noc
 	if (nocopy) {
 		page_data = data;
 	} else {
-		if (thread_id < 0) {
-			pthread_spin_unlock(&hash_locks[lock_idx]);
-			pr_err("BUG: cow_page_buffer_add called with invalid thread_id %d\n",
-			       thread_id);
-			BUG();
-		}
+		BUG_ON(thread_id < 0);
 		page_data = page_pool_get(thread_id);
-		if (!page_data) {
-			pthread_spin_unlock(&hash_locks[lock_idx]);
-			pr_err("BUG: page_pool_get failed for thread %d\n", thread_id);
-			BUG();
-		}
+		BUG_ON(!page_data);
 		memcpy(page_data, data, PAGE_SIZE);
 	}
 
@@ -426,12 +394,7 @@ int cow_page_buffer_add(unsigned long vaddr, void *data, int thread_id, bool noc
 
 	/* Need new node */
 	node = xmalloc(sizeof(*node));
-	if (!node) {
-		pthread_spin_unlock(&hash_locks[lock_idx]);
-		if (!nocopy)
-			page_pool_put(page_data);
-		return -1;
-	}
+	BUG_ON(!node);
 
 	node->entries[0].vaddr = vaddr;
 	node->entries[0].data = page_data;
@@ -439,16 +402,6 @@ int cow_page_buffer_add(unsigned long vaddr, void *data, int thread_id, bool noc
 	INIT_HLIST_NODE(&node->hash);
 	INIT_LIST_HEAD(&node->chunk_list);
 	node->chunk_id = page_pool_get_chunk_id(page_data);
-
-	/* Debug: track pages with missing chunk_id */
-	if (node->chunk_id < 0) {
-		static atomic_int bad_chunk_count = 0;
-		int count = atomic_fetch_add(&bad_chunk_count, 1);
-		if (count < 10 || count % COW_LOG_SAMPLE_100K == 0) {
-			pr_err("CHUNK_ID_MISSING: page_data=%p vaddr=0x%lx count=%d\n",
-			       page_data, vaddr, count + 1);
-		}
-	}
 
 	hlist_add_head(&node->hash, &cow_buffer.hash_table[hash]);
 	page_state_set_with_crc(vaddr, PAGE_STATE_IN_BUFFER, page_data);
@@ -471,9 +424,6 @@ int cow_page_buffer_add(unsigned long vaddr, void *data, int thread_id, bool noc
 	}
 
 	__sync_fetch_and_add(&cow_buffer.nr_pages, 1);
-
-	pr_debug("COW_TRACE ADD: 0x%lx chunk=%d (total=%lu)\n", vaddr, node->chunk_id, cow_buffer.nr_pages);
-
 	return 0;
 }
 
@@ -544,7 +494,6 @@ void cow_page_buffer_destroy(void)
 
 	/* Stop drain thread first */
 	cow_stop_drain_thread();
-	pr_warn("file = %s, line = %d\n",__FILE__, __LINE__);
 	/* Lock all buckets and destroy contents */
 	for (i = 0; i < COW_PAGE_BUFFER_HASH_SIZE; i++) {
 		int lock_idx = lock_index(i);
@@ -558,15 +507,14 @@ void cow_page_buffer_destroy(void)
 		}
 		pthread_spin_unlock(&hash_locks[lock_idx]);
 	}
-	pr_warn("file = %s, line = %d\n",__FILE__, __LINE__);
+
 	xfree(cow_buffer.hash_table);
 	cow_buffer.hash_table = NULL;
 	cow_buffer.initialized = false;
-	pr_warn("file = %s, line = %d\n",__FILE__, __LINE__);
+
 	/* Destroy all fine-grained locks */
 	for (i = 0; i < COW_NUM_HASH_LOCKS; i++)
 		pthread_spin_destroy(&hash_locks[i]);
-	pthread_spin_destroy(&counter_lock);
 
 	/* Clean up chunk index */
 	for (i = 0; i < COW_MAX_POOL_CHUNKS; i++) {
@@ -576,10 +524,8 @@ void cow_page_buffer_destroy(void)
 	atomic_store(&chunk_index_initialized, false);
 	atomic_store(&nr_active_chunks, 0);
 
-	pr_warn("file = %s, line = %d\n",__FILE__, __LINE__);
-	pr_warn("COW page buffer destroyed: applied=%lu discarded=%lu max_bucket=%lu\n",
-		cow_buffer.nr_applied, cow_buffer.nr_discarded,
-		cow_buffer.max_bucket_depth);
+	pr_info("COW page buffer destroyed: applied=%lu discarded=%lu\n",
+		cow_buffer.nr_applied, cow_buffer.nr_discarded);
 
 	/* Destroy all page pools last */
 	page_pool_destroy_all();
@@ -693,11 +639,7 @@ void cow_page_buffer_readd(unsigned long vaddr, void *data)
 
 	/* Need new node */
 	node = xmalloc(sizeof(*node));
-	if (!node) {
-		pr_err("Failed to re-add page 0x%lx on EAGAIN\n", vaddr);
-		page_pool_put(data);
-		return;
-	}
+	BUG_ON(!node);
 
 	node->entries[0].vaddr = vaddr;
 	node->entries[0].data = data;
@@ -720,7 +662,6 @@ void cow_page_buffer_readd(unsigned long vaddr, void *data)
 
 	__sync_fetch_and_add(&cow_buffer.nr_pages, 1);
 	page_state_set(vaddr, PAGE_STATE_EAGAIN_QUEUED);
-	pr_debug("COW_TRACE DRAIN_READD: 0x%lx chunk=%d re-buffered for EAGAIN retry\n", vaddr, node->chunk_id);
 }
 
 /*
@@ -734,11 +675,10 @@ static void drain_orphaned_pages_from_hash(void)
 	struct page_buffer_node *node;
 	struct hlist_node *tmp;
 	unsigned long drained = 0, discarded = 0;
-	unsigned long last_log_count = 0;
 	int bucket;
 
-	pr_err("DRAIN_FALLBACK: Starting hash-table scan for %lu orphaned pages\n",
-	       cow_buffer.nr_pages);
+	pr_info("Fallback drain: scanning hash-table for %lu orphaned pages\n",
+		cow_buffer.nr_pages);
 
 	for (bucket = 0; bucket < COW_PAGE_BUFFER_HASH_SIZE && cow_buffer.nr_pages > 0; bucket++) {
 		int lock_idx = lock_index(bucket);
@@ -756,37 +696,22 @@ static void drain_orphaned_pages_from_hash(void)
 				pthread_spin_unlock(&hash_locks[lock_idx]);
 				__sync_fetch_and_sub(&cow_buffer.nr_pages, 1);
 
-				/* Track state change */
 				page_state_set(vaddr, PAGE_STATE_DRAIN_PENDING);
 
-				/* Find uffd and copy page */
 				uffd = cow_get_uffd_for_vaddr(drain_lpis, vaddr);
-				if (uffd >= 0) {
-					int ret = cow_uffd_copy_and_track(uffd, vaddr, data, 1,
-									 NULL, drain_lpis,
-									 COW_TRACK_STRICT,
-									 "FALLBACK", &data_owned);
-					if (ret > 0)
-						drained++;
-					else
-						discarded++;
-				} else {
-					__sync_fetch_and_add(&cow_buffer.nr_discarded, 1);
+				BUG_ON(uffd < 0);
+
+				int ret = cow_uffd_copy_and_track(uffd, vaddr, data, 1,
+								 NULL, drain_lpis,
+								 COW_TRACK_STRICT,
+								 "FALLBACK", &data_owned);
+				if (ret > 0)
+					drained++;
+				else
 					discarded++;
-					if (!unmapped_tracker_is_unmapped(vaddr) &&
-					    page_state_get(vaddr) != PAGE_STATE_DIRTY)
-						page_state_set(vaddr, PAGE_STATE_DISCARDED);
-				}
 
 				if (!data_owned)
 					page_pool_put(data);
-
-				/* Progress logging every 1M pages */
-				if ((drained + discarded) - last_log_count >= 1000000) {
-					pr_err("DRAIN_FALLBACK: drained=%lu discarded=%lu remaining=%lu\n",
-					       drained, discarded, cow_buffer.nr_pages);
-					last_log_count = drained + discarded;
-				}
 
 				pthread_spin_lock(&hash_locks[lock_idx]);
 			}
@@ -794,18 +719,14 @@ static void drain_orphaned_pages_from_hash(void)
 			/* Remove empty node from hash table */
 			if (node->count == 0) {
 				hlist_del(&node->hash);
-				/*
-				 * Note: chunk_list is self-referential (INIT_LIST_HEAD) for
-				 * nodes with chunk_id=-1, so no list_del needed.
-				 */
 				xfree(node);
 			}
 		}
 		pthread_spin_unlock(&hash_locks[lock_idx]);
 	}
 
-	pr_err("DRAIN_FALLBACK: DONE drained=%lu discarded=%lu remaining=%lu\n",
-	       drained, discarded, cow_buffer.nr_pages);
+	pr_info("Fallback drain done: drained=%lu discarded=%lu remaining=%lu\n",
+		drained, discarded, cow_buffer.nr_pages);
 }
 
 /*
@@ -837,19 +758,14 @@ static void *background_drain_worker(void *arg)
 	snprintf(thread_name, sizeof(thread_name), "cow-drain-%d", thread_id);
 	pthread_setname_np(pthread_self(), thread_name);
 
-	pr_err("DRAIN_PROGRESS: thread=%d STARTED (work-stealing mode) buffered=%lu\n",
-	       thread_id, cow_buffer.nr_pages);
+	pr_info("Drain thread %d started, buffered=%lu\n", thread_id, cow_buffer.nr_pages);
 	last_progress_time = time(NULL);
 
 	while (!atomic_load(&drain_thread_stop) && cow_buffer.nr_pages > 0) {
 		/* Work-stealing: atomically grab next chunk */
 		chunk_id = atomic_fetch_add(&next_drain_chunk, 1);
-		if (chunk_id >= max_drain_chunks) {
-			/* No more chunks to process - exit work loop */
-			pr_info("DRAIN_PROGRESS: thread=%d no more chunks (chunk_id=%d >= max=%d), drained=%lu\n",
-			       thread_id, chunk_id, max_drain_chunks, drained);
+		if (chunk_id >= max_drain_chunks)
 			break;
-		}
 
 		{
 			unsigned long chunk_drained = 0;
@@ -871,26 +787,16 @@ static void *background_drain_worker(void *arg)
 					/* Track: removed from buffer, about to copy */
 					page_state_set(vaddr, PAGE_STATE_DRAIN_PENDING);
 
-					pr_debug("COW_TRACE DRAIN[%d]: 0x%lx chunk=%d (remaining=%lu)\n",
-						 thread_id, vaddr, chunk_id, cow_buffer.nr_pages);
-
 					pthread_spin_unlock(&chunk_index[chunk_id].lock);
 					__sync_fetch_and_sub(&cow_buffer.nr_pages, 1);
 
 					/* Find uffd for this address and copy */
 					uffd = cow_get_uffd_for_vaddr(drain_lpis, vaddr);
-					if (uffd >= 0) {
+					BUG_ON(uffd < 0);
+
+					{
 						bool data_owned = false;
 						int ret;
-						u32 stored_crc;
-
-						/* Check CRC before copy to detect dirty page races */
-						if (!page_state_check_crc(vaddr, data, &stored_crc)) {
-							u32 buf_count = page_state_get_buffer_count(vaddr);
-							pr_err("DRAIN_CRC_MISMATCH: 0x%lx buffer_count=%u "
-							       "- data changed between buffer and copy!\n",
-							       vaddr, buf_count);
-						}
 
 						ret = cow_uffd_copy_and_track(uffd, vaddr, data, 1,
 									     NULL, drain_lpis,
@@ -902,26 +808,14 @@ static void *background_drain_worker(void *arg)
 							/* Log progress every 100k pages or 10 seconds */
 							if (drained - last_progress_drained >= COW_LOG_SAMPLE_100K ||
 							    time(NULL) - last_progress_time >= COW_DRAIN_PROGRESS_SEC) {
-								pr_info("DRAIN_PROGRESS: thread=%d drained=%lu chunk=%d remaining=%lu\n",
+								pr_info("Drain thread %d: drained=%lu chunk=%d remaining=%lu\n",
 								       thread_id, drained, chunk_id, cow_buffer.nr_pages);
 								last_progress_drained = drained;
 								last_progress_time = time(NULL);
-								/* Thread 0 dumps pool stats every 1M pages */
-								if (thread_id == 0 && drained % COW_LOG_SAMPLE_1M < COW_LOG_SAMPLE_100K)
-									page_pool_dump_stats();
 							}
 						}
 						if (data_owned)
 							free_data = false;
-					} else {
-						__sync_fetch_and_add(&cow_buffer.nr_discarded, 1);
-						pr_err("COW_TRACE DRAIN[%d]: 0x%lx no uffd found\n",
-						       thread_id, vaddr);
-						page_state_print_history(vaddr);
-						if (!unmapped_tracker_is_unmapped(vaddr) &&
-						    page_state_get(vaddr) != PAGE_STATE_DIRTY)
-							page_state_set(vaddr, PAGE_STATE_DISCARDED);
-						BUG();
 					}
 
 					if (free_data)
@@ -948,19 +842,13 @@ static void *background_drain_worker(void *arg)
 				}
 			}
 			pthread_spin_unlock(&chunk_index[chunk_id].lock);
-
-			/* Log when we finish draining a chunk */
-			if (chunk_drained > 0) {
-				pr_debug("DRAIN_CHUNK_DONE: thread=%d chunk=%d drained=%lu\n",
-				       thread_id, chunk_id, chunk_drained);
-			}
 		}
 	}
 
 	/* Update global statistics */
 	atomic_fetch_add(&total_drained, drained);
 
-	pr_err("DRAIN_PROGRESS: thread=%d FINISHED drained=%lu\n", thread_id, drained);
+	pr_info("Drain thread %d finished: drained=%lu\n", thread_id, drained);
 
 	/* Decrement active thread count */
 	if (atomic_fetch_sub(&drain_threads_active, 1) == 1) {
@@ -971,43 +859,16 @@ static void *background_drain_worker(void *arg)
 		 */
 		atomic_thread_fence(memory_order_seq_cst);
 
-		pr_err("DRAIN_PROGRESS: ALL_DONE total=%lu applied=%lu discarded=%lu eagain=%lu remaining=%lu\n",
+		pr_info("Drain complete: total=%lu applied=%lu discarded=%lu eagain=%lu remaining=%lu\n",
 		       atomic_load(&total_drained), cow_buffer.nr_applied,
 		       cow_buffer.nr_discarded, cow_buffer.nr_eagain, cow_buffer.nr_pages);
 
-		/* Debug: check what remains in chunk_index vs hash table (limited scan) */
-		if (cow_buffer.nr_pages > 0) {
-			unsigned long in_chunks = 0, in_hash = 0;
-			int i, samples = 0;
-			struct page_buffer_node *node;
-
-			/* Count nodes in chunk_index (fast - only 512 entries) */
-			for (i = 0; i < COW_MAX_POOL_CHUNKS; i++) {
-				int count = atomic_load(&chunk_index[i].page_count);
-				in_chunks += count;
-			}
-
-			/* Sample hash table - check first 10000 buckets only */
-			for (i = 0; i < 10000 && i < COW_PAGE_BUFFER_HASH_SIZE; i++) {
-				hlist_for_each_entry(node, &cow_buffer.hash_table[i], hash) {
-					in_hash += node->count;
-					if (samples < 5) {
-						pr_err("DRAIN_REMAIN_SAMPLE: hash[%d] chunk_id=%d count=%d\n",
-						       i, node->chunk_id, node->count);
-						samples++;
-					}
-				}
-			}
-			/* Extrapolate: hash has 1M buckets, we sampled 10k */
-			pr_err("DRAIN_REMAIN: chunk_index_nodes=%lu hash_sample(10k)=%lu (extrapolated=%lu) nr_pages=%lu\n",
-			       in_chunks, in_hash, in_hash * 100, cow_buffer.nr_pages);
-
-			/*
-			 * Orphaned pages with chunk_id=-1 were never added to chunk_index,
-			 * so chunk-ordered drain missed them. Fall back to hash iteration.
-			 */
+		/*
+		 * Orphaned pages with chunk_id=-1 were never added to chunk_index,
+		 * so chunk-ordered drain missed them. Fall back to hash iteration.
+		 */
+		if (cow_buffer.nr_pages > 0)
 			drain_orphaned_pages_from_hash();
-		}
 	}
 
 	return NULL;
@@ -1042,39 +903,26 @@ int cow_start_drain_thread(struct list_head *lpis)
 	if (chunks_per_thread < 1)
 		chunks_per_thread = 1;
 
-	pr_info("DRAIN_PROGRESS: chunk-ordered drain: total_chunks=%d chunks_per_thread=%d\n",
-	       total_chunks, chunks_per_thread);
-
-	
 	/* Initialize work-stealing globals */
 	atomic_store(&next_drain_chunk, 0);
 	max_drain_chunks = total_chunks;
 
 	for (i = 0; i < COW_NUM_DRAIN_THREADS; i++) {
 		drain_args[i].thread_id = i;
-		/* start/end_chunk unused with work-stealing, but set for debug logging */
 		drain_args[i].start_chunk = 0;
 		drain_args[i].end_chunk = total_chunks;
 
-		if (pthread_create(&drain_threads[i], NULL,
-				   background_drain_worker, &drain_args[i])) {
-			pr_perror("Failed to create drain thread %d", i);
-			continue;
-		}
+		BUG_ON(pthread_create(&drain_threads[i], NULL,
+				      background_drain_worker, &drain_args[i]));
 		atomic_fetch_add(&drain_threads_active, 1);
 		created++;
-	}
-
-	if (created == 0) {
-		pr_err("Failed to create any drain threads\n");
-		return -1;
 	}
 
 	/* Mark drain started and report any puts that happened before */
 	page_pool_mark_drain_started();
 
-	pr_err("DRAIN_PROGRESS: STARTING %d/%d drain threads (work-stealing), buffered=%lu total_chunks=%d\n",
-	       created, COW_NUM_DRAIN_THREADS, cow_buffer.nr_pages, total_chunks);
+	pr_info("Started %d drain threads, buffered=%lu total_chunks=%d\n",
+	       created, cow_buffer.nr_pages, total_chunks);
 
 	return 0;
 }
@@ -1122,60 +970,28 @@ int cow_handle_exit(struct list_head *lpis)
 {
 	struct lazy_pages_info *lpi, *n;
 
-	/* Only log when state changes to avoid log spam */
-	static int last_signal = -1, last_drain = -1;
-	static unsigned long call_count = 0;
-	int cur_signal = cow_is_all_pages_sent_received();
-	int cur_drain = cow_drain_thread_running();
-
-	call_count++;
-	if (cur_signal != last_signal || cur_drain != last_drain || call_count % 100 == 0) {
-		pr_err("cow_handle_exit[%lu]: signal=%d drain=%d buffer=%lu\n",
-		       call_count, cur_signal, cur_drain, cow_page_buffer_count());
-		last_signal = cur_signal;
-		last_drain = cur_drain;
-	}
-
 	/* Condition 1: Wait for all_pages_sent signal from primary */
-	if (!cur_signal) {
+	if (!cow_is_all_pages_sent_received())
 		return 0;
-	}
 
 	/* Condition 2: Wait for drain thread to finish */
-	if (cur_drain) {
+	if (cow_drain_thread_running())
 		return 0;
-	}
 
 	/* Condition 3: Wait for buffer to be empty */
-	if (cow_page_buffer_count() > 0) {
-		pr_err("cow_handle_exit: waiting for buffer to drain (%lu pages remaining)\n",
-		       cow_page_buffer_count());
+	if (cow_page_buffer_count() > 0)
 		return 0;
-	}
 
 	/* Condition 4: Wait for EAGAIN requests to be processed */
-	if (!cow_is_eagain_queue_empty()) {
-		pr_err("cow_handle_exit: waiting for EAGAIN requests to be processed\n");
+	if (!cow_is_eagain_queue_empty())
 		return 0;
-	}
-#if 0
-	/* All conditions met - send ACK to primary */
-	pr_err("All pages received and drained, sending ACK to primary\n");
-	if (send_all_pages_sent_ack() < 0)
-		pr_warn("Failed to send all_pages_sent ACK\n");
-#endif
 
 	/* Cleanup all lpis */
-	pr_err("RACE_DEBUG: [MAIN] cow_handle_exit CLEANUP START - drain_active=%d\n",
-	       atomic_load(&drain_threads_active));
 	list_for_each_entry_safe(lpi, n, lpis, l) {
-		pr_err("RACE_DEBUG: [MAIN] list_del lpi=%p BEFORE\n", lpi);
 		lazy_pages_summary(lpi);
 		list_del(&lpi->l);
-		pr_err("RACE_DEBUG: [MAIN] list_del lpi=%p AFTER - calling lpi_put\n", lpi);
 		lpi_put(lpi);
 	}
-	pr_err("RACE_DEBUG: [MAIN] cow_handle_exit CLEANUP DONE\n");
 
 	return 1;  /* Exit main loop */
 }
@@ -1393,26 +1209,16 @@ int cow_queue_eagain_request(struct lazy_pages_info *lpi, __u64 address,
 	void *buf_copy = NULL;
 	unsigned long len = nr_pages * page_size();
 
-	lp_debug(lpi, "uffd_%s EAGAIN in COW mode: queueing 0x%llx/%ld for later\n",
-		 op_name, address, len);
-
 	/* Copy buffer if provided (copy operation) */
 	if (buf) {
 		buf_copy = xmalloc(len);
-		if (!buf_copy) {
-			lp_err(lpi, "Failed to allocate buffer for EAGAIN request\n");
-			return -1;
-		}
+		BUG_ON(!buf_copy);
 		memcpy(buf_copy, buf, len);
 	}
 
 	/* Create request entry */
 	req = xmalloc(sizeof(*req));
-	if (!req) {
-		if (buf_copy)
-			xfree(buf_copy);
-		return -1;
-	}
+	BUG_ON(!req);
 
 	req->lpi = lpi;
 	req->address = address;
@@ -1617,44 +1423,6 @@ int cow_process_eagain_requests(void)
 
 /*
  * ============================================================================
- * IOV Debugging (COW mode)
- * ============================================================================
- */
-
-void cow_dump_lazy_iov_list(struct lazy_pages_info *lpi, const char *name,
-			    struct list_head *iovs, unsigned int max_dump)
-{
-	struct lazy_iov *iov;
-	unsigned long count = 0;
-	unsigned long pages = 0;
-	unsigned long prev_start = 0;
-	bool sorted = true;
-	bool first = true;
-
-	list_for_each_entry(iov, iovs, l) {
-		unsigned long iov_pages;
-
-		iov_pages = (iov->end - iov->start) / page_size();
-		pages += iov_pages;
-
-		if (!first && iov->start < prev_start)
-			sorted = false;
-		first = false;
-		prev_start = iov->start;
-
-		if (count < max_dump)
-			lp_err(lpi, "%s[%lu]: 0x%lx-0x%lx img_start=0x%lx pages=%lu\n",
-			       name, count, iov->start, iov->end, iov->img_start,
-			       iov_pages);
-		count++;
-	}
-
-	lp_err(lpi, "%s: count=%lu pages=%lu sorted=%s\n", name, count, pages,
-	       sorted ? "yes" : "no");
-}
-
-/*
- * ============================================================================
  * COW Restore State Management
  * ============================================================================
  *
@@ -1712,15 +1480,12 @@ int cow_get_uffd_for_vaddr(struct list_head *lpis, unsigned long vaddr)
 	struct lazy_pages_info *lpi;
 
 	list_for_each_entry(lpi, lpis, l) {
-		
 		if (lpi->exited || lpi->lpfd.fd < 0)
 			continue;
-		if (cow_find_iov(lpi, vaddr)) {
-			
+		if (cow_find_iov(lpi, vaddr))
 			return lpi->lpfd.fd;
-		}
 	}
-	
+
 	return -1;
 }
 
@@ -1778,42 +1543,28 @@ static int prebuffer_io_complete_internal(unsigned long dst_id, unsigned long va
 		unsigned long page_vaddr = vaddr + i * PAGE_SIZE;
 		void *page_data = (char *)data + i * PAGE_SIZE;
 
-		if (cow_page_buffer_add(page_vaddr, page_data, PHASE4_POOL_ID, false) < 0) {
-			pr_err("Failed to buffer dirty page at 0x%lx\n", page_vaddr);
-			return -1;
-		}
+		BUG_ON(cow_page_buffer_add(page_vaddr, page_data, PHASE4_POOL_ID, false) < 0);
 	}
 	return 0;
 }
 
 int cow_setup_prebuffer_reader(void)
 {
-	int ret;
-
 	/*
 	 * Allocate buffer for batch reception (up to 64 pages = 256KB).
 	 * Compressed batches from P3 senders can contain multiple pages.
 	 */
 	prebuffer_buf = xmalloc(COW_BATCH_SIZE);
-	if (!prebuffer_buf)
-		return -1;
+	BUG_ON(!prebuffer_buf);
 
 	/*
 	 * Initialize pool 0 for Phase 4 dirty pages. P3 receivers will also
 	 * init this pool later, but cow_page_buffer_thread_init is idempotent.
 	 */
-	ret = cow_page_buffer_thread_init(PHASE4_POOL_ID);
-	if (ret < 0) {
-		pr_err("Failed to init page pool for Phase 4\n");
-		xfree(prebuffer_buf);
-		prebuffer_buf = NULL;
-		return -1;
-	}
+	BUG_ON(cow_page_buffer_thread_init(PHASE4_POOL_ID) < 0);
 
-	ret = page_server_start_async_read_bulk(
+	return page_server_start_async_read_bulk(
 		prebuffer_buf, COW_BATCH_PAGES, prebuffer_io_complete_internal, prebuffer_buf);
-
-	return ret;
 }
 
 
@@ -1947,8 +1698,7 @@ int cow_convergence_copy_page(struct list_head *lpis,
 		return ret >= 0 ? 0 : -1;
 	}
 
-	pr_err("Copied to unmap range: Convergence callback with no lpi for vaddr 0x%lx\n", vaddr);
-	
+	/* No matching lpi - page was unmapped */
 	return 1;
 }
 
@@ -2076,32 +1826,10 @@ int cow_handle_lazy_accept_post_connect(struct list_head *lpis,
 	 * cleaned up when we received all_pages_sent, and we don't need it
 	 * anymore since all pages are in the buffer.
 	 */
-	if (cow_is_all_pages_sent_received()) {
-		/* Debug: check if target process is frozen */
-		struct lazy_pages_info *lpi;
-		list_for_each_entry(lpi, lpis, l) {
-			char path[64], state[256];
-			FILE *f;
-			snprintf(path, sizeof(path), "/proc/%d/status", lpi->pid);
-			f = fopen(path, "r");
-			if (f) {
-				while (fgets(state, sizeof(state), f)) {
-					if (strncmp(state, "State:", 6) == 0) {
-						pr_err("DRAIN_DEBUG: PID %d %s", lpi->pid, state);
-						break;
-					}
-				}
-				fclose(f);
-			}
-		}
-
-		pr_info("All pages sent, starting drain thread\n");
-		/* Don't call switch_to_convergence - no page server connection */
+	if (cow_is_all_pages_sent_received())
 		cow_start_drain_thread(lpis);
-	}
 
 	return 0;
 }
-
 
 

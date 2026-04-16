@@ -70,12 +70,6 @@ extern int cow_queue_drain_eagain_request(struct list_head *lpis, unsigned long 
 extern bool cow_is_eagain_queue_empty(void);
 extern int cow_process_eagain_requests(void);
 
-/*
- * IOV Debugging (COW mode)
- */
-extern void cow_dump_lazy_iov_list(struct lazy_pages_info *lpi, const char *name,
-				   struct list_head *iovs, unsigned int max_dump);
-
 /* Find IOV for address (wrapper for uffd.c find_iov) */
 struct lazy_iov;
 extern struct lazy_iov *cow_find_iov(struct lazy_pages_info *lpi, unsigned long addr);
