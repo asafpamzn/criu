@@ -791,7 +791,7 @@ static void *background_drain_worker(void *arg)
 		clock_gettime(CLOCK_MONOTONIC, &drain_end_time);
 		elapsed_ms = (drain_end_time.tv_sec - drain_start_time.tv_sec) * 1000 +
 			     (drain_end_time.tv_nsec - drain_start_time.tv_nsec) / 1000000;
-		pr_warn("TIMING: drain took %lu ms\n", elapsed_ms);
+		pr_err("TIMING: drain took %lu ms\n", elapsed_ms);
 
 		pr_info("Drain complete: total=%lu applied=%lu discarded=%lu eagain=%lu remaining=%lu\n",
 		       atomic_load(&total_drained), cow_buffer.nr_applied,
