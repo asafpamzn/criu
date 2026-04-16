@@ -193,24 +193,6 @@ extern int cow_detect_new_vmas(struct vm_area_list *vmas,
 			       unsigned int *nr_new_ranges);
 
 /**
- * cow_merge_dirty_ranges - Merge dirty and new VMA range arrays
- * @dirty_ranges: Dirty pages from PAGEMAP_SCAN
- * @nr_dirty: Count of dirty ranges
- * @new_ranges: New VMA ranges from cow_detect_new_vmas()
- * @nr_new: Count of new ranges
- * @merged_ranges: Output merged array
- * @nr_merged: Output merged count
- *
- * Caller must xfree() the merged_ranges array.
- * Input arrays are NOT freed.
- *
- * Returns: 0 on success, -1 on error
- */
-extern int cow_merge_dirty_ranges(unsigned long *dirty_ranges, unsigned int nr_dirty,
-				  unsigned long *new_ranges, unsigned int nr_new,
-				  unsigned long **merged_ranges, unsigned int *nr_merged);
-
-/**
  * cow_cleanup_async_uffd - Close async uffd without unregistering VMAs
  *
  * Closes the async uffd file descriptor directly without issuing
@@ -220,19 +202,6 @@ extern int cow_merge_dirty_ranges(unsigned long *dirty_ranges, unsigned int nr_d
  */
 extern void cow_cleanup_async_uffd(void);
 
-/**
- * cow_dump_dirty_pages - Dump dirty pages directly while process is frozen
- * @dirty_ranges: Array of [start, len, start, len, ...] pairs
- * @nr_dirty_ranges: Number of ranges
- * @source_pid: PID of source process for process_vm_readv
- *
- * Reads dirty pages using process_vm_readv() and sends them using LZ4
- * compressed batches over the page server socket. Called during Phase 3
- * freeze instead of setting up WP_SYNC for convergence.
- *
- * Returns: 0 on success, -1 on error
- */
-extern int cow_dump_dirty_pages(unsigned long *dirty_ranges, unsigned int nr_dirty_ranges,
-				pid_t source_pid);
+
 
 #endif /* __CR_COW_DUMP_H_ */

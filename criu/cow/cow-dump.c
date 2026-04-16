@@ -1,6 +1,5 @@
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <sys/socket.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
@@ -11,7 +10,6 @@
 #include <pthread.h>
 #include <time.h>
 #include <string.h>
-#include <poll.h>
 
 #include "types.h"
 #include "cr_options.h"
@@ -20,9 +18,7 @@
 #include "mman.h"
 #include "uffd.h"
 #include "pagemap_scan.h"
-#include "proc_parse.h"
 #include "page-xfer.h"
-#include "page-pipe.h"
 #include "parasite-syscall.h"
 #include "mem.h"
 #include "vma.h"
@@ -30,7 +26,6 @@
 #include "kerndat.h"
 #include "criu-log.h"
 #include "parasite.h"
-#include "atomic-bitmap.h"
 #include "cow/cow-conf.h"
 #include "cow/cow-bulk-send.h"
 #include "common/bug.h"
@@ -41,17 +36,13 @@
 struct cow_tracked_vma {
 	unsigned long start;
 	unsigned long end;
-	bool is_new;  /* True if VMA was detected in Phase 3 (needs uffd registration) */
 };
 
 /* COW dump state for one dump session — single tracked process */
 struct cow_dump_info {
 	pid_t source_pid;
 	u64 dst_id;            /* Process identifier for page transfer */
-	int uffd;
-	int uffd_async;        /* WP_ASYNC uffd fd (kept for cleanup) */
-	int uffd_sync;         /* Pre-created WP_SYNC uffd (via parasite) */
-	unsigned long total_pages;
+	int uffd;              /* WP_ASYNC uffd fd */
 	unsigned int nr_tracked_vmas;
 	struct cow_tracked_vma *tracked_vmas;
 	enum cow_dump_phase phase;  /* Current phase */
@@ -95,8 +86,6 @@ static void *cow_wp_worker(void *arg)
 
 	return NULL;
 }
-
-
 
 static unsigned int cow_wp_nr_threads(unsigned int nr_ranges)
 {
@@ -177,8 +166,8 @@ static int cow_apply_writeprotect(struct cow_dump_info *cdi)
 
 	ranges = cow_wp_build_ranges(cdi, &nr_ranges);
 	if (!ranges) {
-		if (nr_ranges)
-			return -1;
+		/* nr_ranges == 0 means no VMAs to protect, which is fine */
+		BUG_ON(nr_ranges != 0);
 		return 0;
 	}
 
@@ -231,8 +220,8 @@ static int cow_apply_writeprotect(struct cow_dump_info *cdi)
 	} else {
 		nsec = t_end.tv_nsec - t_start.tv_nsec;
 	}
-	pr_err("TIMING: cow_dump_writeprotect took %lu.%06lu seconds (%u ranges, %u threads)\n",
-	       sec, nsec / 1000, nr_ranges, created ? created : 1);
+	pr_info("TIMING: cow_dump_writeprotect took %lu.%06lu seconds (%u ranges, %u threads)\n",
+		sec, nsec / 1000, nr_ranges, created ? created : 1);
 
 	xfree(threads);
 	xfree(jobs);
@@ -259,9 +248,6 @@ void cow_set_dst_id(u64 dst_id)
 	if (g_cow_info)
 		g_cow_info->dst_id = dst_id;
 }
-
-
-
 
 /* ------------------------------------------------------------------ */
 /*  Kernel support check                                               */
@@ -294,13 +280,20 @@ bool cow_check_kernel_support(void)
 /*  VMA registration                                                   */
 /* ------------------------------------------------------------------ */
 
+/*
+ * cow_register_vmas - Build list of VMAs to track for COW
+ *
+ * In WP_ASYNC mode, we don't actually register with uffd for WP faults.
+ * Instead, we just build the list of trackable VMAs and use PAGEMAP_SCAN
+ * to detect dirty pages later.
+ */
 static int cow_register_vmas(struct cow_dump_info *cdi,
 			     struct vm_area_list *vma_area_list,
 			     unsigned long *out_total_pages)
 {
 	struct vma_area *vma;
 	struct uffdio_register reg;
-	unsigned int nr_eligible = 0, nr_tracked = 0, nr_failed = 0;
+	unsigned int nr_eligible = 0, nr_tracked = 0;
 	unsigned long total_pages = 0;
 	struct cow_tracked_vma *tvmas;
 	unsigned int i;
@@ -334,7 +327,6 @@ static int cow_register_vmas(struct cow_dump_info *cdi,
 	list_for_each_entry(vma, &vma_area_list->h, list) {
 		unsigned long start = vma->e->start;
 		unsigned long len = vma->e->end - start;
-		int ret;
 
 		if (!vma_entry_can_be_lazy(vma->e))
 			continue;
@@ -350,22 +342,14 @@ static int cow_register_vmas(struct cow_dump_info *cdi,
 		if (vma->e->flags & MAP_DROPPABLE)
 			continue;
 
+		/*
+		 * In WP_ASYNC mode, UFFDIO_REGISTER may fail - that's OK.
+		 * We track via PAGEMAP_SCAN, not fault handling.
+		 */
 		reg.range.start = start;
 		reg.range.len = len;
 		reg.mode = UFFDIO_REGISTER_MODE_WP;
-
-		ret = ioctl(cdi->uffd, UFFDIO_REGISTER, &reg);
-		if (ret && cdi->phase != COW_PHASE_ASYNC_BULK) {
-			pr_warn("UFFDIO_REGISTER WP %lx-%lx failed: %s\n",
-				start, start + len, strerror(errno));
-			nr_failed++;
-			continue;
-		}
-		if (ret && cdi->phase == COW_PHASE_ASYNC_BULK) {
-			pr_info("UFFDIO_REGISTER WP %lx-%lx skipped in WP_ASYNC "
-				"(tracking via PAGEMAP_SCAN)\n",
-				start, start + len);
-		}
+		(void)ioctl(cdi->uffd, UFFDIO_REGISTER, &reg);
 
 		tvmas[i].start = start;
 		tvmas[i].end = start + len;
@@ -386,8 +370,8 @@ static int cow_register_vmas(struct cow_dump_info *cdi,
 	cdi->nr_tracked_vmas = nr_tracked;
 	*out_total_pages = total_pages;
 
-	pr_info("Registered %u/%u VMAs (%u failed) via /proc: %lu pages\n",
-		nr_tracked, nr_eligible, nr_failed, total_pages);
+	pr_info("Tracking %u/%u VMAs for COW: %lu pages\n",
+		nr_tracked, nr_eligible, total_pages);
 	return 0;
 }
 
@@ -401,14 +385,10 @@ void cow_dump_fini(void)
 		return;
 
 	wait_for_page_server_thread();
-	pr_err("Cleaning up COW dump\n");
+	pr_info("Cleaning up COW dump\n");
 
 	if (g_cow_info->uffd >= 0)
 		close(g_cow_info->uffd);
-	if (g_cow_info->uffd_async >= 0)
-		close(g_cow_info->uffd_async);
-	if (g_cow_info->uffd_sync >= 0)
-		close(g_cow_info->uffd_sync);
 	xfree(g_cow_info->tracked_vmas);
 	xfree(g_cow_info);
 	g_cow_info = NULL;
@@ -512,6 +492,7 @@ int cow_dump_init_async(struct pstree_item *item,
 	struct cow_dump_info *cdi;
 	struct parasite_cow_dump_args *args = NULL;
 	unsigned long args_size;
+	unsigned long total_pages;
 	int ret;
 
 	pr_info("Initializing COW dump ASYNC for pid %d\n", item->pid->real);
@@ -527,8 +508,6 @@ int cow_dump_init_async(struct pstree_item *item,
 	cdi->source_pid = item->pid->real;
 	cdi->dst_id = vpid(item);
 	cdi->uffd = -1;
-	cdi->uffd_async = -1;
-	cdi->uffd_sync = -1;
 	cdi->phase = COW_PHASE_ASYNC_BULK;
 
 	g_cow_info = cdi;
@@ -576,21 +555,17 @@ int cow_dump_init_async(struct pstree_item *item,
 		goto err;
 	}
 
-	cdi->uffd_async = cdi->uffd;
-
-	/* Register VMAs — reuse cow_register_vmas() */
-	ret = cow_register_vmas(cdi, vma_area_list, &cdi->total_pages);
+	/* Build list of VMAs to track */
+	ret = cow_register_vmas(cdi, vma_area_list, &total_pages);
 	if (ret)
 		goto err;
 
-	/* Apply write-protect — reuse cow_apply_writeprotect() */
+	/* Apply write-protect */
 	if (cow_apply_writeprotect(cdi))
 		goto err;
 
-	/* DO NOT start monitor thread — WP_ASYNC doesn't generate faults */
 	pr_info("COW ASYNC initialized for pid %d: tracked=%u pages=%lu uffd=%d\n",
-		item->pid->real, cdi->nr_tracked_vmas,
-		cdi->total_pages, cdi->uffd);
+		item->pid->real, cdi->nr_tracked_vmas, total_pages, cdi->uffd);
 	return 0;
 
 err:
@@ -875,6 +850,9 @@ static int cow_extend_tracked_vmas(unsigned long *ranges, unsigned int nr_ranges
 			       new_total * sizeof(*new_tracked));
 	BUG_ON(!new_tracked);
 
+	/* Update pointer immediately - xrealloc may have moved the buffer */
+	cdi->tracked_vmas = new_tracked;
+
 	/* Append new regions (ranges are [start, len] pairs) */
 	for (i = 0; i < nr_ranges; i++) {
 		unsigned long start = ranges[i * 2];
@@ -882,21 +860,17 @@ static int cow_extend_tracked_vmas(unsigned long *ranges, unsigned int nr_ranges
 
 		new_tracked[cdi->nr_tracked_vmas + i].start = start;
 		new_tracked[cdi->nr_tracked_vmas + i].end = start + len;
-		new_tracked[cdi->nr_tracked_vmas + i].is_new = true;
-		pr_info("Added new tracked VMA: 0x%lx-0x%lx (needs uffd registration)\n",
-			start, start + len);
+		pr_info("Added new tracked VMA: 0x%lx-0x%lx\n", start, start + len);
 
 		/* Also add to global_lazy_vmas for page transfer */
 		if (add_lazy_vma_for_new_region(start, len,
 						cdi->dst_id, cdi->source_pid)) {
 			pr_err("Failed to add lazy VMA for 0x%lx-0x%lx\n",
 			       start, start + len);
-			xfree(new_tracked);
-			return -1;
+			BUG();
 		}
 	}
 
-	cdi->tracked_vmas = new_tracked;
 	cdi->nr_tracked_vmas = new_total;
 	pr_info("Extended tracked_vmas: now %u total\n", new_total);
 
@@ -984,61 +958,6 @@ int cow_detect_new_vmas(struct vm_area_list *vmas,
 	return 0;
 }
 
-/*
- * cow_merge_dirty_ranges - Merge two range arrays into one
- *
- * @dirty_ranges: First array (dirty pages from PAGEMAP_SCAN)
- * @nr_dirty: Count of dirty ranges
- * @new_ranges: Second array (new VMAs)
- * @nr_new: Count of new ranges
- * @merged_ranges: Output merged array
- * @nr_merged: Output merged count
- *
- * Caller must xfree() the merged_ranges array.
- * The input arrays are NOT freed by this function.
- * Returns: 0 on success, -1 on error
- */
-int cow_merge_dirty_ranges(unsigned long *dirty_ranges, unsigned int nr_dirty,
-			   unsigned long *new_ranges, unsigned int nr_new,
-			   unsigned long **merged_ranges, unsigned int *nr_merged)
-{
-	unsigned long *merged;
-	unsigned int total = nr_dirty + nr_new;
-	unsigned int i;
-
-	*merged_ranges = NULL;
-	*nr_merged = 0;
-
-	if (total == 0)
-		return 0;
-
-	merged = xmalloc(total * 2 * sizeof(unsigned long));
-	BUG_ON(!merged);
-
-	/* Copy dirty ranges */
-	for (i = 0; i < nr_dirty; i++) {
-		merged[i * 2] = dirty_ranges[i * 2];
-		merged[i * 2 + 1] = dirty_ranges[i * 2 + 1];
-	}
-
-	/* Append new VMA ranges */
-	for (i = 0; i < nr_new; i++) {
-		merged[(nr_dirty + i) * 2] = new_ranges[i * 2];
-		merged[(nr_dirty + i) * 2 + 1] = new_ranges[i * 2 + 1];
-	}
-
-	*merged_ranges = merged;
-	*nr_merged = total;
-
-	pr_info("Merged %u dirty + %u new = %u total ranges\n",
-		nr_dirty, nr_new, total);
-	return 0;
-}
-
-
-
-
-
 /**
  * cow_cleanup_async_uffd - Close async uffd without unregistering VMAs
  *
@@ -1085,114 +1004,12 @@ void cow_cleanup_async_uffd(void)
 	}
 
 	if (cdi->uffd >= 0) {
-		pr_info("Closing async uffd fd=%d\n", cdi->uffd);
+		pr_info("Closing uffd fd=%d\n", cdi->uffd);
 		close(cdi->uffd);
 		cdi->uffd = -1;
-	}
-
-	/* Also close pre-created sync uffd if not used */
-	if (cdi->uffd_sync >= 0) {
-		pr_info("Closing unused sync uffd fd=%d\n", cdi->uffd_sync);
-		close(cdi->uffd_sync);
-		cdi->uffd_sync = -1;
 	}
 
 	cdi->phase = COW_PHASE_DONE;
 }
 
-/**
- * cow_dump_dirty_pages - Dump dirty pages directly while process is frozen
- * @dirty_ranges: Array of [start, len, start, len, ...] pairs
- * @nr_dirty_ranges: Number of ranges
- * @source_pid: PID of source process for process_vm_readv
- *
- * Reads dirty pages using process_vm_readv() and sends them using the
- * existing batch compression protocol. Called during Phase 3 freeze,
- * eliminating the need for WP_SYNC setup and convergence.
- *
- * Returns: 0 on success, -1 on error
- */
-int cow_dump_dirty_pages(unsigned long *dirty_ranges, unsigned int nr_dirty_ranges,
-			 pid_t source_pid)
-{
-	struct cow_dump_info *cdi = g_cow_info;
-	unsigned int i;
-	int sk;
-	u64 dst_id;
-	unsigned long total_pages_sent = 0;
-	struct timeval t_start, t_end, t_delta;
 
-	if (!cdi || nr_dirty_ranges == 0) {
-		pr_info("No dirty pages to dump\n");
-		return 0;
-	}
-
-	sk = get_page_server_sk();
-	if (sk < 0) {
-		pr_err("No page server socket for dirty page dump\n");
-		return -1;
-	}
-
-	dst_id = cdi->dst_id;
-
-	gettimeofday(&t_start, NULL);
-	pr_info("Dumping %u dirty ranges while frozen (pid=%d dst_id=%lu)\n",
-		nr_dirty_ranges, source_pid, (unsigned long)dst_id);
-
-	for (i = 0; i < nr_dirty_ranges; i++) {
-		unsigned long start = dirty_ranges[i * 2];
-		unsigned long len = dirty_ranges[i * 2 + 1];
-		unsigned long offset = 0;
-
-		while (offset < len) {
-			void *buffer;
-			struct iovec local_iov, remote_iov;
-			unsigned long remaining = len - offset;
-			int batch_pages = remaining / PAGE_SIZE;
-			unsigned long batch_addr = start + offset;
-			ssize_t ret;
-
-			if (batch_pages > COW_BATCH_PAGES)
-				batch_pages = COW_BATCH_PAGES;
-			if (batch_pages == 0)
-				break;
-
-			buffer = xmalloc(batch_pages * PAGE_SIZE);
-			BUG_ON(!buffer);
-
-			/* Read pages from source process */
-			local_iov.iov_base = buffer;
-			local_iov.iov_len = batch_pages * PAGE_SIZE;
-			remote_iov.iov_base = (void *)batch_addr;
-			remote_iov.iov_len = batch_pages * PAGE_SIZE;
-
-			ret = process_vm_readv(source_pid, &local_iov, 1, &remote_iov, 1, 0);
-			if (ret != (ssize_t)(batch_pages * PAGE_SIZE)) {
-				pr_perror("Failed to read dirty pages at 0x%lx (%d pages)",
-					  batch_addr, batch_pages);
-				xfree(buffer);
-				BUG();
-			}
-
-			/* Send compressed batch */
-			ret = send_pages_batch_compressed(sk, buffer, batch_pages,
-							  dst_id, batch_addr);
-			xfree(buffer);
-
-			if (ret < 0) {
-				pr_err("Failed to send dirty pages at 0x%lx\n", batch_addr);
-				return -1;
-			}
-
-			total_pages_sent += batch_pages;
-			offset += batch_pages * PAGE_SIZE;
-		}
-	}
-
-	gettimeofday(&t_end, NULL);
-	timersub(&t_end, &t_start, &t_delta);
-	pr_err("TIMING: cow_dump_dirty_pages sent %lu pages in %ld.%06ld seconds\n",
-	       total_pages_sent, t_delta.tv_sec, t_delta.tv_usec);
-
-	return 0;
-}

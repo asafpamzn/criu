@@ -188,8 +188,7 @@ struct cow_dump_info {
     pid_t source_pid;                    // Source process PID
     u64 dst_id;                         // Destination process ID
     int uffd;                           // Current userfaultfd
-    int uffd_async;                     // WP_ASYNC uffd for Phase 2
-    int uffd_sync;                      // Pre-created WP_SYNC uffd
+    int uffd_async;                     // WP_ASYNC uffd for Phase 2    
     unsigned long total_pages;
     unsigned int nr_tracked_vmas;
     struct cow_tracked_vma *tracked_vmas;
