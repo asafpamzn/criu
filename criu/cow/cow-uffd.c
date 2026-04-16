@@ -277,6 +277,7 @@ static int cow_uffd_copy_and_track(int uffd, unsigned long vaddr, void *data,
 		BUG();
 	}
 
+	return -1;  /* unreachable */
 }
 
 int cow_page_buffer_init(void)
@@ -689,7 +690,7 @@ static void drain_orphaned_pages_from_hash(void)
 				int idx = node->count - 1;
 				unsigned long vaddr = node->entries[idx].vaddr;
 				void *data = node->entries[idx].data;
-				int uffd;
+				int uffd, ret;
 				bool data_owned = false;
 
 				node->count--;
@@ -701,10 +702,10 @@ static void drain_orphaned_pages_from_hash(void)
 				uffd = cow_get_uffd_for_vaddr(drain_lpis, vaddr);
 				BUG_ON(uffd < 0);
 
-				int ret = cow_uffd_copy_and_track(uffd, vaddr, data, 1,
-								 NULL, drain_lpis,
-								 COW_TRACK_STRICT,
-								 "FALLBACK", &data_owned);
+				ret = cow_uffd_copy_and_track(uffd, vaddr, data, 1,
+							     NULL, drain_lpis,
+							     COW_TRACK_STRICT,
+							     "FALLBACK", &data_owned);
 				if (ret > 0)
 					drained++;
 				else
