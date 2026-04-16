@@ -199,14 +199,12 @@ struct cow_dump_info {
 struct cow_tracked_vma {
     unsigned long start;
     unsigned long end;
-    bool is_new;  // True if detected in Phase 3
 };
 
 enum cow_dump_phase {
     COW_PHASE_IDLE = 0,
     COW_PHASE_ASYNC_BULK,      // WP_ASYNC active, bulk transfer
     COW_PHASE_SCAN,            // Process frozen, scanning dirty pages
-    COW_PHASE_SYNC_CONVERGE,   // WP_SYNC on dirty pages, convergence
     COW_PHASE_DONE,
 };
 ```

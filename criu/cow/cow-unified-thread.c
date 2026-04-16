@@ -337,7 +337,6 @@ static int send_lazy_vma_page(int sk, unsigned long vaddr, u64 dst_id, pid_t sou
 {
 	void *buffer;
 	int ret;
-	int uffd;
 	struct iovec local_iov, remote_iov;
 	struct timespec t_start, t_readv, t_socket, t_unprot;
 
@@ -371,20 +370,6 @@ static int send_lazy_vma_page(int sk, unsigned long vaddr, u64 dst_id, pid_t sou
 	if (ret != 0) {
 		pr_perror("Failed to send page at 0x%lx", vaddr);
 		return -1;
-	}
-
-	if (cow_get_phase() == COW_PHASE_SYNC_CONVERGE) {
-		pr_debug("[SEND_PAGE unprotect] Sending non-COW page at vaddr=0x%lx pid=%d\n",
-			 vaddr, source_pid);
-		uffd = cow_get_uffd_for_pid(source_pid);
-		if (uffd >= 0) {
-			struct uffdio_writeprotect wp;
-			wp.range.start = vaddr;
-			wp.range.len = PAGE_SIZE;
-			wp.mode = 0;
-			if (ioctl(uffd, UFFDIO_WRITEPROTECT, &wp))
-				pr_perror("Failed to unprotect page at 0x%lx", vaddr);
-		}
 	}
 
 	clock_gettime(CLOCK_MONOTONIC, &t_unprot);

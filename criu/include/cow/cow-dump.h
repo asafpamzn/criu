@@ -25,7 +25,6 @@ enum cow_dump_phase {
 	COW_PHASE_IDLE = 0,
 	COW_PHASE_ASYNC_BULK,      /* WP_ASYNC active, bulk transfer in progress */
 	COW_PHASE_SCAN,            /* Process frozen, scanning dirty pages */
-	COW_PHASE_SYNC_CONVERGE,   /* WP_SYNC on dirty pages, convergence */
 	COW_PHASE_DONE,
 };
 
@@ -59,14 +58,6 @@ extern bool cow_check_kernel_support(void);
 
 
 
-
-/**
- * cow_get_uffd_for_pid - Get the userfaultfd for a tracked source pid
- * @source_pid: Source process pid from dump-time tree
- *
- * Returns: userfaultfd on success, -1 if not found
- */
-extern int cow_get_uffd_for_pid(pid_t source_pid);
 
 /**
  * cow_dump_is_vma_tracked - Check whether a VMA is COW-tracked

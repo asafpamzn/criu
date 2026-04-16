@@ -398,13 +398,6 @@ void cow_dump_fini(void)
 /*  Public query API                                                   */
 /* ------------------------------------------------------------------ */
 
-int cow_get_uffd_for_pid(pid_t source_pid)
-{
-	if (!g_cow_info || g_cow_info->source_pid != source_pid)
-		return -1;
-	return g_cow_info->uffd;
-}
-
 bool cow_dump_is_vma_tracked(pid_t source_pid, unsigned long start,
 			     unsigned long end)
 {
