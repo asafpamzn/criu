@@ -46,6 +46,7 @@ fi
 
 # Step 4: CRIU dump
 echo "Step 4: Starting CRIU dump for PID $PID..."
+START_TIME=$(date +%s%3N)
 
 sudo "$CRIU_BIN" dump \
   --tree "$PID" \
@@ -64,7 +65,6 @@ sudo "$CRIU_BIN" dump \
 # Step 5: Wait for replica master_link_status:up
 echo "Step 5: Waiting for replica master_link_status:up..."
 REPLICA_PORT="${REPLICA_PORT:-6379}"
-START_TIME=$(date +%s%3N)
 for i in $(seq 1 30); do
   STATUS=$($SSH ubuntu@$REPLICA_SSH_HOST "valkey-cli -p $REPLICA_PORT info replication 2>/dev/null | grep master_link_status" || true)
   if [[ "$STATUS" == *"master_link_status:up"* ]]; then
