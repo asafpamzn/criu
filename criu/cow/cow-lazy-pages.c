@@ -32,6 +32,7 @@
 #include "cow/unmapped-tracker.h"
 #include "rst_info.h"
 #include "cow/cow-lazy-pages.h"
+#include "common/bug.h"
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "cow-lazy: "
@@ -78,10 +79,7 @@ static int discover_tasks_from_pagemaps(void)
 			continue;
 
 		ct = xmalloc(sizeof(*ct));
-		if (!ct) {
-			closedir(dir);
-			return -1;
-		}
+		BUG_ON(!ct);
 
 		ct->pid = pid;
 		list_add_tail(&ct->l, &cow_tasks);
@@ -132,7 +130,7 @@ int cr_lazy_pages_cow_phase2(bool daemon)
 	int ret = -1;
 	int nr_fds;
 
-	pr_err("=== REPLICA PHASE 2: Page buffering mode ===\n");
+	pr_info("=== REPLICA PHASE 2: Page buffering mode ===\n");
 
 	/* 1. Discover tasks from pagemap files */
 	if (discover_tasks_from_pagemaps())
@@ -144,20 +142,14 @@ int cr_lazy_pages_cow_phase2(bool daemon)
 		goto err_tasks;
 	}
 
-	/* Initialize page state tracker for debugging */
-	if (page_state_init()) {
-		pr_warn("Failed to initialize page state tracker (non-fatal)\n");
-	}
+	/* Initialize page state tracker */
+	BUG_ON(page_state_init());
 
-	/* Initialize hung page tracker for debugging */
-	if (pf_tracker_init()) {
-		pr_warn("Failed to init hung page tracker (non-fatal)\n");
-	}
+	/* Initialize hung page tracker */
+	BUG_ON(pf_tracker_init());
 
 	/* Initialize unmapped pages tracker */
-	if (unmapped_tracker_init()) {
-		pr_warn("Failed to init unmapped tracker (non-fatal)\n");
-	}
+	BUG_ON(unmapped_tracker_init());
 
 	/* 3. Daemonize if requested */
 	if (daemon) {
@@ -266,23 +258,16 @@ int cr_lazy_pages_cow_phase2(bool daemon)
 	ret = cow_phase3_restore_loop(epollfd, &events, nr_fds);
 	if (ret < 0)
 		pr_err("Phase 3 restore loop failed\n");
-	pr_warn("file = %s, line = %d\n",__FILE__, __LINE__);
-	sleep(30000);//TODO REMOVE
+
 err_disconnect:
-	/* Print page state statistics and cleanup */
 	stop_p3_receiver_connections();
-	pr_warn("file = %s, line = %d\n",__FILE__, __LINE__);
 	pf_tracker_destroy();
-	pr_warn("file = %s, line = %d\n",__FILE__, __LINE__);
-	/* Verify all pages reached terminal states before cleanup */
 	page_state_verify_all_terminal();
 	page_state_destroy();
-	/* Note: page server already closed after all_pages_sent ACK */
 err_epoll:
 	xfree(events);
 err_tasks:
 	free_cow_tasks();
-	pr_warn("file = %s, line = %d\n",__FILE__, __LINE__);
 	return ret;
 }
 
@@ -318,8 +303,7 @@ int cow_phase2_handle_pages(int epollfd, struct epoll_event *events, int nr_fds)
 		/* All pages sent signals Phase 4 is complete */
 		if (cow_is_all_pages_sent_received()) {
 			pr_err("=== REPLICA: All phases complete, ready for restore ===\n");
-			if (send_all_pages_sent_ack() < 0)
-				pr_warn("Failed to send all_pages_sent ACK\n");
+			BUG_ON(send_all_pages_sent_ack() < 0);
 			/* Clean up async bulk reader before socket is closed */
 			page_server_cleanup_async_bulk();
 			return 0;
