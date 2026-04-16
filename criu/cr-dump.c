@@ -2924,6 +2924,9 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 		       t_delta.tv_sec, t_delta.tv_usec);
 	}
 
+	/* Set phase to SCAN so cow_is_phased_skeleton_dump() returns true */
+	cow_set_phase(COW_PHASE_SCAN);
+
 	/* Dump skeleton (everything except pages) */
 	{
 		struct timeval t_start, t_end, t_delta, t_elapsed;
