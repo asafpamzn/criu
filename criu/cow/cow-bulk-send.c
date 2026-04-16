@@ -61,12 +61,6 @@ struct p3_thread_ctx {
 	unsigned long pages_sent;
 	volatile bool active;
 	volatile bool error;  /* Set if thread encountered an error */
-
-	/* Dirty scan state (for iterative convergence) */
-	int pagemap_fd;                  /* Per-thread /proc/<pid>/pagemap fd */
-	unsigned long last_dirty_count;  /* Dirty pages found in last scan */
-	volatile bool below_threshold;   /* True when last_dirty_count < threshold */
-	unsigned int iteration;          /* 0=bulk, 1+=dirty scan */
 };
 
 static struct p3_thread_ctx p3_threads[COW_NUM_P3_THREADS];
@@ -87,8 +81,6 @@ static unsigned int g_nr_new_vma_ranges = 0;
  * Each scanner handles half of each VMA and distributes to half the queues.
  *   Scanner 0: first half of each VMA  → queues 0-9
  *   Scanner 1: second half of each VMA → queues 10-19
- *
- * COW_NUM_SCANNERS and COW_NUM_P3_THREADS are now COW_NUM_SCANNERS and COW_NUM_P3_THREADS in cow-conf.h
  */
 #define QUEUES_PER_SCANNER (COW_NUM_P3_THREADS / COW_NUM_SCANNERS)
 
@@ -103,7 +95,6 @@ struct scanner_ctx {
 	pthread_t thread;
 	int pagemap_fd;
 	unsigned long dirty_count; /* Dirty pages found in current iteration */
-	volatile bool iter_done;   /* Set when iteration complete */
 	volatile bool finished;    /* Set when scanner thread exits */
 };
 static struct scanner_ctx scanners[COW_NUM_SCANNERS];
@@ -138,8 +129,7 @@ int cow_init_sender_queues(void)
 
 struct sender_queue *cow_get_sender_queue(int thread_id)
 {
-	if (thread_id < 0 || thread_id >= COW_NUM_P3_THREADS)
-		return NULL;
+	BUG_ON(thread_id < 0 || thread_id >= COW_NUM_P3_THREADS);
 	return &sender_queues[thread_id];
 }
 
@@ -504,7 +494,6 @@ int cow_start_scanner_thread(pid_t source_pid)
 		scanners[i].id = i;
 		scanners[i].pagemap_fd = -1;
 		scanners[i].dirty_count = 0;
-		scanners[i].iter_done = false;
 		scanners[i].finished = false;
 
 		if (pthread_create(&scanners[i].thread, NULL,
@@ -865,14 +854,6 @@ static void *p3_bulk_sender_thread(void *arg)
 	       thread_id, ctx->socket, (unsigned long)ctx->dst_id);
 	clock_gettime(CLOCK_MONOTONIC, &t_start);
 
-	/* No longer need pagemap fd - scanner thread handles PAGEMAP_SCAN */
-	ctx->pagemap_fd = -1;
-
-	/* Initialize state */
-	ctx->iteration = 0;
-	ctx->last_dirty_count = 0;
-	ctx->below_threshold = false;
-
 	lazy_vmas = get_global_lazy_vmas();
 
 	/* === Iteration 0: Bulk transfer === */
@@ -1017,13 +998,9 @@ static void *p3_bulk_sender_thread(void *arg)
 		}
 		pr_err("P3[%d] TIMING: Queue consumption done: %lu regions, %lu pages in %ld ms\n",
 		       thread_id, regions_processed, loop_total_pages, loop_elapsed_ms);
-
-		/* Mark as below threshold for compatibility */
-		ctx->below_threshold = true;
 	}
 
 	/* === Final: Send pages from new VMAs detected in Phase 3 === */
-	ctx->iteration++;
 	{
 		struct timespec fs_start, fs_end;
 		long fs_elapsed_ms;
@@ -1049,8 +1026,8 @@ out:
 		long elapsed_ms = (t_end.tv_sec - t_start.tv_sec) * 1000 +
 				  (t_end.tv_nsec - t_start.tv_nsec) / 1000000;
 
-		pr_err("P3[%d] done: %lu pages, %u iterations, %ld ms\n",
-		       thread_id, ctx->pages_sent, ctx->iteration, elapsed_ms);
+		pr_err("P3[%d] done: %lu pages, %ld ms\n",
+		       thread_id, ctx->pages_sent, elapsed_ms);
 	}
 
 	ctx->active = false;
@@ -1102,11 +1079,6 @@ int cow_start_p3_threads(int *sockets, int num_sockets, u64 dst_id, pid_t source
 		p3_threads[i].active = true;
 		p3_threads[i].error = false;
 		p3_threads[i].thread = 0;
-		/* Initialize dirty scan state */
-		p3_threads[i].pagemap_fd = -1;
-		p3_threads[i].last_dirty_count = 0;
-		p3_threads[i].below_threshold = false;
-		p3_threads[i].iteration = 0;
 		__sync_fetch_and_add(&p3_threads_active, 1);
 
 		if (pthread_create(&p3_threads[i].thread, NULL,
