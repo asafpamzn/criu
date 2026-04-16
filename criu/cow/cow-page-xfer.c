@@ -10,7 +10,6 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <string.h>
-#include <time.h>
 #include <lz4.h>
 
 #include "cow/cow-page-xfer.h"
@@ -79,18 +78,11 @@ int wait_for_inventory_ready_ack(int sk)
 {
 	struct page_server_iov pi;
 
-	pr_err("Waiting for inventory_ready ACK from replica...\n");
-	if (page_server_recv(sk, &pi, sizeof(pi), MSG_WAITALL) != sizeof(pi)) {
-		pr_perror("Failed to receive inventory_ready ACK");
-		return -1;
-	}
+	pr_info("Waiting for inventory_ready ACK from replica...\n");
+	BUG_ON(page_server_recv(sk, &pi, sizeof(pi), MSG_WAITALL) != sizeof(pi));
+	BUG_ON(decode_ps_cmd(pi.cmd) != PS_IOV_INVENTORY_READY_ACK);
 
-	if (decode_ps_cmd(pi.cmd) != PS_IOV_INVENTORY_READY_ACK) {
-		pr_err("Expected inventory_ready ACK, got cmd=%u\n", decode_ps_cmd(pi.cmd));
-		return -1;
-	}
-
-	pr_err("Received inventory_ready ACK from replica\n");
+	pr_info("Received inventory_ready ACK from replica\n");
 	set_inventory_ready_ack_received();
 	return 0;
 }
@@ -109,12 +101,9 @@ int send_inventory_ready_ack(void)
 	};
 	int sk = get_page_server_sk();
 
-	if (sk < 0) {
-		pr_err("No page server socket for inventory_ready ACK\n");
-		return -1;
-	}
+	BUG_ON(sk < 0);
 
-	pr_err("Sending inventory_ready ACK to primary (sk=%d)\n", sk);
+	pr_info("Sending inventory_ready ACK to primary\n");
 	return send_psi(sk, &pi);
 }
 
@@ -128,15 +117,8 @@ int wait_for_all_pages_sent_ack(int sk)
 	struct page_server_iov pi;
 
 	pr_info("Waiting for all_pages_sent ACK from replica...\n");
-	if (page_server_recv(sk, &pi, sizeof(pi), MSG_WAITALL) != sizeof(pi)) {
-		pr_perror("Failed to receive all_pages_sent ACK");
-		return -1;
-	}
-
-	if (decode_ps_cmd(pi.cmd) != PS_IOV_ALL_PAGES_SENT_ACK) {
-		pr_err("Expected all_pages_sent ACK, got cmd=%u\n", decode_ps_cmd(pi.cmd));
-		return -1;
-	}
+	BUG_ON(page_server_recv(sk, &pi, sizeof(pi), MSG_WAITALL) != sizeof(pi));
+	BUG_ON(decode_ps_cmd(pi.cmd) != PS_IOV_ALL_PAGES_SENT_ACK);
 
 	pr_info("Received all_pages_sent ACK from replica\n");
 	set_all_pages_sent_ack_received();
@@ -160,12 +142,9 @@ int send_all_pages_sent_signal(int sk)
 	};
 	int use_sk = (sk >= 0) ? sk : get_page_server_sk();
 
-	if (use_sk < 0) {
-		pr_err("No page server socket for all_pages_sent signal\n");
-		return -1;
-	}
+	BUG_ON(use_sk < 0);
 
-	pr_info("Sending all_pages_sent signal to replica (sk=%d)\n", use_sk);
+	pr_info("Sending all_pages_sent signal to replica\n");
 	return send_psi(use_sk, &pi);
 }
 
@@ -184,12 +163,9 @@ int send_all_pages_sent_ack(void)
 	};
 	int sk = get_page_server_sk();
 
-	if (sk < 0) {
-		pr_err("No page server socket for all_pages_sent ACK\n");
-		return -1;
-	}
+	BUG_ON(sk < 0);
 
-	pr_info("Sending all_pages_sent ACK to primary (sk=%d)\n", sk);
+	pr_info("Sending all_pages_sent ACK to primary\n");
 	return send_psi(sk, &pi);
 }
 
@@ -208,17 +184,10 @@ int send_inventory_ready_signal(void)
 	};
 	int sk = get_page_server_sk();
 
+	BUG_ON(sk < 0);
+
 	pr_info("Sending inventory ready signal to replica\n");
-
-	if (sk < 0) {
-		pr_err("Page server not connected, cannot send inventory ready signal\n");
-		return -1;
-	}
-
-	if (send_psi(sk, &pi)) {
-		pr_err("Failed to send inventory ready signal\n");
-		return -1;
-	}
+	BUG_ON(send_psi(sk, &pi));
 
 	return 0;
 }
@@ -242,18 +211,11 @@ int send_page_compressed(int sk, const void *data, u64 dst_id, unsigned long vad
 	/* 1. Compress directly into send buffer (no memcpy!) */
 	*compressed_size = LZ4_compress_default(data, compressed_data, PAGE_SIZE,
 						LZ4_compressBound(PAGE_SIZE));
-	if (*compressed_size <= 0) {
-		pr_err("LZ4 compression failed for page at %lx\n", vaddr);
-		return -1;
-	}
+	BUG_ON(*compressed_size <= 0);
 
 	/* Track compression statistics */
 	g_compress_uncompressed_bytes += PAGE_SIZE;
 	g_compress_compressed_bytes += *compressed_size;
-
-	pr_debug("Compressed page at %lx: %lu -> %d bytes (%.1f%%)\n",
-		 vaddr, PAGE_SIZE, *compressed_size,
-		 (float)(*compressed_size) * 100 / PAGE_SIZE);
 
 	/* 2. Fill in header (after compression so we know it succeeded) */
 	pi->cmd = encode_ps_cmd(PS_IOV_ADD_F_COMPRESS, PE_PRESENT);
@@ -264,10 +226,7 @@ int send_page_compressed(int sk, const void *data, u64 dst_id, unsigned long vad
 	/* 3. Single send: header + size + compressed data */
 	total_len = sizeof(*pi) + sizeof(int) + *compressed_size;
 	ret = page_server_send(sk, send_buf, total_len, 0);
-	if (ret != total_len) {
-		pr_perror("Failed to send compressed page (sent %d/%d)", ret, total_len);
-		return -1;
-	}
+	BUG_ON(ret != total_len);
 
 	return 0;
 }
@@ -289,62 +248,9 @@ int send_page_uncompressed(int sk, const void *data, u64 dst_id, unsigned long v
 
 	total_len = sizeof(*pi) + PAGE_SIZE;
 	ret = page_server_send(sk, send_buf, total_len, 0);
-	if (ret != total_len) {
-		pr_perror("Failed to send page (sent %d/%d)", ret, total_len);
-		return -1;
-	}
+	BUG_ON(ret != total_len);
 
 	return 0;
-}
-
-/*
- * Statistics tracking for COW page server (debug/monitoring).
- */
-static struct {
-	unsigned long serve_open;
-	unsigned long serve_open2;
-	unsigned long serve_parent;
-	unsigned long serve_add_f;
-	unsigned long serve_add;
-	unsigned long serve_hole;
-	unsigned long serve_close;
-	unsigned long serve_force_close;
-	unsigned long serve_get;
-	unsigned long serve_unknown;
-	time_t last_print_time;
-} cow_ps_stats = {0};
-
-void cow_ps_stats_inc_open(void) { cow_ps_stats.serve_open++; }
-void cow_ps_stats_inc_open2(void) { cow_ps_stats.serve_open2++; }
-void cow_ps_stats_inc_parent(void) { cow_ps_stats.serve_parent++; }
-void cow_ps_stats_inc_add_f(void) { cow_ps_stats.serve_add_f++; }
-void cow_ps_stats_inc_add(void) { cow_ps_stats.serve_add++; }
-void cow_ps_stats_inc_hole(void) { cow_ps_stats.serve_hole++; }
-void cow_ps_stats_inc_close(void) { cow_ps_stats.serve_close++; }
-void cow_ps_stats_inc_force_close(void) { cow_ps_stats.serve_force_close++; }
-void cow_ps_stats_inc_get(void) { cow_ps_stats.serve_get++; }
-void cow_ps_stats_inc_unknown(void) { cow_ps_stats.serve_unknown++; }
-
-void cow_check_and_print_stats(void)
-{
-	time_t now = time(NULL);
-
-	if (now - cow_ps_stats.last_print_time >= 60) {
-		pr_err("[PAGE_SERVER_STATS] serve: open=%lu open2=%lu parent=%lu add_f=%lu add=%lu hole=%lu get=%lu close=%lu unknown=%lu\n",
-			cow_ps_stats.serve_open,
-			cow_ps_stats.serve_open2,
-			cow_ps_stats.serve_parent,
-			cow_ps_stats.serve_add_f,
-			cow_ps_stats.serve_add,
-			cow_ps_stats.serve_hole,
-			cow_ps_stats.serve_get,
-			cow_ps_stats.serve_close + cow_ps_stats.serve_force_close,
-			cow_ps_stats.serve_unknown);
-
-		/* Reset all counters */
-		memset(&cow_ps_stats, 0, sizeof(cow_ps_stats));
-		cow_ps_stats.last_print_time = now;
-	}
 }
 
 /*
@@ -361,9 +267,7 @@ int cow_request_all_remote_pages(unsigned long img_id)
 	};
 
 	pr_info("Requesting all pages for img_id=%lu in batch mode\n", img_id);
-
-	if (send_psi(get_page_server_sk(), &pi))
-		return -1;
+	BUG_ON(send_psi(get_page_server_sk(), &pi));
 
 	page_server_tcp_nodelay(get_page_server_sk(), true);
 	return 0;
@@ -377,7 +281,6 @@ void cow_close_page_server_socket(void)
 {
 	int sk = get_page_server_sk();
 
-	pr_debug("DEBUG_SOCKET: cow_close_page_server_socket called fd=%d\n", sk);
 	if (sk >= 0)
 		pr_info("Closing page server socket (server-side)\n");
 	/* Also close the listen socket to release the port */
@@ -431,10 +334,7 @@ int cow_write_lazy_vmas_before(struct page_xfer *xfer, unsigned long before_vadd
 			(unsigned long)lve->start, (unsigned long)lve->end,
 			(unsigned long)(iov.iov_len / PAGE_SIZE));
 
-		if (xfer->write_pagemap(xfer, &iov, flags)) {
-			pr_err("Failed to write pagemap for lazy VMA\n");
-			return -1;
-		}
+		BUG_ON(xfer->write_pagemap(xfer, &iov, flags));
 
 		lve = list_entry(lve->list.next, struct lazy_vma_entry, list);
 	}
@@ -490,7 +390,7 @@ int cow_handle_protocol_cmd(u32 cmd, struct page_server_iov *pi, int sk,
 		 * Replica acknowledges inventory_ready signal received.
 		 * Primary can now close the socket.
 		 */
-		pr_err("Received inventory_ready ACK from replica\n");
+		pr_info("Received inventory_ready ACK from replica\n");
 		set_inventory_ready_ack_received();
 		*ret_val = 0;
 		*flushed = true;
@@ -521,44 +421,22 @@ int cow_receive_compressed_pages(int sk, struct page_server_iov *pi,
 		int decomp_ret;
 
 		/* Receive compressed size */
-		if (page_server_recv(sk, &compressed_size, sizeof(compressed_size),
-				     MSG_WAITALL) != sizeof(compressed_size)) {
-			pr_perror("Failed to receive compressed size");
-			return -1;
-		}
-
-		if (compressed_size <= 0 || compressed_size > LZ4_compressBound(PAGE_SIZE)) {
-			pr_err("Invalid compressed size: %d\n", compressed_size);
-			return -1;
-		}
+		BUG_ON(page_server_recv(sk, &compressed_size, sizeof(compressed_size),
+					MSG_WAITALL) != sizeof(compressed_size));
+		BUG_ON(compressed_size <= 0 || compressed_size > LZ4_compressBound(PAGE_SIZE));
 
 		/* Receive compressed data */
-		if (page_server_recv(sk, compressed_buf, compressed_size,
-				     MSG_WAITALL) != compressed_size) {
-			pr_perror("Failed to receive compressed data");
-			return -1;
-		}
+		BUG_ON(page_server_recv(sk, compressed_buf, compressed_size,
+					MSG_WAITALL) != compressed_size);
 
 		/* Decompress */
 		decomp_ret = LZ4_decompress_safe(compressed_buf, decompressed,
 						 compressed_size, PAGE_SIZE);
-		if (decomp_ret != PAGE_SIZE) {
-			pr_err("LZ4 decompression failed: expected %lu, got %d\n",
-			       PAGE_SIZE, decomp_ret);
-			return -1;
-		}
-
-		pr_debug("Decompressed page: %d -> %lu bytes\n",
-			 compressed_size, PAGE_SIZE);
+		BUG_ON(decomp_ret != PAGE_SIZE);
 
 		/* Write decompressed page data to pipe and then to image */
-		if (write(write_fd, decompressed, PAGE_SIZE) != PAGE_SIZE) {
-			pr_perror("Failed to write decompressed page to pipe");
-			return -1;
-		}
-
-		if (lxfer->write_pages(lxfer, read_fd, PAGE_SIZE))
-			return -1;
+		BUG_ON(write(write_fd, decompressed, PAGE_SIZE) != PAGE_SIZE);
+		BUG_ON(lxfer->write_pages(lxfer, read_fd, PAGE_SIZE));
 
 		pages_left--;
 	}

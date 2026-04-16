@@ -1155,8 +1155,6 @@ static int prep_loc_xfer(struct page_server_iov *pi)
 		return 0;
 }
 
-/* Statistics tracking is in cow-page-xfer.c (cow_check_and_print_stats) */
-
 static int page_server_add(int sk, struct page_server_iov *pi, u32 flags, bool compressed)
 {
 	size_t len;
@@ -1338,24 +1336,14 @@ static int page_server_serve(int sk)
 		flushed = false;
 		cmd = decode_ps_cmd(pi.cmd);
 
-		/* Check and print stats on each iteration (COW mode only) */
-		if (opts.cow_dump)
-			cow_check_and_print_stats();
-
 		switch (cmd) {
 		case PS_IOV_OPEN:
-			if (opts.cow_dump)
-				cow_ps_stats_inc_open();
 			ret = page_server_open(-1, &pi);
 			break;
 		case PS_IOV_OPEN2:
-			if (opts.cow_dump)
-				cow_ps_stats_inc_open2();
 			ret = page_server_open(sk, &pi);
 			break;
 		case PS_IOV_PARENT:
-			if (opts.cow_dump)
-				cow_ps_stats_inc_parent();
 			ret = page_server_check_parent(sk, &pi);
 			break;
 		case PS_IOV_ADD_F_COMPRESS:
@@ -1372,16 +1360,10 @@ static int page_server_serve(int sk)
 			}
 			if (likely(cmd == PS_IOV_ADD_F || cmd == PS_IOV_ADD_F_COMPRESS)) {
 				flags = decode_ps_flags(pi.cmd);
-				if (opts.cow_dump)
-					cow_ps_stats_inc_add_f();
 			} else if (cmd == PS_IOV_ADD) {
 				flags = PE_PRESENT;
-				if (opts.cow_dump)
-					cow_ps_stats_inc_add();
 			} else /* PS_IOV_HOLE */ {
 				flags = PE_PARENT;
-				if (opts.cow_dump)
-					cow_ps_stats_inc_hole();
 			}
 
 			ret = page_server_add(sk, &pi, flags, cmd == PS_IOV_ADD_F_COMPRESS);
@@ -1392,13 +1374,6 @@ static int page_server_serve(int sk)
 			int32_t status = 0;
 
 			ret = 0;
-
-			if (opts.cow_dump) {
-				if (cmd == PS_IOV_CLOSE)
-					cow_ps_stats_inc_close();
-				else
-					cow_ps_stats_inc_force_close();
-			}
 
 			/*
 			 * An answer must be sent back to inform another side,
@@ -1414,8 +1389,6 @@ static int page_server_serve(int sk)
 			break;
 		}
 		case PS_IOV_GET:
-			if (opts.cow_dump)
-				cow_ps_stats_inc_get();
 			ret = page_server_get_pages(sk, &pi);
 			break;
 		case PS_IOV_GET_ALL:
@@ -1437,8 +1410,6 @@ static int page_server_serve(int sk)
 			break;
 		default:
 			pr_err("Unknown command %u\n", pi.cmd);
-			if (opts.cow_dump)
-				cow_ps_stats_inc_unknown();
 			ret = -1;
 			break;
 		}
