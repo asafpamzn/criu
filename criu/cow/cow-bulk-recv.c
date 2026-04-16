@@ -24,6 +24,7 @@
 #include "cow/cow-bulk-recv.h"
 #include "cow/cow-uffd.h"
 #include "uffd.h"
+#include "common/bug.h"
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "cow-bulk-recv: "
@@ -40,7 +41,6 @@
 struct ps_async_read_bulk {
 	unsigned long rb;      /* Bytes read */
 	unsigned long goal;    /* Total bytes expected */
-	unsigned long nr_pages;
 
 	struct page_server_iov pi;
 	void *pages;
@@ -55,12 +55,6 @@ struct ps_async_read_bulk {
 	int compressed_rb;       /* Bytes read of compressed data */
 	char *compressed_buf;    /* Buffer for compressed data */
 	int compress_state;      /* enum compress_read_state */
-
-	/* Dirty bitmap support (COW phased migration) */
-	unsigned int nr_dirty_ranges;
-	unsigned long dirty_ranges_size;
-	unsigned long *dirty_ranges;
-	unsigned long dirty_rb;
 };
 
 static LIST_HEAD(bulk_async_reads);
@@ -257,10 +251,7 @@ static int read_compressed_size(struct ps_async_read_bulk *ar, int flags)
 	}
 
 	ar->compressed_buf = xmalloc(ar->compressed_size);
-	if (!ar->compressed_buf) {
-		pr_err("Failed to allocate compressed buffer\n");
-		return -1;
-	}
+	BUG_ON(!ar->compressed_buf);
 
 	ar->compressed_rb = 0;
 	ar->compress_state = COMPRESS_STATE_READING_COMPRESSED;
@@ -301,13 +292,7 @@ static int read_compressed_data(struct ps_async_read_bulk *ar, int flags)
 		/* Allocate buffer for batch decompression */
 		if (ar->pi.nr_pages > 1) {
 			decomp_buf = xmalloc(expected_size);
-			if (!decomp_buf) {
-				pr_err("Failed to allocate decompression buffer for %lu pages\n",
-				       (unsigned long)ar->pi.nr_pages);
-				xfree(ar->compressed_buf);
-				ar->compressed_buf = NULL;
-				return -1;
-			}
+			BUG_ON(!decomp_buf);
 		} else {
 			decomp_buf = ar->pages;  /* Single page - use existing buffer */
 		}
@@ -405,8 +390,8 @@ static int read_uncompressed_data(struct ps_async_read_bulk *ar, int flags)
  */
 static int page_server_read_bulk_stream(struct ps_async_read_bulk *ar, int flags)
 {
-	pr_debug("bulk_stream: state=%d rb=%lu dirty_rb=%lu flags=%d\n",
-		ar->compress_state, ar->rb, ar->dirty_rb, flags);
+	pr_debug("bulk_stream: state=%d rb=%lu flags=%d\n",
+		ar->compress_state, ar->rb, flags);
 
 	switch (ar->compress_state) {
 	case COMPRESS_STATE_READING_HEADER:
@@ -423,7 +408,7 @@ static int page_server_read_bulk_stream(struct ps_async_read_bulk *ar, int flags
 
 	default:
 		pr_err("Invalid bulk stream state: %d\n", ar->compress_state);
-		return -1;
+		BUG();
 	}
 }
 
@@ -463,7 +448,7 @@ int page_server_async_read_bulk(struct epoll_rfd *f)
 		if (opts.cow_dump && page_server_bulk_stream_done())
 			return 0;
 		pr_err("Bulk async read with empty queue\n");
-		return -1;
+		BUG();
 	}
 
 	ar = list_first_entry(&bulk_async_reads, struct ps_async_read_bulk, l);
@@ -500,13 +485,11 @@ int page_server_start_async_read_bulk(void *buf, unsigned long nr_pages,
 		return 0;
 
 	ar = xmalloc(sizeof(*ar));
-	if (ar == NULL)
-		return -1;
+	BUG_ON(!ar);
 
 	ar->pages = buf;
 	ar->rb = 0;
 	ar->goal = 0; /* Will be set when header arrives */
-	ar->nr_pages = nr_pages; /* Max buffer size */
 	ar->complete = complete;
 	ar->priv = priv;
 
@@ -515,12 +498,6 @@ int page_server_start_async_read_bulk(void *buf, unsigned long nr_pages,
 	ar->compressed_size = 0;
 	ar->compressed_rb = 0;
 	ar->compressed_buf = NULL;
-
-	/* Initialize dirty bitmap state */
-	ar->nr_dirty_ranges = 0;
-	ar->dirty_ranges_size = 0;
-	ar->dirty_ranges = NULL;
-	ar->dirty_rb = 0;
 
 	list_add_tail(&ar->l, &bulk_async_reads);
 	return 0;
@@ -534,10 +511,7 @@ int page_server_update_async_callback(ps_async_read_complete complete, void *pri
 {
 	struct ps_async_read_bulk *ar;
 
-	if (list_empty(&bulk_async_reads)) {
-		pr_err("bulk_async_reads is empty, cannot update callback\n");
-		return -1;
-	}
+	BUG_ON(list_empty(&bulk_async_reads));
 
 	ar = list_first_entry(&bulk_async_reads, struct ps_async_read_bulk, l);
 	ar->complete = complete;
@@ -557,8 +531,6 @@ void page_server_cleanup_async_bulk(void)
 		list_del(&ar->l);
 		if (ar->compressed_buf)
 			xfree(ar->compressed_buf);
-		if (ar->dirty_ranges)
-			xfree(ar->dirty_ranges);
 		xfree(ar);
 	}
 	pr_debug("Cleaned up async bulk reader state\n");
