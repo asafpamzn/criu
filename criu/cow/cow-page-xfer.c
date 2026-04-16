@@ -352,8 +352,7 @@ int cow_handle_protocol_cmd(u32 cmd, struct page_server_iov *pi, int sk,
 			    int *ret_val, bool *flushed, bool *bulk_ack)
 {
 	switch (cmd) {
-	case PS_IOV_GET_ALL:
-		cow_ps_stats_inc_get();
+	case PS_IOV_GET_ALL:		
 		*ret_val = cow_page_server_get_all_pages(sk, pi->dst_id);
 		return 0;
 
