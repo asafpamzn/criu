@@ -46,7 +46,7 @@
 struct chunk_header {
 	atomic_int refcount;      /* Pages still in use */
 	atomic_int max_allocated; /* High-water mark of pages allocated */
-	int chunk_idx;            /* Index in all_chunks array (-1 if untracked) */
+	int chunk_idx;            /* Index in all_chunks array */
 	void *base;               /* Self-pointer for validation */
 };
 
@@ -83,7 +83,7 @@ static void *alloc_chunk(void)
 		   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	if (raw == MAP_FAILED) {
 		pr_perror("Failed to mmap 256MB chunk");
-		return NULL;
+		BUG();
 	}
 
 	/* Align to 256MB boundary */
@@ -128,9 +128,12 @@ static void *alloc_chunk(void)
 			}
 		}
 		if (reused_slot < 0) {
-			/* No NULL slots available - chunk will be untracked */
+			/* No NULL slots available - untracked chunks not supported */
+			pthread_spin_unlock(&chunk_list_lock);
 			pr_err("PAGE_POOL: Hit limit (%d) with no free slots\n",
 			       COW_MAX_POOL_CHUNKS);
+			munmap(chunk, COW_CHUNK_SIZE);
+			BUG();
 		}
 	}
 	pthread_spin_unlock(&chunk_list_lock);
@@ -144,10 +147,6 @@ static void *alloc_chunk(void)
 int page_pool_thread_init(int thread_id)
 {
 	BUG_ON(thread_id < 0 || thread_id >= COW_MAX_THREADS);
-	if (thread_id < 0 || thread_id >= COW_MAX_THREADS) {
-		pr_err("Invalid thread_id %d (max %d)\n", thread_id, COW_MAX_THREADS);
-		return -1;
-	}
 
 	if (pools[thread_id].initialized)
 		return 0;
@@ -159,9 +158,6 @@ int page_pool_thread_init(int thread_id)
 	}
 
 	pools[thread_id].current_chunk = alloc_chunk();
-	if (!pools[thread_id].current_chunk)
-		return -1;
-
 	pools[thread_id].next_page = 1;  /* Skip header page */
 	pools[thread_id].initialized = true;
 
@@ -174,19 +170,15 @@ void *page_pool_get(int thread_id)
 	struct thread_pool *pool;
 	void *page;
 
-	if (thread_id < 0 || thread_id >= COW_MAX_THREADS)
-		return NULL;
+	BUG_ON(thread_id < 0 || thread_id >= COW_MAX_THREADS);
 
 	pool = &pools[thread_id];
 
-	if (!pool->initialized)
-		return NULL;
+	BUG_ON(!pool->initialized);
 
 	/* Need new chunk? */
 	if (pool->next_page >= COW_PAGES_PER_CHUNK) {
 		pool->current_chunk = alloc_chunk();
-		if (!pool->current_chunk)
-			return NULL;
 		pool->next_page = 1;  /* Skip header */
 	}
 
@@ -211,19 +203,15 @@ void *page_pool_get_chunk(int thread_id, int *out_nr_pages)
 	struct thread_pool *pool;
 	void *batch_start;
 
-	if (thread_id < 0 || thread_id >= COW_MAX_THREADS)
-		return NULL;
+	BUG_ON(thread_id < 0 || thread_id >= COW_MAX_THREADS);
 
 	pool = &pools[thread_id];
 
-	if (!pool->initialized)
-		return NULL;
+	BUG_ON(!pool->initialized);
 
 	/* Need new chunk if not enough pages left for a batch */
 	if (pool->next_page + COW_ALLOC_BATCH > COW_PAGES_PER_CHUNK) {
 		pool->current_chunk = alloc_chunk();
-		if (!pool->current_chunk)
-			return NULL;
 		pool->next_page = 1;  /* Skip header page */
 	}
 
@@ -257,7 +245,6 @@ void *page_pool_get_chunk(int thread_id, int *out_nr_pages)
  * More efficient than page_pool_get_chunk() when exact count is known,
  * as it doesn't waste pages that would need to be freed immediately.
  *
- * Returns pointer to first page of the allocation, or NULL on failure.
  * Each page must be freed individually with page_pool_put().
  */
 void *page_pool_get_pages(int thread_id, int nr_pages)
@@ -265,22 +252,16 @@ void *page_pool_get_pages(int thread_id, int nr_pages)
 	struct thread_pool *pool;
 	void *pages_start;
 
-	if (thread_id < 0 || thread_id >= COW_MAX_THREADS)
-		return NULL;
-
-	if (nr_pages <= 0 || nr_pages > COW_PAGES_PER_CHUNK - 1)
-		return NULL;
+	BUG_ON(thread_id < 0 || thread_id >= COW_MAX_THREADS);
+	BUG_ON(nr_pages <= 0 || nr_pages > COW_PAGES_PER_CHUNK - 1);
 
 	pool = &pools[thread_id];
 
-	if (!pool->initialized)
-		return NULL;
+	BUG_ON(!pool->initialized);
 
 	/* Need new chunk if not enough pages left */
 	if (pool->next_page + nr_pages > COW_PAGES_PER_CHUNK) {
 		pool->current_chunk = alloc_chunk();
-		if (!pool->current_chunk)
-			return NULL;
 		pool->next_page = 1;  /* Skip header page */
 	}
 
@@ -316,10 +297,6 @@ void page_pool_put(void *page)
 	if (!page)
 		return;
 
-	/* Track puts before drain started */
-	if (!atomic_load(&drain_started))
-		atomic_fetch_add(&puts_before_drain, 1);
-
 	/* Calculate chunk base from page address (256MB aligned) */
 	hdr = (struct chunk_header *)((unsigned long)page & COW_CHUNK_ALIGN_MASK);
 
@@ -348,12 +325,11 @@ void page_pool_put(void *page)
 		pr_info("PAGE_POOL_FREE: chunk=%p[%d] total_freed=%d\n",
 		       hdr, chunk_idx, freed_count);
 
-		/* Remove from tracking list */
+		/* Remove from tracking list - chunk must be tracked */
 		pthread_spin_lock(&chunk_list_lock);
-		if (chunk_idx >= 0 && chunk_idx < COW_MAX_POOL_CHUNKS) {
-			if (all_chunks[chunk_idx] == hdr)
-				all_chunks[chunk_idx] = NULL;
-		}
+		BUG_ON(chunk_idx < 0 || chunk_idx >= COW_MAX_POOL_CHUNKS);
+		BUG_ON(all_chunks[chunk_idx] != hdr);
+		all_chunks[chunk_idx] = NULL;
 		pthread_spin_unlock(&chunk_list_lock);
 
 		munmap(hdr, COW_CHUNK_SIZE);
