@@ -505,65 +505,62 @@ free_iovs:
  * Purge range (addr, addr + len) from lazy_iovs. The range may
  * cover several continuous IOVs.
  */
-static int __drop_iovs(struct list_head *iovs, unsigned long addr, int len)
+static int __drop_iovs(struct list_head *iovs, unsigned long addr, unsigned long len)
 {
 	struct lazy_iov *iov, *n;
+	unsigned long drop_end;
+
+	if (!len)
+		return 0;
+
+	drop_end = addr + len;
+	if (drop_end < addr)
+		drop_end = ULONG_MAX;
 
 	list_for_each_entry_safe(iov, n, iovs, l) {
 		unsigned long start = iov->start;
 		unsigned long end = iov->end;
+		unsigned long overlap_start;
+		unsigned long overlap_end;
 
-		if (len <= 0 || addr + len < start)
-			break;
-
-		if (addr >= end)
+		if (end <= addr)
 			continue;
 
-		if (addr < start) {
-			len -= (start - addr);
-			addr = start;
-		}
-
-		/*
-		 * The range completely fits into the current IOV.
-		 * If addr equals iov_start we just "drop" the
-		 * beginning of the IOV. Otherwise, we make the IOV to
-		 * end at addr, and add a new IOV start starts at
-		 * addr + len.
-		 */
-		if (addr + len < end) {
-			if (addr == start) {
-				iov->start += len;
-				iov->img_start += len;
-			} else {
-				if (split_iov(iov, addr + len))
-					return -1;
-				iov->end = addr;
-			}
+		if (start >= drop_end)
 			break;
-		}
 
-		/*
-		 * The range spawns beyond the end of the current IOV.
-		 * If addr equals iov_start we just "drop" the entire
-		 * IOV.  Otherwise, we cut the beginning of the IOV
-		 * and continue to the next one with the updated range
-		 */
-		if (addr == start) {
+		overlap_start = max(start, addr);
+		overlap_end = min(end, drop_end);
+		if (overlap_start >= overlap_end)
+			continue;
+
+		if (overlap_start == start && overlap_end == end) {
 			list_del(&iov->l);
 			xfree(iov);
-		} else {
-			iov->end = addr;
+			continue;
 		}
 
-		len -= (end - addr);
-		addr = end;
+		if (overlap_start == start) {
+			iov->start = overlap_end;
+			iov->img_start += overlap_end - start;
+			continue;
+		}
+
+		if (overlap_end == end) {
+			iov->end = overlap_start;
+			continue;
+		}
+
+		if (split_iov(iov, overlap_end))
+			return -1;
+		iov->end = overlap_start;
+		break;
 	}
 
 	return 0;
 }
 
-static int drop_iovs(struct lazy_pages_info *lpi, unsigned long addr, int len)
+static int drop_iovs(struct lazy_pages_info *lpi, unsigned long addr, unsigned long len)
 {
 	if (__drop_iovs(&lpi->iovs, addr, len))
 		return -1;
@@ -658,7 +655,8 @@ static int remap_iovs(struct lazy_pages_info *lpi, unsigned long from, unsigned 
 static int collect_iovs(struct lazy_pages_info *lpi)
 {
 	unsigned long start, end, len, nr_pages = 0;
-	int n_vma = 0, max_iov_len = 0, ret = -1;
+	unsigned long max_iov_len = 0;
+	int n_vma = 0, ret = -1;
 	struct page_read *pr = &lpi->pr;
 	struct lazy_iov *iov;
 	MmEntry *mm;
@@ -691,6 +689,9 @@ static int collect_iovs(struct lazy_pages_info *lpi)
 			iov->end = iov->start + len;
 			list_add_tail(&iov->l, &lpi->iovs);
 
+			pr_info("Created IOV for VMA: 0x%lx-0x%lx (%lu pages)\n",
+					start, end, len / PAGE_SIZE);
+
 			if (len > max_iov_len)
 				max_iov_len = len;
 
@@ -698,6 +699,7 @@ static int collect_iovs(struct lazy_pages_info *lpi)
 				break;
 
 			start = vma->end;
+			
 		}
 	}
 
@@ -792,16 +794,21 @@ out:
 
 static int handle_exit(struct lazy_pages_info *lpi)
 {
+	lp_err(lpi, "RACE_DEBUG: [MAIN] handle_exit ENTER lpi=%p fd=%d\n", lpi, lpi->lpfd.fd);
 	if (epoll_del_rfd(epollfd, &lpi->lpfd))
 		return -1;
 	free_iovs(lpi);
+	lp_err(lpi, "RACE_DEBUG: [MAIN] handle_exit closing fd=%d\n", lpi->lpfd.fd);
 	close(lpi->lpfd.fd);
 	lpi->lpfd.fd = -lpi->lpfd.fd;
+	lp_err(lpi, "RACE_DEBUG: [MAIN] handle_exit setting exited=true lpi=%p\n", lpi);
 	lpi->exited = true;
 
 	/* keep it for tracking in-flight requests and for the summary */
+	lp_err(lpi, "RACE_DEBUG: [MAIN] handle_exit list_move_tail lpi=%p\n", lpi);
 	list_move_tail(&lpi->l, &lpis);
 
+	lp_err(lpi, "RACE_DEBUG: [MAIN] handle_exit EXIT lpi=%p\n", lpi);
 	return 0;
 }
 
@@ -868,7 +875,20 @@ static int uffd_copy(struct lazy_pages_info *lpi, __u64 address, unsigned long *
 
 	lp_debug(lpi, "uffd_copy: 0x%llx/%ld\n", uffdio_copy.dst, len);
 
+	if (ioctl(lpi->lpfd.fd, UFFDIO_COPY, &uffdio_copy) == -1) {
+		if (uffd_check_op_error(lpi, "copy", nr_pages, uffdio_copy.copy))
+			return -1;
+		return 0;
+	}
 
+	if (uffdio_copy.copy < 0) {
+		errno = -uffdio_copy.copy;
+		if (uffd_check_op_error(lpi, "copy", nr_pages, uffdio_copy.copy))
+			return -1;
+		return 0;
+	}
+
+	lpi->copied_pages += *nr_pages;
 	return 0;
 }
 
