@@ -450,7 +450,6 @@ static void *dirty_scanner_thread(void *arg)
 
 	xfree(regs);
 
-out_close:
 	if (ctx->pagemap_fd >= 0) {
 		close(ctx->pagemap_fd);
 		ctx->pagemap_fd = -1;
