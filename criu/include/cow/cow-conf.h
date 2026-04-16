@@ -196,7 +196,18 @@
 #define COW_DRAIN_BATCH_SIZE		100
 
 /* ================================================================
- * SECTION 9: Logging/Debug Thresholds
+ * SECTION 9: Work-Stealing Configuration
+ * ================================================================ */
+
+/* Work chunk size for bulk transfer load balancing (32MB) */
+#define COW_WORK_CHUNK_SIZE		(32UL * 1024 * 1024)
+#define COW_WORK_CHUNK_PAGES		(COW_WORK_CHUNK_SIZE / PAGE_SIZE)
+
+/* Maximum work queue items for bulk transfer */
+#define COW_MAX_WORK_ITEMS		16384
+
+/* ================================================================
+ * SECTION 10: Logging/Debug Thresholds
  * ================================================================ */
 
 /* Sample rates for high-frequency logging (modulo values) */
@@ -212,14 +223,14 @@
 #define COW_EXIT_DEBUG_FREQUENCY	100
 
 /* ================================================================
- * SECTION 10: Refcount Warning Thresholds (page-pool.c)
+ * SECTION 11: Refcount Warning Thresholds (page-pool.c)
  * ================================================================ */
 
 #define COW_REFCOUNT_LOW		1000
 #define COW_REFCOUNT_MID		30000
 
 /* ================================================================
- * SECTION 11: Cache Line Padding
+ * SECTION 12: Cache Line Padding
  * ================================================================ */
 
 /* Cache line size for struct padding to avoid false sharing */

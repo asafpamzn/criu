@@ -5,6 +5,10 @@
  * - Single process_vm_readv for 64 pages
  * - Single LZ4 compression for 256KB
  * - Single socket send
+ *
+ * Work-stealing architecture:
+ * - Bulk transfer: shared work queue of VMA chunks, threads pull work dynamically
+ * - Queue consumption: threads can steal from other threads' queues when idle
  */
 
 #include <sys/uio.h>
@@ -49,7 +53,12 @@
  * COW configuration constants (COW_BATCH_PAGES, etc.) are in cow-conf.h
  */
 
-#define NUM_P3_SPLITTER_THREADS (COW_NUM_P3_THREADS - 1)  /* Threads 1-(N-1) split large VMAs */
+/*
+ * Work-stealing chunk size: COW_WORK_CHUNK_SIZE (default 32MB).
+ * Smaller chunks = better balancing but more overhead.
+ * Larger chunks = less overhead but worse balancing.
+ * Configuration in cow-conf.h.
+ */
 
 /* Per-thread state */
 struct p3_thread_ctx {
@@ -108,6 +117,76 @@ static pthread_cond_t g_scanner_cond = PTHREAD_COND_INITIALIZER;
 /* Synchronization: scanner waits for bulk transfer to complete */
 static volatile int g_bulk_transfer_done_count = 0;
 static volatile int g_num_sender_threads = 0;
+
+/*
+ * Work-stealing infrastructure for bulk transfer phase.
+ * Instead of statically assigning VMA chunks to threads, we create a shared
+ * work queue of chunks that threads pull from dynamically.
+ */
+struct bulk_work_item {
+	struct lazy_vma_entry *lve;
+	unsigned long start;
+	unsigned long end;
+};
+
+static struct bulk_work_item g_work_queue[COW_MAX_WORK_ITEMS];
+static volatile int g_work_queue_size = 0;
+static volatile int g_work_queue_next = 0;  /* Next item to dequeue (atomic) */
+
+/*
+ * Build the work queue by splitting all VMAs into COW_WORK_CHUNK_SIZE pieces.
+ * Must be called before starting sender threads.
+ */
+static void build_bulk_work_queue(u64 dst_id)
+{
+	struct list_head *lazy_vmas = get_global_lazy_vmas();
+	struct lazy_vma_entry *lve;
+	int count = 0;
+
+	list_for_each_entry(lve, lazy_vmas, list) {
+		unsigned long vaddr;
+
+		if (lve->dst_id != dst_id)
+			continue;
+
+		/* Split VMA into COW_WORK_CHUNK_SIZE pieces */
+		for (vaddr = lve->start; vaddr < lve->end; vaddr += COW_WORK_CHUNK_SIZE) {
+			unsigned long chunk_end = vaddr + COW_WORK_CHUNK_SIZE;
+
+			if (chunk_end > lve->end)
+				chunk_end = lve->end;
+
+			if (count >= COW_MAX_WORK_ITEMS) {
+				pr_err("Work queue overflow! Increase COW_MAX_WORK_ITEMS\n");
+				BUG();
+			}
+
+			g_work_queue[count].lve = lve;
+			g_work_queue[count].start = vaddr;
+			g_work_queue[count].end = chunk_end;
+			count++;
+		}
+	}
+
+	g_work_queue_size = count;
+	g_work_queue_next = 0;
+	pr_info("Built bulk work queue: %d chunks of %luMB max\n",
+		count, COW_WORK_CHUNK_SIZE / (1024 * 1024));
+}
+
+/*
+ * Get next work item from the shared queue (thread-safe).
+ * Returns NULL when queue is exhausted.
+ */
+static struct bulk_work_item *get_next_work_item(void)
+{
+	int idx = __atomic_fetch_add(&g_work_queue_next, 1, __ATOMIC_RELAXED);
+
+	if (idx >= g_work_queue_size)
+		return NULL;
+
+	return &g_work_queue[idx];
+}
 
 int cow_init_sender_queues(void)
 {
@@ -711,44 +790,26 @@ static int send_dirty_region(struct p3_thread_ctx *ctx,
 }
 
 /*
- * Calculate this thread's chunk of a VMA for parallel processing.
- * Returns true if this thread should process the VMA, false to skip.
+ * Try to steal work from another thread's queue.
+ * Returns a dirty region entry if successful, NULL otherwise.
  */
-static bool get_thread_vma_range(struct p3_thread_ctx *ctx,
-				 struct lazy_vma_entry *lve,
-				 unsigned long *out_start,
-				 unsigned long *out_end)
+static struct dirty_region_entry *steal_from_queue(int my_thread_id)
 {
-	unsigned long vma_size = lve->end - lve->start;
-	unsigned long chunk_size;
-	int thread_id = ctx->thread_id;
+	int i;
+	int num_threads = __atomic_load_n(&g_num_sender_threads, __ATOMIC_ACQUIRE);
 
-	if (lve->dst_id != ctx->dst_id)
-		return false;
+	/* Try each queue starting from the one after ours */
+	for (i = 1; i < num_threads; i++) {
+		int target = (my_thread_id + i) % num_threads;
+		struct sender_queue *q = &sender_queues[target];
+		struct dirty_region_entry *region;
 
-	if (vma_size < COW_MIN_VMA_SIZE_FOR_SPLIT) {
-		/* Small VMAs (< 256KB) - only thread 0 handles them */
-		if (thread_id != 0)
-			return false;
-		*out_start = lve->start;
-		*out_end = lve->end;
-	} else {
-		/* Large VMAs (>= 256KB) - threads 1-N split them */
-		if (thread_id == 0)
-			return false;
-
-		chunk_size = vma_size / NUM_P3_SPLITTER_THREADS;
-		chunk_size = (chunk_size / PAGE_SIZE) * PAGE_SIZE;
-
-		*out_start = lve->start + (thread_id - 1) * chunk_size;
-
-		if (thread_id == COW_NUM_P3_THREADS - 1)
-			*out_end = lve->end;
-		else
-			*out_end = *out_start + chunk_size;
+		region = spsc_dequeue(q->head, q->size);
+		if (region)
+			return region;
 	}
 
-	return true;
+	return NULL;
 }
 
 /*
@@ -836,17 +897,16 @@ static unsigned long send_new_vma_pages(struct p3_thread_ctx *ctx)
 
 /*
  * P3 bulk sender thread - sends regular pages in batches.
- * Each thread handles 1/COW_NUM_P3_THREADS of each VMA's address range.
+ * Uses work-stealing: threads pull chunks from a shared work queue.
  * After bulk transfer, transitions to iterative dirty scanning until convergence.
  */
 static void *p3_bulk_sender_thread(void *arg)
 {
 	struct p3_thread_ctx *ctx = (struct p3_thread_ctx *)arg;
-	struct lazy_vma_entry *lve;
-	struct list_head *lazy_vmas;
 	unsigned long total_sent = 0;
 	struct timespec t_start, t_end;
 	int thread_id = ctx->thread_id;
+	int chunks_processed = 0;
 
 	pr_info("P3[%d] bulk sender thread started (batch=%d pages)\n",
 		thread_id, COW_BATCH_PAGES);
@@ -854,51 +914,30 @@ static void *p3_bulk_sender_thread(void *arg)
 	       thread_id, ctx->socket, (unsigned long)ctx->dst_id);
 	clock_gettime(CLOCK_MONOTONIC, &t_start);
 
-	lazy_vmas = get_global_lazy_vmas();
-
-	/* === Iteration 0: Bulk transfer === */
+	/* === Iteration 0: Bulk transfer with work-stealing === */
 	{
 		struct timespec bulk_start, bulk_end;
 		long bulk_elapsed_ms;
-		int vma_count = 0;
+		struct bulk_work_item *work;
 
 		clock_gettime(CLOCK_MONOTONIC, &bulk_start);
-		pr_err("P3[%d]: Starting bulk transfer, scanning lazy_vmas\n", thread_id);
-		list_for_each_entry(lve, lazy_vmas, list) {
-			vma_count++;
-		}
-		pr_err("P3[%d]: Found %d VMAs in lazy_vmas list\n", thread_id, vma_count);
+		pr_err("P3[%d]: Starting bulk transfer (work-stealing)\n", thread_id);
 
-		list_for_each_entry(lve, lazy_vmas, list) {
-			unsigned long my_start, my_end;
+		/* Pull work items from shared queue until exhausted */
+		while ((work = get_next_work_item()) != NULL) {
 			unsigned long vaddr;
-			unsigned long vma_size = lve->end - lve->start;
 
-			pr_info("P3[%d]: Checking VMA %lx-%lx (%lu KB) dst_id=%lu (my dst_id=%lu)\n",
-				thread_id, lve->start, lve->end, vma_size / 1024,
-				lve->dst_id, ctx->dst_id);
-
-			if (!get_thread_vma_range(ctx, lve, &my_start, &my_end)) {
-				pr_info("P3[%d]: -> Skipped by get_thread_vma_range\n", thread_id);
-				continue;
-			}
-
-			pr_info("P3[%d]: Bulk VMA %lx-%lx chunk %lx-%lx\n",
-				thread_id,
-				(unsigned long)lve->start, (unsigned long)lve->end,
-				my_start, my_end);
-
-			for (vaddr = my_start; vaddr < my_end;
+			for (vaddr = work->start; vaddr < work->end;
 			     vaddr += COW_BATCH_PAGES * PAGE_SIZE) {
 				int batch_pages;
 				int sent;
 
-				batch_pages = (my_end - vaddr) / PAGE_SIZE;
+				batch_pages = (work->end - vaddr) / PAGE_SIZE;
 				if (batch_pages > COW_BATCH_PAGES)
 					batch_pages = COW_BATCH_PAGES;
 
 				sent = send_lazy_vma_pages_batch(
-					ctx->socket, lve, vaddr, batch_pages,
+					ctx->socket, work->lve, vaddr, batch_pages,
 					ctx->dst_id, ctx->source_pid);
 
 				if (sent < 0) {
@@ -910,24 +949,26 @@ static void *p3_bulk_sender_thread(void *arg)
 
 				total_sent += sent;
 			}
+			chunks_processed++;
 		}
 
 		clock_gettime(CLOCK_MONOTONIC, &bulk_end);
 		bulk_elapsed_ms = (bulk_end.tv_sec - bulk_start.tv_sec) * 1000 +
 				  (bulk_end.tv_nsec - bulk_start.tv_nsec) / 1000000;
-		pr_err("P3[%d] TIMING: Bulk transfer done: %lu pages in %ld ms\n",
-		       thread_id, total_sent, bulk_elapsed_ms);
+		pr_err("P3[%d] TIMING: Bulk transfer done: %lu pages, %d chunks in %ld ms\n",
+		       thread_id, total_sent, chunks_processed, bulk_elapsed_ms);
 
 		/* Signal scanner that this thread's bulk transfer is complete */
 		__atomic_fetch_add(&g_bulk_transfer_done_count, 1, __ATOMIC_RELEASE);
 	}
 
-	/* === Phase 2: Consume dirty regions from scanner queue === */
+	/* === Phase 2: Consume dirty regions from scanner queue with work-stealing === */
 	{
 		struct timespec loop_start, loop_end, drain_start;
 		long loop_elapsed_ms;
 		unsigned long loop_total_pages = 0;
 		unsigned long regions_processed = 0;
+		unsigned long stolen_regions = 0;
 		unsigned long wait_count = 0;
 		unsigned long drain_regions = 0;
 		unsigned long drain_pages = 0;
@@ -935,12 +976,13 @@ static void *p3_bulk_sender_thread(void *arg)
 		struct sender_queue *my_queue = cow_get_sender_queue(thread_id);
 
 		clock_gettime(CLOCK_MONOTONIC, &loop_start);
-		pr_err("P3[%d] starting queue consumption, queue=%p\n", thread_id, (void *)my_queue);
+		pr_err("P3[%d] starting queue consumption (work-stealing enabled)\n", thread_id);
 
 		/* Consume dirty regions from queue until scanner completes */
 		while (!cow_is_scan_complete() || spsc_peek(my_queue->head)) {
 			struct dirty_region_entry *region;
 			int sent;
+			bool was_stolen = false;
 
 			/* Track when we start draining after scan_complete */
 			if (!drain_started && cow_is_scan_complete()) {
@@ -952,19 +994,26 @@ static void *p3_bulk_sender_thread(void *arg)
 
 			/* Periodic status logging */
 			if (regions_processed > 0 && regions_processed % COW_LOG_SAMPLE_10K == 0) {
-				pr_info("P3[%d] queue progress: processed=%lu, queue_size=%lu, scan_complete=%d\n",
-				       thread_id, regions_processed, spsc_size(my_queue->size),
+				pr_info("P3[%d] queue progress: processed=%lu (stolen=%lu), scan_complete=%d\n",
+				       thread_id, regions_processed, stolen_regions,
 				       cow_is_scan_complete());
 			}
 
+			/* Try own queue first */
 			region = spsc_dequeue(my_queue->head, my_queue->size);
 			if (!region) {
-				/* Queue empty, brief wait */
+				/* Own queue empty - try to steal from others */
+				region = steal_from_queue(thread_id);
+				if (region)
+					was_stolen = true;
+			}
+
+			if (!region) {
+				/* No work anywhere, brief wait */
 				wait_count++;
 				if (wait_count % COW_LOG_SAMPLE_10K == 0) {
-					pr_err("P3[%d] waiting: queue empty, scan_complete=%d, wait_count=%lu, peek=%d\n",
-					       thread_id, cow_is_scan_complete(), wait_count,
-					       spsc_peek(my_queue->head));
+					pr_debug("P3[%d] waiting: all queues empty, scan_complete=%d\n",
+						 thread_id, cow_is_scan_complete());
 				}
 				usleep(COW_USLEEP_100US);
 				continue;
@@ -976,6 +1025,8 @@ static void *p3_bulk_sender_thread(void *arg)
 			if (sent > 0) {
 				loop_total_pages += sent;
 				regions_processed++;
+				if (was_stolen)
+					stolen_regions++;
 				if (drain_started) {
 					drain_regions++;
 					drain_pages += sent;
@@ -983,8 +1034,8 @@ static void *p3_bulk_sender_thread(void *arg)
 			}
 			xfree(region);
 		}
-		pr_err("P3[%d] exiting queue loop: scan_complete=%d, peek=%d\n",
-		       thread_id, cow_is_scan_complete(), spsc_peek(my_queue->head));
+		pr_err("P3[%d] exiting queue loop: processed=%lu, stolen=%lu\n",
+		       thread_id, regions_processed, stolen_regions);
 
 		clock_gettime(CLOCK_MONOTONIC, &loop_end);
 		loop_elapsed_ms = (loop_end.tv_sec - loop_start.tv_sec) * 1000 +
@@ -1050,6 +1101,9 @@ int cow_start_p3_threads(int *sockets, int num_sockets, u64 dst_id, pid_t source
 	g_scan_complete = false;
 	g_scanner_freeze_signal = false;
 	g_bulk_transfer_done_count = 0;
+
+	/* Build shared work queue for bulk transfer (work-stealing) */
+	build_bulk_work_queue(dst_id);
 
 	/* Initialize sender queues */
 	if (cow_init_sender_queues()) {
