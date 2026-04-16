@@ -790,27 +790,17 @@ static int send_dirty_region(struct p3_thread_ctx *ctx,
 }
 
 /*
- * Try to steal work from another thread's queue.
- * Returns a dirty region entry if successful, NULL otherwise.
+ * NOTE: Work-stealing from queue consumption was removed because the sender
+ * queues use SPSC (Single Producer Single Consumer) design. Stealing would
+ * introduce multiple consumers and cause race conditions.
+ *
+ * The bulk transfer phase uses work-stealing via the shared work queue
+ * (g_work_queue), which is safe because it uses atomic fetch-and-add.
+ *
+ * For better queue balancing, consider:
+ * 1. Having scanners distribute more evenly (round-robin by page count, not region count)
+ * 2. Using MPMC queues if work-stealing is needed
  */
-static struct dirty_region_entry *steal_from_queue(int my_thread_id)
-{
-	int i;
-	int num_threads = __atomic_load_n(&g_num_sender_threads, __ATOMIC_ACQUIRE);
-
-	/* Try each queue starting from the one after ours */
-	for (i = 1; i < num_threads; i++) {
-		int target = (my_thread_id + i) % num_threads;
-		struct sender_queue *q = &sender_queues[target];
-		struct dirty_region_entry *region;
-
-		region = spsc_dequeue(q->head, q->size);
-		if (region)
-			return region;
-	}
-
-	return NULL;
-}
 
 /*
  * Send all pages from new VMAs detected in Phase 3.
@@ -962,13 +952,12 @@ static void *p3_bulk_sender_thread(void *arg)
 		__atomic_fetch_add(&g_bulk_transfer_done_count, 1, __ATOMIC_RELEASE);
 	}
 
-	/* === Phase 2: Consume dirty regions from scanner queue with work-stealing === */
+	/* === Phase 2: Consume dirty regions from scanner queue === */
 	{
 		struct timespec loop_start, loop_end, drain_start;
 		long loop_elapsed_ms;
 		unsigned long loop_total_pages = 0;
 		unsigned long regions_processed = 0;
-		unsigned long stolen_regions = 0;
 		unsigned long wait_count = 0;
 		unsigned long drain_regions = 0;
 		unsigned long drain_pages = 0;
@@ -976,13 +965,12 @@ static void *p3_bulk_sender_thread(void *arg)
 		struct sender_queue *my_queue = cow_get_sender_queue(thread_id);
 
 		clock_gettime(CLOCK_MONOTONIC, &loop_start);
-		pr_err("P3[%d] starting queue consumption (work-stealing enabled)\n", thread_id);
+		pr_err("P3[%d] starting queue consumption\n", thread_id);
 
 		/* Consume dirty regions from queue until scanner completes */
 		while (!cow_is_scan_complete() || spsc_peek(my_queue->head)) {
 			struct dirty_region_entry *region;
 			int sent;
-			bool was_stolen = false;
 
 			/* Track when we start draining after scan_complete */
 			if (!drain_started && cow_is_scan_complete()) {
@@ -994,25 +982,17 @@ static void *p3_bulk_sender_thread(void *arg)
 
 			/* Periodic status logging */
 			if (regions_processed > 0 && regions_processed % COW_LOG_SAMPLE_10K == 0) {
-				pr_info("P3[%d] queue progress: processed=%lu (stolen=%lu), scan_complete=%d\n",
-				       thread_id, regions_processed, stolen_regions,
+				pr_info("P3[%d] queue progress: processed=%lu, scan_complete=%d\n",
+				       thread_id, regions_processed,
 				       cow_is_scan_complete());
 			}
 
-			/* Try own queue first */
 			region = spsc_dequeue(my_queue->head, my_queue->size);
 			if (!region) {
-				/* Own queue empty - try to steal from others */
-				region = steal_from_queue(thread_id);
-				if (region)
-					was_stolen = true;
-			}
-
-			if (!region) {
-				/* No work anywhere, brief wait */
+				/* Queue empty, brief wait */
 				wait_count++;
 				if (wait_count % COW_LOG_SAMPLE_10K == 0) {
-					pr_debug("P3[%d] waiting: all queues empty, scan_complete=%d\n",
+					pr_debug("P3[%d] waiting: queue empty, scan_complete=%d\n",
 						 thread_id, cow_is_scan_complete());
 				}
 				usleep(COW_USLEEP_100US);
@@ -1025,8 +1005,6 @@ static void *p3_bulk_sender_thread(void *arg)
 			if (sent > 0) {
 				loop_total_pages += sent;
 				regions_processed++;
-				if (was_stolen)
-					stolen_regions++;
 				if (drain_started) {
 					drain_regions++;
 					drain_pages += sent;
@@ -1034,8 +1012,8 @@ static void *p3_bulk_sender_thread(void *arg)
 			}
 			xfree(region);
 		}
-		pr_err("P3[%d] exiting queue loop: processed=%lu, stolen=%lu\n",
-		       thread_id, regions_processed, stolen_regions);
+		pr_err("P3[%d] exiting queue loop: processed=%lu\n",
+		       thread_id, regions_processed);
 
 		clock_gettime(CLOCK_MONOTONIC, &loop_end);
 		loop_elapsed_ms = (loop_end.tv_sec - loop_start.tv_sec) * 1000 +
