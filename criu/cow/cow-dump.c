@@ -12,7 +12,6 @@
 #include <time.h>
 #include <string.h>
 #include <poll.h>
-#include <sys/eventfd.h>
 
 #include "types.h"
 #include "cr_options.h"
@@ -32,7 +31,6 @@
 #include "criu-log.h"
 #include "parasite.h"
 #include "atomic-bitmap.h"
-#include "cow/mpsc-queue.h"
 #include "cow/cow-conf.h"
 #include "cow/cow-bulk-send.h"
 #include "common/bug.h"
@@ -46,15 +44,6 @@ struct cow_tracked_vma {
 	bool is_new;  /* True if VMA was detected in Phase 3 (needs uffd registration) */
 };
 
-/* MPSC queue node type for COW page entries (multi-producer safe) */
-DECLARE_MPSC_NODE(cow_page, struct cow_page_queue_entry);
-struct cow_page_queue {
-	struct cow_page_mpsc_node *head;
-	char _pad[COW_CACHE_LINE_SIZE - sizeof(struct cow_page_mpsc_node *)];
-	struct cow_page_mpsc_node *tail;
-	unsigned long size;
-};
-
 /* COW dump state for one dump session — single tracked process */
 struct cow_dump_info {
 	pid_t source_pid;
@@ -66,8 +55,6 @@ struct cow_dump_info {
 	unsigned int nr_tracked_vmas;
 	struct cow_tracked_vma *tracked_vmas;
 	enum cow_dump_phase phase;  /* Current phase */
-
-	struct cow_page_queue page_queue;
 };
 
 /*
@@ -247,7 +234,6 @@ static int cow_apply_writeprotect(struct cow_dump_info *cdi)
 	pr_err("TIMING: cow_dump_writeprotect took %lu.%06lu seconds (%u ranges, %u threads)\n",
 	       sec, nsec / 1000, nr_ranges, created ? created : 1);
 
-out:
 	xfree(threads);
 	xfree(jobs);
 	xfree(ranges);
@@ -274,20 +260,6 @@ void cow_set_dst_id(u64 dst_id)
 		g_cow_info->dst_id = dst_id;
 }
 
-static int g_monitor_eventfd = -1;
-static struct cow_page_queue_entry *g_putback_list = NULL;
-
-/* Per-worker page buffer pool — avoids malloc(PAGE_SIZE) on the hot path
- * COW_PAGE_POOL_SIZE, COW_FAULT_WORKERS, COW_PREREAD_* now in cow-conf.h
- */
-
-struct cow_fault_worker {
-	pthread_t thread;
-	int id;
-	struct cow_dump_info *cdi;
-	void *page_pool[COW_PAGE_POOL_SIZE];
-	unsigned int pool_count;
-};
 
 
 
@@ -422,48 +394,14 @@ static int cow_register_vmas(struct cow_dump_info *cdi,
 /* ------------------------------------------------------------------ */
 /*  Init / Fini                                                        */
 /* ------------------------------------------------------------------ */
-static void free_cow_page_entry(struct cow_page_queue_entry *entry)
-{
-	if (entry->data)
-		xfree(entry->data);
-	xfree(entry);
-}
-
-
 
 void cow_dump_fini(void)
 {
-	struct cow_page_queue_entry *qe;
-	int queue_remaining = 0;
-
 	if (!g_cow_info)
 		return;
 
-
 	wait_for_page_server_thread();
 	pr_err("Cleaning up COW dump\n");
-
-	if (g_monitor_eventfd >= 0) {
-		close(g_monitor_eventfd);
-		g_monitor_eventfd = -1;
-	}
-
-	while (g_putback_list) {
-		qe = g_putback_list;
-		g_putback_list = qe->next;
-		if (qe->data)
-			xfree(qe->data);
-		xfree(qe);
-		queue_remaining++;
-	}
-
-	if (g_cow_info->page_queue.head) {
-		mpsc_drain(g_cow_info->page_queue.head, free_cow_page_entry);
-		g_cow_info->page_queue.tail = NULL;
-	}
-
-	if (queue_remaining > 0)
-		pr_warn("Freed %d remaining queue entries\n", queue_remaining);
 
 	if (g_cow_info->uffd >= 0)
 		close(g_cow_info->uffd);
@@ -504,46 +442,30 @@ bool cow_dump_is_vma_tracked(pid_t source_pid, unsigned long start,
 	return false;
 }
 
+/*
+ * Page queue API stubs - kept for API compatibility with cow-unified-thread.c
+ * The MPSC queue was removed as nothing produces to it (WP_ASYNC uses PAGEMAP_SCAN
+ * instead of fault-driven page capture).
+ */
+
 struct cow_page_queue_entry *cow_get_next_page(void)
 {
-	struct cow_page_queue_entry *entry;
-
-	if (!g_cow_info)
-		return NULL;
-
-	if (g_putback_list) {
-		entry = g_putback_list;
-		g_putback_list = entry->next;
-		entry->next = NULL;
-		return entry;
-	}
-
-	return mpsc_dequeue(g_cow_info->page_queue.head, g_cow_info->page_queue.size);
+	return NULL;
 }
 
 bool cow_has_pending_pages(void)
 {
-	if (!g_cow_info)
-		return false;
-	if (g_putback_list)
-		return true;
-	return mpsc_peek(g_cow_info->page_queue.head);
+	return false;
 }
 
 void cow_put_back_page(struct cow_page_queue_entry *entry)
 {
-	if (!g_cow_info || !entry)
-		return;
-	entry->next = g_putback_list;
-	g_putback_list = entry;
-	pr_debug("Re-queued COW page 0x%lx to putback list\n", entry->vaddr);
+	(void)entry;
 }
 
 unsigned long cow_get_pages_queue_size(void)
 {
-	if (!g_cow_info)
-		return 0;
-	return mpsc_size(g_cow_info->page_queue.size);
+	return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -609,23 +531,7 @@ int cow_dump_init_async(struct pstree_item *item,
 	cdi->uffd_sync = -1;
 	cdi->phase = COW_PHASE_ASYNC_BULK;
 
-	if (mpsc_init(cdi->page_queue.head, cdi->page_queue.tail,
-		      cdi->page_queue.size, struct cow_page_mpsc_node)) {
-		xfree(cdi);
-		return -1;
-	}
-
 	g_cow_info = cdi;
-
-	if (g_monitor_eventfd >= 0) {
-		close(g_monitor_eventfd);
-		g_monitor_eventfd = -1;
-	}
-	g_monitor_eventfd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
-	if (g_monitor_eventfd < 0) {
-		pr_perror("Failed to create cow monitor eventfd");
-		goto err;
-	}
 
 	/*
 	 * Create UFFD with WP_ASYNC via the parasite running inside
@@ -691,16 +597,8 @@ err:
 	if (cdi->uffd >= 0)
 		close(cdi->uffd);
 	xfree(cdi->tracked_vmas);
-	if (cdi->page_queue.head) {
-		mpsc_drain(cdi->page_queue.head, free_cow_page_entry);
-		cdi->page_queue.tail = NULL;
-	}
 	xfree(cdi);
 	g_cow_info = NULL;
-	if (g_monitor_eventfd >= 0) {
-		close(g_monitor_eventfd);
-		g_monitor_eventfd = -1;
-	}
 	return -1;
 }
 
@@ -1273,9 +1171,7 @@ int cow_dump_dirty_pages(unsigned long *dirty_ranges, unsigned int nr_dirty_rang
 				pr_perror("Failed to read dirty pages at 0x%lx (%d pages)",
 					  batch_addr, batch_pages);
 				xfree(buffer);
-				/* Continue with next batch - page may be unmapped */
-				offset += batch_pages * PAGE_SIZE;
-				continue;
+				BUG();
 			}
 
 			/* Send compressed batch */
