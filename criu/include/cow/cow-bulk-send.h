@@ -89,12 +89,6 @@ int cow_start_p3_threads(int *sockets, int num_sockets, u64 dst_id, pid_t source
 void cow_wait_p3_threads(void);
 
 /*
- * Legacy single-thread interface (backward compatible).
- */
-int cow_start_p3_thread(int sk, u64 dst_id, pid_t source_pid);
-void cow_wait_p3_thread(void);
-
-/*
  * Check if any P3 thread is still running.
  */
 bool cow_p3_thread_running(void);
