@@ -19,9 +19,6 @@ extern int page_server_async_read_bulk(struct epoll_rfd *f);
 extern int page_server_start_async_read_bulk(void *buf, unsigned long nr_pages,
 					     ps_async_read_complete complete, void *priv);
 
-/* Update callback for COW convergence phase */
-extern int page_server_update_async_callback(ps_async_read_complete complete, void *priv);
-
 /* Cleanup async bulk reader state (call before closing socket) */
 extern void page_server_cleanup_async_bulk(void);
 

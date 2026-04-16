@@ -504,22 +504,6 @@ int page_server_start_async_read_bulk(void *buf, unsigned long nr_pages,
 }
 
 /*
- * Update the async bulk reader callback (for COW convergence phase).
- * Called when restore connects AND dirty bitmap is received.
- */
-int page_server_update_async_callback(ps_async_read_complete complete, void *priv)
-{
-	struct ps_async_read_bulk *ar;
-
-	BUG_ON(list_empty(&bulk_async_reads));
-
-	ar = list_first_entry(&bulk_async_reads, struct ps_async_read_bulk, l);
-	ar->complete = complete;
-	ar->priv = priv;
-	return 0;
-}
-
-/*
  * Cleanup async bulk reader state.
  * Called when closing the page server socket to prevent stale fd reads.
  */

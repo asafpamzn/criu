@@ -1742,7 +1742,6 @@ static bool phase3_active_flag = false;
 /* Forward declarations for page server async reader */
 extern int page_server_start_async_read_bulk(void *buf, unsigned long nr_pages,
 					     ps_async_read_complete complete, void *priv);
-extern int page_server_update_async_callback(ps_async_read_complete complete, void *priv);
 
 void cow_set_phase3_active(bool active)
 {
