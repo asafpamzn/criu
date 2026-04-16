@@ -53,8 +53,6 @@ void cow_page_buffer_readd(unsigned long vaddr, void *data);
  */
 extern void check_and_print_uffd_stats(void);
 extern int cow_get_histogram_bucket(unsigned long nr_pages);
-extern void cow_uffd_stats_inc_pf(unsigned long nr_pages);
-extern void cow_uffd_stats_inc_bg(unsigned long nr_pages);
 extern void cow_uffd_stats_add_io_bulk(unsigned long ns);
 extern void cow_uffd_stats_inc_io_bulk_start(void);
 extern void cow_uffd_stats_add_copy(unsigned long ns);
@@ -150,12 +148,6 @@ extern int cow_uffd_copy(int uffd, unsigned long vaddr, void *data,
  */
 extern int cow_uffd_io_complete_bulk(struct lazy_pages_info *lpi,
 				     unsigned long vaddr, unsigned long nr_pages);
-
-/*
- * Remove buffered pages before urgent copy (uffd_io_complete).
- * Prevents EEXIST when drain thread copies later.
- */
-extern void cow_uffd_remove_buffered_pages(unsigned long addr, unsigned long nr);
 
 /*
  * Handle UNMAP/REMOVE event in COW mode.

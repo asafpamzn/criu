@@ -998,22 +998,6 @@ static const char *get_bucket_label(int bucket)
 	}
 }
 
-void cow_uffd_stats_inc_pf(unsigned long nr_pages)
-{
-	int bucket = cow_get_histogram_bucket(nr_pages);
-	uffd_stats.total_pf_reqs++;
-	uffd_stats.total_pages += nr_pages;
-	uffd_stats.pf_hist[bucket]++;
-}
-
-void cow_uffd_stats_inc_bg(unsigned long nr_pages)
-{
-	int bucket = cow_get_histogram_bucket(nr_pages);
-	uffd_stats.total_bg_reqs++;
-	uffd_stats.total_pages += nr_pages;
-	uffd_stats.bg_hist[bucket]++;
-}
-
 void cow_uffd_stats_add_io_bulk(unsigned long ns)
 {
 	uffd_stats.io_complete_bulk_total_ns += ns;
@@ -1489,25 +1473,6 @@ int cow_setup_prebuffer_reader(void)
 		prebuffer_buf, COW_BATCH_PAGES, prebuffer_io_complete_internal, prebuffer_buf);
 }
 
-
-/*
- * Remove buffered pages before urgent copy.
- * Called from uffd_io_complete to prevent EEXIST when drain thread
- * tries to copy the same page later.
- */
-void cow_uffd_remove_buffered_pages(unsigned long addr, unsigned long nr)
-{
-	unsigned long i;
-
-	for (i = 0; i < nr; i++) {
-		unsigned long page_addr = addr + i * PAGE_SIZE;
-		void *buffered = cow_page_buffer_lookup_and_remove(page_addr);
-
-		page_state_set(page_addr, PAGE_STATE_URGENT_PENDING);
-		if (buffered)
-			page_pool_put(buffered);
-	}
-}
 
 /*
  * Handle UNMAP/REMOVE event in COW mode.

@@ -87,10 +87,9 @@ static struct epoll_rfd lazy_sk_rfd;
 static int lazy_pages_sk_id = -1;
 
 /*
- * COW stats, EAGAIN handling, and histogram functions are in cow-uffd.c:
+ * COW stats and EAGAIN handling functions are in cow-uffd.c:
  * - check_and_print_uffd_stats()
  * - cow_queue_eagain_request(), cow_process_eagain_requests()
- * - cow_uffd_stats_inc_pf(), cow_uffd_stats_inc_bg(), etc.
  */
 
 static int handle_uffd_event(struct epoll_rfd *lpfd);
@@ -899,7 +898,7 @@ static int uffd_io_complete(struct page_read *pr, unsigned long img_addr, unsign
 	unsigned long addr = 0, req_pages;
 	struct lazy_iov *req;
 	int ret;
-
+	BUG();//TODO ASAF REMOVE
 	lpi = container_of(pr, struct lazy_pages_info, pr);
 
 	/*
@@ -931,10 +930,6 @@ static int uffd_io_complete(struct page_read *pr, unsigned long img_addr, unsign
 	req_pages = (req->end - req->start) / PAGE_SIZE;
 	nr = min(nr, req_pages);
 
-	/* COW mode: remove from buffer to avoid EEXIST when drain copies later */
-	if (opts.cow_dump)
-		cow_uffd_remove_buffered_pages(addr, nr);
-
 	ret = uffd_copy(lpi, addr, &nr);
 	if (ret < 0)
 		return ret;
@@ -949,13 +944,12 @@ static int uffd_io_complete(struct page_read *pr, unsigned long img_addr, unsign
 	 * list and let drop_iovs do the range math, free memory etc.
 	 */
 	iov_list_insert(req, &lpi->iovs);
-	if (opts.cow_dump) return 0;//WE do not drop_iov since it is not thread safe
 	return drop_iovs(lpi, addr, nr * PAGE_SIZE);
 }
 
 /*
  * COW bulk mode io_complete callback.
- * Used when opts.cow_dump is true but NOT using Phase 2/3 mode.
+ * Used when opts.cow_dump is true.
  */
 static int uffd_io_complete_bulk(struct page_read *pr, unsigned long vaddr, unsigned long nr)
 {
@@ -1080,7 +1074,7 @@ static int xfer_pages(struct lazy_pages_info *lpi)
 	unsigned long nr_pages;
 	unsigned long len;
 	int err;
-
+	BUG();//TODO ASAF REMOVE
 	iov = pick_next_range(lpi);
 	if (!iov)
 		return 0;
@@ -1094,10 +1088,6 @@ static int xfer_pages(struct lazy_pages_info *lpi)
 
 	nr_pages = (iov->end - iov->start) / PAGE_SIZE;
 
-	/* Update COW statistics */
-	if (opts.cow_dump)
-		cow_uffd_stats_inc_bg(nr_pages);
-
 	update_xfer_len(lpi, false);
 
 	err = uffd_handle_pages(lpi, iov->img_start, nr_pages, PR_ASYNC | PR_ASAP);
@@ -1105,10 +1095,6 @@ static int xfer_pages(struct lazy_pages_info *lpi)
 		lp_err(lpi, "Error during UFFD copy\n");
 		return -1;
 	}
-
-	/* COW mode: track background transfer as waiting for server response */
-	if (opts.cow_dump)
-		pf_tracker_add(iov->start, nr_pages, lpi->pid, false);
 
 	return 0;
 }
@@ -1300,10 +1286,6 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 
 	nr_pages = (iov->end - iov->start) / PAGE_SIZE;
 
-	/* Update COW statistics */
-	if (opts.cow_dump)
-		cow_uffd_stats_inc_pf(nr_pages);
-
 	update_xfer_len(lpi, true);
 
 	ret = uffd_handle_pages(lpi, iov->img_start, nr_pages, PR_ASYNC | PR_ASAP);
@@ -1311,10 +1293,6 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 		lp_err(lpi, "Error during regular page copy\n");
 		return -1;
 	}
-
-	/* COW mode: track page fault as waiting for server response */
-	if (opts.cow_dump)
-		pf_tracker_add(address, nr_pages, lpi->pid, true);
 
 	return 0;
 }
