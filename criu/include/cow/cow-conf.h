@@ -139,7 +139,7 @@
  * ================================================================ */
 
 /* Dirty page scan freeze threshold (request freeze when below this) */
-#define COW_DIRTY_SCAN_FREEZE_THRESHOLD	300000
+#define COW_DIRTY_SCAN_FREEZE_THRESHOLD	10000000
 
 /* Legacy per-thread convergence threshold */
 #define COW_DIRTY_CONVERGENCE_THRESHOLD	50000

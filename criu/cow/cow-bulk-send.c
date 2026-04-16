@@ -396,13 +396,18 @@ static void *dirty_scanner_thread(void *arg)
 		}
 		pthread_mutex_unlock(&g_scanner_mutex);
 
-		/* Log timing (only scanner 0 logs combined stats) */
-		if (scanner_id == 0) {
+		/* Log timing - each scanner logs its own stats */
+		{
 			long iter_ms = (iter_end.tv_sec - iter_start.tv_sec) * 1000 +
 				       (iter_end.tv_nsec - iter_start.tv_nsec) / 1000000;
-			pr_err("Scanner: iter=%u, %lu total pages, scan=%lu ms, dist=%lu ms, total=%ld ms\n",
-			       iteration, g_total_dirty_pages,
+			pr_warn("DEBUG_PERF: Scanner[%d] iter=%u: pages=%lu regions=%lu scan=%lu ms dist=%lu ms total=%ld ms\n",
+			       scanner_id, iteration, my_dirty_pages, num_regions,
 			       scan_time_ns / 1000000, dist_time_ns / 1000000, iter_ms);
+		}
+		/* Scanner 0 also logs combined stats */
+		if (scanner_id == 0) {
+			pr_err("Scanner: iter=%u, %lu total pages\n",
+			       iteration, g_total_dirty_pages);
 		}
 
 		/* Check convergence - both scanners check the combined total */
