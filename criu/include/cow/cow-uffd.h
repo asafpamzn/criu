@@ -81,10 +81,6 @@ extern bool cow_is_restore_connected(void);
 extern void cow_set_restore_connected(bool connected);
 
 
-/* Check/set if inventory.img is ready on disk */
-extern bool cow_is_inventory_ready_received(void);
-extern void cow_set_inventory_ready_received(void);
-
 /* Check/set if all pages have been sent by primary */
 extern bool cow_is_all_pages_sent_received(void);
 extern void cow_set_all_pages_sent_received(void);

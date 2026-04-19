@@ -175,24 +175,10 @@ static int read_bulk_header(struct ps_async_read_bulk *ar, int flags)
 	/* Header complete, dispatch based on command */
 	cmd = decode_ps_cmd(ar->pi.cmd);
 
-	if (ar->pi.nr_pages == 0 &&
-	    cmd != PS_IOV_INVENTORY_READY && cmd != PS_IOV_ALL_PAGES_SENT)
+	if (ar->pi.nr_pages == 0 && cmd != PS_IOV_ALL_PAGES_SENT)
 		return handle_end_of_transfer(ar, cmd);
 
 	switch (cmd) {
-	case PS_IOV_INVENTORY_READY:
-		/* Primary signals inventory.img is ready */
-		pr_err("=== REPLICA PHASE 3: Inventory ready signal received ===\n");
-		cow_set_inventory_ready_received();
-		/* Send ACK so primary knows it's safe to close socket */
-		if (send_inventory_ready_ack()) {
-			pr_err("Failed to send inventory ready ACK\n");
-			return -1;
-		}
-		ar->rb = 0;
-		ar->compress_state = COMPRESS_STATE_READING_HEADER;
-		return BULK_STREAM_PROGRESS;
-
 	case PS_IOV_ALL_PAGES_SENT:
 		/* Primary signals all pages sent - replica can zero-fill rest */
 		pr_err("=== REPLICA PHASE 4: All pages sent signal received ===\n");

@@ -2281,7 +2281,7 @@ static int cr_dump_finish(int ret)
 
 	/*
 	 * For COW mode, don't disconnect yet - we need the socket open
-	 * to send inventory_ready_signal. It will be closed later.
+	 * to send all_pages_sent signal. It will be closed later.
 	 */
 	if (!(opts.cow_dump && cow_get_phase() == COW_PHASE_DONE)) {
 		if (disconnect_from_page_server())
@@ -2371,82 +2371,28 @@ static int cr_dump_finish(int ret)
 	 * Inventory was already written in cr_dump_tasks_cow_phased().
 	 */
 	if (opts.cow_dump && cow_get_phase() == COW_PHASE_DONE) {
-		struct timeval t_start, t_end, t_delta, t_elapsed;
+		struct timeval t_start, t_end, t_delta;
+		int sk = get_page_server_sk();
 
-		pr_err("COW: Signaling replica (ret=%d)\n", ret);
+		pr_err("COW: Signaling replica (ret=%d, sk=%d)\n", ret, sk);
 
-		/* Signal replica that inventory is ready and wait for ACK */
-		pr_err("COW: About to send inventory ready signal (ret=%d, sk=%d)\n", ret, get_page_server_sk());
+		/*
+		 * Send single completion signal while frozen (fast).
+		 * Replica waits for this before starting restore.
+		 */
 		gettimeofday(&t_start, NULL);
-		if (!ret && send_inventory_ready_signal()) {
-			pr_err("COW: Failed to send inventory ready signal\n");
-			ret = -1;
+		if (!ret && sk >= 0) {
+			if (send_all_pages_sent_signal(sk) < 0) {
+				pr_err("COW: Failed to send completion signal\n");
+				ret = -1;
+			}
 		}
 		gettimeofday(&t_end, NULL);
 		timersub(&t_end, &t_start, &t_delta);
-		pr_err("TIMING: send_inventory_ready_signal took %ld.%06ld seconds\n",
+		pr_err("TIMING: send_completion_signal took %ld.%06ld seconds\n",
 		       t_delta.tv_sec, t_delta.tv_usec);
 
-		gettimeofday(&t_start, NULL);
-		if (!ret && wait_for_inventory_ready_ack(get_page_server_sk())) {
-			pr_err("COW: Failed to receive inventory ready ACK\n");
-			ret = -1;
-		}
-		gettimeofday(&t_end, NULL);
-		timersub(&t_end, &t_start, &t_delta);
-		pr_err("TIMING: wait_for_inventory_ready_ack took %ld.%06ld seconds\n",
-		       t_delta.tv_sec, t_delta.tv_usec);
-		pr_err("COW: After inventory signal+ACK (ret=%d)\n", ret);
-
-		/* NOW send all_pages_sent - after inventory ready so replica receives in order */
-		{
-			int sk = get_page_server_sk();
-			if (!ret && sk >= 0) {
-				pr_info("Sending all_pages_sent signal (after inventory ready)\n");
-
-				gettimeofday(&t_start, NULL);
-				if (send_all_pages_sent_signal(sk) < 0) {
-					pr_err("COW: Failed to send all_pages_sent signal\n");
-					ret = -1;
-				}
-				gettimeofday(&t_end, NULL);
-				timersub(&t_end, &t_start, &t_delta);
-				pr_err("TIMING: send_all_pages_sent_signal took %ld.%06ld seconds\n",
-				       t_delta.tv_sec, t_delta.tv_usec);
-
-				gettimeofday(&t_start, NULL);
-				if (!ret && wait_for_all_pages_sent_ack(sk) < 0) {
-					pr_err("COW: Failed to receive all_pages_sent ACK\n");
-					ret = -1;
-				}
-				gettimeofday(&t_end, NULL);
-				timersub(&t_end, &t_start, &t_delta);
-				pr_err("TIMING: wait_for_all_pages_sent_ack took %ld.%06ld seconds\n",
-				       t_delta.tv_sec, t_delta.tv_usec);
-			}
-		}
-		timersub(&t_end, &g_phase3_freeze_start, &t_elapsed);
-		pr_err("TIMING @%ld.%06ld: After all_pages_sent signal+ACK (ret=%d)\n",
-		       t_elapsed.tv_sec, t_elapsed.tv_usec, ret);
-
-#ifdef CONFIG_COW_COMPARE
-		/* Process comparison with replica (BOTH FROZEN) */
-		{
-			int compare_sk;
-			pid_t target_pid = root_item->pid->real;
-
-			pr_err("COMPARE: PRIMARY waiting for replica connection (PID %d FROZEN)\n",
-			       target_pid);
-
-			if (cow_compare_listen(&compare_sk) == 0) {
-				cow_compare_send_state(compare_sk, target_pid);
-				close(compare_sk);
-			}
-			pr_err("COMPARE: PRIMARY comparison done\n");
-		}
-#endif
-
-		/* NOW unfreeze - after comparison */
+		/* Unfreeze IMMEDIATELY - don't wait for ACK while frozen */
 		{
 			struct timeval freeze_end, freeze_delta;
 			gettimeofday(&freeze_end, NULL);
@@ -2457,7 +2403,35 @@ static int cr_dump_finish(int ret)
 		pr_err("COW: Unfreezing process\n");
 		pstree_switch_state(root_item, TASK_ALIVE);
 
-		sleep(15);
+		/* Wait for ACK AFTER unfreeze - not on critical path */
+		gettimeofday(&t_start, NULL);
+		if (!ret && sk >= 0) {
+			if (wait_for_all_pages_sent_ack(sk) < 0) {
+				pr_err("COW: Failed to receive completion ACK\n");
+				ret = -1;
+			}
+		}
+		gettimeofday(&t_end, NULL);
+		timersub(&t_end, &t_start, &t_delta);
+		pr_err("TIMING: wait_for_completion_ack took %ld.%06ld seconds (after unfreeze)\n",
+		       t_delta.tv_sec, t_delta.tv_usec);
+
+#ifdef CONFIG_COW_COMPARE
+		/* Process comparison with replica (source already unfrozen) */
+		{
+			int compare_sk;
+			pid_t target_pid = root_item->pid->real;
+
+			pr_err("COMPARE: PRIMARY waiting for replica connection (PID %d running)\n",
+			       target_pid);
+
+			if (cow_compare_listen(&compare_sk) == 0) {
+				cow_compare_send_state(compare_sk, target_pid);
+				close(compare_sk);
+			}
+			pr_err("COMPARE: PRIMARY comparison done\n");
+		}
+#endif
 
 		/* Cleanup after unfreeze - not on critical path */
 		cow_cleanup_async_uffd();
@@ -3188,8 +3162,7 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 	cow_free_new_vma_ranges();
 
 	/*
-	 * all_pages_sent signal is now sent in cr_dump_finish() AFTER
-	 * inventory_ready signal, so replica receives them in correct order.
+	 * all_pages_sent signal is sent in cr_dump_finish() after unfreeze.
 	 */
 
 	cow_set_phase(COW_PHASE_DONE);

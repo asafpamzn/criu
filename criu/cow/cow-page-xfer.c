@@ -32,7 +32,6 @@ unsigned long g_compress_compressed_bytes = 0;
 /* COW state flags for phased migration */
 static bool bulk_stream_done = false;
 static bool all_pages_sent_ack_received = false;
-static bool inventory_ready_ack_received = false;
 
 bool page_server_bulk_stream_done(void)
 {
@@ -57,53 +56,6 @@ void set_all_pages_sent_ack_received(void)
 bool is_all_pages_sent_ack_received(void)
 {
 	return all_pages_sent_ack_received;
-}
-
-void set_inventory_ready_ack_received(void)
-{
-	inventory_ready_ack_received = true;
-}
-
-bool is_inventory_ready_ack_received(void)
-{
-	return inventory_ready_ack_received;
-}
-
-/*
- * Wait for inventory_ready ACK from replica.
- * Called by primary after sending PS_IOV_INVENTORY_READY.
- */
-int wait_for_inventory_ready_ack(int sk)
-{
-	struct page_server_iov pi;
-
-	pr_info("Waiting for inventory_ready ACK from replica...\n");
-	BUG_ON(page_server_recv(sk, &pi, sizeof(pi), MSG_WAITALL) != sizeof(pi));
-	BUG_ON(decode_ps_cmd(pi.cmd) != PS_IOV_INVENTORY_READY_ACK);
-
-	pr_info("Received inventory_ready ACK from replica\n");
-	set_inventory_ready_ack_received();
-	return 0;
-}
-
-/*
- * Send inventory_ready ACK to primary (COW phased migration).
- * Called by replica after receiving PS_IOV_INVENTORY_READY and loading pstree.
- */
-int send_inventory_ready_ack(void)
-{
-	struct page_server_iov pi = {
-		.cmd = PS_IOV_INVENTORY_READY_ACK,
-		.nr_pages = 0,
-		.vaddr = 0,
-		.dst_id = 0,
-	};
-	int sk = get_page_server_sk();
-
-	BUG_ON(sk < 0);
-
-	pr_info("Sending inventory_ready ACK to primary\n");
-	return send_psi(sk, &pi);
 }
 
 /*
@@ -167,30 +119,6 @@ int send_all_pages_sent_ack(void)
 	pr_info("Sending all_pages_sent ACK to primary\n");
 	return send_psi(sk, &pi);
 }
-
-/*
- * Send inventory ready signal to replica (COW phased migration).
- * Called by primary after writing inventory.img, so replica knows
- * it's safe to load the pstree.
- */
-int send_inventory_ready_signal(void)
-{
-	struct page_server_iov pi = {
-		.cmd = PS_IOV_INVENTORY_READY,
-		.nr_pages = 0,
-		.vaddr = 0,
-		.dst_id = 0,
-	};
-	int sk = get_page_server_sk();
-
-	BUG_ON(sk < 0);
-
-	pr_info("Sending inventory ready signal to replica\n");
-	BUG_ON(send_psi(sk, &pi));
-
-	return 0;
-}
-
 
 /*
  * Request all pages from primary in batch mode.
@@ -319,17 +247,6 @@ int cow_handle_protocol_cmd(u32 cmd, struct page_server_iov *pi, int sk,
 		 */
 		pr_info("Received all_pages_sent ACK from replica\n");
 		set_all_pages_sent_ack_received();
-		*ret_val = 0;
-		*flushed = true;
-		return 0;
-
-	case PS_IOV_INVENTORY_READY_ACK:
-		/*
-		 * Replica acknowledges inventory_ready signal received.
-		 * Primary can now close the socket.
-		 */
-		pr_info("Received inventory_ready ACK from replica\n");
-		set_inventory_ready_ack_received();
 		*ret_val = 0;
 		*flushed = true;
 		return 0;

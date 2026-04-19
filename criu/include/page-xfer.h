@@ -132,9 +132,6 @@ extern int send_all_pages_sent_signal(int sk);
 /* COW phased migration: replica ACK for all_pages_sent, primary can close */
 extern int send_all_pages_sent_ack(void);
 
-/* COW phased migration: signal replica that inventory.img is ready */
-extern int send_inventory_ready_signal(void);
-
 /* P3 parallel transfer: REPLICA creates connections and receiver threads */
 extern int start_p3_receiver_connections(int num_connections);
 extern void stop_p3_receiver_connections(void);

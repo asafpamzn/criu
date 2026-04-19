@@ -21,7 +21,6 @@ extern int get_first_lpi_uffd(void);
 /*
  * COW state accessors are in cow-uffd.c (include cow/cow-uffd.h):
  * - cow_is_restore_connected(), cow_set_restore_connected()
- * - cow_is_inventory_ready_received(), cow_set_inventory_ready_received()
  * - cow_is_all_pages_sent_received(), cow_set_all_pages_sent_received()
  * - cow_get_uffd_for_vaddr()
  * - cow_queue_drain_eagain_request(), cow_is_eagain_queue_empty()

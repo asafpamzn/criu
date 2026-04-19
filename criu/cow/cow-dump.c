@@ -1002,7 +1002,6 @@ void cow_cleanup_async_uffd(void)
 		cdi->uffd = -1;
 	}
 
-	cdi->phase = COW_PHASE_DONE;
 }
 
 

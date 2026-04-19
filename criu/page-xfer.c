@@ -1379,7 +1379,6 @@ static int page_server_serve(int sk)
 		case PS_IOV_START_RESTORE:
 		case PS_IOV_BULK_COMPLETE_ACK:
 		case PS_IOV_ALL_PAGES_SENT_ACK:
-		case PS_IOV_INVENTORY_READY_ACK:
 			/* COW-specific commands handled in cow-page-xfer.c */
 			if (!opts.cow_dump) {
 				pr_err("COW command %u requires COW mode\n", cmd);

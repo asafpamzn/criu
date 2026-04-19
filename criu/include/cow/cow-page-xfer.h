@@ -13,10 +13,8 @@
 #define PS_IOV_ADD_F_COMPRESS     10
 #define PS_IOV_START_RESTORE      12  /* Signal replica to start process */
 #define PS_IOV_BULK_COMPLETE_ACK  13  /* Replica -> Primary: all bulk pages received */
-#define PS_IOV_INVENTORY_READY    14  /* Primary -> Replica: inventory.img written */
 #define PS_IOV_ALL_PAGES_SENT     16  /* Primary -> Replica: all pages sent, zero-fill rest */
 #define PS_IOV_ALL_PAGES_SENT_ACK 17  /* Replica -> Primary: ACK, safe to close connection */
-#define PS_IOV_INVENTORY_READY_ACK 18 /* Replica -> Primary: ACK, inventory received */
 
 /* Compression state machine states for bulk stream reader */
 enum compress_read_state {
@@ -42,17 +40,10 @@ extern bool is_all_pages_sent_ack_received(void);
 /* Wait for all_pages_sent ACK (called from page-xfer.c) */
 extern int wait_for_all_pages_sent_ack(int sk);
 
-/* Inventory ready ACK state and functions */
-extern void set_inventory_ready_ack_received(void);
-extern bool is_inventory_ready_ack_received(void);
-extern int wait_for_inventory_ready_ack(int sk);
-extern int send_inventory_ready_ack(void);
-
 /*
  * COW signaling functions are declared in page-xfer.h:
  * - send_all_pages_sent_signal()
  * - send_all_pages_sent_ack()
- * - send_inventory_ready_signal()
  * - start_p3_receiver_connections()
  * - stop_p3_receiver_connections()
  */

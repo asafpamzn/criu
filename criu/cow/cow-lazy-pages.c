@@ -230,11 +230,11 @@ int cr_lazy_pages_cow_phase2(bool daemon)
 
 	/*
 	 * Now inventory.img and pstree.img exist on disk.
-	 * The PS_IOV_INVENTORY_READY signal ensures we don't race
-	 * with the primary writing inventory.img.
+	 * The all_pages_sent signal indicates all pages are sent
+	 * and skeleton dump is complete.
 	 */
-	if (!cow_is_inventory_ready_received()) {
-		pr_err("Inventory ready signal not received!\n");
+	if (!cow_is_all_pages_sent_received()) {
+		pr_err("Completion signal (all_pages_sent) not received!\n");
 		goto err_disconnect;
 	}
 
@@ -280,7 +280,6 @@ int cow_phase2_handle_pages(int epollfd, struct epoll_event *events, int nr_fds)
 {
 	int ret;
 	bool bulk_done = false;
-	bool inventory_ready = false;
 
 	while (1) {
 		ret = epoll_run_rfds(epollfd, events, nr_fds, -1);
@@ -295,15 +294,9 @@ int cow_phase2_handle_pages(int epollfd, struct epoll_event *events, int nr_fds)
 			bulk_done = true;
 		}
 
-		/* Track inventory ready signal */
-		if (!inventory_ready && cow_is_inventory_ready_received()) {
-			pr_info("Inventory ready signal received\n");
-			inventory_ready = true;
-		}
-
-		/* All pages sent signals Phase 4 is complete */
+		/* All pages sent = completion signal, ready for restore */
 		if (cow_is_all_pages_sent_received()) {
-			pr_err("=== REPLICA: All phases complete, ready for restore ===\n");
+			pr_err("=== REPLICA: Completion signal received, ready for restore ===\n");
 			BUG_ON(send_all_pages_sent_ack() < 0);
 			/* Clean up async bulk reader before socket is closed */
 			page_server_cleanup_async_bulk();

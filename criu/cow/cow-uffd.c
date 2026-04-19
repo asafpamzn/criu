@@ -1432,7 +1432,6 @@ int cow_process_eagain_requests(void)
 
 /* State flags for COW restore synchronization */
 static bool cow_restore_connected = false;
-static bool cow_inventory_ready_received = false;
 static bool cow_all_pages_sent_received = false;
 
 /* Check if restore has connected (uffd available) */
@@ -1448,18 +1447,6 @@ void cow_set_restore_connected(bool connected)
 }
 
 
-/* Check if inventory.img is ready on disk */
-bool cow_is_inventory_ready_received(void)
-{
-	return cow_inventory_ready_received;
-}
-
-/* Set inventory ready flag (called when PS_IOV_INVENTORY_READY received) */
-void cow_set_inventory_ready_received(void)
-{
-	pr_info("Received inventory ready signal from primary\n");
-	cow_inventory_ready_received = true;
-}
 
 /* Check if all pages have been sent by primary */
 bool cow_is_all_pages_sent_received(void)

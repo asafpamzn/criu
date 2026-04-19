@@ -1684,7 +1684,6 @@ err:
 /*
  * Simple COW state accessors are in cow-uffd.c:
  * - cow_is_restore_connected(), cow_set_restore_connected()
- * - cow_is_inventory_ready_received(), cow_set_inventory_ready_received()
  * - cow_is_all_pages_sent_received(), cow_set_all_pages_sent_received()
  */
 
