@@ -2457,6 +2457,8 @@ static int cr_dump_finish(int ret)
 		pr_err("COW: Unfreezing process\n");
 		pstree_switch_state(root_item, TASK_ALIVE);
 
+		sleep(15);
+
 		/* Cleanup after unfreeze - not on critical path */
 		cow_cleanup_async_uffd();
 
