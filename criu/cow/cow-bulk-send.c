@@ -682,7 +682,7 @@ int cow_start_scanner_thread(pid_t source_pid)
 	 */
 	if (cow_bpf_active()) {
 		g_using_bpf_mode = true;
-		pr_info("BPF mode: skipping scanner threads for pid %d\n", source_pid);
+		pr_err("BPF mode: skipping scanner threads for pid %d\n", source_pid);
 		return 0;
 	}
 #endif
@@ -714,7 +714,7 @@ void cow_wait_scanner_thread(void)
 #ifdef CONFIG_HAS_LIBBPF
 	/* In BPF mode, no scanner threads to wait for */
 	if (g_using_bpf_mode) {
-		pr_info("BPF mode: no scanner threads to wait for\n");
+		pr_err("BPF mode: no scanner threads to wait for\n");
 		return;
 	}
 #endif
