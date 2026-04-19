@@ -113,6 +113,9 @@ int __attribute__((weak)) arch_set_thread_regs(struct pstree_item *item, bool wi
 #define PERSONALITY_LENGTH 9
 static char loc_buf[PERSONALITY_LENGTH];
 
+/* Phase 3 freeze start time - set in cr_dump_tasks_cow_phased, used in cr_dump_finish */
+static struct timeval g_phase3_freeze_start;
+
 static int cr_dump_tasks_cow_phased(pid_t pid);
 #ifdef COW_CONF_TODO_ASK_AVI_cow_seize_cure_parasite
 /* Stop parasite - optionally fast (skip rt_sigreturn single-stepping) */
@@ -2417,6 +2420,13 @@ static int cr_dump_finish(int ret)
 #endif
 
 		/* NOW unfreeze - after comparison */
+		{
+			struct timeval freeze_end, freeze_delta;
+			gettimeofday(&freeze_end, NULL);
+			timersub(&freeze_end, &g_phase3_freeze_start, &freeze_delta);
+			pr_err("TIMING: Phase 3 total freeze time: %ld.%06ld seconds\n",
+			       freeze_delta.tv_sec, freeze_delta.tv_usec);
+		}
 		pr_err("COW: Unfreezing process\n");
 		pstree_switch_state(root_item, TASK_ALIVE);
 
@@ -2880,6 +2890,7 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 	pr_err("=== PHASE 3: Freeze + skeleton dump ===\n");
 
 	gettimeofday(&freeze_start, NULL);
+	g_phase3_freeze_start = freeze_start;  /* Save for cr_dump_finish */
 	pr_err("TIMING: Phase 3 freeze started\n");
 
 	/*
