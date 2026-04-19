@@ -992,7 +992,7 @@ void cow_cleanup_async_uffd(void)
 
 			/* Yield to let target process run between chunks */
 			if ((i + 1) % COW_UFFD_UNREGISTER_YIELD == 0)
-				usleep(COW_USLEEP_1MS);
+				usleep(COW_USLEEP_10MS);
 		}
 	}
 

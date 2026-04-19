@@ -2371,18 +2371,31 @@ static int cr_dump_finish(int ret)
 	 * Inventory was already written in cr_dump_tasks_cow_phased().
 	 */
 	if (opts.cow_dump && cow_get_phase() == COW_PHASE_DONE) {
+		struct timeval t_start, t_end, t_delta, t_elapsed;
+
 		pr_err("COW: Signaling replica (ret=%d)\n", ret);
 
 		/* Signal replica that inventory is ready and wait for ACK */
 		pr_err("COW: About to send inventory ready signal (ret=%d, sk=%d)\n", ret, get_page_server_sk());
+		gettimeofday(&t_start, NULL);
 		if (!ret && send_inventory_ready_signal()) {
 			pr_err("COW: Failed to send inventory ready signal\n");
 			ret = -1;
 		}
+		gettimeofday(&t_end, NULL);
+		timersub(&t_end, &t_start, &t_delta);
+		pr_err("TIMING: send_inventory_ready_signal took %ld.%06ld seconds\n",
+		       t_delta.tv_sec, t_delta.tv_usec);
+
+		gettimeofday(&t_start, NULL);
 		if (!ret && wait_for_inventory_ready_ack(get_page_server_sk())) {
 			pr_err("COW: Failed to receive inventory ready ACK\n");
 			ret = -1;
 		}
+		gettimeofday(&t_end, NULL);
+		timersub(&t_end, &t_start, &t_delta);
+		pr_err("TIMING: wait_for_inventory_ready_ack took %ld.%06ld seconds\n",
+		       t_delta.tv_sec, t_delta.tv_usec);
 		pr_err("COW: After inventory signal+ACK (ret=%d)\n", ret);
 
 		/* NOW send all_pages_sent - after inventory ready so replica receives in order */
@@ -2390,17 +2403,31 @@ static int cr_dump_finish(int ret)
 			int sk = get_page_server_sk();
 			if (!ret && sk >= 0) {
 				pr_info("Sending all_pages_sent signal (after inventory ready)\n");
+
+				gettimeofday(&t_start, NULL);
 				if (send_all_pages_sent_signal(sk) < 0) {
 					pr_err("COW: Failed to send all_pages_sent signal\n");
 					ret = -1;
 				}
+				gettimeofday(&t_end, NULL);
+				timersub(&t_end, &t_start, &t_delta);
+				pr_err("TIMING: send_all_pages_sent_signal took %ld.%06ld seconds\n",
+				       t_delta.tv_sec, t_delta.tv_usec);
+
+				gettimeofday(&t_start, NULL);
 				if (!ret && wait_for_all_pages_sent_ack(sk) < 0) {
 					pr_err("COW: Failed to receive all_pages_sent ACK\n");
 					ret = -1;
 				}
+				gettimeofday(&t_end, NULL);
+				timersub(&t_end, &t_start, &t_delta);
+				pr_err("TIMING: wait_for_all_pages_sent_ack took %ld.%06ld seconds\n",
+				       t_delta.tv_sec, t_delta.tv_usec);
 			}
 		}
-		pr_err("COW: After all_pages_sent signal+ACK (ret=%d)\n", ret);
+		timersub(&t_end, &g_phase3_freeze_start, &t_elapsed);
+		pr_err("TIMING @%ld.%06ld: After all_pages_sent signal+ACK (ret=%d)\n",
+		       t_elapsed.tv_sec, t_elapsed.tv_usec, ret);
 
 #ifdef CONFIG_COW_COMPARE
 		/* Process comparison with replica (BOTH FROZEN) */
@@ -2429,6 +2456,9 @@ static int cr_dump_finish(int ret)
 		}
 		pr_err("COW: Unfreezing process\n");
 		pstree_switch_state(root_item, TASK_ALIVE);
+
+		/* Cleanup after unfreeze - not on critical path */
+		cow_cleanup_async_uffd();
 
 		/* Close page server socket AFTER unfreeze */
 		close_page_server_socket();
@@ -3162,8 +3192,7 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 
 	cow_set_phase(COW_PHASE_DONE);
 
-	/* Close async uffd */
-	cow_cleanup_async_uffd();
+	/* NOTE: cow_cleanup_async_uffd() moved to cr_dump_finish() after unfreeze */
 
 	/* Set up inventory fields and write - like standard path */
 	he.has_pre_dump_mode = false;
