@@ -114,14 +114,14 @@ int __attribute__((weak)) arch_set_thread_regs(struct pstree_item *item, bool wi
 static char loc_buf[PERSONALITY_LENGTH];
 
 static int cr_dump_tasks_cow_phased(pid_t pid);
-
+#ifdef COW_CONF_TODO_ASK_AVI_cow_seize_cure_parasite
 /* Stop parasite - optionally fast (skip rt_sigreturn single-stepping) */
 static int cow_seize_stop_parasite(struct parasite_ctl *ctl)
 {
 	return compel_stop_daemon_fast(ctl);
 }
 
-#ifdef COW_CONF_TODO_ASK_AVI_cow_seize_cure_parasite
+
 /* Cure parasite without remote munmap (restorer handles cleanup) */
 static int cow_seize_cure_parasite(struct parasite_ctl *ctl)
 {
