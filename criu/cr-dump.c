@@ -2403,7 +2403,11 @@ static int cr_dump_finish(int ret)
 		pr_err("COW: Unfreezing process\n");
 		pstree_switch_state(root_item, TASK_ALIVE);
 
-		/* Wait for ACK AFTER unfreeze - not on critical path */
+#ifdef CONFIG_COW_COMPARE
+		/*
+		 * When comparing, wait for ACK before compare starts.
+		 * Replica sends ACK after it's ready for comparison.
+		 */
 		gettimeofday(&t_start, NULL);
 		if (!ret && sk >= 0) {
 			if (wait_for_all_pages_sent_ack(sk) < 0) {
@@ -2413,10 +2417,9 @@ static int cr_dump_finish(int ret)
 		}
 		gettimeofday(&t_end, NULL);
 		timersub(&t_end, &t_start, &t_delta);
-		pr_err("TIMING: wait_for_completion_ack took %ld.%06ld seconds (after unfreeze)\n",
+		pr_err("TIMING: wait_for_completion_ack took %ld.%06ld seconds (before compare)\n",
 		       t_delta.tv_sec, t_delta.tv_usec);
 
-#ifdef CONFIG_COW_COMPARE
 		/* Process comparison with replica (source already unfrozen) */
 		{
 			int compare_sk;
@@ -2431,6 +2434,19 @@ static int cr_dump_finish(int ret)
 			}
 			pr_err("COMPARE: PRIMARY comparison done\n");
 		}
+#else
+		/* Wait for ACK AFTER unfreeze - not on critical path */
+		gettimeofday(&t_start, NULL);
+		if (!ret && sk >= 0) {
+			if (wait_for_all_pages_sent_ack(sk) < 0) {
+				pr_err("COW: Failed to receive completion ACK\n");
+				ret = -1;
+			}
+		}
+		gettimeofday(&t_end, NULL);
+		timersub(&t_end, &t_start, &t_delta);
+		pr_err("TIMING: wait_for_completion_ack took %ld.%06ld seconds (after unfreeze)\n",
+		       t_delta.tv_sec, t_delta.tv_usec);
 #endif
 
 		/* Cleanup after unfreeze - not on critical path */
