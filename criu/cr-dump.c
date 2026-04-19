@@ -70,6 +70,9 @@
 #include "cow/cow-page-xfer.h"
 #include "cow/cow-bulk-send.h"
 #include "cow/cow-compare.h"
+#ifdef CONFIG_HAS_LIBBPF
+#include "cow/cow-bpf.h"
+#endif
 #include "posix-timer.h"
 #include "vdso.h"
 #include "vma.h"
@@ -111,6 +114,19 @@ int __attribute__((weak)) arch_set_thread_regs(struct pstree_item *item, bool wi
 static char loc_buf[PERSONALITY_LENGTH];
 
 static int cr_dump_tasks_cow_phased(pid_t pid);
+
+/* Stop parasite - optionally fast (skip rt_sigreturn single-stepping) */
+static int cow_seize_stop_parasite(struct parasite_ctl *ctl)
+{
+	return compel_stop_daemon_fast(ctl);
+}
+
+/* Cure parasite without remote munmap (restorer handles cleanup) */
+static int cow_seize_cure_parasite(struct parasite_ctl *ctl)
+{
+	return compel_cure_local(ctl);
+}
+
 void free_mappings(struct vm_area_list *vma_area_list)
 {
 	struct vma_area *vma_area, *p;
@@ -157,6 +173,29 @@ int collect_mappings(pid_t pid, struct vm_area_list *vma_area_list, dump_filemap
 	 *
 	 * Also, we don't need to dump them during pre-dump.
 	 */
+
+	 /*
+		 * TODO(Avi): collect_madv_guards - Guard pages for COW mode
+		 *
+		 * Guard pages (MADV_GUARD_INSTALL) are page-level metadata that mark
+		 * memory regions as "guard pages". They are NOT represented as VMAs
+		 * in the kernel, but CRIU treats them as pseudo-VMAs with VMA_AREA_GUARD.
+		 *
+		 * Why we need them:
+		 * 1. Security: Guard pages catch buffer/stack overflows (SIGSEGV).
+		 *    Without them, overflows silently corrupt memory.
+		 * 2. Heap allocators: jemalloc/tcmalloc use guards between arenas.
+		 * 3. Stack protection: Applications may install stack boundary guards.
+		 *
+		 * Since REPLICA runs for hours, missing guard pages means silent
+		 * memory corruption instead of clean crashes on overflow bugs.
+		 *
+		 * Data stored: just {start, end, VMA_AREA_GUARD} - address ranges.
+		 * Restore: sys_madvise(start, len, MADV_GUARD_INSTALL)
+		 *
+		 * We collect at T3 (freeze) because that's when we capture consistent
+		 * metadata. T1 is just for data transfer setup.
+		 */
 	if (dump_file) {
 		ret = collect_madv_guards(pid, vma_area_list);
 		gettimeofday(&t_now, NULL);
@@ -1868,7 +1907,28 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	}
 
 
-	ret = compel_stop_daemon(parasite_ctl);
+	/*
+	 * TODO(Avi): COW_CONF_TODO_ASK_AVI_cow_seize_stop_parasite
+	 *
+	 * Originally we had a "fast path" here using cow_seize_stop_parasite()
+	 * which calls compel_stop_daemon_fast() - skipping rt_sigreturn
+	 * single-stepping. The theory was this would save ~14ms.
+	 *
+	 * However, actual timing shows compel_stop_daemon() only takes ~126us.
+	 * The optimization is not worth the complexity/risk. We now always use
+	 * the regular compel_stop_daemon() path.
+	 *
+	 * If you want to re-enable the fast path, define
+	 * COW_CONF_TODO_ASK_AVI_cow_seize_stop_parasite in cow-conf.h.
+	 * The fast path is safe because COW mode overwrites registers via
+	 * arch_set_thread_regs() and detaches via pstree_switch_state(TASK_ALIVE).
+	 */
+#ifdef COW_CONF_TODO_ASK_AVI_cow_seize_stop_parasite
+	if (opts.cow_dump && opts.lazy_pages)
+		ret = cow_seize_stop_parasite(parasite_ctl);
+	else
+#endif
+		ret = compel_stop_daemon(parasite_ctl);
 	gettimeofday(&t_now, NULL);
 	timersub(&t_now, &t_checkpoint, &t_delta);
 	pr_err("TIMING: compel_stop_daemon took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
@@ -1889,14 +1949,33 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	}
 
 	/*
+	 * TODO(Avi): COW_CONF_TODO_ASK_AVI_cow_seize_cure_parasite
+	 *
 	 * On failure local map will be cured in cr_dump_finish()
 	 * for lazy pages. In COW phased skeleton dump, always use
 	 * compel_cure_remote() to keep mappings for convergence.
+	 *
+	 * Originally COW mode used local cure to skip remote munmap,
+	 * with the theory that restorer handles parasite cleanup.
+	 * However, compel_cure() only takes ~9.6ms - optimization may
+	 * not be worth the complexity/risk.
+	 *
+	 * If you want to re-enable the local cure optimization, define
+	 * COW_CONF_TODO_ASK_AVI_cow_seize_cure_parasite in cow-conf.h.
 	 */
+#ifdef COW_CONF_TODO_ASK_AVI_cow_seize_cure_parasite
+	if (opts.cow_dump && opts.lazy_pages)
+		ret = cow_seize_cure_parasite(parasite_ctl);
+	else if (opts.lazy_pages || cow_is_phased_skeleton_dump())
+		ret = compel_cure_remote(parasite_ctl);
+	else
+		ret = compel_cure(parasite_ctl);
+#else
 	if (opts.lazy_pages || cow_is_phased_skeleton_dump())
 		ret = compel_cure_remote(parasite_ctl);
 	else
 		ret = compel_cure(parasite_ctl);
+#endif
 	gettimeofday(&t_now, NULL);
 	timersub(&t_now, &t_checkpoint, &t_delta);
 	pr_err("TIMING: compel_cure took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
@@ -2253,7 +2332,32 @@ static int cr_dump_finish(int ret)
 	 */
 	if (ret || post_dump_ret || opts.final_state == TASK_ALIVE) {
 		unsuspend_lsm();
-		network_unlock();
+		/*
+		 * TODO(Avi): COW_CONF_TODO_ASK_AVI_network_lock
+		 * COW mode skips network_unlock(). See cow-conf.h for details.
+		 */
+#ifdef COW_CONF_TODO_ASK_AVI_network_lock
+		if (!opts.cow_dump)
+		{
+			struct timeval t_start, t_end, t_delta;
+			gettimeofday(&t_start, NULL);
+			network_unlock();
+			gettimeofday(&t_end, NULL);
+			timersub(&t_end, &t_start, &t_delta);
+			pr_err("TIMING: network_unlock took %ld.%06ld seconds\n",
+			       t_delta.tv_sec, t_delta.tv_usec);
+		}
+#else
+		{
+			struct timeval t_start, t_end, t_delta;
+			gettimeofday(&t_start, NULL);
+			network_unlock();
+			gettimeofday(&t_end, NULL);
+			timersub(&t_end, &t_start, &t_delta);
+			pr_err("TIMING: network_unlock took %ld.%06ld seconds\n",
+			       t_delta.tv_sec, t_delta.tv_usec);
+		}
+#endif
 		delete_link_remaps();
 	}
 
@@ -2523,8 +2627,21 @@ int cr_dump_tasks(pid_t pid)
 	if (collect_pstree_ids())
 		goto err;
 
+	/*
+	 * TODO(Avi): COW_CONF_TODO_ASK_AVI_network_lock
+	 * COW mode skips network_lock(). See cow-conf.h for details.
+	 * Questions: Is this intentional? How does COW handle TCP state?
+	 */
+#ifdef COW_CONF_TODO_ASK_AVI_network_lock
+	if (!opts.cow_dump) {
+		if (network_lock())
+			goto err;
+	}
+#else	
 	if (network_lock())
 		goto err;
+	
+#endif
 
 	if (rpc_query_external_files())
 		goto err;
@@ -2689,8 +2806,20 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 			goto err;
 	}
 
-	
-	/* Unfreeze — process runs with WP_ASYNC */
+	/*
+	 * Start BPF dirty page tracker BEFORE unfreezing the process.
+	 * This ensures we capture all page faults from the moment the
+	 * process resumes. Starting after unfreeze creates a race window
+	 * where faults could be missed.
+	 */
+#ifdef CONFIG_HAS_LIBBPF
+	if (cow_bpf_start(root_item->pid->real) == 0)
+		pr_err("BPF dirty tracker started (before unfreeze)\n");
+	else
+		pr_info("BPF dirty tracker not available, using PAGEMAP_SCAN\n");
+#endif
+
+	/* Unfreeze — process runs with WP_ASYNC, BPF captures all faults */
 	ret = arch_set_thread_regs(root_item, false);
 	if (ret)
 		goto err;
@@ -2856,6 +2985,12 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 	 */
 	cow_signal_last_scan();
 
+	/*
+	 * TODO(Avi): COW_CONF_TODO_ASK_AVI_network_lock
+	 * COW mode skips network_lock(). See cow-conf.h for details.
+	 */
+#ifdef COW_CONF_TODO_ASK_AVI_network_lock
+	if (!opts.cow_dump) {
 	{
 		struct timeval t_start, t_end, t_delta;
 		gettimeofday(&t_start, NULL);
@@ -2866,6 +3001,18 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 		pr_err("TIMING: network_lock took %ld.%06ld seconds\n",
 		       t_delta.tv_sec, t_delta.tv_usec);
 	}
+#else
+	{	
+		struct timeval t_start, t_end, t_delta;
+		gettimeofday(&t_start, NULL);
+		if (network_lock())
+			goto err;
+		gettimeofday(&t_end, NULL);
+		timersub(&t_end, &t_start, &t_delta);
+		pr_err("TIMING: network_lock took %ld.%06ld seconds\n",
+		       t_delta.tv_sec, t_delta.tv_usec);
+	}
+#endif
 
 	{
 		struct timeval t_start, t_end, t_delta;

@@ -39,6 +39,9 @@
 #include "pagemap.h"
 #include "pagemap_scan.h"
 #include "common/bug.h"
+#ifdef CONFIG_HAS_LIBBPF
+#include "cow/cow-bpf.h"
+#endif
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "cow-bulk: "
@@ -436,11 +439,65 @@ static void *dirty_scanner_thread(void *arg)
 		unsigned long final_dirty = 0;
 		unsigned int queue_idx = queue_base;
 		struct timespec fs_start, fs_end;
+#ifdef CONFIG_HAS_LIBBPF
+		bool use_bpf = false;
+#endif
 
 		clock_gettime(CLOCK_MONOTONIC, &fs_start);
 		if (scanner_id == 0) {
 			pr_err("Scanner: final scan (frozen)\n");
 		}
+
+#ifdef CONFIG_HAS_LIBBPF
+		/*
+		 * If BPF dirty tracking is active, scanner 0 drains the BPF ring
+		 * and other scanners skip. This is O(dirty) vs O(total_pages).
+		 */
+		if (scanner_id == 0 && cow_bpf_active()) {
+			struct cow_bpf_region *bpf_regions;
+			unsigned long bpf_pages = 0;
+			int bpf_nr, i;
+
+			use_bpf = true;
+			bpf_regions = xmalloc(COW_PAGEMAP_SCAN_VEC_LEN * sizeof(*bpf_regions));
+			if (bpf_regions) {
+				bpf_nr = cow_bpf_drain(bpf_regions, COW_PAGEMAP_SCAN_VEC_LEN, &bpf_pages);
+				if (bpf_nr >= 0) {
+					pr_err("BPF drain: %d regions, %lu pages\n", bpf_nr, bpf_pages);
+					for (i = 0; i < bpf_nr; i++) {
+						struct dirty_region_entry *entry;
+						unsigned long pages;
+
+						pages = (bpf_regions[i].end - bpf_regions[i].start) / PAGE_SIZE;
+						final_dirty += pages;
+
+						entry = xmalloc(sizeof(*entry));
+						BUG_ON(!entry);
+						entry->start = bpf_regions[i].start;
+						entry->end = bpf_regions[i].end;
+						entry->dst_id = 0;  /* Will be set per-VMA */
+						entry->source_pid = g_scanner_source_pid;
+
+						spsc_enqueue(sender_queues[queue_idx].tail,
+							     sender_queues[queue_idx].size,
+							     entry, struct dirty_region_spsc_node);
+						__sync_fetch_and_add(&queue_pages_dist[queue_idx], pages);
+						__sync_fetch_and_add(&queue_regions_dist[queue_idx], 1);
+						queue_idx = (queue_idx + 1) % COW_NUM_P3_THREADS;
+					}
+				} else if (bpf_nr == -2) {
+					/* BPF ring drops - fall back to PAGEMAP_SCAN */
+					pr_err("BPF ring drops detected, falling back to PAGEMAP_SCAN\n");
+					use_bpf = false;
+				}
+				xfree(bpf_regions);
+			}
+			cow_bpf_stop();
+		}
+
+		if (use_bpf)
+			goto skip_pagemap_scan;
+#endif
 
 		list_for_each_entry(lve, lazy_vmas, list) {
 			struct pm_scan_arg args;
@@ -505,6 +562,9 @@ static void *dirty_scanner_thread(void *arg)
 			} while (args.walk_end < my_end);
 		}
 
+#ifdef CONFIG_HAS_LIBBPF
+skip_pagemap_scan:
+#endif
 		clock_gettime(CLOCK_MONOTONIC, &fs_end);
 
 		/* Store final dirty count for this scanner */
@@ -595,6 +655,9 @@ out:
 	return NULL;
 }
 
+/* Track whether we're using BPF mode (no scanner threads) */
+static bool g_using_bpf_mode = false;
+
 int cow_start_scanner_thread(pid_t source_pid)
 {
 	int i;
@@ -611,7 +674,22 @@ int cow_start_scanner_thread(pid_t source_pid)
 		queue_regions_dist[i] = 0;
 	}
 
-	/* Initialize and start dual scanners */
+#ifdef CONFIG_HAS_LIBBPF
+	/*
+	 * When BPF is active, skip scanner threads entirely.
+	 * BPF collects dirty pages in ring buffer during Phase 2.
+	 * At freeze time, we drain the ring and distribute to sender queues.
+	 */
+	if (cow_bpf_active()) {
+		g_using_bpf_mode = true;
+		pr_info("BPF mode: skipping scanner threads for pid %d\n", source_pid);
+		return 0;
+	}
+#endif
+
+	g_using_bpf_mode = false;
+
+	/* Initialize and start dual scanners (non-BPF path) */
 	for (i = 0; i < COW_NUM_SCANNERS; i++) {
 		scanners[i].id = i;
 		scanners[i].pagemap_fd = -1;
@@ -633,6 +711,14 @@ void cow_wait_scanner_thread(void)
 {
 	int i;
 
+#ifdef CONFIG_HAS_LIBBPF
+	/* In BPF mode, no scanner threads to wait for */
+	if (g_using_bpf_mode) {
+		pr_info("BPF mode: no scanner threads to wait for\n");
+		return;
+	}
+#endif
+
 	for (i = 0; i < COW_NUM_SCANNERS; i++) {
 		if (scanners[i].thread) {
 			pthread_join(scanners[i].thread, NULL);
@@ -642,6 +728,95 @@ void cow_wait_scanner_thread(void)
 	}
 	/* Senders drain their own queues during normal exit */
 }
+
+#ifdef CONFIG_HAS_LIBBPF
+/*
+ * Drain BPF ring buffer and distribute dirty regions to sender queues.
+ * Called at freeze time when using BPF mode.
+ * Returns number of dirty pages, or -1 on error.
+ */
+int cow_bpf_drain_to_queues(void)
+{
+	struct cow_bpf_region *bpf_regions;
+	unsigned long total_pages = 0;
+	int bpf_nr, i;
+	unsigned int queue_idx = 0;
+	u64 drops;
+
+	if (!g_using_bpf_mode || !cow_bpf_active()) {
+		pr_err("cow_bpf_drain_to_queues called but BPF not active\n");
+		return -1;
+	}
+
+	/* Check for ring buffer overflow - BUG() if detected */
+	drops = cow_bpf_drop_count();
+	if (drops > 0) {
+		pr_err("BPF ring buffer overflow: %llu events dropped!\n",
+		       (unsigned long long)drops);
+		BUG();
+	}
+
+	bpf_regions = xmalloc(COW_PAGEMAP_SCAN_VEC_LEN * sizeof(*bpf_regions));
+	if (!bpf_regions) {
+		pr_err("Failed to allocate BPF regions buffer\n");
+		return -1;
+	}
+
+	bpf_nr = cow_bpf_drain(bpf_regions, COW_PAGEMAP_SCAN_VEC_LEN, &total_pages);
+	if (bpf_nr < 0) {
+		if (bpf_nr == -2) {
+			pr_err("BPF ring drops detected during drain!\n");
+			BUG();
+		}
+		pr_err("BPF drain failed: %d\n", bpf_nr);
+		xfree(bpf_regions);
+		return -1;
+	}
+
+	pr_info("BPF drain: %d regions, %lu dirty pages\n", bpf_nr, total_pages);
+
+	/* Distribute regions to sender queues (round-robin) */
+	for (i = 0; i < bpf_nr; i++) {
+		struct dirty_region_entry *entry;
+		unsigned long pages;
+
+		pages = (bpf_regions[i].end - bpf_regions[i].start) / PAGE_SIZE;
+
+		entry = xmalloc(sizeof(*entry));
+		BUG_ON(!entry);
+		entry->start = bpf_regions[i].start;
+		entry->end = bpf_regions[i].end;
+		entry->dst_id = 0;  /* Will use lve->dst_id when processing */
+		entry->source_pid = g_scanner_source_pid;
+
+		spsc_enqueue(sender_queues[queue_idx].tail,
+			     sender_queues[queue_idx].size,
+			     entry, struct dirty_region_spsc_node);
+		__sync_fetch_and_add(&queue_pages_dist[queue_idx], pages);
+		__sync_fetch_and_add(&queue_regions_dist[queue_idx], 1);
+
+		queue_idx = (queue_idx + 1) % COW_NUM_P3_THREADS;
+	}
+
+	xfree(bpf_regions);
+
+	/* Signal scan complete so sender threads process their queues */
+	__atomic_store_n(&g_scan_complete, true, __ATOMIC_RELEASE);
+
+	pr_info("BPF drain complete: distributed %d regions to %d queues\n",
+		bpf_nr, COW_NUM_P3_THREADS);
+
+	return (int)total_pages;
+}
+
+/*
+ * Check if using BPF mode (no scanner threads).
+ */
+bool cow_using_bpf_mode(void)
+{
+	return g_using_bpf_mode;
+}
+#endif /* CONFIG_HAS_LIBBPF */
 
 void cow_set_new_vma_ranges(unsigned long *ranges, unsigned int nr_ranges)
 {
@@ -1231,11 +1406,23 @@ int cow_get_num_p3_threads(void)
 /*
  * Check if ready to freeze.
  * In scanner architecture: returns true when scanner signals freeze (g_last_scan_flag).
- * This replaces the old per-thread threshold check.
+ * In BPF mode: returns true immediately after bulk transfer completes.
  */
 bool cow_all_threads_below_threshold(void)
 {
-	/* Scanner decides when to freeze based on total dirty pages < 1M */
+#ifdef CONFIG_HAS_LIBBPF
+	/*
+	 * In BPF mode: no iterative scanning, freeze immediately after bulk transfer.
+	 * Check that all sender threads have completed bulk transfer.
+	 */
+	if (g_using_bpf_mode) {
+		int done = __atomic_load_n(&g_bulk_transfer_done_count, __ATOMIC_ACQUIRE);
+		int total = __atomic_load_n(&g_num_sender_threads, __ATOMIC_ACQUIRE);
+		return done >= total && p3_threads_active > 0;
+	}
+#endif
+
+	/* Scanner decides when to freeze based on total dirty pages < threshold */
 	return g_last_scan_flag && p3_threads_active > 0;
 }
 
@@ -1247,6 +1434,25 @@ void cow_signal_last_scan(void)
 {
 	pr_err("=== CONVERGENCE: Signaling last scan ===\n");
 	g_last_scan_flag = true;
+
+#ifdef CONFIG_HAS_LIBBPF
+	/*
+	 * In BPF mode: drain ring buffer and distribute to sender queues.
+	 * No scanner threads to signal.
+	 */
+	if (g_using_bpf_mode) {
+		int dirty_pages = cow_bpf_drain_to_queues();
+		if (dirty_pages < 0) {
+			pr_err("BPF drain failed!\n");
+			BUG();
+		}
+		pr_err("BPF mode: drained %d dirty pages to sender queues\n", dirty_pages);
+		cow_bpf_stop();
+		__sync_synchronize();
+		return;
+	}
+#endif
+
 	cow_signal_scanner_freeze();  /* Signal scanner to do final scan */
 	__sync_synchronize();  /* Memory barrier */
 }

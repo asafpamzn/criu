@@ -58,6 +58,47 @@
  */
 // #define CONFIG_COW_WAIT_REPLICA_TOUCH
 
+/*
+ * COW_CONF_TODO_ASK_AVI_cow_seize_stop_parasite - Use fast parasite stop.
+ * When enabled, uses compel_stop_daemon_fast() which skips rt_sigreturn
+ * single-stepping. Measured at ~126us - not worth optimizing.
+ * TODO: Ask Avi if this is actually needed.
+ */
+// #define COW_CONF_TODO_ASK_AVI_cow_seize_stop_parasite
+
+/*
+ * COW_CONF_TODO_ASK_AVI_network_lock - Enable network locking for COW mode.
+ * Currently COW mode skips network_lock() entirely. This means:
+ * 1. Process can do network I/O while running during Phase 2
+ * 2. TCP connections are not locked/checkpointed in the traditional way
+ *
+ * Questions for Avi:
+ * - Is this intentional? Process keeps running, so locking would block I/O.
+ * - How does COW handle TCP connection state consistency?
+ * - If process does network I/O between T1 and T3, does REPLICA get correct state?
+ *
+ * Timing shows network_lock takes ~0us, so perf is not the reason to skip it.
+ * TODO: Ask Avi why we skip network lock in COW mode.
+ */
+// #define COW_CONF_TODO_ASK_AVI_network_lock
+
+/*
+ * COW_CONF_TODO_ASK_AVI_cow_seize_cure_parasite - Use local-only parasite cure.
+ * When enabled, uses compel_cure_local() which skips remote munmap.
+ * The theory was that restorer handles parasite cleanup anyway.
+ *
+ * However, actual timing shows compel_cure() only takes ~9.6ms.
+ * The optimization may not be worth the complexity/risk.
+ *
+ * Questions for Avi:
+ * - Is skipping remote munmap actually needed for COW correctness?
+ * - Or was it just a perf optimization that's not worth ~9.6ms?
+ * - Does the restorer actually clean up the parasite mapping?
+ *
+ * TODO: Ask Avi if this is actually needed.
+ */
+// #define COW_CONF_TODO_ASK_AVI_cow_seize_cure_parasite
+
 /* ================================================================
  * SECTION 1: Batch Transfer Configuration
  * ================================================================ */
@@ -238,5 +279,22 @@
 
 /* SPSC queue padding (2 cache lines) */
 #define COW_SPSC_PADDING		128
+
+/* ================================================================
+ * SECTION 13: eBPF Dirty Page Tracker Configuration
+ * ================================================================ */
+
+/*
+ * BPF ring buffer size for dirty page addresses.
+ * Each entry is 8 bytes (u64 address), so 64MB = 8M entries.
+ * If this fills up, we fall back to PAGEMAP_SCAN.
+ */
+#define COW_BPF_RING_SIZE		(64UL * 1024 * 1024)  /* 64MB */
+
+/*
+ * Initial capacity for BPF drain address array.
+ * Will be dynamically grown if needed.
+ */
+#define COW_BPF_DRAIN_INITIAL_CAP	65536
 
 #endif /* __CR_COW_CONF_H__ */

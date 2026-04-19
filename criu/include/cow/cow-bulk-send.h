@@ -132,4 +132,19 @@ void cow_set_new_vma_ranges(unsigned long *ranges, unsigned int nr_ranges);
  */
 void cow_free_new_vma_ranges(void);
 
+#ifdef CONFIG_HAS_LIBBPF
+/*
+ * Drain BPF ring buffer and distribute dirty regions to sender queues.
+ * Called at freeze time when using BPF mode (no scanner threads).
+ * Returns number of dirty pages, or -1 on error.
+ * BUG() if ring buffer overflow detected.
+ */
+int cow_bpf_drain_to_queues(void);
+
+/*
+ * Check if using BPF mode (no scanner threads).
+ */
+bool cow_using_bpf_mode(void);
+#endif /* CONFIG_HAS_LIBBPF */
+
 #endif /* __CR_COW_BULK_SEND_H__ */

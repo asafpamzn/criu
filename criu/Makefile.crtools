@@ -109,6 +109,7 @@ obj-y			+= timens.o
 obj-y			+= timer.o
 obj-y			+= sigact.o
 obj-$(CONFIG_HAS_LIBBPF)	+= bpfmap.o
+obj-$(CONFIG_HAS_LIBBPF)	+= cow/cow-bpf.o
 obj-$(CONFIG_COMPAT)	+= pie-util-vdso-elf32.o
 CFLAGS_pie-util-vdso-elf32.o	+= -DCONFIG_VDSO_32
 obj-$(CONFIG_COMPAT)	+= vdso-compat.o

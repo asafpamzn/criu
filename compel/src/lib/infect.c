@@ -1479,6 +1479,78 @@ int compel_stop_daemon(struct parasite_ctl *ctl)
 	return 0;
 }
 
+/*
+ * Stop parasite fast: skip rt_sigreturn single-stepping.
+ *
+ * Unlike compel_stop_daemon(), this does NOT walk the parasite code
+ * to rt_sigreturn (compel_stop_pie + compel_stop_on_syscall).
+ *
+ * Safe when the caller will:
+ * 1. Call compel_cure_remote() (munmap via syscall injection - works
+ *    on any stopped task regardless of PC)
+ * 2. Overwrite registers via arch_set_thread_regs()
+ * 3. Detach via pstree_switch_state(TASK_ALIVE)
+ */
+int compel_stop_daemon_fast(struct parasite_ctl *ctl)
+{
+	pid_t pid;
+	user_regs_struct_t regs;
+	int status, ret;
+
+	if (!ctl->daemonized)
+		return 0;
+
+	if (ctl->tsock < 0)
+		return -1;
+
+	pid = ctl->rpid;
+
+	if (restore_child_handler(ctl))
+		goto err;
+
+	if (ptrace(PTRACE_INTERRUPT, pid, NULL, NULL)) {
+		pr_perror("Unable to interrupt the process");
+		goto err;
+	}
+
+	if (wait4(pid, &status, __WALL, NULL) != pid) {
+		pr_perror("Waited pid mismatch (pid: %d)", pid);
+		goto err;
+	}
+
+	if (!WIFSTOPPED(status)) {
+		pr_err("Task is still running (pid: %d, status: 0x%x)\n",
+		       pid, status);
+		goto err;
+	}
+
+	ret = ptrace_get_regs(pid, &regs);
+	if (ret) {
+		pr_perror("Unable to get registers");
+		goto err;
+	}
+
+	if (!task_in_parasite(ctl, &regs)) {
+		pr_err("The task is not in parasite code\n");
+		goto err;
+	}
+
+	ret = compel_rpc_call(PARASITE_CMD_FINI, ctl);
+	close_safe(&ctl->tsock);
+	if (ret)
+		goto err;
+
+	/* Skip compel_stop_pie + compel_stop_on_syscall - the caller
+	 * will overwrite registers and detach anyway. */
+
+	ctl->daemonized = false;
+	return 0;
+
+err:
+	close_safe(&ctl->tsock);
+	return -1;
+}
+
 int compel_cure_remote(struct parasite_ctl *ctl)
 {
 	long ret;
