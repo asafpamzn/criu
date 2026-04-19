@@ -121,11 +121,13 @@ static int cow_seize_stop_parasite(struct parasite_ctl *ctl)
 	return compel_stop_daemon_fast(ctl);
 }
 
+#ifdef COW_CONF_TODO_ASK_AVI_cow_seize_cure_parasite
 /* Cure parasite without remote munmap (restorer handles cleanup) */
 static int cow_seize_cure_parasite(struct parasite_ctl *ctl)
 {
-	return compel_cure_local(ctl);
+	return compel_cure_local(ctl);	
 }
+#endif
 
 void free_mappings(struct vm_area_list *vma_area_list)
 {
