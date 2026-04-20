@@ -834,6 +834,13 @@ int cow_bpf_drain_to_queues(void)
 }
 
 #ifdef SCAN_COMPARE
+static int scan_compare_addr_cmp(const void *a, const void *b)
+{
+	unsigned long va = *(const unsigned long *)a;
+	unsigned long vb = *(const unsigned long *)b;
+	return (va > vb) - (va < vb);
+}
+
 /*
  * DEBUG: Compare BPF vs PAGEMAP_SCAN at freeze time.
  * Call this after freeze, before any page transfer.
@@ -853,6 +860,10 @@ void cow_debug_scan_compare(void)
 	unsigned long scan_in_bpf = 0;
 	unsigned long page_size = sysconf(_SC_PAGESIZE);
 	u64 drops;
+	/* Track SCAN addresses for duplicate detection */
+	unsigned long *scan_addrs = NULL;
+	unsigned long scan_addrs_cap = 0;
+	unsigned long scan_addrs_count = 0;
 
 	pr_err("=== SCAN_COMPARE DEBUG MODE ===\n");
 
@@ -885,6 +896,14 @@ void cow_debug_scan_compare(void)
 	regs = xmalloc(COW_PAGEMAP_SCAN_VEC_LEN * sizeof(*regs));
 	if (!regs) {
 		pr_err("Failed to allocate regs\n");
+		exit(1);
+	}
+
+	/* Allocate array to collect all SCAN addresses for duplicate detection */
+	scan_addrs_cap = bpf_addr_count > 0 ? bpf_addr_count * 2 : 1000000;
+	scan_addrs = xmalloc(scan_addrs_cap * sizeof(*scan_addrs));
+	if (!scan_addrs) {
+		pr_err("Failed to allocate scan_addrs\n");
 		exit(1);
 	}
 
@@ -925,31 +944,18 @@ void cow_debug_scan_compare(void)
 				unsigned long addr;
 
 				for (addr = regs[r].start; addr < regs[r].end; addr += page_size) {
-					unsigned long lo = 0, hi = bpf_addr_count;
-					bool found = false;
-
-					scan_count++;
-
-					/* Binary search in sorted BPF addresses */
-					while (lo < hi) {
-						unsigned long mid = (lo + hi) / 2;
-						if (bpf_addrs[mid] == addr) {
-							found = true;
-							break;
-						} else if (bpf_addrs[mid] < addr) {
-							lo = mid + 1;
-						} else {
-							hi = mid;
+					/* Collect address for duplicate detection */
+					if (scan_addrs_count >= scan_addrs_cap) {
+						unsigned long new_cap = scan_addrs_cap * 2;
+						unsigned long *tmp = xrealloc(scan_addrs, new_cap * sizeof(*tmp));
+						if (!tmp) {
+							pr_err("Failed to grow scan_addrs\n");
+							exit(1);
 						}
+						scan_addrs = tmp;
+						scan_addrs_cap = new_cap;
 					}
-					if (!found) {
-						scan_only++;
-						/* Log ALL missed addresses */
-						pr_err("BPF MISSED: 0x%lx (VMA 0x%lx-0x%lx)\n",
-						       addr, lve->start, lve->end);
-					} else {
-						scan_in_bpf++;
-					}
+					scan_addrs[scan_addrs_count++] = addr;
 				}
 			}
 		} while (args.walk_end < lve->end);
@@ -958,67 +964,73 @@ void cow_debug_scan_compare(void)
 	xfree(regs);
 	close(pagemap_fd);
 
-	/*
-	 * Now check reverse: BPF pages not in SCAN.
-	 * Build hash of SCAN addresses and check each BPF address.
-	 */
+	pr_err("Raw SCAN returned: %lu addresses\n", scan_addrs_count);
+
+	/* Sort SCAN addresses for dedup and binary search */
+	qsort(scan_addrs, scan_addrs_count, sizeof(*scan_addrs), scan_compare_addr_cmp);
+
+	/* Count duplicates and unique SCAN addresses */
+	{
+		unsigned long unique = 0;
+		unsigned long duplicates = 0;
+		unsigned long i;
+
+		if (scan_addrs_count > 0) {
+			unique = 1;
+			for (i = 1; i < scan_addrs_count; i++) {
+				if (scan_addrs[i] == scan_addrs[i - 1]) {
+					pr_err("SCAN DUPLICATE: 0x%lx\n", scan_addrs[i]);
+					duplicates++;
+				} else {
+					/* Move unique to front */
+					scan_addrs[unique++] = scan_addrs[i];
+				}
+			}
+		}
+		pr_err("SCAN duplicates: %lu, unique: %lu\n", duplicates, unique);
+		scan_count = unique;  /* Now scan_count = unique SCAN pages */
+	}
+
+	/* Now compare: both arrays are sorted and unique */
 	{
 		unsigned long i;
-		/* Simple approach: for each BPF addr, binary search in sorted SCAN results */
-		/* But we don't have sorted SCAN results. Instead, check if addr is in any VMA
-		 * and has PAGE_IS_WRITTEN set. Simpler: just report the count difference. */
+		unsigned long bpf_idx = 0, scan_idx = 0;
 
-		pr_err("=== SCAN_COMPARE RESULTS ===\n");
-		pr_err("BPF found:  %lu pages\n", bpf_addr_count);
-		pr_err("SCAN found: %lu pages (scan_count)\n", scan_count);
-		pr_err("SCAN in BPF: %lu pages (found in both)\n", scan_in_bpf);
-		pr_err("SCAN only:  %lu pages (BPF MISSED)\n", scan_only);
-		pr_err("Sanity check: scan_in_bpf(%lu) + scan_only(%lu) = %lu, should = scan_count(%lu)\n",
-		       scan_in_bpf, scan_only, scan_in_bpf + scan_only, scan_count);
-		pr_err("BPF only (calc): BPF(%lu) - scan_in_bpf(%lu) = %lu\n",
-		       bpf_addr_count, scan_in_bpf,
-		       bpf_addr_count > scan_in_bpf ? bpf_addr_count - scan_in_bpf : 0);
-
-		/* Log ALL BPF-only addresses by checking which BPF addrs aren't PAGE_IS_WRITTEN */
-		if (bpf_addrs) {
-			unsigned long actual_bpf_only = 0;
-			pr_err("Checking BPF-only addresses...\n");
-
-			/* Re-open pagemap to check individual BPF addresses */
-			pagemap_fd = open(path, O_RDONLY);
-			if (pagemap_fd >= 0) {
-				for (i = 0; i < bpf_addr_count; i++) {
-					struct pm_scan_arg args;
-					struct page_region reg;
-					long ret;
-
-					memset(&args, 0, sizeof(args));
-					args.size = sizeof(args);
-					args.flags = 0;
-					args.start = bpf_addrs[i];
-					args.end = bpf_addrs[i] + page_size;
-					args.walk_end = bpf_addrs[i];
-					args.vec = (u64)(unsigned long)&reg;
-					args.vec_len = 1;
-					args.max_pages = 1;
-					args.category_anyof_mask = PAGE_IS_WRITTEN;
-					args.return_mask = PAGE_IS_WRITTEN;
-
-					ret = ioctl(pagemap_fd, PAGEMAP_SCAN, &args);
-					if (ret == 0) {
-						/* Not found by SCAN - this is a BPF-only page */
-						pr_err("BPF ONLY: 0x%lx (not PAGE_IS_WRITTEN)\n", bpf_addrs[i]);
-						actual_bpf_only++;
-					}
-				}
-				close(pagemap_fd);
-				pr_err("Actual BPF-only count: %lu\n", actual_bpf_only);
+		while (bpf_idx < bpf_addr_count && scan_idx < scan_count) {
+			if (bpf_addrs[bpf_idx] == scan_addrs[scan_idx]) {
+				scan_in_bpf++;
+				bpf_idx++;
+				scan_idx++;
+			} else if (bpf_addrs[bpf_idx] < scan_addrs[scan_idx]) {
+				/* BPF has page that SCAN doesn't */
+				bpf_idx++;
+			} else {
+				/* SCAN has page that BPF doesn't - BPF MISSED */
+				pr_err("BPF MISSED: 0x%lx\n", scan_addrs[scan_idx]);
+				scan_only++;
+				scan_idx++;
 			}
+		}
+		/* Remaining SCAN addresses are all missed by BPF */
+		while (scan_idx < scan_count) {
+			pr_err("BPF MISSED: 0x%lx\n", scan_addrs[scan_idx]);
+			scan_only++;
+			scan_idx++;
 		}
 	}
 
+	pr_err("=== SCAN_COMPARE RESULTS ===\n");
+	pr_err("BPF found:  %lu unique pages\n", bpf_addr_count);
+	pr_err("SCAN found: %lu unique pages\n", scan_count);
+	pr_err("In both:    %lu pages\n", scan_in_bpf);
+	pr_err("SCAN only:  %lu pages (BPF MISSED)\n", scan_only);
+	pr_err("BPF only:   %lu pages (SCAN missed)\n",
+	       bpf_addr_count > scan_in_bpf ? bpf_addr_count - scan_in_bpf : 0);
+
 	if (bpf_addrs)
 		xfree(bpf_addrs);
+	if (scan_addrs)
+		xfree(scan_addrs);
 
 	pr_err("=== EXITING DEBUG MODE ===\n");
 
