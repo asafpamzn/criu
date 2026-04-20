@@ -993,7 +993,6 @@ void cow_debug_scan_compare(void)
 
 	/* Now compare: both arrays are sorted and unique */
 	{
-		unsigned long i;
 		unsigned long bpf_idx = 0, scan_idx = 0;
 
 		while (bpf_idx < bpf_addr_count && scan_idx < scan_count) {
