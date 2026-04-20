@@ -23,15 +23,8 @@ void *cow_page_buffer_lookup_and_remove(unsigned long vaddr);
  *            must have called cow_page_buffer_thread_init(thread_id) first
  * nocopy: if true, takes ownership of data pointer (from page_pool_get_chunk)
  *         if false, copies data to new page pool allocation
- * Returns: 0 if page is NEW, 1 if page already existed (dirty overwrite)
  */
 int cow_page_buffer_add(unsigned long vaddr, void *data, int thread_id, bool nocopy);
-
-/*
- * Register a batch of contiguous pages for efficient drain.
- * Called from P3 receiver when all pages in the batch are new.
- */
-void cow_drain_batch_add(unsigned long vaddr, int nr_pages, void *data);
 
 /* Get current page count */
 unsigned long cow_page_buffer_count(void);

@@ -1257,24 +1257,8 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 			uffdio_copy.copy = 0;
 
 			if (ioctl(lpi->lpfd.fd, UFFDIO_COPY, &uffdio_copy) < 0) {
-				int err = errno;
-				/*
-				 * EEXIST: drain already copied this page.
-				 * EAGAIN: kernel busy, queue for retry (copies data).
-				 * Other errors are real failures.
-				 */
-				if (err == EEXIST) {
-					page_pool_put(page_data);
-					pr_err("PAGE_FAULT: 0x%llx EEXIST (drain won)\n", address);
-					return 0;
-				}
-				if (err == EAGAIN) {
-					cow_queue_eagain_request(lpi, address, 1, page_data, "pf_copy");
-					page_pool_put(page_data);
-					return 0;
-				}
-				page_pool_put(page_data);
 				pr_perror("PAGE_FAULT: UFFDIO_COPY failed for 0x%llx", address);
+				page_pool_put(page_data);
 				return -1;
 			}
 			page_pool_put(page_data);
@@ -1282,14 +1266,7 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 			return 0;
 		}
 
-		/*
-		 * Not in buffer. Two possibilities:
-		 * 1. Page was never sent (zero/sparse page) - zero it
-		 * 2. Drain already UFFDIO_COPY'd and removed from hash
-		 *
-		 * Try to zero. If drain already installed the page, we get
-		 * EEXIST which uffd_zero treats as success (returns 0).
-		 */
+		/* Not in buffer - zero the page */
 		pr_err("PAGE_FAULT: 0x%llx not in buffer, zeroing\n", address);
 		return uffd_zero(lpi, address, 1);
 	}
