@@ -71,4 +71,12 @@ extern bool cow_bpf_active(void);
  */
 extern int cow_bpf_drain_addrs(unsigned long **out_addrs, unsigned long *out_count);
 
+#ifdef SCAN_COMPARE
+/*
+ * Get the initial dirty pages captured at BPF start time.
+ * Returns pointer to static array (do not free).
+ */
+extern unsigned long *cow_bpf_get_initial_dirty(unsigned long *count);
+#endif
+
 #endif /* __CR_COW_BPF_H__ */

@@ -75,22 +75,44 @@ static int addr_cmp(const void *a, const void *b)
 
 #ifdef SCAN_COMPARE
 /*
- * DEBUG: Quick count of dirty pages via PAGEMAP_SCAN.
- * Scans entire address space and counts PAGE_IS_WRITTEN pages.
+ * DEBUG: Store initial dirty pages found at BPF start time.
+ * These are pages that were dirty BEFORE we started tracking.
  */
-static unsigned long debug_count_dirty_pages(pid_t pid)
+static unsigned long *g_initial_dirty_addrs = NULL;
+static unsigned long g_initial_dirty_count = 0;
+static pid_t g_debug_pid = 0;
+
+/*
+ * DEBUG: Scan all VMAs and collect dirty page addresses.
+ * Returns count of dirty pages found.
+ */
+static unsigned long debug_scan_dirty_pages(pid_t pid, unsigned long **out_addrs)
 {
 	char path[64];
 	int fd;
 	struct pm_scan_arg args;
 	struct page_region regs[1024];
 	unsigned long count = 0;
+	unsigned long cap = 65536;
+	unsigned long *addrs;
 	unsigned long page_size = sysconf(_SC_PAGESIZE);
+	struct timeval start, end, delta;
+
+	gettimeofday(&start, NULL);
+
+	addrs = xmalloc(cap * sizeof(*addrs));
+	if (!addrs) {
+		*out_addrs = NULL;
+		return 0;
+	}
 
 	snprintf(path, sizeof(path), "/proc/%d/pagemap", pid);
 	fd = open(path, O_RDONLY);
-	if (fd < 0)
+	if (fd < 0) {
+		xfree(addrs);
+		*out_addrs = NULL;
 		return 0;
+	}
 
 	/* Scan entire user address space */
 	memset(&args, 0, sizeof(args));
@@ -115,12 +137,42 @@ static unsigned long debug_count_dirty_pages(pid_t pid)
 			break;
 
 		for (i = 0; i < ret; i++) {
-			count += (regs[i].end - regs[i].start) / page_size;
+			unsigned long addr;
+			for (addr = regs[i].start; addr < regs[i].end; addr += page_size) {
+				if (count >= cap) {
+					unsigned long new_cap = cap * 2;
+					unsigned long *tmp = xrealloc(addrs, new_cap * sizeof(*tmp));
+					if (!tmp) {
+						close(fd);
+						*out_addrs = addrs;
+						return count;
+					}
+					addrs = tmp;
+					cap = new_cap;
+				}
+				addrs[count++] = addr;
+			}
 		}
 	} while (args.walk_end < args.end);
 
 	close(fd);
+
+	gettimeofday(&end, NULL);
+	timersub(&end, &start, &delta);
+	pr_err("SCAN_COMPARE: debug_scan_dirty_pages took %ld.%06ld sec, found %lu pages\n",
+	       delta.tv_sec, delta.tv_usec, count);
+
+	*out_addrs = addrs;
 	return count;
+}
+
+/*
+ * Get the initial dirty pages captured at BPF start.
+ */
+unsigned long *cow_bpf_get_initial_dirty(unsigned long *count)
+{
+	*count = g_initial_dirty_count;
+	return g_initial_dirty_addrs;
 }
 #endif
 
@@ -129,10 +181,26 @@ int cow_bpf_start(pid_t target_pid)
 	struct dirty_track_bpf *skel;
 	int err;
 #ifdef SCAN_COMPARE
-	unsigned long dirty_before, dirty_after;
+	unsigned long *dirty_before_addrs = NULL;
+	unsigned long dirty_before_count;
 
-	dirty_before = debug_count_dirty_pages(target_pid);
-	pr_err("SCAN_COMPARE: Dirty pages BEFORE BPF attach: %lu\n", dirty_before);
+	g_debug_pid = target_pid;
+	dirty_before_count = debug_scan_dirty_pages(target_pid, &dirty_before_addrs);
+	pr_err("SCAN_COMPARE: Dirty pages BEFORE BPF attach: %lu\n", dirty_before_count);
+
+	/* Store for later comparison */
+	g_initial_dirty_addrs = dirty_before_addrs;
+	g_initial_dirty_count = dirty_before_count;
+
+	/* Print first 20 addresses if any */
+	if (dirty_before_count > 0) {
+		unsigned long i;
+		unsigned long to_print = dirty_before_count < 20 ? dirty_before_count : 20;
+		pr_err("SCAN_COMPARE: First %lu initial dirty addresses:\n", to_print);
+		for (i = 0; i < to_print; i++) {
+			pr_err("  INITIAL_DIRTY[%lu]: 0x%lx\n", i, dirty_before_addrs[i]);
+		}
+	}
 #endif
 
 	skel = dirty_track_bpf__open();
@@ -162,11 +230,15 @@ int cow_bpf_start(pid_t target_pid)
 	g_skel = skel;
 
 #ifdef SCAN_COMPARE
-	dirty_after = debug_count_dirty_pages(target_pid);
-	pr_err("SCAN_COMPARE: Dirty pages AFTER BPF attach: %lu\n", dirty_after);
-	if (dirty_before > 0 || dirty_after > 0) {
-		pr_err("SCAN_COMPARE: WARNING - %lu pages were already dirty before BPF!\n",
-		       dirty_before);
+	{
+		unsigned long *dirty_after_addrs = NULL;
+		unsigned long dirty_after_count;
+
+		dirty_after_count = debug_scan_dirty_pages(target_pid, &dirty_after_addrs);
+		pr_err("SCAN_COMPARE: Dirty pages AFTER BPF attach: %lu\n", dirty_after_count);
+
+		if (dirty_after_addrs)
+			xfree(dirty_after_addrs);
 	}
 #endif
 
