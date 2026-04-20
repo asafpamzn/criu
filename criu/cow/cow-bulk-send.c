@@ -900,7 +900,6 @@ void cow_debug_scan_compare(void)
 	list_for_each_entry(lve, lazy_vmas, list) {
 		struct pm_scan_arg args;
 		long regs_len;
-		unsigned long vma_scan_count = 0;
 
 		memset(&args, 0, sizeof(args));
 		args.size = sizeof(args);
@@ -964,7 +963,6 @@ void cow_debug_scan_compare(void)
 	 * Build hash of SCAN addresses and check each BPF address.
 	 */
 	{
-		unsigned long bpf_only = 0;
 		unsigned long i;
 		/* Simple approach: for each BPF addr, binary search in sorted SCAN results */
 		/* But we don't have sorted SCAN results. Instead, check if addr is in any VMA
