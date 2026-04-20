@@ -1716,8 +1716,8 @@ static void *p3_bulk_sender_thread(void *arg)
 
 		clock_gettime(CLOCK_MONOTONIC, &loop_start);
 
-		/* Consume dirty regions from queue until scanner completes */
-		while (!cow_is_scan_complete() || spmc_peek(my_queue->head)) {
+		/* Consume dirty regions from queue until scanner completes AND all queues empty */
+		while (1) {
 			struct dirty_region_entry *region;
 			int sent;
 
@@ -1748,7 +1748,12 @@ static void *p3_bulk_sender_thread(void *arg)
 					}
 				}
 				if (!region) {
-					/* No work anywhere, brief wait */
+					/* No work found anywhere */
+					if (cow_is_scan_complete()) {
+						/* Scanner done and all queues empty - we're done */
+						break;
+					}
+					/* Scanner still running, wait for more work */
 					wait_count++;
 					usleep(COW_USLEEP_100US);
 					continue;
