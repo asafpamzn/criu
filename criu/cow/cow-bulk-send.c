@@ -1187,6 +1187,7 @@ static void *p3_bulk_sender_thread(void *arg)
 		unsigned long wait_count = 0;
 		unsigned long p3_regions = 0;
 		unsigned long p3_pages = 0;
+		unsigned long pages_before_scan_done = 0;
 		bool p3_started = false;
 		bool scan_done_logged = false;
 		struct sender_queue *my_queue = cow_get_sender_queue(thread_id);
@@ -1207,6 +1208,7 @@ static void *p3_bulk_sender_thread(void *arg)
 			/* Track when scan completes */
 			if (!scan_done_logged && cow_is_scan_complete()) {
 				scan_done_logged = true;
+				pages_before_scan_done = p3_pages;
 				clock_gettime(CLOCK_MONOTONIC, &scan_done_time);
 			}
 
@@ -1233,6 +1235,14 @@ static void *p3_bulk_sender_thread(void *arg)
 		}
 
 		clock_gettime(CLOCK_MONOTONIC, &loop_end);
+
+		/* Capture scan_done_time if loop exited with scan complete but flag not yet set */
+		if (!scan_done_logged && cow_is_scan_complete()) {
+			scan_done_logged = true;
+			pages_before_scan_done = p3_pages;
+			scan_done_time = loop_end;  /* Scan finished just as loop exited */
+		}
+
 		loop_elapsed_ms = (loop_end.tv_sec - loop_start.tv_sec) * 1000 +
 				  (loop_end.tv_nsec - loop_start.tv_nsec) / 1000000;
 
@@ -1240,17 +1250,18 @@ static void *p3_bulk_sender_thread(void *arg)
 		if (p3_started) {
 			long p3_total_ms = (loop_end.tv_sec - p3_start.tv_sec) * 1000 +
 					   (loop_end.tv_nsec - p3_start.tv_nsec) / 1000000;
-			long wait_for_scan_ms = 0;
+			long send_during_scan_ms = 0;
 			long send_after_scan_ms = 0;
 
 			if (scan_done_logged) {
-				wait_for_scan_ms = (scan_done_time.tv_sec - p3_start.tv_sec) * 1000 +
-						   (scan_done_time.tv_nsec - p3_start.tv_nsec) / 1000000;
+				send_during_scan_ms = (scan_done_time.tv_sec - p3_start.tv_sec) * 1000 +
+						      (scan_done_time.tv_nsec - p3_start.tv_nsec) / 1000000;
 				send_after_scan_ms = (loop_end.tv_sec - scan_done_time.tv_sec) * 1000 +
 						     (loop_end.tv_nsec - scan_done_time.tv_nsec) / 1000000;
 			}
-			pr_err("P3[%d] TIMING P3: total=%ld ms (wait_for_scan=%ld ms + send_after_scan=%ld ms), %lu regions, %lu pages\n",
-			       thread_id, p3_total_ms, wait_for_scan_ms, send_after_scan_ms, p3_regions, p3_pages);
+			pr_err("P3[%d] TIMING P3: total=%ld ms (during_scan=%ld ms [%lu pages] + after_scan=%ld ms [%lu pages])\n",
+			       thread_id, p3_total_ms, send_during_scan_ms, pages_before_scan_done,
+			       send_after_scan_ms, p3_pages - pages_before_scan_done);
 		}
 		pr_err("P3[%d] TIMING: Queue consumption done: %lu regions, %lu pages in %ld ms\n",
 		       thread_id, regions_processed, loop_total_pages, loop_elapsed_ms);

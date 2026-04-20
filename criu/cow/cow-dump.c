@@ -973,6 +973,9 @@ void cow_cleanup_async_uffd(void)
 	 * This spreads the kernel page-table walk time and allows
 	 * the target process to make progress between chunks.
 	 */
+	pr_err("Unregistering VMAs from uffd sleeping 15 seconds\n");
+	sleep(15);
+	pr_err("Unregistering VMAs from uffd sleeping 15 seconds done\n");
 	if (cdi->uffd >= 0 && cdi->tracked_vmas && cdi->nr_tracked_vmas > 0) {
 		pr_info("Unregistering %u VMAs from uffd fd=%d (chunked)\n",
 			cdi->nr_tracked_vmas, cdi->uffd);
@@ -997,7 +1000,7 @@ void cow_cleanup_async_uffd(void)
 	}
 
 	if (cdi->uffd >= 0) {
-		pr_info("Closing uffd fd=%d\n", cdi->uffd);
+		pr_err("Closing uffd fd=%d\n", cdi->uffd);
 		close(cdi->uffd);
 		cdi->uffd = -1;
 	}
