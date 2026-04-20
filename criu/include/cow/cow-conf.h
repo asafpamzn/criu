@@ -137,7 +137,7 @@
 #define COW_NUM_P3_THREADS		20
 
 /* Number of parallel scanner threads */
-#define COW_NUM_SCANNERS		4
+#define COW_NUM_SCANNERS		1
 
 /* Number of background drain threads */
 #define COW_NUM_DRAIN_THREADS		20
