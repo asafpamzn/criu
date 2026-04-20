@@ -727,6 +727,7 @@ static void *background_drain_worker(void *arg)
 {
 	struct drain_thread_args *args = (struct drain_thread_args *)arg;
 	struct page_buffer_node *node, *tmp_node;
+	struct drain_page_entry *entries;
 	unsigned long drained = 0;
 	unsigned long last_progress_drained = 0;
 	unsigned long batches = 0;
@@ -748,7 +749,7 @@ static void *background_drain_worker(void *arg)
 	 * Allocate collection buffer once - 2MB is enough for 128K pages.
 	 * A 256MB chunk has 64K pages max, so this is plenty.
 	 */
-	struct drain_page_entry *entries = xmalloc(2 * 1024 * 1024);
+	entries = xmalloc(2 * 1024 * 1024);
 	BUG_ON(!entries);
 
 	while (!atomic_load(&drain_thread_stop) && cow_buffer.nr_pages > 0) {
