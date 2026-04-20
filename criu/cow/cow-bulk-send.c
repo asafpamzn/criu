@@ -968,14 +968,6 @@ void cow_debug_scan_compare(void)
 		/* But we don't have sorted SCAN results. Instead, check if addr is in any VMA
 		 * and has PAGE_IS_WRITTEN set. Simpler: just report the count difference. */
 
-		/* The math: if overlap = X, then:
-		 * BPF = overlap + bpf_only
-		 * SCAN = overlap + scan_only
-		 * So: bpf_only = BPF - (SCAN - scan_only) = BPF - SCAN + scan_only
-		 */
-		if (bpf_addr_count + scan_only > scan_count)
-			bpf_only = bpf_addr_count + scan_only - scan_count;
-
 		pr_err("=== SCAN_COMPARE RESULTS ===\n");
 		pr_err("BPF found:  %lu pages\n", bpf_addr_count);
 		pr_err("SCAN found: %lu pages (scan_count)\n", scan_count);
