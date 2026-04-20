@@ -747,9 +747,11 @@ int cow_bpf_drain_to_queues(void)
 {
 	struct cow_bpf_region *bpf_regions;
 	unsigned long total_pages = 0;
+	unsigned long total_regions = 0;
 	int bpf_nr, i;
 	unsigned int queue_idx = 0;
-	u64 drops;
+	u64 drops, event_count;
+	int max_regions;
 
 	if (!g_using_bpf_mode || !cow_bpf_active()) {
 		pr_err("cow_bpf_drain_to_queues called but BPF not active\n");
@@ -764,13 +766,26 @@ int cow_bpf_drain_to_queues(void)
 		BUG();
 	}
 
-	bpf_regions = xmalloc(COW_PAGEMAP_SCAN_VEC_LEN * sizeof(*bpf_regions));
+	/*
+	 * Allocate enough regions for worst case (no coalescing).
+	 * event_count gives upper bound on unique pages.
+	 */
+	event_count = cow_bpf_event_count();
+	max_regions = (event_count > 0) ? (int)event_count : COW_PAGEMAP_SCAN_VEC_LEN;
+	/* Cap at reasonable maximum to avoid OOM */
+	if (max_regions > 10 * 1024 * 1024)
+		max_regions = 10 * 1024 * 1024;
+
+	pr_info("BPF drain: allocating %d regions (event_count=%llu)\n",
+		max_regions, (unsigned long long)event_count);
+
+	bpf_regions = xmalloc(max_regions * sizeof(*bpf_regions));
 	if (!bpf_regions) {
 		pr_err("Failed to allocate BPF regions buffer\n");
 		return -1;
 	}
 
-	bpf_nr = cow_bpf_drain(bpf_regions, COW_PAGEMAP_SCAN_VEC_LEN, &total_pages);
+	bpf_nr = cow_bpf_drain(bpf_regions, max_regions, &total_pages);
 	if (bpf_nr < 0) {
 		if (bpf_nr == -2) {
 			pr_err("BPF ring drops detected during drain!\n");
@@ -804,6 +819,7 @@ int cow_bpf_drain_to_queues(void)
 		__sync_fetch_and_add(&queue_regions_dist[queue_idx], 1);
 
 		queue_idx = (queue_idx + 1) % COW_NUM_P3_THREADS;
+		total_regions++;
 	}
 
 	xfree(bpf_regions);
@@ -811,8 +827,8 @@ int cow_bpf_drain_to_queues(void)
 	/* Signal scan complete so sender threads process their queues */
 	__atomic_store_n(&g_scan_complete, true, __ATOMIC_RELEASE);
 
-	pr_info("BPF drain complete: distributed %d regions to %d queues\n",
-		bpf_nr, COW_NUM_P3_THREADS);
+	pr_info("BPF drain complete: distributed %lu regions (%lu pages) to %d queues\n",
+		total_regions, total_pages, COW_NUM_P3_THREADS);
 
 	return (int)total_pages;
 }
