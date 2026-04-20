@@ -445,7 +445,9 @@ int cow_bpf_drain_addrs(unsigned long **out_addrs, unsigned long *out_count)
 	struct ring_buffer *rb;
 	struct drain_ctx dc;
 	int err, i, unique;
+#ifdef SCAN_COMPARE
 	unsigned long *merged;
+#endif
 
 	*out_addrs = NULL;
 	*out_count = 0;
