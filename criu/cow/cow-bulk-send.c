@@ -1134,7 +1134,6 @@ void cow_debug_scan_compare(void)
 
 	pr_err("=== EXITING DEBUG MODE ===\n");
 
-	exit(0);
 }
 #endif /* SCAN_COMPARE */
 
