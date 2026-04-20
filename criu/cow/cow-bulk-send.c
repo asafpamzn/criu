@@ -774,7 +774,7 @@ int cow_bpf_drain_to_queues(void)
 	int pagemap_fd = -1;
 	char path[64];
 	struct page_region *regs = NULL;
-	unsigned long page_size = PAGE_SIZE;
+	unsigned long pgsz = PAGE_SIZE;
 
 	if (!g_using_bpf_mode || !cow_bpf_active()) {
 		pr_err("cow_bpf_drain_to_queues called but BPF not active\n");
@@ -850,7 +850,7 @@ int cow_bpf_drain_to_queues(void)
 				break;
 
 			for (r = 0; r < regs_len; r++) {
-				for (addr = regs[r].start; addr < regs[r].end; addr += page_size) {
+				for (addr = regs[r].start; addr < regs[r].end; addr += pgsz) {
 					if (scan_addr_count >= scan_addr_cap) {
 						unsigned long new_cap = scan_addr_cap * 2;
 						unsigned long *tmp = xrealloc(scan_addrs, new_cap * sizeof(*tmp));
@@ -1153,7 +1153,7 @@ void cow_debug_scan_compare(void)
 			for (r = 0; r < regs_len; r++) {
 				unsigned long addr;
 
-				for (addr = regs[r].start; addr < regs[r].end; addr += page_size) {
+				for (addr = regs[r].start; addr < regs[r].end; addr += pgsz) {
 					/* Collect address for duplicate detection */
 					if (scan_addrs_count >= scan_addrs_cap) {
 						unsigned long new_cap = scan_addrs_cap * 2;
