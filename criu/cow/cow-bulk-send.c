@@ -911,6 +911,7 @@ void cow_debug_scan_compare(void)
 	{
 		unsigned long vma_count = 0;
 		list_for_each_entry(lve, lazy_vmas, list) {
+			pr_err("VMA[%lu]: 0x%lx-0x%lx\n", vma_count, lve->start, lve->end);
 			vma_count++;
 		}
 		pr_err("Scanning %lu VMAs\n", vma_count);
