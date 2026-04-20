@@ -102,8 +102,6 @@ static atomic_bool drain_thread_stop = false;
 static atomic_int drain_threads_active = 0;
 static struct list_head *drain_lpis = NULL;  /* lpis list for EAGAIN handling */
 static atomic_ulong total_drained = 0;  /* Total pages drained across all threads */
-static atomic_int next_drain_chunk = 0;  /* Work-stealing: next chunk to process */
-static int max_drain_chunks = 0;  /* Total chunks to drain */
 static struct timespec drain_start_time;  /* For TIMING prefix debug */
 
 /*
@@ -123,12 +121,6 @@ static atomic_int drain_batch_count = 0;
 static int drain_batch_capacity = 0;
 static pthread_spinlock_t drain_batch_lock;
 static atomic_int next_drain_batch = 0;  /* Work-stealing for drain */
-
-/* Old per-page collector (kept for fallback with dirty pages) */
-struct drain_page_entry {
-	unsigned long vaddr;
-	void *data;
-};
 
 static inline unsigned int page_buffer_hash(unsigned long vaddr)
 {
@@ -720,60 +712,6 @@ void cow_page_buffer_readd(unsigned long vaddr, void *data)
 
 	__sync_fetch_and_add(&cow_buffer.nr_pages, 1);
 	page_state_set(vaddr, PAGE_STATE_EAGAIN_QUEUED);
-}
-
-/*
- * Batch drain support - collect contiguous pages for batched UFFDIO_COPY.
- */
-struct drain_batch {
-	unsigned long vaddr;	/* Start vaddr of contiguous run */
-	void *data;		/* Start data pointer */
-	int count;		/* Number of contiguous pages */
-	int start_idx;		/* Starting index in node->entries */
-};
-
-/*
- * Apply a batch of contiguous pages via UFFDIO_COPY.
- * Returns number of pages successfully copied, or negative on error.
- *
- * Note: Uses non-strict mode because page faults may have already copied
- * some pages from the batch (via cow_page_buffer_lookup_and_remove).
- * EEXIST is expected in this case and silently handled.
- */
-static int drain_apply_batch(struct drain_batch *batch, struct list_head *lpis)
-{
-	int uffd;
-	int ret;
-	int i;
-
-	/* Mark all pages as drain pending */
-	for (i = 0; i < batch->count; i++)
-		page_state_set(batch->vaddr + i * PAGE_SIZE, PAGE_STATE_DRAIN_PENDING);
-
-	uffd = cow_get_uffd_for_vaddr(lpis, batch->vaddr);
-	if (uffd < 0)
-		return -1;
-
-	/*
-	 * Don't use COW_TRACK_STRICT - some pages may have been handled by
-	 * page faults already (removed from hash table and UFFDIO_COPY'd).
-	 * EEXIST is expected and returns 0, which we treat as success.
-	 */
-	ret = cow_uffd_copy(uffd, batch->vaddr, batch->data, batch->count,
-			    NULL, lpis, 0, "DRAIN_BATCH");
-
-	return ret >= 0 ? batch->count : ret;
-}
-
-/*
- * Return batch pages to the page pool.
- */
-static void drain_free_batch(struct drain_batch *batch)
-{
-	int i;
-
-	for (i = 0; i < batch->count; i++)
-		page_pool_put((char *)batch->data + i * PAGE_SIZE);
 }
 
 /*
