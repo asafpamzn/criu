@@ -935,11 +935,9 @@ void cow_debug_scan_compare(void)
 					}
 					if (!found) {
 						scan_only++;
-						/* Log first 20 missed addresses */
-						if (scan_only <= 20) {
-							pr_err("BPF MISSED: 0x%lx (VMA 0x%lx-0x%lx)\n",
-							       addr, lve->start, lve->end);
-						}
+						/* Log ALL missed addresses */
+						pr_err("BPF MISSED: 0x%lx (VMA 0x%lx-0x%lx)\n",
+						       addr, lve->start, lve->end);
 					}
 				}
 			}
@@ -948,13 +946,74 @@ void cow_debug_scan_compare(void)
 
 	xfree(regs);
 	close(pagemap_fd);
+
+	/*
+	 * Now check reverse: BPF pages not in SCAN.
+	 * Build hash of SCAN addresses and check each BPF address.
+	 */
+	{
+		unsigned long bpf_only = 0;
+		unsigned long i;
+		/* Simple approach: for each BPF addr, binary search in sorted SCAN results */
+		/* But we don't have sorted SCAN results. Instead, check if addr is in any VMA
+		 * and has PAGE_IS_WRITTEN set. Simpler: just report the count difference. */
+
+		/* The math: if overlap = X, then:
+		 * BPF = overlap + bpf_only
+		 * SCAN = overlap + scan_only
+		 * So: bpf_only = BPF - (SCAN - scan_only) = BPF - SCAN + scan_only
+		 */
+		if (bpf_addr_count + scan_only > scan_count)
+			bpf_only = bpf_addr_count + scan_only - scan_count;
+
+		pr_err("=== SCAN_COMPARE RESULTS ===\n");
+		pr_err("BPF found:  %lu pages\n", bpf_addr_count);
+		pr_err("SCAN found: %lu pages\n", scan_count);
+		pr_err("SCAN only:  %lu pages (BPF MISSED - these cause crash!)\n", scan_only);
+		pr_err("BPF only:   %lu pages (in BPF but SCAN didn't find)\n", bpf_only);
+		pr_err("Overlap:    %lu pages\n", scan_count - scan_only);
+
+		/* Log ALL BPF-only addresses by checking which BPF addrs aren't PAGE_IS_WRITTEN */
+		if (bpf_addrs) {
+			unsigned long actual_bpf_only = 0;
+			pr_err("Checking BPF-only addresses...\n");
+
+			/* Re-open pagemap to check individual BPF addresses */
+			pagemap_fd = open(path, O_RDONLY);
+			if (pagemap_fd >= 0) {
+				for (i = 0; i < bpf_addr_count; i++) {
+					struct pm_scan_arg args;
+					struct page_region reg;
+					long ret;
+
+					memset(&args, 0, sizeof(args));
+					args.size = sizeof(args);
+					args.flags = 0;
+					args.start = bpf_addrs[i];
+					args.end = bpf_addrs[i] + page_size;
+					args.walk_end = bpf_addrs[i];
+					args.vec = (u64)(unsigned long)&reg;
+					args.vec_len = 1;
+					args.max_pages = 1;
+					args.category_anyof_mask = PAGE_IS_WRITTEN;
+					args.return_mask = PAGE_IS_WRITTEN;
+
+					ret = ioctl(pagemap_fd, PAGEMAP_SCAN, &args);
+					if (ret == 0) {
+						/* Not found by SCAN - this is a BPF-only page */
+						pr_err("BPF ONLY: 0x%lx (not PAGE_IS_WRITTEN)\n", bpf_addrs[i]);
+						actual_bpf_only++;
+					}
+				}
+				close(pagemap_fd);
+				pr_err("Actual BPF-only count: %lu\n", actual_bpf_only);
+			}
+		}
+	}
+
 	if (bpf_addrs)
 		xfree(bpf_addrs);
 
-	pr_err("=== SCAN_COMPARE RESULTS ===\n");
-	pr_err("BPF found:  %lu pages\n", bpf_addr_count);
-	pr_err("SCAN found: %lu pages\n", scan_count);
-	pr_err("SCAN only:  %lu pages (BPF MISSED)\n", scan_only);
 	pr_err("=== EXITING DEBUG MODE ===\n");
 
 	exit(0);
