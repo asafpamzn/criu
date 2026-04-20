@@ -738,9 +738,18 @@ void cow_wait_scanner_thread(void)
 }
 
 #ifdef CONFIG_HAS_LIBBPF
+/* Address comparison for qsort - used by BPF drain and SCAN_COMPARE */
+static int addr_cmp_ul(const void *a, const void *b)
+{
+	unsigned long va = *(const unsigned long *)a;
+	unsigned long vb = *(const unsigned long *)b;
+	return (va > vb) - (va < vb);
+}
+
 /*
  * Drain BPF ring buffer and distribute dirty regions to sender queues.
  * Called at freeze time when using BPF mode.
+ * Also does PAGEMAP_SCAN to catch any pages BPF missed.
  * Returns number of dirty pages, or -1 on error.
  */
 int cow_bpf_drain_to_queues(void)
@@ -752,6 +761,20 @@ int cow_bpf_drain_to_queues(void)
 	unsigned int queue_idx = 0;
 	u64 drops, event_count;
 	int max_regions;
+	/* For PAGEMAP_SCAN merge */
+	struct list_head *lazy_vmas = get_global_lazy_vmas();
+	struct lazy_vma_entry *lve;
+	unsigned long *bpf_addrs = NULL;
+	unsigned long bpf_addr_count = 0;
+	unsigned long *scan_addrs = NULL;
+	unsigned long scan_addr_count = 0;
+	unsigned long scan_addr_cap = 0;
+	unsigned long *merged_addrs = NULL;
+	unsigned long merged_count = 0;
+	int pagemap_fd = -1;
+	char path[64];
+	struct page_region *regs = NULL;
+	unsigned long page_size = PAGE_SIZE;
 
 	if (!g_using_bpf_mode || !cow_bpf_active()) {
 		pr_err("cow_bpf_drain_to_queues called but BPF not active\n");
@@ -767,36 +790,211 @@ int cow_bpf_drain_to_queues(void)
 	}
 
 	/*
-	 * Allocate enough regions for worst case (no coalescing).
-	 * event_count gives upper bound on unique pages.
+	 * Step 1: Drain BPF ring buffer to get addresses
 	 */
-	event_count = cow_bpf_event_count();
+	if (cow_bpf_drain_addrs(&bpf_addrs, &bpf_addr_count) < 0) {
+		pr_err("BPF drain_addrs failed\n");
+		return -1;
+	}
+	pr_info("BPF drain: %lu unique addresses from ring buffer\n", bpf_addr_count);
+
+	/*
+	 * Step 2: Do PAGEMAP_SCAN on all lazy VMAs to catch pages BPF missed
+	 */
+	snprintf(path, sizeof(path), "/proc/%d/pagemap", g_scanner_source_pid);
+	pagemap_fd = open(path, O_RDONLY);
+	if (pagemap_fd < 0) {
+		pr_perror("Failed to open pagemap for SCAN merge");
+		/* Continue with BPF-only results */
+		goto skip_scan_merge;
+	}
+
+	regs = xmalloc(COW_PAGEMAP_SCAN_VEC_LEN * sizeof(*regs));
+	if (!regs) {
+		close(pagemap_fd);
+		goto skip_scan_merge;
+	}
+
+	scan_addr_cap = bpf_addr_count > 0 ? bpf_addr_count : 65536;
+	scan_addrs = xmalloc(scan_addr_cap * sizeof(*scan_addrs));
+	if (!scan_addrs) {
+		xfree(regs);
+		close(pagemap_fd);
+		goto skip_scan_merge;
+	}
+
+	/* Scan each lazy VMA */
+	list_for_each_entry(lve, lazy_vmas, list) {
+		struct pm_scan_arg args;
+		long regs_len;
+		int r;
+
+		memset(&args, 0, sizeof(args));
+		args.size = sizeof(args);
+		args.flags = 0;
+		args.start = lve->start;
+		args.end = lve->end;
+		args.walk_end = lve->start;
+		args.vec = (u64)(unsigned long)regs;
+		args.vec_len = COW_PAGEMAP_SCAN_VEC_LEN;
+		args.max_pages = 0;
+		args.category_anyof_mask = PAGE_IS_WRITTEN;
+		args.return_mask = PAGE_IS_WRITTEN;
+
+		do {
+			unsigned long addr;
+
+			args.start = args.walk_end;
+			regs_len = ioctl(pagemap_fd, PAGEMAP_SCAN, &args);
+			if (regs_len <= 0)
+				break;
+
+			for (r = 0; r < regs_len; r++) {
+				for (addr = regs[r].start; addr < regs[r].end; addr += page_size) {
+					if (scan_addr_count >= scan_addr_cap) {
+						unsigned long new_cap = scan_addr_cap * 2;
+						unsigned long *tmp = xrealloc(scan_addrs, new_cap * sizeof(*tmp));
+						if (!tmp)
+							goto done_scan;
+						scan_addrs = tmp;
+						scan_addr_cap = new_cap;
+					}
+					scan_addrs[scan_addr_count++] = addr;
+				}
+			}
+		} while (args.walk_end < lve->end);
+	}
+
+done_scan:
+	xfree(regs);
+	close(pagemap_fd);
+
+	pr_info("PAGEMAP_SCAN found: %lu dirty pages\n", scan_addr_count);
+
+	/*
+	 * Step 3: Merge BPF and SCAN results
+	 * Both arrays should be sorted. Merge and deduplicate.
+	 */
+	if (scan_addr_count > 0) {
+		unsigned long bpf_idx = 0, scan_idx = 0, out_idx = 0;
+		unsigned long total_cap = bpf_addr_count + scan_addr_count;
+
+		/* Sort SCAN results */
+		qsort(scan_addrs, scan_addr_count, sizeof(*scan_addrs), addr_cmp_ul);
+
+		/* Remove duplicates from SCAN */
+		{
+			unsigned long unique = 1;
+			for (i = 1; i < (int)scan_addr_count; i++) {
+				if (scan_addrs[i] != scan_addrs[unique - 1])
+					scan_addrs[unique++] = scan_addrs[i];
+			}
+			scan_addr_count = unique;
+		}
+
+		merged_addrs = xmalloc(total_cap * sizeof(*merged_addrs));
+		if (!merged_addrs) {
+			xfree(scan_addrs);
+			goto skip_scan_merge;
+		}
+
+		/* Merge two sorted arrays */
+		while (bpf_idx < bpf_addr_count && scan_idx < scan_addr_count) {
+			unsigned long bpf_val = bpf_addrs[bpf_idx];
+			unsigned long scan_val = scan_addrs[scan_idx];
+
+			if (bpf_val < scan_val) {
+				if (out_idx == 0 || merged_addrs[out_idx - 1] != bpf_val)
+					merged_addrs[out_idx++] = bpf_val;
+				bpf_idx++;
+			} else if (bpf_val > scan_val) {
+				if (out_idx == 0 || merged_addrs[out_idx - 1] != scan_val)
+					merged_addrs[out_idx++] = scan_val;
+				scan_idx++;
+			} else {
+				if (out_idx == 0 || merged_addrs[out_idx - 1] != bpf_val)
+					merged_addrs[out_idx++] = bpf_val;
+				bpf_idx++;
+				scan_idx++;
+			}
+		}
+		while (bpf_idx < bpf_addr_count) {
+			if (out_idx == 0 || merged_addrs[out_idx - 1] != bpf_addrs[bpf_idx])
+				merged_addrs[out_idx++] = bpf_addrs[bpf_idx];
+			bpf_idx++;
+		}
+		while (scan_idx < scan_addr_count) {
+			if (out_idx == 0 || merged_addrs[out_idx - 1] != scan_addrs[scan_idx])
+				merged_addrs[out_idx++] = scan_addrs[scan_idx];
+			scan_idx++;
+		}
+
+		merged_count = out_idx;
+		pr_info("Merged BPF+SCAN: %lu unique pages (BPF=%lu, SCAN=%lu, new from SCAN=%lu)\n",
+			merged_count, bpf_addr_count, scan_addr_count,
+			merged_count > bpf_addr_count ? merged_count - bpf_addr_count : 0);
+
+		xfree(scan_addrs);
+		xfree(bpf_addrs);
+		bpf_addrs = merged_addrs;
+		bpf_addr_count = merged_count;
+		merged_addrs = NULL;
+	} else {
+		if (scan_addrs)
+			xfree(scan_addrs);
+	}
+
+skip_scan_merge:
+	/*
+	 * Step 4: Convert addresses to regions and distribute to queues
+	 */
+	event_count = bpf_addr_count;
 	max_regions = (event_count > 0) ? (int)event_count : COW_PAGEMAP_SCAN_VEC_LEN;
-	/* Cap at reasonable maximum to avoid OOM */
 	if (max_regions > 10 * 1024 * 1024)
 		max_regions = 10 * 1024 * 1024;
 
-	pr_info("BPF drain: allocating %d regions (event_count=%llu)\n",
-		max_regions, (unsigned long long)event_count);
-
 	bpf_regions = xmalloc(max_regions * sizeof(*bpf_regions));
 	if (!bpf_regions) {
-		pr_err("Failed to allocate BPF regions buffer\n");
+		pr_err("Failed to allocate regions buffer\n");
+		if (bpf_addrs)
+			xfree(bpf_addrs);
 		return -1;
 	}
 
-	bpf_nr = cow_bpf_drain(bpf_regions, max_regions, &total_pages);
-	if (bpf_nr < 0) {
-		if (bpf_nr == -2) {
-			pr_err("BPF ring drops detected during drain!\n");
-			BUG();
+	/* Convert sorted addresses to coalesced regions */
+	bpf_nr = 0;
+	if (bpf_addr_count > 0) {
+		unsigned long start = bpf_addrs[0];
+		unsigned long end = start + page_size;
+
+		for (i = 1; i < (int)bpf_addr_count && bpf_nr < max_regions; i++) {
+			if (bpf_addrs[i] == end) {
+				/* Contiguous - extend region */
+				end += page_size;
+			} else {
+				/* Not contiguous - save current region and start new */
+				bpf_regions[bpf_nr].start = start;
+				bpf_regions[bpf_nr].end = end;
+				bpf_regions[bpf_nr].categories = 0;
+				bpf_nr++;
+				start = bpf_addrs[i];
+				end = start + page_size;
+			}
 		}
-		pr_err("BPF drain failed: %d\n", bpf_nr);
-		xfree(bpf_regions);
-		return -1;
+		/* Save last region */
+		if (bpf_nr < max_regions) {
+			bpf_regions[bpf_nr].start = start;
+			bpf_regions[bpf_nr].end = end;
+			bpf_regions[bpf_nr].categories = 0;
+			bpf_nr++;
+		}
 	}
 
-	pr_info("BPF drain: %d regions, %lu dirty pages\n", bpf_nr, total_pages);
+	total_pages = bpf_addr_count;
+	if (bpf_addrs)
+		xfree(bpf_addrs);
+
+	pr_info("Final: %d regions, %lu dirty pages\n", bpf_nr, total_pages);
 
 	/* Distribute regions to sender queues (round-robin) */
 	for (i = 0; i < bpf_nr; i++) {
