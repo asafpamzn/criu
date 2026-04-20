@@ -125,15 +125,50 @@ static int p3_receive_and_buffer(struct p3_receiver_ctx *ctx)
 		BUG();
 	}
 
-	/* Add each page to buffer - no copy, just store the pointer */
-	for (i = 0; i < nr_pages; i++) {
-		unsigned long vaddr = pi.vaddr + i * PAGE_SIZE;
-		if (cow_page_buffer_add(vaddr, chunk_buf + i * PAGE_SIZE, ctx->thread_id, true) < 0) {
-			pr_err("P3 receive: failed to buffer page at 0x%lx\n", vaddr);
-			/* Free remaining pages on error */
-			for (; i < nr_pages; i++)
-				page_pool_put(chunk_buf + i * PAGE_SIZE);
-			return -1;
+	/*
+	 * Add each page to buffer and register for drain.
+	 * Track contiguous runs of new pages to form efficient batches.
+	 * When a dirty page breaks the run, close the current batch.
+	 */
+	{
+		int run_start = -1;  /* Index of first page in current new-page run */
+
+		for (i = 0; i < nr_pages; i++) {
+			unsigned long vaddr = pi.vaddr + i * PAGE_SIZE;
+			int ret = cow_page_buffer_add(vaddr, chunk_buf + i * PAGE_SIZE, ctx->thread_id, true);
+
+			if (ret < 0) {
+				pr_err("P3 receive: failed to buffer page at 0x%lx\n", vaddr);
+				/* Free remaining pages on error */
+				for (; i < nr_pages; i++)
+					page_pool_put(chunk_buf + i * PAGE_SIZE);
+				return -1;
+			}
+
+			if (ret == 0) {
+				/* New page - extend or start run */
+				if (run_start < 0)
+					run_start = i;
+			} else {
+				/* Dirty page (ret == 1) - close current run if any */
+				if (run_start >= 0) {
+					int run_len = i - run_start;
+					cow_drain_batch_add(pi.vaddr + run_start * PAGE_SIZE,
+							    run_len,
+							    chunk_buf + run_start * PAGE_SIZE);
+					run_start = -1;
+				}
+				/* Register dirty page as single-page batch for drain */
+				cow_drain_batch_add(vaddr, 1, chunk_buf + i * PAGE_SIZE);
+			}
+		}
+
+		/* Close final run if any */
+		if (run_start >= 0) {
+			int run_len = nr_pages - run_start;
+			cow_drain_batch_add(pi.vaddr + run_start * PAGE_SIZE,
+					    run_len,
+					    chunk_buf + run_start * PAGE_SIZE);
 		}
 	}
 
