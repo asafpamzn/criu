@@ -15,6 +15,7 @@
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
+#include <stdio.h>
 #include <sys/time.h>
 #include <sys/ioctl.h>
 #include <fcntl.h>
@@ -83,13 +84,15 @@ static unsigned long g_initial_dirty_count = 0;
 static pid_t g_debug_pid = 0;
 
 /*
- * DEBUG: Scan all VMAs and collect dirty page addresses.
+ * DEBUG: Parse /proc/pid/maps and scan each VMA for dirty pages.
  * Returns count of dirty pages found.
  */
 static unsigned long debug_scan_dirty_pages(pid_t pid, unsigned long **out_addrs)
 {
-	char path[64];
-	int fd;
+	char path[128];
+	char line[512];
+	FILE *maps_fp;
+	int pagemap_fd;
 	struct pm_scan_arg args;
 	struct page_region regs[1024];
 	unsigned long count = 0;
@@ -97,6 +100,7 @@ static unsigned long debug_scan_dirty_pages(pid_t pid, unsigned long **out_addrs
 	unsigned long *addrs;
 	unsigned long page_size = sysconf(_SC_PAGESIZE);
 	struct timeval start, end, delta;
+	unsigned long vma_count = 0;
 
 	gettimeofday(&start, NULL);
 
@@ -106,61 +110,98 @@ static unsigned long debug_scan_dirty_pages(pid_t pid, unsigned long **out_addrs
 		return 0;
 	}
 
-	snprintf(path, sizeof(path), "/proc/%d/pagemap", pid);
-	fd = open(path, O_RDONLY);
-	if (fd < 0) {
+	/* Open /proc/pid/maps to get VMA ranges */
+	snprintf(path, sizeof(path), "/proc/%d/maps", pid);
+	maps_fp = fopen(path, "r");
+	if (!maps_fp) {
+		pr_err("SCAN_COMPARE: failed to open %s\n", path);
 		xfree(addrs);
 		*out_addrs = NULL;
 		return 0;
 	}
 
-	/* Scan entire user address space */
-	memset(&args, 0, sizeof(args));
-	args.size = sizeof(args);
-	args.flags = 0;
-	args.start = 0;
-	args.end = 0x7fffffffffff;  /* Max user address */
-	args.walk_end = 0;
-	args.vec = (u64)(unsigned long)regs;
-	args.vec_len = 1024;
-	args.max_pages = 0;
-	args.category_anyof_mask = PAGE_IS_WRITTEN;
-	args.return_mask = PAGE_IS_WRITTEN;
+	/* Open pagemap for scanning */
+	snprintf(path, sizeof(path), "/proc/%d/pagemap", pid);
+	pagemap_fd = open(path, O_RDONLY);
+	if (pagemap_fd < 0) {
+		pr_err("SCAN_COMPARE: failed to open %s\n", path);
+		fclose(maps_fp);
+		xfree(addrs);
+		*out_addrs = NULL;
+		return 0;
+	}
 
-	do {
-		long ret;
-		int i;
+	/* Parse each line of /proc/pid/maps */
+	while (fgets(line, sizeof(line), maps_fp)) {
+		unsigned long vma_start, vma_end;
+		char perms[8];
+		int ret;
 
-		args.start = args.walk_end;
-		ret = ioctl(fd, PAGEMAP_SCAN, &args);
-		if (ret <= 0)
-			break;
+		/* Parse: start-end perms ... */
+		ret = sscanf(line, "%lx-%lx %4s", &vma_start, &vma_end, perms);
+		if (ret < 3)
+			continue;
 
-		for (i = 0; i < ret; i++) {
-			unsigned long addr;
-			for (addr = regs[i].start; addr < regs[i].end; addr += page_size) {
-				if (count >= cap) {
-					unsigned long new_cap = cap * 2;
-					unsigned long *tmp = xrealloc(addrs, new_cap * sizeof(*tmp));
-					if (!tmp) {
-						close(fd);
-						*out_addrs = addrs;
-						return count;
+		/* Skip non-writable VMAs */
+		if (perms[1] != 'w')
+			continue;
+
+		vma_count++;
+
+		/* Scan this VMA for dirty pages */
+		memset(&args, 0, sizeof(args));
+		args.size = sizeof(args);
+		args.flags = 0;
+		args.start = vma_start;
+		args.end = vma_end;
+		args.walk_end = vma_start;
+		args.vec = (u64)(unsigned long)regs;
+		args.vec_len = 1024;
+		args.max_pages = 0;
+		args.category_anyof_mask = PAGE_IS_WRITTEN;
+		args.return_mask = PAGE_IS_WRITTEN;
+
+		do {
+			long scan_ret;
+			int i;
+
+			args.start = args.walk_end;
+			scan_ret = ioctl(pagemap_fd, PAGEMAP_SCAN, &args);
+			if (scan_ret <= 0)
+				break;
+
+			for (i = 0; i < scan_ret; i++) {
+				unsigned long addr;
+				for (addr = regs[i].start; addr < regs[i].end; addr += page_size) {
+					if (count >= cap) {
+						unsigned long new_cap = cap * 2;
+						unsigned long *tmp = xrealloc(addrs, new_cap * sizeof(*tmp));
+						if (!tmp) {
+							close(pagemap_fd);
+							fclose(maps_fp);
+							*out_addrs = addrs;
+							return count;
+						}
+						addrs = tmp;
+						cap = new_cap;
 					}
-					addrs = tmp;
-					cap = new_cap;
+					addrs[count++] = addr;
 				}
-				addrs[count++] = addr;
 			}
-		}
-	} while (args.walk_end < args.end);
+		} while (args.walk_end < vma_end);
+	}
 
-	close(fd);
+	close(pagemap_fd);
+	fclose(maps_fp);
+
+	/* Sort addresses for binary search later */
+	if (count > 1)
+		qsort(addrs, count, sizeof(*addrs), addr_cmp);
 
 	gettimeofday(&end, NULL);
 	timersub(&end, &start, &delta);
-	pr_err("SCAN_COMPARE: debug_scan_dirty_pages took %ld.%06ld sec, found %lu pages\n",
-	       delta.tv_sec, delta.tv_usec, count);
+	pr_err("SCAN_COMPARE: debug_scan_dirty_pages scanned %lu VMAs, took %ld.%06ld sec, found %lu pages\n",
+	       vma_count, delta.tv_sec, delta.tv_usec, count);
 
 	*out_addrs = addrs;
 	return count;
