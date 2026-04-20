@@ -446,7 +446,6 @@ int cow_bpf_drain_addrs(unsigned long **out_addrs, unsigned long *out_count)
 	struct drain_ctx dc;
 	int err, i, unique;
 	unsigned long *merged;
-	unsigned long merged_count;
 
 	*out_addrs = NULL;
 	*out_count = 0;
