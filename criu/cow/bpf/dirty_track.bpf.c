@@ -25,7 +25,7 @@ const volatile unsigned int page_shift = 12;
 /* Ring buffer for dirty page addresses */
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
-	__uint(max_entries, 64 * 1024 * 1024); /* 64MB ring */
+	__uint(max_entries, 512 * 1024 * 1024); /* 512MB ring - ~64M addresses */
 } dirty_ring SEC(".maps");
 
 /* Stats — readable from userspace */
@@ -51,6 +51,7 @@ int BPF_PROG(track_wp_fault, struct vm_fault *vmf)
 	__u64 *valp;
 	__u32 zero = 0;
 	pid_t pid;
+	__u64 count;
 
 	pid = bpf_get_current_pid_tgid() >> 32;
 	if (pid != target_pid)
@@ -70,10 +71,16 @@ int BPF_PROG(track_wp_fault, struct vm_fault *vmf)
 			__sync_fetch_and_add(dropp, 1);
 	}
 
-	/* Bump counter */
+	/* Bump counter and log every 100K faults */
 	valp = bpf_map_lookup_elem(&event_count, &zero);
-	if (valp)
-		__sync_fetch_and_add(valp, 1);
+	if (valp) {
+		count = __sync_fetch_and_add(valp, 1) + 1;
+		if (count % 100000 == 0) {
+			__u64 ns = bpf_ktime_get_ns();
+			bpf_printk("COW-BPF: %llu page faults, time=%llu ns\n",
+				   count, ns);
+		}
+	}
 
 	return 0;
 }
