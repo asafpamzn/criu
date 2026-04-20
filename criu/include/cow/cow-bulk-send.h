@@ -2,11 +2,11 @@
 #define __CR_COW_BULK_SEND_H__
 
 #include "int.h"
-#include "cow/spsc-queue.h"
+#include "cow/spmc-queue.h"
 #include "cow/cow-conf.h"
 
 /*
- * Dirty region entry - passed from scanner thread to sender threads via SPSC queue.
+ * Dirty region entry - passed from scanner thread to sender threads via SPMC queue.
  * Each entry represents a contiguous range of dirty pages to be transferred.
  */
 struct dirty_region_entry {
@@ -16,18 +16,19 @@ struct dirty_region_entry {
 	pid_t source_pid;         /* Source process PID */
 };
 
-/* SPSC queue node for dirty regions */
-DECLARE_SPSC_NODE(dirty_region, struct dirty_region_entry);
+/* SPMC queue node for dirty regions (single producer, multi consumer for work stealing) */
+DECLARE_SPMC_NODE(dirty_region, struct dirty_region_entry);
 
 /*
  * Per-sender-thread queue for receiving dirty regions from scanner.
+ * SPMC allows work stealing from other threads' queues.
  * Cache-line padded to avoid false sharing.
  */
 struct sender_queue {
-	struct dirty_region_spsc_node *head;
-	char _pad1[COW_CACHE_LINE_SIZE - sizeof(struct dirty_region_spsc_node *)];
-	struct dirty_region_spsc_node *tail;
-	char _pad2[COW_CACHE_LINE_SIZE - sizeof(struct dirty_region_spsc_node *)];
+	struct dirty_region_spmc_node *head;
+	char _pad1[COW_CACHE_LINE_SIZE - sizeof(struct dirty_region_spmc_node *)];
+	struct dirty_region_spmc_node *tail;
+	char _pad2[COW_CACHE_LINE_SIZE - sizeof(struct dirty_region_spmc_node *)];
 	unsigned long size;
 	char _pad3[COW_CACHE_LINE_SIZE - sizeof(unsigned long)];
 };

@@ -203,9 +203,9 @@ int cow_init_sender_queues(void)
 	int i;
 
 	for (i = 0; i < COW_NUM_P3_THREADS; i++) {
-		if (spsc_init(sender_queues[i].head, sender_queues[i].tail,
+		if (spmc_init(sender_queues[i].head, sender_queues[i].tail,
 			      sender_queues[i].size,
-			      struct dirty_region_spsc_node)) {
+			      struct dirty_region_spmc_node)) {
 			pr_err("Failed to init sender queue %d\n", i);
 			return -1;
 		}
@@ -367,9 +367,9 @@ static void *dirty_scanner_thread(void *arg)
 					entry->dst_id = lve->dst_id;
 					entry->source_pid = g_scanner_source_pid;
 
-					spsc_enqueue(sender_queues[queue_idx].tail,
+					spmc_enqueue(sender_queues[queue_idx].tail,
 						     sender_queues[queue_idx].size,
-						     entry, struct dirty_region_spsc_node);
+						     entry, struct dirty_region_spmc_node);
 					__sync_fetch_and_add(&queue_pages_dist[queue_idx], pages);
 					__sync_fetch_and_add(&queue_regions_dist[queue_idx], 1);
 					queue_idx = queue_base + ((queue_idx - queue_base + 1) % QUEUES_PER_SCANNER);
@@ -483,9 +483,9 @@ static void *dirty_scanner_thread(void *arg)
 						entry->dst_id = 0;  /* Will be set per-VMA */
 						entry->source_pid = g_scanner_source_pid;
 
-						spsc_enqueue(sender_queues[queue_idx].tail,
+						spmc_enqueue(sender_queues[queue_idx].tail,
 							     sender_queues[queue_idx].size,
-							     entry, struct dirty_region_spsc_node);
+							     entry, struct dirty_region_spmc_node);
 						__sync_fetch_and_add(&queue_pages_dist[queue_idx], pages);
 						__sync_fetch_and_add(&queue_regions_dist[queue_idx], 1);
 						queue_idx = (queue_idx + 1) % COW_NUM_P3_THREADS;
@@ -557,9 +557,9 @@ static void *dirty_scanner_thread(void *arg)
 					entry->dst_id = lve->dst_id;
 					entry->source_pid = g_scanner_source_pid;
 
-					spsc_enqueue(sender_queues[queue_idx].tail,
+					spmc_enqueue(sender_queues[queue_idx].tail,
 						     sender_queues[queue_idx].size,
-						     entry, struct dirty_region_spsc_node);
+						     entry, struct dirty_region_spmc_node);
 					__sync_fetch_and_add(&queue_pages_dist[queue_idx], pages);
 					__sync_fetch_and_add(&queue_regions_dist[queue_idx], 1);
 					queue_idx = queue_base + ((queue_idx - queue_base + 1) % QUEUES_PER_SCANNER);
@@ -1012,9 +1012,9 @@ skip_scan_merge:
 		entry->dst_id = 0;  /* Will use lve->dst_id when processing */
 		entry->source_pid = g_scanner_source_pid;
 
-		spsc_enqueue(sender_queues[queue_idx].tail,
+		spmc_enqueue(sender_queues[queue_idx].tail,
 			     sender_queues[queue_idx].size,
-			     entry, struct dirty_region_spsc_node);
+			     entry, struct dirty_region_spmc_node);
 		__sync_fetch_and_add(&queue_pages_dist[queue_idx], pages);
 		__sync_fetch_and_add(&queue_regions_dist[queue_idx], 1);
 
@@ -1708,14 +1708,16 @@ static void *p3_bulk_sender_thread(void *arg)
 		unsigned long p3_regions = 0;
 		unsigned long p3_pages = 0;
 		unsigned long pages_before_scan_done = 0;
+		unsigned long stolen_regions = 0;
 		bool p3_started = false;
 		bool scan_done_logged = false;
 		struct sender_queue *my_queue = cow_get_sender_queue(thread_id);
+		int steal_victim = (thread_id + 1) % COW_NUM_P3_THREADS;
 
 		clock_gettime(CLOCK_MONOTONIC, &loop_start);
 
 		/* Consume dirty regions from queue until scanner completes */
-		while (!cow_is_scan_complete() || spsc_peek(my_queue->head)) {
+		while (!cow_is_scan_complete() || spmc_peek(my_queue->head)) {
 			struct dirty_region_entry *region;
 			int sent;
 
@@ -1732,12 +1734,25 @@ static void *p3_bulk_sender_thread(void *arg)
 				clock_gettime(CLOCK_MONOTONIC, &scan_done_time);
 			}
 
-			region = spsc_dequeue(my_queue->head, my_queue->size);
+			region = spmc_dequeue(my_queue->head, my_queue->size);
 			if (!region) {
-				/* Queue empty, brief wait */
-				wait_count++;
-				usleep(COW_USLEEP_100US);
-				continue;
+				/* Try work stealing from other queues */
+				int attempts;
+				for (attempts = 0; attempts < COW_NUM_P3_THREADS - 1; attempts++) {
+					struct sender_queue *victim_queue = cow_get_sender_queue(steal_victim);
+					region = spmc_dequeue(victim_queue->head, victim_queue->size);
+					steal_victim = (steal_victim + 1) % COW_NUM_P3_THREADS;
+					if (region) {
+						stolen_regions++;
+						break;
+					}
+				}
+				if (!region) {
+					/* No work anywhere, brief wait */
+					wait_count++;
+					usleep(COW_USLEEP_100US);
+					continue;
+				}
 			}
 			wait_count = 0;
 
@@ -1783,8 +1798,8 @@ static void *p3_bulk_sender_thread(void *arg)
 			       thread_id, p3_total_ms, send_during_scan_ms, pages_before_scan_done,
 			       send_after_scan_ms, p3_pages - pages_before_scan_done);
 		}
-		pr_err("P3[%d] TIMING: Queue consumption done: %lu regions, %lu pages in %ld ms\n",
-		       thread_id, regions_processed, loop_total_pages, loop_elapsed_ms);
+		pr_err("P3[%d] TIMING: Queue consumption done: %lu regions (%lu stolen), %lu pages in %ld ms\n",
+		       thread_id, regions_processed, stolen_regions, loop_total_pages, loop_elapsed_ms);
 	}
 
 	/* === Final: Send pages from new VMAs detected in Phase 3 === */
