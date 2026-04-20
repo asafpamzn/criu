@@ -980,7 +980,7 @@ void cow_debug_scan_compare(void)
 			unique = 1;
 			for (i = 1; i < scan_addrs_count; i++) {
 				if (scan_addrs[i] == scan_addrs[i - 1]) {
-					pr_err("SCAN DUPLICATE: 0x%lx\n", scan_addrs[i]);
+					pr_debug("SCAN DUPLICATE: 0x%lx\n", scan_addrs[i]);
 					duplicates++;
 				} else {
 					/* Move unique to front */
