@@ -1057,7 +1057,7 @@ void cow_debug_scan_compare(void)
 	unsigned long scan_count = 0;
 	unsigned long scan_only = 0;
 	unsigned long scan_in_bpf = 0;
-	unsigned long page_size = sysconf(_SC_PAGESIZE);
+	unsigned long pgsz = sysconf(_SC_PAGESIZE);
 	u64 drops;
 	/* Track SCAN addresses for duplicate detection */
 	unsigned long *scan_addrs = NULL;
