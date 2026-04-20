@@ -850,6 +850,7 @@ void cow_debug_scan_compare(void)
 	char path[64];
 	unsigned long scan_count = 0;
 	unsigned long scan_only = 0;
+	unsigned long scan_in_bpf = 0;
 	unsigned long page_size = sysconf(_SC_PAGESIZE);
 	u64 drops;
 
@@ -888,13 +889,22 @@ void cow_debug_scan_compare(void)
 	}
 
 	/* Run PAGEMAP_SCAN and compare with BPF */
+	{
+		unsigned long vma_count = 0;
+		list_for_each_entry(lve, lazy_vmas, list) {
+			vma_count++;
+		}
+		pr_err("Scanning %lu VMAs\n", vma_count);
+	}
+
 	list_for_each_entry(lve, lazy_vmas, list) {
 		struct pm_scan_arg args;
 		long regs_len;
+		unsigned long vma_scan_count = 0;
 
 		memset(&args, 0, sizeof(args));
 		args.size = sizeof(args);
-		args.flags = 0;  /* Don't clear WP */
+		args.flags = 0;  /* Just read, don't modify WP */
 		args.start = lve->start;
 		args.end = lve->end;
 		args.walk_end = lve->start;
@@ -938,6 +948,8 @@ void cow_debug_scan_compare(void)
 						/* Log ALL missed addresses */
 						pr_err("BPF MISSED: 0x%lx (VMA 0x%lx-0x%lx)\n",
 						       addr, lve->start, lve->end);
+					} else {
+						scan_in_bpf++;
 					}
 				}
 			}
@@ -968,10 +980,14 @@ void cow_debug_scan_compare(void)
 
 		pr_err("=== SCAN_COMPARE RESULTS ===\n");
 		pr_err("BPF found:  %lu pages\n", bpf_addr_count);
-		pr_err("SCAN found: %lu pages\n", scan_count);
-		pr_err("SCAN only:  %lu pages (BPF MISSED - these cause crash!)\n", scan_only);
-		pr_err("BPF only:   %lu pages (in BPF but SCAN didn't find)\n", bpf_only);
-		pr_err("Overlap:    %lu pages\n", scan_count - scan_only);
+		pr_err("SCAN found: %lu pages (scan_count)\n", scan_count);
+		pr_err("SCAN in BPF: %lu pages (found in both)\n", scan_in_bpf);
+		pr_err("SCAN only:  %lu pages (BPF MISSED)\n", scan_only);
+		pr_err("Sanity check: scan_in_bpf(%lu) + scan_only(%lu) = %lu, should = scan_count(%lu)\n",
+		       scan_in_bpf, scan_only, scan_in_bpf + scan_only, scan_count);
+		pr_err("BPF only (calc): BPF(%lu) - scan_in_bpf(%lu) = %lu\n",
+		       bpf_addr_count, scan_in_bpf,
+		       bpf_addr_count > scan_in_bpf ? bpf_addr_count - scan_in_bpf : 0);
 
 		/* Log ALL BPF-only addresses by checking which BPF addrs aren't PAGE_IS_WRITTEN */
 		if (bpf_addrs) {
