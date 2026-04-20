@@ -438,13 +438,15 @@ bool cow_bpf_active(void)
 
 /*
  * Drain BPF ring buffer and return raw sorted/deduped addresses.
- * Used for debug comparison with PAGEMAP_SCAN.
+ * Also merges in the initial dirty pages captured at BPF start time.
  */
 int cow_bpf_drain_addrs(unsigned long **out_addrs, unsigned long *out_count)
 {
 	struct ring_buffer *rb;
 	struct drain_ctx dc;
 	int err, i, unique;
+	unsigned long *merged;
+	unsigned long merged_count;
 
 	*out_addrs = NULL;
 	*out_count = 0;
@@ -473,6 +475,79 @@ int cow_bpf_drain_addrs(unsigned long **out_addrs, unsigned long *out_count)
 		xfree(dc.addrs);
 		return -1;
 	}
+
+#ifdef SCAN_COMPARE
+	/*
+	 * Merge initial dirty pages (captured at BPF start) with BPF-captured pages.
+	 * Initial dirty pages are already sorted. BPF pages need sorting.
+	 */
+	if (g_initial_dirty_count > 0 && g_initial_dirty_addrs) {
+		unsigned long total_cap;
+		unsigned long bpf_idx, init_idx, out_idx;
+
+		pr_err("BPF drain: merging %lu initial dirty pages with %d BPF pages\n",
+		       g_initial_dirty_count, dc.count);
+
+		/* Sort BPF addresses first */
+		if (dc.count > 1)
+			qsort(dc.addrs, dc.count, sizeof(*dc.addrs), addr_cmp);
+
+		/* Allocate merged array */
+		total_cap = g_initial_dirty_count + dc.count;
+		merged = xmalloc(total_cap * sizeof(*merged));
+		if (!merged) {
+			xfree(dc.addrs);
+			return -1;
+		}
+
+		/* Merge two sorted arrays, removing duplicates */
+		bpf_idx = 0;
+		init_idx = 0;
+		out_idx = 0;
+
+		while (bpf_idx < (unsigned long)dc.count && init_idx < g_initial_dirty_count) {
+			unsigned long bpf_val = dc.addrs[bpf_idx];
+			unsigned long init_val = g_initial_dirty_addrs[init_idx];
+
+			if (bpf_val < init_val) {
+				if (out_idx == 0 || merged[out_idx - 1] != bpf_val)
+					merged[out_idx++] = bpf_val;
+				bpf_idx++;
+			} else if (bpf_val > init_val) {
+				if (out_idx == 0 || merged[out_idx - 1] != init_val)
+					merged[out_idx++] = init_val;
+				init_idx++;
+			} else {
+				/* Equal - take one, skip both */
+				if (out_idx == 0 || merged[out_idx - 1] != bpf_val)
+					merged[out_idx++] = bpf_val;
+				bpf_idx++;
+				init_idx++;
+			}
+		}
+
+		/* Copy remaining from BPF */
+		while (bpf_idx < (unsigned long)dc.count) {
+			if (out_idx == 0 || merged[out_idx - 1] != dc.addrs[bpf_idx])
+				merged[out_idx++] = dc.addrs[bpf_idx];
+			bpf_idx++;
+		}
+
+		/* Copy remaining from initial */
+		while (init_idx < g_initial_dirty_count) {
+			if (out_idx == 0 || merged[out_idx - 1] != g_initial_dirty_addrs[init_idx])
+				merged[out_idx++] = g_initial_dirty_addrs[init_idx];
+			init_idx++;
+		}
+
+		xfree(dc.addrs);
+		*out_addrs = merged;
+		*out_count = out_idx;
+
+		pr_err("BPF drain: merged result has %lu unique pages\n", out_idx);
+		return 0;
+	}
+#endif
 
 	if (dc.count == 0) {
 		xfree(dc.addrs);
