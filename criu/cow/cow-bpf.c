@@ -26,7 +26,7 @@
 #include "common/xmalloc.h"
 #include "cow/cow-bpf.h"
 #include "cow/cow-conf.h"
-#include "cow/bpf/dirty_track.skel.h"
+#include "bpf/dirty_track.skel.h"
 
 static struct dirty_track_bpf *g_skel;
 static int g_ring_fd = -1;
