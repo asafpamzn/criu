@@ -736,6 +736,8 @@ static void *background_drain_worker(void *arg)
 	time_t last_progress_time = 0;
 	int thread_id = args->thread_id;
 	int chunk_id;
+	int chunks_empty = 0;
+	int chunks_with_pages = 0;
 	char thread_name[16];
 
 	/* Set thread name for debugging (max 15 chars + null) */
@@ -762,6 +764,7 @@ static void *background_drain_worker(void *arg)
 			unsigned long chunk_drained = 0;
 			int collected = 0;
 			int i;
+			int max_entries = 2 * 1024 * 1024 / sizeof(struct drain_page_entry);
 
 			/* Phase 1: Collect all pages from all nodes in this chunk */
 			pthread_spin_lock(&chunk_index[chunk_id].lock);
@@ -769,6 +772,11 @@ static void *background_drain_worker(void *arg)
 						 &chunk_index[chunk_id].pages, chunk_list) {
 				/* Copy all entries from this node */
 				for (i = 0; i < node->count; i++) {
+					if (collected >= max_entries) {
+						pr_err("Drain thread %d: OVERFLOW chunk %d collected=%d max=%d\n",
+						       thread_id, chunk_id, collected, max_entries);
+						BUG();
+					}
 					entries[collected].vaddr = node->entries[i].vaddr;
 					entries[collected].data = node->entries[i].data;
 					collected++;
@@ -776,17 +784,19 @@ static void *background_drain_worker(void *arg)
 				node->count = 0;
 				list_del(&node->chunk_list);
 				atomic_fetch_sub(&chunk_index[chunk_id].page_count, 1);
-				/*
-				 * Leave node in hash table with count=0. Lookups will
-				 * find the node but no entries match, returning NULL.
-				 * Cleanup happens in cow_page_buffer_destroy().
-				 */
 			}
 			pthread_spin_unlock(&chunk_index[chunk_id].lock);
 
-			if (collected == 0)
+			if (collected == 0) {
+				chunks_empty++;
 				continue;
+			}
 
+			/* Log when starting a chunk with pages */
+			pr_info("Drain thread %d: chunk %d has %d pages\n",
+				thread_id, chunk_id, collected);
+
+			chunks_with_pages++;
 			__sync_fetch_and_sub(&cow_buffer.nr_pages, collected);
 
 			/*
@@ -848,9 +858,10 @@ static void *background_drain_worker(void *arg)
 	/* Update global statistics */
 	atomic_fetch_add(&total_drained, drained);
 
-	pr_info("Drain thread %d finished: drained=%lu batches=%lu batches_gt1=%lu max_batch=%d avg=%.1f\n",
+	pr_info("Drain thread %d finished: drained=%lu batches=%lu batches_gt1=%lu max_batch=%d avg=%.1f chunks_empty=%d chunks_with_pages=%d\n",
 	       thread_id, drained, batches, batches_gt1, max_batch,
-	       batches > 0 ? (double)drained / batches : 0.0);
+	       batches > 0 ? (double)drained / batches : 0.0,
+	       chunks_empty, chunks_with_pages);
 
 	/* Decrement active thread count */
 	if (atomic_fetch_sub(&drain_threads_active, 1) == 1) {
