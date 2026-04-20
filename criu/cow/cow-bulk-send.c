@@ -523,7 +523,7 @@ static void *dirty_scanner_thread(void *arg)
 
 			memset(&args, 0, sizeof(args));
 			args.size = sizeof(args);
-			args.flags = PM_SCAN_WP_MATCHING;
+			args.flags = 0;  /* No WP_MATCHING - just read dirty state */
 			args.start = my_start;
 			args.end = my_end;
 			args.walk_end = my_start;
