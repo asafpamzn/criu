@@ -286,6 +286,7 @@ static void *dirty_scanner_thread(void *arg)
 
 	lazy_vmas = get_global_lazy_vmas();
 
+#ifdef COW_PRE_SCAN
 	/* Iterative dirty scanning until freeze signal */
 	while (!__atomic_load_n(&g_scanner_freeze_signal, __ATOMIC_ACQUIRE)) {
 		unsigned long my_dirty_pages = 0;
@@ -428,6 +429,7 @@ static void *dirty_scanner_thread(void *arg)
 
 		usleep(COW_USLEEP_1MS);
 	}
+#endif /* COW_PRE_SCAN */
 
 	/* Wait for freeze signal from main thread */
 	if (scanner_id == 0) {
@@ -1950,8 +1952,8 @@ int cow_get_num_p3_threads(void)
 
 /*
  * Check if ready to freeze.
- * In scanner architecture: returns true when scanner signals freeze (g_last_scan_flag).
- * In BPF mode: returns true immediately after bulk transfer completes.
+ * In scanner architecture with COW_PRE_SCAN: returns true when scanner signals freeze.
+ * In BPF mode or without COW_PRE_SCAN: returns true immediately after bulk transfer completes.
  */
 bool cow_all_threads_below_threshold(void)
 {
@@ -1967,8 +1969,15 @@ bool cow_all_threads_below_threshold(void)
 	}
 #endif
 
+#ifdef COW_PRE_SCAN
 	/* Scanner decides when to freeze based on total dirty pages < threshold */
 	return g_last_scan_flag && p3_threads_active > 0;
+#else
+	/* No pre-scan: freeze immediately after bulk transfer completes */
+	int done = __atomic_load_n(&g_bulk_transfer_done_count, __ATOMIC_ACQUIRE);
+	int total = __atomic_load_n(&g_num_sender_threads, __ATOMIC_ACQUIRE);
+	return done >= total && p3_threads_active > 0;
+#endif
 }
 
 /*

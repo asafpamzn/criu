@@ -41,6 +41,17 @@
 // #define SCAN_COMPARE
 
 /*
+ * COW_PRE_SCAN - Enable iterative dirty scanning before freeze.
+ * When enabled: Scanners do iterative PAGEMAP_SCAN while process runs,
+ *               waiting for dirty pages to converge below threshold before
+ *               requesting freeze.
+ * When disabled (default): Scanners wait for freeze signal immediately after
+ *               bulk transfer completes, then do a single final PAGEMAP_SCAN
+ *               on the frozen process. This is faster and simpler.
+ */
+// #define COW_PRE_SCAN
+
+/*
  * CONFIG_HUNG_PAGE_TRACKER - Enable hung page detection.
  * Tracks pages that take too long to be processed.
  * Adds overhead, use only for debugging.
