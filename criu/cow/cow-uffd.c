@@ -727,7 +727,7 @@ static void *background_drain_worker(void *arg)
 {
 	struct drain_thread_args *args = (struct drain_thread_args *)arg;
 	struct page_buffer_node *node, *tmp_node;
-	struct drain_page_entry *entries;
+	struct drain_page_entry batch_entries[COW_BATCH_PAGES];  /* 64 entries on stack */
 	unsigned long drained = 0;
 	unsigned long last_progress_drained = 0;
 	unsigned long batches = 0;
@@ -747,13 +747,6 @@ static void *background_drain_worker(void *arg)
 	pr_info("Drain thread %d started, buffered=%lu\n", thread_id, cow_buffer.nr_pages);
 	last_progress_time = time(NULL);
 
-	/*
-	 * Allocate collection buffer once - 2MB is enough for 128K pages.
-	 * A 256MB chunk has 64K pages max, so this is plenty.
-	 */
-	entries = xmalloc(2 * 1024 * 1024);
-	BUG_ON(!entries);
-
 	while (!atomic_load(&drain_thread_stop) && cow_buffer.nr_pages > 0) {
 		/* Work-stealing: atomically grab next chunk */
 		chunk_id = atomic_fetch_add(&next_drain_chunk, 1);
@@ -762,24 +755,95 @@ static void *background_drain_worker(void *arg)
 
 		{
 			unsigned long chunk_drained = 0;
-			int collected = 0;
+			int chunk_total_pages = 0;
+			int batch_count = 0;
 			int i;
-			int max_entries = 2 * 1024 * 1024 / sizeof(struct drain_page_entry);
 
-			/* Phase 1: Collect all pages from all nodes in this chunk */
+			/*
+			 * Stream through nodes, building batches on the fly.
+			 * Apply batch when: not contiguous, batch full (64), or chunk done.
+			 */
 			pthread_spin_lock(&chunk_index[chunk_id].lock);
 			list_for_each_entry_safe(node, tmp_node,
 						 &chunk_index[chunk_id].pages, chunk_list) {
-				/* Copy all entries from this node */
 				for (i = 0; i < node->count; i++) {
-					if (collected >= max_entries) {
-						pr_err("Drain thread %d: OVERFLOW chunk %d collected=%d max=%d\n",
-						       thread_id, chunk_id, collected, max_entries);
-						BUG();
+					unsigned long vaddr = node->entries[i].vaddr;
+					void *data = node->entries[i].data;
+
+					/* Check if NOT contiguous - apply current batch first */
+					if (batch_count > 0 &&
+					    (batch_entries[batch_count - 1].vaddr + PAGE_SIZE != vaddr ||
+					     (char *)batch_entries[batch_count - 1].data + PAGE_SIZE != data)) {
+						struct drain_batch batch;
+						int copied;
+
+						pthread_spin_unlock(&chunk_index[chunk_id].lock);
+						__sync_fetch_and_sub(&cow_buffer.nr_pages, batch_count);
+
+						batch.start_idx = 0;
+						batch.vaddr = batch_entries[0].vaddr;
+						batch.data = batch_entries[0].data;
+						batch.count = batch_count;
+
+						copied = drain_apply_batch(&batch, drain_lpis);
+						if (copied > 0) {
+							drained += copied;
+							chunk_drained += copied;
+							batches++;
+							if (batch_count > 1)
+								batches_gt1++;
+							if (batch_count > max_batch)
+								max_batch = batch_count;
+						}
+						drain_free_batch(&batch);
+
+						pthread_spin_lock(&chunk_index[chunk_id].lock);
+						batch_count = 0;
 					}
-					entries[collected].vaddr = node->entries[i].vaddr;
-					entries[collected].data = node->entries[i].data;
-					collected++;
+
+					/* Add page to batch */
+					batch_entries[batch_count].vaddr = vaddr;
+					batch_entries[batch_count].data = data;
+					batch_count++;
+					chunk_total_pages++;
+
+					/* Batch full - apply it */
+					if (batch_count >= COW_BATCH_PAGES) {
+						struct drain_batch batch;
+						int copied;
+
+						pthread_spin_unlock(&chunk_index[chunk_id].lock);
+						__sync_fetch_and_sub(&cow_buffer.nr_pages, batch_count);
+
+						batch.start_idx = 0;
+						batch.vaddr = batch_entries[0].vaddr;
+						batch.data = batch_entries[0].data;
+						batch.count = batch_count;
+
+						copied = drain_apply_batch(&batch, drain_lpis);
+						if (copied > 0) {
+							drained += copied;
+							chunk_drained += copied;
+							batches++;
+							if (batch_count > 1)
+								batches_gt1++;
+							if (batch_count > max_batch)
+								max_batch = batch_count;
+
+							/* Log progress every 100k pages or 10 seconds */
+							if (drained - last_progress_drained >= COW_LOG_SAMPLE_100K ||
+							    time(NULL) - last_progress_time >= COW_DRAIN_PROGRESS_SEC) {
+								pr_err("Drain thread %d: drained=%lu chunk=%d remaining=%lu batch=%d\n",
+								       thread_id, drained, chunk_id, cow_buffer.nr_pages, batch_count);
+								last_progress_drained = drained;
+								last_progress_time = time(NULL);
+							}
+						}
+						drain_free_batch(&batch);
+
+						pthread_spin_lock(&chunk_index[chunk_id].lock);
+						batch_count = 0;
+					}
 				}
 				node->count = 0;
 				list_del(&node->chunk_list);
@@ -787,44 +851,16 @@ static void *background_drain_worker(void *arg)
 			}
 			pthread_spin_unlock(&chunk_index[chunk_id].lock);
 
-			if (collected == 0) {
-				chunks_empty++;
-				continue;
-			}
-
-			/* Log when starting a chunk with pages */
-			pr_info("Drain thread %d: chunk %d has %d pages\n",
-				thread_id, chunk_id, collected);
-
-			chunks_with_pages++;
-			__sync_fetch_and_sub(&cow_buffer.nr_pages, collected);
-
-			/*
-			 * Phase 2: Find contiguous runs and apply batched UFFDIO_COPY.
-			 * Pages are already in insertion order (list_add_tail), so we
-			 * just verify contiguity and break batch when it fails.
-			 */
-			for (i = 0; i < collected; ) {
-				int batch_start = i;
-				int batch_count = 1;
+			/* Apply remaining batch */
+			if (batch_count > 0) {
 				struct drain_batch batch;
 				int copied;
 
-				/* Extend batch while vaddr AND data are contiguous */
-				while (i + batch_count < collected && batch_count < COW_BATCH_PAGES) {
-					struct drain_page_entry *curr = &entries[i + batch_count - 1];
-					struct drain_page_entry *next = &entries[i + batch_count];
+				__sync_fetch_and_sub(&cow_buffer.nr_pages, batch_count);
 
-					if (curr->vaddr + PAGE_SIZE != next->vaddr ||
-					    (char *)curr->data + PAGE_SIZE != next->data)
-						break;
-					batch_count++;
-				}
-
-				/* Apply batch via existing drain_apply_batch */
-				batch.start_idx = 0;  /* Not used in drain_apply_batch */
-				batch.vaddr = entries[batch_start].vaddr;
-				batch.data = entries[batch_start].data;
+				batch.start_idx = 0;
+				batch.vaddr = batch_entries[0].vaddr;
+				batch.data = batch_entries[0].data;
 				batch.count = batch_count;
 
 				copied = drain_apply_batch(&batch, drain_lpis);
@@ -836,24 +872,17 @@ static void *background_drain_worker(void *arg)
 						batches_gt1++;
 					if (batch_count > max_batch)
 						max_batch = batch_count;
-
-					/* Log progress every 100k pages or 10 seconds */
-					if (drained - last_progress_drained >= COW_LOG_SAMPLE_100K ||
-					    time(NULL) - last_progress_time >= COW_DRAIN_PROGRESS_SEC) {
-						pr_err("Drain thread %d: drained=%lu chunk=%d remaining=%lu batch=%d\n",
-						       thread_id, drained, chunk_id, cow_buffer.nr_pages, batch_count);
-						last_progress_drained = drained;
-						last_progress_time = time(NULL);
-					}
 				}
-
 				drain_free_batch(&batch);
-				i += batch_count;
+			}
+
+			if (chunk_total_pages == 0) {
+				chunks_empty++;
+			} else {
+				chunks_with_pages++;
 			}
 		}
 	}
-
-	xfree(entries);
 
 	/* Update global statistics */
 	atomic_fetch_add(&total_drained, drained);
