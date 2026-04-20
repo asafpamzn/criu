@@ -82,6 +82,9 @@ static unsigned long p3_total_pages_sent = 0;
 /* Global flag for signaling last scan (set by main thread after freeze) */
 static volatile bool g_last_scan_flag = false;
 
+/* Timestamp when freeze signal was sent - for P3 thread timing */
+static struct timespec g_freeze_signal_time;
+
 /* New VMA ranges detected in Phase 3 - set by main thread before last scan */
 static unsigned long *g_new_vma_ranges = NULL;  /* [start, len, start, len, ...] */
 static unsigned int g_nr_new_vma_ranges = 0;
@@ -582,7 +585,7 @@ skip_pagemap_scan:
 				total_final += scanners[s].dirty_count;
 			fs_ms = (fs_end.tv_sec - fs_start.tv_sec) * 1000 +
 				(fs_end.tv_nsec - fs_start.tv_nsec) / 1000000;
-			pr_err("Scanner: final scan done, %lu dirty pages, %ld ms\n",
+			pr_err("Scanner: PAGEMAP_SCAN done: %lu dirty pages found in %ld ms\n",
 			       total_final, fs_ms);
 			g_scanners_iter_done = 0;
 			pthread_cond_broadcast(&g_scanner_cond);
@@ -626,8 +629,13 @@ out:
 		if (all_done) {
 			int q;
 			unsigned long total_pages = 0, min_pages = ULONG_MAX, max_pages = 0;
+			struct timespec now;
+			long from_freeze_ms;
 
-			pr_err("Scanner: all scanners done, setting g_scan_complete=true\n");
+			clock_gettime(CLOCK_MONOTONIC, &now);
+			from_freeze_ms = (now.tv_sec - g_freeze_signal_time.tv_sec) * 1000 +
+					 (now.tv_nsec - g_freeze_signal_time.tv_nsec) / 1000000;
+			pr_err("Scanner: all scanners done, %ld ms from freeze signal\n", from_freeze_ms);
 
 			/* DEBUG_PERF: Print queue distribution summary */
 			for (q = 0; q < COW_NUM_P3_THREADS; q++) {
@@ -1172,47 +1180,40 @@ static void *p3_bulk_sender_thread(void *arg)
 
 	/* === Phase 2: Consume dirty regions from scanner queue === */
 	{
-		struct timespec loop_start, loop_end, drain_start;
+		struct timespec loop_start, loop_end, p3_start, scan_done_time;
 		long loop_elapsed_ms;
 		unsigned long loop_total_pages = 0;
 		unsigned long regions_processed = 0;
 		unsigned long wait_count = 0;
-		unsigned long drain_regions = 0;
-		unsigned long drain_pages = 0;
-		bool drain_started = false;
+		unsigned long p3_regions = 0;
+		unsigned long p3_pages = 0;
+		bool p3_started = false;
+		bool scan_done_logged = false;
 		struct sender_queue *my_queue = cow_get_sender_queue(thread_id);
 
 		clock_gettime(CLOCK_MONOTONIC, &loop_start);
-		pr_err("P3[%d] starting queue consumption\n", thread_id);
 
 		/* Consume dirty regions from queue until scanner completes */
 		while (!cow_is_scan_complete() || spsc_peek(my_queue->head)) {
 			struct dirty_region_entry *region;
 			int sent;
 
-			/* Track when we start draining after scan_complete */
-			if (!drain_started && cow_is_scan_complete()) {
-				drain_started = true;
-				clock_gettime(CLOCK_MONOTONIC, &drain_start);
-				pr_err("P3[%d] scan complete, draining queue (size=%lu)\n",
-				       thread_id, spsc_size(my_queue->size));
+			/* Track when freeze signal was sent (Phase 3 start) */
+			if (!p3_started && g_last_scan_flag) {
+				p3_started = true;
+				clock_gettime(CLOCK_MONOTONIC, &p3_start);
 			}
 
-			/* Periodic status logging */
-			if (regions_processed > 0 && regions_processed % COW_LOG_SAMPLE_10K == 0) {
-				pr_info("P3[%d] queue progress: processed=%lu, scan_complete=%d\n",
-				       thread_id, regions_processed,
-				       cow_is_scan_complete());
+			/* Track when scan completes */
+			if (!scan_done_logged && cow_is_scan_complete()) {
+				scan_done_logged = true;
+				clock_gettime(CLOCK_MONOTONIC, &scan_done_time);
 			}
 
 			region = spsc_dequeue(my_queue->head, my_queue->size);
 			if (!region) {
 				/* Queue empty, brief wait */
 				wait_count++;
-				if (wait_count % COW_LOG_SAMPLE_10K == 0) {
-					pr_debug("P3[%d] waiting: queue empty, scan_complete=%d\n",
-						 thread_id, cow_is_scan_complete());
-				}
 				usleep(COW_USLEEP_100US);
 				continue;
 			}
@@ -1223,25 +1224,33 @@ static void *p3_bulk_sender_thread(void *arg)
 			if (sent > 0) {
 				loop_total_pages += sent;
 				regions_processed++;
-				if (drain_started) {
-					drain_regions++;
-					drain_pages += sent;
+				if (p3_started) {
+					p3_regions++;
+					p3_pages += sent;
 				}
 			}
 			xfree(region);
 		}
-		pr_err("P3[%d] exiting queue loop: processed=%lu\n",
-		       thread_id, regions_processed);
 
 		clock_gettime(CLOCK_MONOTONIC, &loop_end);
 		loop_elapsed_ms = (loop_end.tv_sec - loop_start.tv_sec) * 1000 +
 				  (loop_end.tv_nsec - loop_start.tv_nsec) / 1000000;
 
-		if (drain_started) {
-			long drain_ms = (loop_end.tv_sec - drain_start.tv_sec) * 1000 +
-					(loop_end.tv_nsec - drain_start.tv_nsec) / 1000000;
-			pr_err("P3[%d] TIMING: Drain after scan_complete: %lu regions, %lu pages in %ld ms\n",
-			       thread_id, drain_regions, drain_pages, drain_ms);
+		/* Print Phase 3 specific timing */
+		if (p3_started) {
+			long p3_total_ms = (loop_end.tv_sec - p3_start.tv_sec) * 1000 +
+					   (loop_end.tv_nsec - p3_start.tv_nsec) / 1000000;
+			long wait_for_scan_ms = 0;
+			long send_after_scan_ms = 0;
+
+			if (scan_done_logged) {
+				wait_for_scan_ms = (scan_done_time.tv_sec - p3_start.tv_sec) * 1000 +
+						   (scan_done_time.tv_nsec - p3_start.tv_nsec) / 1000000;
+				send_after_scan_ms = (loop_end.tv_sec - scan_done_time.tv_sec) * 1000 +
+						     (loop_end.tv_nsec - scan_done_time.tv_nsec) / 1000000;
+			}
+			pr_err("P3[%d] TIMING P3: total=%ld ms (wait_for_scan=%ld ms + send_after_scan=%ld ms), %lu regions, %lu pages\n",
+			       thread_id, p3_total_ms, wait_for_scan_ms, send_after_scan_ms, p3_regions, p3_pages);
 		}
 		pr_err("P3[%d] TIMING: Queue consumption done: %lu regions, %lu pages in %ld ms\n",
 		       thread_id, regions_processed, loop_total_pages, loop_elapsed_ms);
@@ -1350,29 +1359,28 @@ void cow_wait_p3_threads(void)
 	int i;
 	unsigned long total = 0;
 	int errors = 0;
+	struct timespec t_scanner_done, t_senders_done;
+	long scanner_ms, senders_ms, total_ms;
 
 	/* Wait for scanner thread first */
 	cow_wait_scanner_thread();
+	clock_gettime(CLOCK_MONOTONIC, &t_scanner_done);
 
 	/* Then wait for sender threads */
 	for (i = 0; i < COW_NUM_P3_THREADS; i++) {
 		if (p3_threads[i].thread) {
-			pr_debug("DEBUG_THREAD: Waiting for P3 sender[%d] to join\n", i);
 			pthread_join(p3_threads[i].thread, NULL);
-			pr_debug("DEBUG_THREAD: P3 sender[%d] JOINED pages=%lu error=%d\n",
-			       i, p3_threads[i].pages_sent, p3_threads[i].error);
 			total += p3_threads[i].pages_sent;
 			if (p3_threads[i].error)
 				errors++;
 			p3_threads[i].thread = 0;
 		}
 	}
+	clock_gettime(CLOCK_MONOTONIC, &t_senders_done);
 
 	/* Close P3 sockets so replica receivers get EOF */
 	for (i = 0; i < COW_NUM_P3_THREADS; i++) {
 		if (p3_threads[i].socket >= 0) {
-			pr_debug("DEBUG_THREAD: Closing P3 sender[%d] socket=%d\n",
-				i, p3_threads[i].socket);
 			close(p3_threads[i].socket);
 			p3_threads[i].socket = -1;
 		}
@@ -1381,11 +1389,19 @@ void cow_wait_p3_threads(void)
 	p3_total_pages_sent = total;
 	p3_threads_active = 0;
 
+	/* Print timing breakdown from freeze signal */
+	scanner_ms = (t_scanner_done.tv_sec - g_freeze_signal_time.tv_sec) * 1000 +
+		     (t_scanner_done.tv_nsec - g_freeze_signal_time.tv_nsec) / 1000000;
+	senders_ms = (t_senders_done.tv_sec - t_scanner_done.tv_sec) * 1000 +
+		     (t_senders_done.tv_nsec - t_scanner_done.tv_nsec) / 1000000;
+	total_ms = (t_senders_done.tv_sec - g_freeze_signal_time.tv_sec) * 1000 +
+		   (t_senders_done.tv_nsec - g_freeze_signal_time.tv_nsec) / 1000000;
+
+	pr_err("P3 TIMING from freeze: scanner=%ld ms, senders=%ld ms, total=%ld ms, %lu pages\n",
+	       scanner_ms, senders_ms, total_ms, total);
+
 	if (errors > 0)
-		pr_warn("P3 threads completed with %d errors, %lu pages sent\n",
-			errors, total);
-	else
-		pr_info("All P3 threads joined: %lu total pages\n", total);
+		pr_warn("P3 threads completed with %d errors\n", errors);
 }
 
 bool cow_p3_thread_running(void)
@@ -1433,6 +1449,7 @@ bool cow_all_threads_below_threshold(void)
 void cow_signal_last_scan(void)
 {
 	pr_err("=== CONVERGENCE: Signaling last scan ===\n");
+	clock_gettime(CLOCK_MONOTONIC, &g_freeze_signal_time);
 	g_last_scan_flag = true;
 
 #ifdef CONFIG_HAS_LIBBPF
