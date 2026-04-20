@@ -60,4 +60,15 @@ extern void cow_bpf_stop(void);
  */
 extern bool cow_bpf_active(void);
 
+/*
+ * Drain BPF ring buffer and return raw sorted/deduped addresses.
+ * Caller must xfree() the returned array.
+ *
+ * @out_addrs: output pointer to allocated address array
+ * @out_count: number of unique addresses
+ *
+ * Returns 0 on success, -1 on error.
+ */
+extern int cow_bpf_drain_addrs(unsigned long **out_addrs, unsigned long *out_count);
+
 #endif /* __CR_COW_BPF_H__ */

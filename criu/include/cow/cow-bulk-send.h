@@ -147,4 +147,12 @@ int cow_bpf_drain_to_queues(void);
 bool cow_using_bpf_mode(void);
 #endif /* CONFIG_HAS_LIBBPF */
 
+#ifdef SCAN_COMPARE
+/*
+ * DEBUG: Compare BPF vs PAGEMAP_SCAN at freeze time.
+ * Call after freeze. Exits after comparison - no page transfer.
+ */
+void cow_debug_scan_compare(void);
+#endif
+
 #endif /* __CR_COW_BULK_SEND_H__ */

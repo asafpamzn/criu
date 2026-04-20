@@ -833,6 +833,128 @@ int cow_bpf_drain_to_queues(void)
 	return (int)total_pages;
 }
 
+#ifdef SCAN_COMPARE
+/*
+ * DEBUG: Compare BPF vs PAGEMAP_SCAN at freeze time.
+ * Call this after freeze, before any page transfer.
+ * Exits after comparison - no page transfer happens.
+ */
+void cow_debug_scan_compare(void)
+{
+	struct list_head *lazy_vmas = get_global_lazy_vmas();
+	struct lazy_vma_entry *lve;
+	struct page_region *regs;
+	unsigned long *bpf_addrs = NULL;
+	unsigned long bpf_addr_count = 0;
+	int pagemap_fd;
+	char path[64];
+	unsigned long scan_count = 0;
+	unsigned long scan_only = 0;
+	unsigned long page_size = sysconf(_SC_PAGESIZE);
+	u64 drops;
+
+	pr_err("=== SCAN_COMPARE DEBUG MODE ===\n");
+
+	/* Check BPF status */
+	if (!cow_bpf_active()) {
+		pr_err("BPF not active, cannot compare\n");
+		exit(1);
+	}
+
+	drops = cow_bpf_drop_count();
+	if (drops > 0) {
+		pr_err("BPF ring overflow: %llu drops\n", (unsigned long long)drops);
+	}
+
+	/* Drain BPF addresses */
+	if (cow_bpf_drain_addrs(&bpf_addrs, &bpf_addr_count) < 0) {
+		pr_err("BPF drain failed\n");
+		exit(1);
+	}
+	pr_err("BPF found: %lu unique pages\n", bpf_addr_count);
+
+	/* Open pagemap for SCAN */
+	snprintf(path, sizeof(path), "/proc/%d/pagemap", g_scanner_source_pid);
+	pagemap_fd = open(path, O_RDONLY);
+	if (pagemap_fd < 0) {
+		pr_perror("Failed to open pagemap");
+		exit(1);
+	}
+
+	regs = xmalloc(COW_PAGEMAP_SCAN_VEC_LEN * sizeof(*regs));
+	if (!regs) {
+		pr_err("Failed to allocate regs\n");
+		exit(1);
+	}
+
+	/* Run PAGEMAP_SCAN and compare with BPF */
+	list_for_each_entry(lve, lazy_vmas, list) {
+		struct pm_scan_arg args;
+		long regs_len;
+
+		memset(&args, 0, sizeof(args));
+		args.size = sizeof(args);
+		args.flags = 0;  /* Don't clear WP */
+		args.start = lve->start;
+		args.end = lve->end;
+		args.walk_end = lve->start;
+		args.vec = (u64)(unsigned long)regs;
+		args.vec_len = COW_PAGEMAP_SCAN_VEC_LEN;
+		args.max_pages = 0;
+		args.category_anyof_mask = PAGE_IS_WRITTEN;
+		args.return_mask = PAGE_IS_WRITTEN;
+
+		do {
+			int r;
+			args.start = args.walk_end;
+
+			regs_len = ioctl(pagemap_fd, PAGEMAP_SCAN, &args);
+			if (regs_len <= 0)
+				break;
+
+			for (r = 0; r < regs_len; r++) {
+				unsigned long addr;
+
+				for (addr = regs[r].start; addr < regs[r].end; addr += page_size) {
+					unsigned long lo = 0, hi = bpf_addr_count;
+					bool found = false;
+
+					scan_count++;
+
+					/* Binary search in sorted BPF addresses */
+					while (lo < hi) {
+						unsigned long mid = (lo + hi) / 2;
+						if (bpf_addrs[mid] == addr) {
+							found = true;
+							break;
+						} else if (bpf_addrs[mid] < addr) {
+							lo = mid + 1;
+						} else {
+							hi = mid;
+						}
+					}
+					if (!found)
+						scan_only++;
+				}
+			}
+		} while (args.walk_end < lve->end);
+	}
+
+	xfree(regs);
+	close(pagemap_fd);
+	if (bpf_addrs)
+		xfree(bpf_addrs);
+
+	pr_err("=== SCAN_COMPARE RESULTS ===\n");
+	pr_err("BPF found:  %lu pages\n", bpf_addr_count);
+	pr_err("SCAN found: %lu pages\n", scan_count);
+	pr_err("SCAN only:  %lu pages (BPF MISSED)\n", scan_only);
+	pr_err("=== EXITING DEBUG MODE ===\n");
+
+	exit(0);
+}
+#endif /* SCAN_COMPARE */
+
 /*
  * Check if using BPF mode (no scanner threads).
  */

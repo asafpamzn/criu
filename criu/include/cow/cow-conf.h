@@ -30,6 +30,17 @@
 // #define CONFIG_PAGE_STATE_TRACKER
 
 /*
+ * SCAN_COMPARE - Debug mode to compare BPF vs PAGEMAP_SCAN at freeze time.
+ * When enabled, after freeze the code will:
+ * 1. Drain BPF ring buffer and count unique dirty pages
+ * 2. Run PAGEMAP_SCAN and count dirty pages
+ * 3. Report pages that SCAN found but BPF missed
+ * 4. Exit immediately (no page transfer)
+ * Use this to debug why BPF might be missing pages.
+ */
+#define SCAN_COMPARE
+
+/*
  * CONFIG_HUNG_PAGE_TRACKER - Enable hung page detection.
  * Tracks pages that take too long to be processed.
  * Adds overhead, use only for debugging.

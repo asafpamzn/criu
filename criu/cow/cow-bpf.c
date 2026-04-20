@@ -101,7 +101,7 @@ int cow_bpf_start(pid_t target_pid)
 	g_ring_fd = bpf_map__fd(skel->maps.dirty_ring);
 	g_skel = skel;
 
-	pr_info("BPF dirty tracker: attached to do_wp_page "
+	pr_warn("BPF dirty tracker: attached to do_wp_page "
 	       "for pid %d (ring_fd=%d)\n", target_pid, g_ring_fd);
 	return 0;
 }
@@ -252,4 +252,61 @@ void cow_bpf_stop(void)
 bool cow_bpf_active(void)
 {
 	return g_skel != NULL;
+}
+
+/*
+ * Drain BPF ring buffer and return raw sorted/deduped addresses.
+ * Used for debug comparison with PAGEMAP_SCAN.
+ */
+int cow_bpf_drain_addrs(unsigned long **out_addrs, unsigned long *out_count)
+{
+	struct ring_buffer *rb;
+	struct drain_ctx dc;
+	int err, i, unique;
+
+	*out_addrs = NULL;
+	*out_count = 0;
+
+	if (!g_skel || g_ring_fd < 0)
+		return 0;
+
+	dc.cap = COW_BPF_DRAIN_INITIAL_CAP;
+	dc.count = 0;
+	dc.addrs = xmalloc(dc.cap * sizeof(*dc.addrs));
+	if (!dc.addrs)
+		return -1;
+
+	rb = ring_buffer__new(g_ring_fd, ring_event_cb, &dc, NULL);
+	if (!rb) {
+		pr_perror("BPF drain_addrs: ring_buffer__new failed");
+		xfree(dc.addrs);
+		return -1;
+	}
+
+	err = ring_buffer__consume(rb);
+	ring_buffer__free(rb);
+
+	if (err < 0 && err != -EAGAIN) {
+		pr_err("BPF drain_addrs: consume error %d\n", err);
+		xfree(dc.addrs);
+		return -1;
+	}
+
+	if (dc.count == 0) {
+		xfree(dc.addrs);
+		return 0;
+	}
+
+	/* Sort + dedup */
+	qsort(dc.addrs, dc.count, sizeof(*dc.addrs), addr_cmp);
+
+	unique = 1;
+	for (i = 1; i < dc.count; i++) {
+		if (dc.addrs[i] != dc.addrs[unique - 1])
+			dc.addrs[unique++] = dc.addrs[i];
+	}
+
+	*out_addrs = dc.addrs;
+	*out_count = unique;
+	return 0;
 }
