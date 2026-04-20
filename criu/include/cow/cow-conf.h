@@ -38,7 +38,7 @@
  * 4. Exit immediately (no page transfer)
  * Use this to debug why BPF might be missing pages.
  */
-#define SCAN_COMPARE
+// #define SCAN_COMPARE
 
 /*
  * CONFIG_HUNG_PAGE_TRACKER - Enable hung page detection.
