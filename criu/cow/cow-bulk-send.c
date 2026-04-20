@@ -850,6 +850,7 @@ void cow_debug_scan_compare(void)
 {
 	struct list_head *lazy_vmas = get_global_lazy_vmas();
 	struct lazy_vma_entry *lve;
+	struct lazy_vma_entry *vma_match;
 	struct page_region *regs;
 	unsigned long *bpf_addrs = NULL;
 	unsigned long bpf_addr_count = 0;
@@ -864,6 +865,16 @@ void cow_debug_scan_compare(void)
 	unsigned long *scan_addrs = NULL;
 	unsigned long scan_addrs_cap = 0;
 	unsigned long scan_addrs_count = 0;
+	/* Initial dirty tracking */
+	unsigned long *initial_dirty = NULL;
+	unsigned long initial_dirty_count = 0;
+	unsigned long missed_in_initial = 0;
+	unsigned long missed_not_initial = 0;
+	/* Loop variables */
+	unsigned long bpf_idx, scan_idx;
+	bool was_initial;
+	unsigned long offset, vma_size;
+	unsigned long lo, hi, mid;
 
 	pr_err("=== SCAN_COMPARE DEBUG MODE ===\n");
 
@@ -993,83 +1004,31 @@ void cow_debug_scan_compare(void)
 	}
 
 	/* Get initial dirty pages from BPF start time */
-	unsigned long *initial_dirty = NULL;
-	unsigned long initial_dirty_count = 0;
-	unsigned long missed_in_initial = 0;
-	unsigned long missed_not_initial = 0;
-
 	initial_dirty = cow_bpf_get_initial_dirty(&initial_dirty_count);
 	pr_err("Initial dirty pages at BPF start: %lu\n", initial_dirty_count);
 
 	/* Now compare: both arrays are sorted and unique */
-	{
-		unsigned long bpf_idx = 0, scan_idx = 0;
+	bpf_idx = 0;
+	scan_idx = 0;
 
-		while (bpf_idx < bpf_addr_count && scan_idx < scan_count) {
-			if (bpf_addrs[bpf_idx] == scan_addrs[scan_idx]) {
-				scan_in_bpf++;
-				bpf_idx++;
-				scan_idx++;
-			} else if (bpf_addrs[bpf_idx] < scan_addrs[scan_idx]) {
-				/* BPF has page that SCAN doesn't */
-				bpf_idx++;
-			} else {
-				/* SCAN has page that BPF doesn't - BPF MISSED */
-				/* Check if this was in initial dirty set */
-				bool was_initial = false;
-				if (initial_dirty && initial_dirty_count > 0) {
-					/* Binary search in initial_dirty (it's sorted) */
-					unsigned long lo = 0, hi = initial_dirty_count;
-					while (lo < hi) {
-						unsigned long mid = (lo + hi) / 2;
-						if (initial_dirty[mid] == scan_addrs[scan_idx]) {
-							was_initial = true;
-							break;
-						} else if (initial_dirty[mid] < scan_addrs[scan_idx]) {
-							lo = mid + 1;
-						} else {
-							hi = mid;
-						}
-					}
-				}
-
-				/* Find which VMA this belongs to */
-				struct lazy_vma_entry *vma_match = NULL;
-				list_for_each_entry(lve, lazy_vmas, list) {
-					if (scan_addrs[scan_idx] >= lve->start &&
-					    scan_addrs[scan_idx] < lve->end) {
-						vma_match = lve;
-						break;
-					}
-				}
-				if (vma_match) {
-					unsigned long offset = scan_addrs[scan_idx] - vma_match->start;
-					unsigned long vma_size = vma_match->end - vma_match->start;
-					pr_err("BPF MISSED: 0x%lx (VMA 0x%lx-0x%lx, offset=0x%lx, vma_size=%luMB) %s\n",
-					       scan_addrs[scan_idx], vma_match->start, vma_match->end,
-					       offset, vma_size / (1024 * 1024),
-					       was_initial ? "WAS_INITIAL_DIRTY" : "NEW_DIRTY");
-				} else {
-					pr_err("BPF MISSED: 0x%lx (NO VMA MATCH!) %s\n",
-					       scan_addrs[scan_idx],
-					       was_initial ? "WAS_INITIAL_DIRTY" : "NEW_DIRTY");
-				}
-				if (was_initial)
-					missed_in_initial++;
-				else
-					missed_not_initial++;
-				scan_only++;
-				scan_idx++;
-			}
-		}
-		/* Remaining SCAN addresses are all missed by BPF */
-		while (scan_idx < scan_count) {
+	while (bpf_idx < bpf_addr_count && scan_idx < scan_count) {
+		if (bpf_addrs[bpf_idx] == scan_addrs[scan_idx]) {
+			scan_in_bpf++;
+			bpf_idx++;
+			scan_idx++;
+		} else if (bpf_addrs[bpf_idx] < scan_addrs[scan_idx]) {
+			/* BPF has page that SCAN doesn't */
+			bpf_idx++;
+		} else {
+			/* SCAN has page that BPF doesn't - BPF MISSED */
 			/* Check if this was in initial dirty set */
-			bool was_initial = false;
+			was_initial = false;
 			if (initial_dirty && initial_dirty_count > 0) {
-				unsigned long lo = 0, hi = initial_dirty_count;
+				/* Binary search in initial_dirty (it's sorted) */
+				lo = 0;
+				hi = initial_dirty_count;
 				while (lo < hi) {
-					unsigned long mid = (lo + hi) / 2;
+					mid = (lo + hi) / 2;
 					if (initial_dirty[mid] == scan_addrs[scan_idx]) {
 						was_initial = true;
 						break;
@@ -1081,7 +1040,8 @@ void cow_debug_scan_compare(void)
 				}
 			}
 
-			struct lazy_vma_entry *vma_match = NULL;
+			/* Find which VMA this belongs to */
+			vma_match = NULL;
 			list_for_each_entry(lve, lazy_vmas, list) {
 				if (scan_addrs[scan_idx] >= lve->start &&
 				    scan_addrs[scan_idx] < lve->end) {
@@ -1090,8 +1050,8 @@ void cow_debug_scan_compare(void)
 				}
 			}
 			if (vma_match) {
-				unsigned long offset = scan_addrs[scan_idx] - vma_match->start;
-				unsigned long vma_size = vma_match->end - vma_match->start;
+				offset = scan_addrs[scan_idx] - vma_match->start;
+				vma_size = vma_match->end - vma_match->start;
 				pr_err("BPF MISSED: 0x%lx (VMA 0x%lx-0x%lx, offset=0x%lx, vma_size=%luMB) %s\n",
 				       scan_addrs[scan_idx], vma_match->start, vma_match->end,
 				       offset, vma_size / (1024 * 1024),
@@ -1108,6 +1068,53 @@ void cow_debug_scan_compare(void)
 			scan_only++;
 			scan_idx++;
 		}
+	}
+	/* Remaining SCAN addresses are all missed by BPF */
+	while (scan_idx < scan_count) {
+		/* Check if this was in initial dirty set */
+		was_initial = false;
+		if (initial_dirty && initial_dirty_count > 0) {
+			lo = 0;
+			hi = initial_dirty_count;
+			while (lo < hi) {
+				mid = (lo + hi) / 2;
+				if (initial_dirty[mid] == scan_addrs[scan_idx]) {
+					was_initial = true;
+					break;
+				} else if (initial_dirty[mid] < scan_addrs[scan_idx]) {
+					lo = mid + 1;
+				} else {
+					hi = mid;
+				}
+			}
+		}
+
+		vma_match = NULL;
+		list_for_each_entry(lve, lazy_vmas, list) {
+			if (scan_addrs[scan_idx] >= lve->start &&
+			    scan_addrs[scan_idx] < lve->end) {
+				vma_match = lve;
+				break;
+			}
+		}
+		if (vma_match) {
+			offset = scan_addrs[scan_idx] - vma_match->start;
+			vma_size = vma_match->end - vma_match->start;
+			pr_err("BPF MISSED: 0x%lx (VMA 0x%lx-0x%lx, offset=0x%lx, vma_size=%luMB) %s\n",
+			       scan_addrs[scan_idx], vma_match->start, vma_match->end,
+			       offset, vma_size / (1024 * 1024),
+			       was_initial ? "WAS_INITIAL_DIRTY" : "NEW_DIRTY");
+		} else {
+			pr_err("BPF MISSED: 0x%lx (NO VMA MATCH!) %s\n",
+			       scan_addrs[scan_idx],
+			       was_initial ? "WAS_INITIAL_DIRTY" : "NEW_DIRTY");
+		}
+		if (was_initial)
+			missed_in_initial++;
+		else
+			missed_not_initial++;
+		scan_only++;
+		scan_idx++;
 	}
 
 	pr_err("=== SCAN_COMPARE RESULTS ===\n");
