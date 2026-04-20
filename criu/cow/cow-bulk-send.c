@@ -933,8 +933,14 @@ void cow_debug_scan_compare(void)
 							hi = mid;
 						}
 					}
-					if (!found)
+					if (!found) {
 						scan_only++;
+						/* Log first 20 missed addresses */
+						if (scan_only <= 20) {
+							pr_err("BPF MISSED: 0x%lx (VMA 0x%lx-0x%lx)\n",
+							       addr, lve->start, lve->end);
+						}
+					}
 				}
 			}
 		} while (args.walk_end < lve->end);
