@@ -965,12 +965,12 @@ skip_scan_merge:
 	bpf_nr = 0;
 	if (bpf_addr_count > 0) {
 		unsigned long start = bpf_addrs[0];
-		unsigned long end = start + page_size;
+		unsigned long end = start + pgsz;
 
 		for (i = 1; i < (int)bpf_addr_count && bpf_nr < max_regions; i++) {
 			if (bpf_addrs[i] == end) {
 				/* Contiguous - extend region */
-				end += page_size;
+				end += pgsz;
 			} else {
 				/* Not contiguous - save current region and start new */
 				bpf_regions[bpf_nr].start = start;
@@ -978,7 +978,7 @@ skip_scan_merge:
 				bpf_regions[bpf_nr].categories = 0;
 				bpf_nr++;
 				start = bpf_addrs[i];
-				end = start + page_size;
+				end = start + pgsz;
 			}
 		}
 		/* Save last region */
