@@ -1006,14 +1006,47 @@ void cow_debug_scan_compare(void)
 				bpf_idx++;
 			} else {
 				/* SCAN has page that BPF doesn't - BPF MISSED */
-				pr_err("BPF MISSED: 0x%lx\n", scan_addrs[scan_idx]);
+				/* Find which VMA this belongs to */
+				struct lazy_vma_entry *vma_match = NULL;
+				list_for_each_entry(lve, lazy_vmas, list) {
+					if (scan_addrs[scan_idx] >= lve->start &&
+					    scan_addrs[scan_idx] < lve->end) {
+						vma_match = lve;
+						break;
+					}
+				}
+				if (vma_match) {
+					unsigned long offset = scan_addrs[scan_idx] - vma_match->start;
+					unsigned long vma_size = vma_match->end - vma_match->start;
+					pr_err("BPF MISSED: 0x%lx (VMA 0x%lx-0x%lx, offset=0x%lx, vma_size=%luMB)\n",
+					       scan_addrs[scan_idx], vma_match->start, vma_match->end,
+					       offset, vma_size / (1024 * 1024));
+				} else {
+					pr_err("BPF MISSED: 0x%lx (NO VMA MATCH!)\n", scan_addrs[scan_idx]);
+				}
 				scan_only++;
 				scan_idx++;
 			}
 		}
 		/* Remaining SCAN addresses are all missed by BPF */
 		while (scan_idx < scan_count) {
-			pr_err("BPF MISSED: 0x%lx\n", scan_addrs[scan_idx]);
+			struct lazy_vma_entry *vma_match = NULL;
+			list_for_each_entry(lve, lazy_vmas, list) {
+				if (scan_addrs[scan_idx] >= lve->start &&
+				    scan_addrs[scan_idx] < lve->end) {
+					vma_match = lve;
+					break;
+				}
+			}
+			if (vma_match) {
+				unsigned long offset = scan_addrs[scan_idx] - vma_match->start;
+				unsigned long vma_size = vma_match->end - vma_match->start;
+				pr_err("BPF MISSED: 0x%lx (VMA 0x%lx-0x%lx, offset=0x%lx, vma_size=%luMB)\n",
+				       scan_addrs[scan_idx], vma_match->start, vma_match->end,
+				       offset, vma_size / (1024 * 1024));
+			} else {
+				pr_err("BPF MISSED: 0x%lx (NO VMA MATCH!)\n", scan_addrs[scan_idx]);
+			}
 			scan_only++;
 			scan_idx++;
 		}

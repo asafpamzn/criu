@@ -16,6 +16,8 @@
 #include <errno.h>
 #include <unistd.h>
 #include <sys/time.h>
+#include <sys/ioctl.h>
+#include <fcntl.h>
 #include <bpf/libbpf.h>
 
 #undef LOG_PREFIX
@@ -27,6 +29,7 @@
 #include "cow/cow-bpf.h"
 #include "cow/cow-conf.h"
 #include "bpf/dirty_track.skel.h"
+#include "pagemap_scan.h"
 
 static struct dirty_track_bpf *g_skel;
 static int g_ring_fd = -1;
@@ -70,10 +73,67 @@ static int addr_cmp(const void *a, const void *b)
 	return (va > vb) - (va < vb);
 }
 
+#ifdef SCAN_COMPARE
+/*
+ * DEBUG: Quick count of dirty pages via PAGEMAP_SCAN.
+ * Scans entire address space and counts PAGE_IS_WRITTEN pages.
+ */
+static unsigned long debug_count_dirty_pages(pid_t pid)
+{
+	char path[64];
+	int fd;
+	struct pm_scan_arg args;
+	struct page_region regs[1024];
+	unsigned long count = 0;
+	unsigned long page_size = sysconf(_SC_PAGESIZE);
+
+	snprintf(path, sizeof(path), "/proc/%d/pagemap", pid);
+	fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return 0;
+
+	/* Scan entire user address space */
+	memset(&args, 0, sizeof(args));
+	args.size = sizeof(args);
+	args.flags = 0;
+	args.start = 0;
+	args.end = 0x7fffffffffff;  /* Max user address */
+	args.walk_end = 0;
+	args.vec = (u64)(unsigned long)regs;
+	args.vec_len = 1024;
+	args.max_pages = 0;
+	args.category_anyof_mask = PAGE_IS_WRITTEN;
+	args.return_mask = PAGE_IS_WRITTEN;
+
+	do {
+		long ret;
+		int i;
+
+		args.start = args.walk_end;
+		ret = ioctl(fd, PAGEMAP_SCAN, &args);
+		if (ret <= 0)
+			break;
+
+		for (i = 0; i < ret; i++) {
+			count += (regs[i].end - regs[i].start) / page_size;
+		}
+	} while (args.walk_end < args.end);
+
+	close(fd);
+	return count;
+}
+#endif
+
 int cow_bpf_start(pid_t target_pid)
 {
 	struct dirty_track_bpf *skel;
 	int err;
+#ifdef SCAN_COMPARE
+	unsigned long dirty_before, dirty_after;
+
+	dirty_before = debug_count_dirty_pages(target_pid);
+	pr_err("SCAN_COMPARE: Dirty pages BEFORE BPF attach: %lu\n", dirty_before);
+#endif
 
 	skel = dirty_track_bpf__open();
 	if (!skel) {
@@ -100,6 +160,15 @@ int cow_bpf_start(pid_t target_pid)
 
 	g_ring_fd = bpf_map__fd(skel->maps.dirty_ring);
 	g_skel = skel;
+
+#ifdef SCAN_COMPARE
+	dirty_after = debug_count_dirty_pages(target_pid);
+	pr_err("SCAN_COMPARE: Dirty pages AFTER BPF attach: %lu\n", dirty_after);
+	if (dirty_before > 0 || dirty_after > 0) {
+		pr_err("SCAN_COMPARE: WARNING - %lu pages were already dirty before BPF!\n",
+		       dirty_before);
+	}
+#endif
 
 	pr_warn("BPF dirty tracker: attached to do_wp_page "
 	       "for pid %d (ring_fd=%d)\n", target_pid, g_ring_fd);
