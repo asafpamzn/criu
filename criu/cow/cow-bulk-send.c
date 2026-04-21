@@ -253,16 +253,20 @@ void cow_signal_scanner_freeze(void)
 }
 
 /*
- * Dual scanner thread - each scanner handles half of each VMA's address range.
- * Scanner 0: first half (start → midpoint) → distributes to queues 0-9
- * Scanner 1: second half (midpoint → end) → distributes to queues 10-19
+ * Scanner thread. Each scanner:
+ *   - Scans its own disjoint slice of every lazy VMA's address range
+ *     (slice = vma_size / COW_NUM_SCANNERS, last scanner gets the remainder).
+ *   - Enqueues dirty regions into its own disjoint partition of sender_queues[],
+ *     namely [scanner_id * COW_QUEUES_PER_THREAD, scanner_id * COW_QUEUES_PER_THREAD
+ *     + COW_QUEUES_PER_THREAD). This preserves the SPSC single-producer invariant:
+ *     no two scanners ever enqueue to the same queue.
  */
 static void *dirty_scanner_thread(void *arg)
 {
 	struct scanner_ctx *ctx = (struct scanner_ctx *)arg;
 	int scanner_id = ctx->id;
-	/* Each scanner distributes round-robin across ALL queues, starting at different offset */
-	int queue_idx = scanner_id;  /* Start offset for round-robin */
+	const int queue_base = scanner_id * COW_QUEUES_PER_THREAD;
+	int queue_idx = queue_base;
 	struct list_head *lazy_vmas;
 	struct lazy_vma_entry *lve;
 	struct page_region *regs;
@@ -271,8 +275,9 @@ static void *dirty_scanner_thread(void *arg)
 	char pagemap_path[64];
 	struct timespec t_start, t_end;
 
-	pr_err("Scanner[%d] started, distributing to %d queues, source_pid=%d\n",
-	       scanner_id, COW_TOTAL_QUEUES, g_scanner_source_pid);
+	pr_err("Scanner[%d] started, owns queues [%d..%d), source_pid=%d\n",
+	       scanner_id, queue_base, queue_base + COW_QUEUES_PER_THREAD,
+	       g_scanner_source_pid);
 	clock_gettime(CLOCK_MONOTONIC, &t_start);
 
 	/* Wait for all sender threads to complete bulk transfer first */
@@ -308,7 +313,6 @@ static void *dirty_scanner_thread(void *arg)
 	/* Iterative dirty scanning until freeze signal */
 	while (!__atomic_load_n(&g_scanner_freeze_signal, __ATOMIC_ACQUIRE)) {
 		unsigned long my_dirty_pages = 0;
-		unsigned int queue_idx = queue_base;
 		struct timespec iter_start, iter_end;
 		unsigned long scan_time_ns = 0;
 		unsigned long dist_time_ns = 0;
@@ -370,7 +374,7 @@ static void *dirty_scanner_thread(void *arg)
 
 				num_regions += regs_len;
 
-				/* Distribute to this scanner's queues (round-robin within queue_base to queue_base+9) */
+				/* Distribute within this scanner's partition [queue_base, queue_base + COW_QUEUES_PER_THREAD) */
 				for (i = 0; i < regs_len; i++) {
 					struct dirty_region_entry *entry;
 					unsigned long pages;
@@ -391,7 +395,9 @@ static void *dirty_scanner_thread(void *arg)
 					__sync_fetch_and_add(&queue_pages_dist[queue_idx], pages);
 					__sync_fetch_and_add(&queue_regions_dist[queue_idx], 1);
 					__sync_fetch_and_add(&g_total_scanned_pages, pages);
-					queue_idx = (queue_idx + 1) % COW_TOTAL_QUEUES;
+					queue_idx = queue_base +
+						    ((queue_idx - queue_base + 1) %
+						     COW_QUEUES_PER_THREAD);
 				}
 				clock_gettime(CLOCK_MONOTONIC, &t3);
 				dist_time_ns += (t3.tv_sec - t2.tv_sec) * 1000000000UL +
@@ -507,7 +513,9 @@ static void *dirty_scanner_thread(void *arg)
 							     entry, struct dirty_region_spsc_node);
 						__sync_fetch_and_add(&queue_pages_dist[queue_idx], pages);
 						__sync_fetch_and_add(&queue_regions_dist[queue_idx], 1);
-						queue_idx = (queue_idx + 1) % COW_TOTAL_QUEUES;
+						queue_idx = queue_base +
+							    ((queue_idx - queue_base + 1) %
+							     COW_QUEUES_PER_THREAD);
 					}
 				} else if (bpf_nr == -2) {
 					/* BPF ring drops - fall back to PAGEMAP_SCAN */
@@ -582,7 +590,9 @@ static void *dirty_scanner_thread(void *arg)
 					__sync_fetch_and_add(&queue_pages_dist[queue_idx], pages);
 					__sync_fetch_and_add(&queue_regions_dist[queue_idx], 1);
 					__sync_fetch_and_add(&g_total_scanned_pages, pages);
-					queue_idx = (queue_idx + 1) % COW_TOTAL_QUEUES;
+					queue_idx = queue_base +
+						    ((queue_idx - queue_base + 1) %
+						     COW_QUEUES_PER_THREAD);
 				}
 			} while (args.walk_end < my_end);
 		}
