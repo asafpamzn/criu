@@ -21,8 +21,9 @@ struct dirty_region_entry {
 DECLARE_SPSC_NODE(dirty_region, struct dirty_region_entry);
 
 /*
- * Per-queue structure with ownership tracking for work stealing.
- * Stealing takes ownership of an entire queue (not individual items).
+ * Per-queue structure for dirty region distribution.
+ * SPSC queues - single producer (scanner), single consumer at a time.
+ * Threads get next queue via atomic counter - simple round-robin.
  * Cache-line padded to avoid false sharing.
  */
 struct sender_queue {
@@ -32,10 +33,6 @@ struct sender_queue {
 	char _pad2[COW_CACHE_LINE_SIZE - sizeof(struct dirty_region_spsc_node *)];
 	unsigned long size;
 	char _pad3[COW_CACHE_LINE_SIZE - sizeof(unsigned long)];
-	/* Owner thread ID, or -1 if queue is available for stealing */
-	volatile int owner;
-	pthread_spinlock_t lock;  /* Protects ownership transfer */
-	char _pad4[COW_CACHE_LINE_SIZE - sizeof(int) - sizeof(pthread_spinlock_t)];
 };
 
 /*

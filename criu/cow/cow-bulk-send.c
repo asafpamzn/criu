@@ -1709,33 +1709,23 @@ static void *p3_bulk_sender_thread(void *arg)
 		unsigned long p3_regions = 0;
 		unsigned long p3_pages = 0;
 		unsigned long pages_before_scan_done = 0;
-		unsigned long stolen_regions = 0;
 		bool p3_started = false;
 		bool scan_done_logged = false;
-		/*
-		 * Queue ownership model:
-		 * - Thread initially owns queues [my_base, my_base + COW_QUEUES_PER_THREAD)
-		 * - When own queues are empty, try to steal an entire queue from another thread
-		 * - Stealing uses spinlock to take ownership atomically
-		 * - Only owner can dequeue; this keeps SPSC invariant safe
-		 */
-		int my_base = thread_id * COW_QUEUES_PER_THREAD;
-		int my_queue_offset = 0;
-		unsigned int rand_state = thread_id + 1;
-		int owned_queues[COW_TOTAL_QUEUES];  /* Queues we currently own */
-		int num_owned = COW_QUEUES_PER_THREAD;
 		int i;
-
-		/* Initialize with our original queues */
-		for (i = 0; i < COW_QUEUES_PER_THREAD; i++)
-			owned_queues[i] = my_base + i;
 
 		clock_gettime(CLOCK_MONOTONIC, &loop_start);
 
-		/* Consume dirty regions from queue until scanner completes AND all queues empty */
+		/*
+		 * Simple atomic counter distribution:
+		 * - Each thread gets next queue via atomic increment
+		 * - Try to dequeue from that queue
+		 * - If empty, try next queue
+		 * - Exit when scan complete AND all queues verified empty
+		 */
 		while (1) {
 			struct dirty_region_entry *region = NULL;
 			int sent;
+			int q;
 
 			/* Track when freeze signal was sent (Phase 3 start) */
 			if (!p3_started && g_last_scan_flag) {
@@ -1750,46 +1740,21 @@ static void *p3_bulk_sender_thread(void *arg)
 				clock_gettime(CLOCK_MONOTONIC, &scan_done_time);
 			}
 
-			/* Try owned queues (round-robin) */
-			for (i = 0; i < num_owned && !region; i++) {
-				int q = owned_queues[(my_queue_offset + i) % num_owned];
-				struct sender_queue *queue = cow_get_sender_queue(q);
-				region = spsc_dequeue(queue->head, queue->size);
-			}
-			if (num_owned > 0)
-				my_queue_offset = (my_queue_offset + 1) % num_owned;
+			/* Get next queue via atomic counter and try to dequeue */
+			q = __atomic_fetch_add(&g_next_queue, 1, __ATOMIC_RELAXED) % COW_TOTAL_QUEUES;
+			region = spsc_dequeue(sender_queues[q].head, sender_queues[q].size);
 
 			if (!region) {
-				/* Try to steal an entire queue from another thread */
-				int attempts = COW_TOTAL_QUEUES;
-				int steal_start = rand_r(&rand_state) % COW_TOTAL_QUEUES;
-
-				for (i = 0; i < attempts && !region; i++) {
-					int q = (steal_start + i) % COW_TOTAL_QUEUES;
-					struct sender_queue *queue = &sender_queues[q];
-
-					/* Skip if we already own this queue */
-					if (queue->owner == thread_id)
-						continue;
-
-					/* Try to take ownership */
-					if (pthread_spin_trylock(&queue->lock) == 0) {
-						/* Check if queue has work and is not ours */
-						if (queue->owner != thread_id && spsc_peek(queue->head)) {
-							/* Steal the queue */
-							queue->owner = thread_id;
-							owned_queues[num_owned++] = q;
-							stolen_regions++;
-							/* Get first item from stolen queue */
-							region = spsc_dequeue(queue->head, queue->size);
-						}
-						pthread_spin_unlock(&queue->lock);
-					}
+				/* Queue was empty, scan through all queues looking for work */
+				for (i = 0; i < COW_TOTAL_QUEUES && !region; i++) {
+					int try_q = (q + i) % COW_TOTAL_QUEUES;
+					region = spsc_dequeue(sender_queues[try_q].head,
+							      sender_queues[try_q].size);
 				}
 			}
 
 			if (!region) {
-				/* No work found */
+				/* No work found in any queue */
 				wait_count++;
 				if (cow_is_scan_complete()) {
 					/*
@@ -1855,8 +1820,8 @@ static void *p3_bulk_sender_thread(void *arg)
 			       thread_id, p3_total_ms, send_during_scan_ms, pages_before_scan_done,
 			       send_after_scan_ms, p3_pages - pages_before_scan_done);
 		}
-		pr_err("P3[%d] TIMING: Queue consumption done: %lu regions (%lu stolen), %lu pages in %ld ms\n",
-		       thread_id, regions_processed, stolen_regions, loop_total_pages, loop_elapsed_ms);
+		pr_err("P3[%d] TIMING: Queue consumption done: %lu regions, %lu pages in %ld ms\n",
+		       thread_id, regions_processed, loop_total_pages, loop_elapsed_ms);
 	}
 
 	/* === Final: Send pages from new VMAs detected in Phase 3 === */
