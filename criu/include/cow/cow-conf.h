@@ -134,20 +134,25 @@
  * ================================================================ */
 
 /* Number of parallel P3 sender/receiver threads */
-#define COW_NUM_P3_THREADS		20
+#define COW_NUM_P3_THREADS		40
 
-/* Number of queues per P3 thread for work stealing */
-#define COW_QUEUES_PER_THREAD		5
-#define COW_TOTAL_QUEUES		(COW_NUM_P3_THREADS * COW_QUEUES_PER_THREAD)
+/*
+ * Number of queues per scanner (producer). Scanner i owns queues
+ * [i*COW_QUEUES_PER_THREAD, (i+1)*COW_QUEUES_PER_THREAD). Total is
+ * driven by the producer count so every queue has exactly one producer;
+ * consumers (P3 threads) round-robin over the full set.
+ */
+#define COW_QUEUES_PER_THREAD		10
+#define COW_TOTAL_QUEUES		(COW_NUM_SCANNERS * COW_QUEUES_PER_THREAD)
 
 /* Number of parallel scanner threads */
 #define COW_NUM_SCANNERS		20
 
 /* Number of background drain threads */
-#define COW_NUM_DRAIN_THREADS		20
+#define COW_NUM_DRAIN_THREADS		40
 
-/* Maximum threads for page pool */
-#define COW_MAX_THREADS			32
+/* Maximum threads for page pool (must exceed COW_NUM_P3_THREADS - 1) */
+#define COW_MAX_THREADS			48
 
 /* Maximum epoll fds for COW lazy-pages */
 #define COW_MAX_EPOLL_FDS		128
