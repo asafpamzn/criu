@@ -1398,6 +1398,14 @@ void cow_free_new_vma_ranges(void)
 }
 
 /*
+ * Thread-local send buffer (header + compressed-size + compressed-data),
+ * sized for the max batch so it's allocated once per thread and reused.
+ */
+#define COW_SEND_BUF_SIZE	(sizeof(struct page_server_iov) + sizeof(int) + \
+				 LZ4_COMPRESSBOUND(COW_BATCH_SIZE))
+static __thread char *tls_send_buf;
+
+/*
  * Send a batch of pages with LZ4 compression.
  * Protocol: header (PS_IOV_ADD_F_COMPRESS) + compressed_size + compressed_data
  * Header contains nr_pages and base_vaddr.
@@ -1406,7 +1414,6 @@ int send_pages_batch_compressed(int sk, const void *data,
 				int nr_pages, u64 dst_id,
 				unsigned long base_vaddr)
 {
-	/* Allocate buffer for: header + compressed_size + compressed_data */
 	int max_compressed = LZ4_compressBound(nr_pages * PAGE_SIZE);
 	int total_uncompressed = nr_pages * PAGE_SIZE;
 	char *send_buf;
@@ -1415,8 +1422,11 @@ int send_pages_batch_compressed(int sk, const void *data,
 	char *compressed_data;
 	int total_len, ret;
 
-	send_buf = xmalloc(sizeof(struct page_server_iov) + sizeof(int) + max_compressed);
-	BUG_ON(!send_buf);
+	if (!tls_send_buf) {
+		tls_send_buf = xmalloc(COW_SEND_BUF_SIZE);
+		BUG_ON(!tls_send_buf);
+	}
+	send_buf = tls_send_buf;
 
 	pi = (struct page_server_iov *)send_buf;
 	compressed_size = (int *)(send_buf + sizeof(*pi));
@@ -1428,7 +1438,6 @@ int send_pages_batch_compressed(int sk, const void *data,
 	if (*compressed_size <= 0) {
 		pr_err("LZ4 compression failed for batch at %lx (%d pages)\n",
 		       base_vaddr, nr_pages);
-		xfree(send_buf);
 		return -1;
 	}
 
@@ -1450,14 +1459,27 @@ int send_pages_batch_compressed(int sk, const void *data,
 	total_len = sizeof(*pi) + sizeof(int) + *compressed_size;
 	ret = page_server_send(sk, send_buf, total_len, 0);
 
-	xfree(send_buf);
-
 	if (ret != total_len) {
 		pr_perror("Failed to send compressed batch (sent %d/%d)", ret, total_len);
 		return -1;
 	}
 
 	return 0;
+}
+
+/*
+ * Thread-local page read buffer, sized for the max batch.
+ * Allocated once per thread and reused across all process_vm_readv calls.
+ */
+static __thread char *tls_read_buf;
+
+static inline char *cow_get_read_buf(void)
+{
+	if (!tls_read_buf) {
+		tls_read_buf = xmalloc(COW_BATCH_SIZE);
+		BUG_ON(!tls_read_buf);
+	}
+	return tls_read_buf;
 }
 
 /*
@@ -1485,9 +1507,7 @@ static int send_lazy_vma_pages_batch(int sk, struct lazy_vma_entry *lve,
 	if (nr_pages == 0)
 		return 0;
 
-	/* Allocate buffer for batch */
-	buffer = xmalloc(nr_pages * PAGE_SIZE);
-	BUG_ON(!buffer);
+	buffer = cow_get_read_buf();
 
 	/* Single process_vm_readv for all pages */
 	local_iov.iov_base = buffer;
@@ -1499,14 +1519,11 @@ static int send_lazy_vma_pages_batch(int sk, struct lazy_vma_entry *lve,
 	if (ret != (ssize_t)(nr_pages * PAGE_SIZE)) {
 		pr_perror("Failed to read %d pages at %lx from pid %d (got %d)",
 			  nr_pages, base_vaddr, source_pid, ret);
-		xfree(buffer);
 		return -1;
 	}
 
 	/* Compress and send batch */
 	ret = send_pages_batch_compressed(sk, buffer, nr_pages, dst_id, base_vaddr);
-	xfree(buffer);
-
 	if (ret < 0)
 		return -1;
 
@@ -1520,13 +1537,10 @@ static int send_lazy_vma_pages_batch(int sk, struct lazy_vma_entry *lve,
 static int send_dirty_region(struct p3_thread_ctx *ctx,
 			     struct dirty_region_entry *region)
 {
-	void *buffer;
+	void *buffer = cow_get_read_buf();
 	struct iovec local_iov, remote_iov;
 	unsigned long vaddr;
 	int total_sent = 0;
-
-	buffer = xmalloc(COW_BATCH_PAGES * PAGE_SIZE);
-	BUG_ON(!buffer);
 
 	for (vaddr = region->start; vaddr < region->end;
 	     vaddr += COW_BATCH_PAGES * PAGE_SIZE) {
@@ -1557,7 +1571,6 @@ static int send_dirty_region(struct p3_thread_ctx *ctx,
 		if (ret < 0) {
 			pr_err("P3[%d] failed to send dirty region at %lx\n",
 			       ctx->thread_id, vaddr);
-			xfree(buffer);
 			return -1;
 		}
 
@@ -1566,7 +1579,6 @@ static int send_dirty_region(struct p3_thread_ctx *ctx,
 		__sync_fetch_and_add(&g_total_sent_pages, batch_pages);
 	}
 
-	xfree(buffer);
 	return total_sent;
 }
 
@@ -1612,8 +1624,7 @@ static unsigned long send_new_vma_pages(struct p3_thread_ctx *ctx)
 	pr_info("P3[%d] sending new VMA pages: ranges %u-%u of %u\n",
 		thread_id, my_start_idx, my_end_idx, g_nr_new_vma_ranges);
 
-	buffer = xmalloc(COW_BATCH_PAGES * PAGE_SIZE);
-	BUG_ON(!buffer);
+	buffer = cow_get_read_buf();
 
 	for (i = my_start_idx; i < my_end_idx; i++) {
 		unsigned long start = g_new_vma_ranges[i * 2];
@@ -1651,7 +1662,6 @@ static unsigned long send_new_vma_pages(struct p3_thread_ctx *ctx)
 			if (ret < 0) {
 				pr_err("P3[%d] failed to send new VMA pages at %lx, aborting\n",
 				       thread_id, vaddr);
-				xfree(buffer);
 				return total_sent;  /* Abort - socket is likely broken */
 			}
 
@@ -1661,7 +1671,6 @@ static unsigned long send_new_vma_pages(struct p3_thread_ctx *ctx)
 		}
 	}
 
-	xfree(buffer);
 	pr_info("P3[%d] sent %lu pages from new VMAs\n", thread_id, total_sent);
 	return total_sent;
 }
@@ -1788,6 +1797,13 @@ static void *p3_bulk_sender_thread(void *arg)
 			 * Claim queue via CAS. ACQUIRE on success pairs with the
 			 * RELEASE on owner clear below, so we see any writes the
 			 * previous owner made before releasing.
+			 *
+			 * Note: we intentionally do NOT spsc_peek() before the
+			 * CAS - peek dereferences `head`, but the current owner
+			 * mutates `head` and xfree()s the old node inside
+			 * spsc_dequeue(). A non-owner peek would race with that
+			 * free (use-after-free). Only the CAS winner may touch
+			 * the queue's head.
 			 */
 			expected = -1;
 			if (!__atomic_compare_exchange_n(&g_queue_owner[q], &expected,
@@ -1821,14 +1837,19 @@ check_exit:
 			/* Check if we should exit */
 			if (cow_is_scan_complete()) {
 				/*
-				 * Every queue must be both empty and unowned -
-				 * a currently-owned queue may still have work
-				 * being processed.
+				 * Every queue must be both empty and unowned.
+				 * Use spsc_size (relaxed atomic load on the
+				 * counter) rather than spsc_peek: peek reads
+				 * head->next, but head is mutated and xfree'd
+				 * by the current owner inside spsc_dequeue, so
+				 * a non-owner peek would race with that free.
+				 * size may transiently lag, but that only
+				 * delays exit - we loop again.
 				 */
 				bool any_work = false;
 				int i;
 				for (i = 0; i < COW_TOTAL_QUEUES; i++) {
-					if (spsc_peek(sender_queues[i].head) ||
+					if (spsc_size(sender_queues[i].size) > 0 ||
 					    __atomic_load_n(&g_queue_owner[i],
 							    __ATOMIC_ACQUIRE) != -1) {
 						any_work = true;
