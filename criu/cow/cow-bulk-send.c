@@ -90,13 +90,14 @@ static unsigned long *g_new_vma_ranges = NULL;  /* [start, len, start, len, ...]
 static unsigned int g_nr_new_vma_ranges = 0;
 
 /*
- * Multi-queue work stealing architecture:
- * - Each P3 thread owns COW_QUEUES_PER_THREAD queues (100 queues total)
+ * Simple atomic queue distribution:
  * - Scanners distribute round-robin across all COW_TOTAL_QUEUES
- * - Threads process own queues first, then steal randomly from others
+ * - Senders get next queue via atomic increment on global counter
+ * - No ownership, no stealing - just simple round-robin consumption
  */
 
 static struct sender_queue sender_queues[COW_TOTAL_QUEUES];
+static volatile int g_next_queue = 0;  /* Atomic counter for queue distribution */
 static volatile bool g_scan_complete = false;
 static volatile bool g_scanner_freeze_signal = false;
 static pid_t g_scanner_source_pid;
@@ -200,17 +201,19 @@ int cow_init_sender_queues(void)
 	int i;
 
 	for (i = 0; i < COW_TOTAL_QUEUES; i++) {
-		if (spmc_init(sender_queues[i].head, sender_queues[i].tail,
+		if (spsc_init(sender_queues[i].head, sender_queues[i].tail,
 			      sender_queues[i].size,
-			      struct dirty_region_spmc_node)) {
+			      struct dirty_region_spsc_node)) {
 			pr_err("Failed to init sender queue %d\n", i);
 			return -1;
 		}
+		/* No ownership tracking - use simple atomic counter */
 	}
+	g_next_queue = 0;
 	g_scan_complete = false;
 	g_scanner_freeze_signal = false;
-	pr_info("Initialized %d sender queues (%d per thread)\n",
-		COW_TOTAL_QUEUES, COW_QUEUES_PER_THREAD);
+	pr_info("Initialized %d sender queues (atomic counter distribution)\n",
+		COW_TOTAL_QUEUES);
 	return 0;
 }
 
@@ -365,9 +368,9 @@ static void *dirty_scanner_thread(void *arg)
 					entry->dst_id = lve->dst_id;
 					entry->source_pid = g_scanner_source_pid;
 
-					spmc_enqueue(sender_queues[queue_idx].tail,
+					spsc_enqueue(sender_queues[queue_idx].tail,
 						     sender_queues[queue_idx].size,
-						     entry, struct dirty_region_spmc_node);
+						     entry, struct dirty_region_spsc_node);
 					__sync_fetch_and_add(&queue_pages_dist[queue_idx], pages);
 					__sync_fetch_and_add(&queue_regions_dist[queue_idx], 1);
 					queue_idx = (queue_idx + 1) % COW_TOTAL_QUEUES;
@@ -481,9 +484,9 @@ static void *dirty_scanner_thread(void *arg)
 						entry->dst_id = 0;  /* Will be set per-VMA */
 						entry->source_pid = g_scanner_source_pid;
 
-						spmc_enqueue(sender_queues[queue_idx].tail,
+						spsc_enqueue(sender_queues[queue_idx].tail,
 							     sender_queues[queue_idx].size,
-							     entry, struct dirty_region_spmc_node);
+							     entry, struct dirty_region_spsc_node);
 						__sync_fetch_and_add(&queue_pages_dist[queue_idx], pages);
 						__sync_fetch_and_add(&queue_regions_dist[queue_idx], 1);
 						queue_idx = (queue_idx + 1) % COW_TOTAL_QUEUES;
@@ -555,9 +558,9 @@ static void *dirty_scanner_thread(void *arg)
 					entry->dst_id = lve->dst_id;
 					entry->source_pid = g_scanner_source_pid;
 
-					spmc_enqueue(sender_queues[queue_idx].tail,
+					spsc_enqueue(sender_queues[queue_idx].tail,
 						     sender_queues[queue_idx].size,
-						     entry, struct dirty_region_spmc_node);
+						     entry, struct dirty_region_spsc_node);
 					__sync_fetch_and_add(&queue_pages_dist[queue_idx], pages);
 					__sync_fetch_and_add(&queue_regions_dist[queue_idx], 1);
 					queue_idx = (queue_idx + 1) % COW_TOTAL_QUEUES;
@@ -1010,9 +1013,9 @@ skip_scan_merge:
 		entry->dst_id = 0;  /* Will use lve->dst_id when processing */
 		entry->source_pid = g_scanner_source_pid;
 
-		spmc_enqueue(sender_queues[queue_idx].tail,
+		spsc_enqueue(sender_queues[queue_idx].tail,
 			     sender_queues[queue_idx].size,
-			     entry, struct dirty_region_spmc_node);
+			     entry, struct dirty_region_spsc_node);
 		__sync_fetch_and_add(&queue_pages_dist[queue_idx], pages);
 		__sync_fetch_and_add(&queue_regions_dist[queue_idx], 1);
 
@@ -1709,10 +1712,23 @@ static void *p3_bulk_sender_thread(void *arg)
 		unsigned long stolen_regions = 0;
 		bool p3_started = false;
 		bool scan_done_logged = false;
-		/* Multi-queue: this thread owns queues [my_base, my_base + COW_QUEUES_PER_THREAD) */
+		/*
+		 * Queue ownership model:
+		 * - Thread initially owns queues [my_base, my_base + COW_QUEUES_PER_THREAD)
+		 * - When own queues are empty, try to steal an entire queue from another thread
+		 * - Stealing uses spinlock to take ownership atomically
+		 * - Only owner can dequeue; this keeps SPSC invariant safe
+		 */
 		int my_base = thread_id * COW_QUEUES_PER_THREAD;
-		int my_queue_offset = 0;  /* Cycles through own queues */
-		unsigned int rand_state = thread_id + 1;  /* Per-thread PRNG seed (non-zero) */
+		int my_queue_offset = 0;
+		unsigned int rand_state = thread_id + 1;
+		int owned_queues[COW_TOTAL_QUEUES];  /* Queues we currently own */
+		int num_owned = COW_QUEUES_PER_THREAD;
+		int i;
+
+		/* Initialize with our original queues */
+		for (i = 0; i < COW_QUEUES_PER_THREAD; i++)
+			owned_queues[i] = my_base + i;
 
 		clock_gettime(CLOCK_MONOTONIC, &loop_start);
 
@@ -1720,7 +1736,6 @@ static void *p3_bulk_sender_thread(void *arg)
 		while (1) {
 			struct dirty_region_entry *region = NULL;
 			int sent;
-			int i;
 
 			/* Track when freeze signal was sent (Phase 3 start) */
 			if (!p3_started && g_last_scan_flag) {
@@ -1735,38 +1750,64 @@ static void *p3_bulk_sender_thread(void *arg)
 				clock_gettime(CLOCK_MONOTONIC, &scan_done_time);
 			}
 
-			/* Try own queues first (round-robin through all COW_QUEUES_PER_THREAD) */
-			for (i = 0; i < COW_QUEUES_PER_THREAD && !region; i++) {
-				int q = my_base + ((my_queue_offset + i) % COW_QUEUES_PER_THREAD);
+			/* Try owned queues (round-robin) */
+			for (i = 0; i < num_owned && !region; i++) {
+				int q = owned_queues[(my_queue_offset + i) % num_owned];
 				struct sender_queue *queue = cow_get_sender_queue(q);
-				region = spmc_dequeue(queue->head, queue->size);
+				region = spsc_dequeue(queue->head, queue->size);
 			}
-			my_queue_offset = (my_queue_offset + 1) % COW_QUEUES_PER_THREAD;
+			if (num_owned > 0)
+				my_queue_offset = (my_queue_offset + 1) % num_owned;
 
 			if (!region) {
-				/* Try stealing from random other queues */
-				int num_other_queues = COW_TOTAL_QUEUES - COW_QUEUES_PER_THREAD;
-				for (i = 0; i < num_other_queues && !region; i++) {
-					/* Pick random queue outside our range */
-					int steal_q = rand_r(&rand_state) % num_other_queues;
-					struct sender_queue *victim_queue;
-					if (steal_q >= my_base)
-						steal_q += COW_QUEUES_PER_THREAD;
-					victim_queue = cow_get_sender_queue(steal_q);
-					region = spmc_dequeue(victim_queue->head, victim_queue->size);
-					if (region)
-						stolen_regions++;
+				/* Try to steal an entire queue from another thread */
+				int attempts = COW_TOTAL_QUEUES;
+				int steal_start = rand_r(&rand_state) % COW_TOTAL_QUEUES;
+
+				for (i = 0; i < attempts && !region; i++) {
+					int q = (steal_start + i) % COW_TOTAL_QUEUES;
+					struct sender_queue *queue = &sender_queues[q];
+
+					/* Skip if we already own this queue */
+					if (queue->owner == thread_id)
+						continue;
+
+					/* Try to take ownership */
+					if (pthread_spin_trylock(&queue->lock) == 0) {
+						/* Check if queue has work and is not ours */
+						if (queue->owner != thread_id && spsc_peek(queue->head)) {
+							/* Steal the queue */
+							queue->owner = thread_id;
+							owned_queues[num_owned++] = q;
+							stolen_regions++;
+							/* Get first item from stolen queue */
+							region = spsc_dequeue(queue->head, queue->size);
+						}
+						pthread_spin_unlock(&queue->lock);
+					}
 				}
 			}
 
 			if (!region) {
-				/* No work found anywhere */
-				if (cow_is_scan_complete()) {
-					/* Scanner done and all queues empty - we're done */
-					break;
-				}
-				/* Scanner still running, wait for more work */
+				/* No work found */
 				wait_count++;
+				if (cow_is_scan_complete()) {
+					/*
+					 * Scanner done. Verify ALL queues are truly empty
+					 * by doing a full scan before exiting.
+					 */
+					bool any_work = false;
+					for (i = 0; i < COW_TOTAL_QUEUES; i++) {
+						if (spsc_peek(sender_queues[i].head)) {
+							any_work = true;
+							break;
+						}
+					}
+					if (!any_work && wait_count > 10) {
+						/* All queues verified empty, done */
+						break;
+					}
+				}
 				usleep(COW_USLEEP_100US);
 				continue;
 			}
