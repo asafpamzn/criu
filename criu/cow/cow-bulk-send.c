@@ -1883,7 +1883,7 @@ check_exit:
 		       thread_id, new_vma_pages, fs_elapsed_ms);
 	}
 
-out:
+
 	clock_gettime(CLOCK_MONOTONIC, &t_end);
 	{
 		long elapsed_ms = (t_end.tv_sec - t_start.tv_sec) * 1000 +
