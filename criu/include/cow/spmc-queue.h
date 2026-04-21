@@ -71,6 +71,9 @@ struct prefix##_spmc_node {				\
  * spmc_dequeue(head, size) - remove and return the oldest entry.
  * Multi-consumer safe using CAS on head pointer.
  * Evaluates to entry pointer or NULL if empty/contended.
+ *
+ * NOTE: Does NOT free the old head node to avoid use-after-free when
+ * multiple consumers race. Nodes are leaked but cleaned up at drain time.
  */
 #define spmc_dequeue(head, size)					\
 ({									\
@@ -85,10 +88,10 @@ struct prefix##_spmc_node {				\
 		/* Try to swing head from _head to _next */		\
 		if (__atomic_compare_exchange_n(&(head), &_head, _next,	\
 				0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {\
-			/* Won the race - extract entry and free old head */\
+			/* Won the race - extract entry */		\
 			_entry = _next->entry;				\
 			_next->entry = NULL;				\
-			xfree(_head);					\
+			/* Don't free _head - other threads may still reference it */ \
 			__atomic_fetch_sub(&(size), 1, __ATOMIC_RELAXED);\
 			break;						\
 		}							\
