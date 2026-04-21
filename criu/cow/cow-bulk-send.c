@@ -1705,27 +1705,25 @@ static void *p3_bulk_sender_thread(void *arg)
 		long loop_elapsed_ms;
 		unsigned long loop_total_pages = 0;
 		unsigned long regions_processed = 0;
-		unsigned long wait_count = 0;
-		unsigned long p3_regions = 0;
 		unsigned long p3_pages = 0;
 		unsigned long pages_before_scan_done = 0;
+		unsigned long queues_claimed = 0;
 		bool p3_started = false;
 		bool scan_done_logged = false;
-		int i;
 
 		clock_gettime(CLOCK_MONOTONIC, &loop_start);
 
 		/*
-		 * Simple atomic counter distribution:
-		 * - Each thread gets next queue via atomic increment
-		 * - Try to dequeue from that queue
-		 * - If empty, try next queue
-		 * - Exit when scan complete AND all queues verified empty
+		 * Claim-and-drain queue distribution:
+		 * - Thread claims a queue via atomic counter
+		 * - Thread drains that queue completely
+		 * - Thread claims next queue
+		 * - Exit when no more queues AND scan complete
+		 *
+		 * SPSC is safe: each queue has exactly one consumer (the claimer).
 		 */
 		while (1) {
-			struct dirty_region_entry *region = NULL;
-			int sent;
-			int q;
+			int q = __atomic_fetch_add(&g_next_queue, 1, __ATOMIC_RELAXED);
 
 			/* Track when freeze signal was sent (Phase 3 start) */
 			if (!p3_started && g_last_scan_flag) {
@@ -1740,55 +1738,41 @@ static void *p3_bulk_sender_thread(void *arg)
 				clock_gettime(CLOCK_MONOTONIC, &scan_done_time);
 			}
 
-			/* Get next queue via atomic counter and try to dequeue */
-			q = __atomic_fetch_add(&g_next_queue, 1, __ATOMIC_RELAXED) % COW_TOTAL_QUEUES;
-			region = spsc_dequeue(sender_queues[q].head, sender_queues[q].size);
-
-			if (!region) {
-				/* Queue was empty, scan through all queues looking for work */
-				for (i = 0; i < COW_TOTAL_QUEUES && !region; i++) {
-					int try_q = (q + i) % COW_TOTAL_QUEUES;
-					region = spsc_dequeue(sender_queues[try_q].head,
-							      sender_queues[try_q].size);
-				}
-			}
-
-			if (!region) {
-				/* No work found in any queue */
-				wait_count++;
-				if (cow_is_scan_complete()) {
-					/*
-					 * Scanner done. Verify ALL queues are truly empty
-					 * by doing a full scan before exiting.
-					 */
-					bool any_work = false;
-					for (i = 0; i < COW_TOTAL_QUEUES; i++) {
-						if (spsc_peek(sender_queues[i].head)) {
-							any_work = true;
-							break;
-						}
-					}
-					if (!any_work && wait_count > 10) {
-						/* All queues verified empty, done */
-						break;
-					}
-				}
+			if (q >= COW_TOTAL_QUEUES) {
+				/* No more queues to claim */
+				if (cow_is_scan_complete())
+					break;
+				/* Scanner still running, wait and retry */
 				usleep(COW_USLEEP_100US);
 				continue;
 			}
-			wait_count = 0;
 
-			/* Send the dirty region */
-			sent = send_dirty_region(ctx, region);
-			if (sent > 0) {
-				loop_total_pages += sent;
-				regions_processed++;
-				if (p3_started) {
-					p3_regions++;
-					p3_pages += sent;
+			/* Successfully claimed queue q - drain it completely */
+			queues_claimed++;
+			while (1) {
+				struct dirty_region_entry *region;
+				int sent;
+
+				region = spsc_dequeue(sender_queues[q].head,
+						      sender_queues[q].size);
+				if (!region) {
+					/* Queue empty - but scanner might add more */
+					if (cow_is_scan_complete())
+						break;  /* Scanner done, queue truly empty */
+					usleep(COW_USLEEP_100US);
+					continue;
 				}
+
+				/* Send the dirty region */
+				sent = send_dirty_region(ctx, region);
+				if (sent > 0) {
+					loop_total_pages += sent;
+					regions_processed++;
+					if (p3_started)
+						p3_pages += sent;
+				}
+				xfree(region);
 			}
-			xfree(region);
 		}
 
 		clock_gettime(CLOCK_MONOTONIC, &loop_end);
@@ -1797,7 +1781,7 @@ static void *p3_bulk_sender_thread(void *arg)
 		if (!scan_done_logged && cow_is_scan_complete()) {
 			scan_done_logged = true;
 			pages_before_scan_done = p3_pages;
-			scan_done_time = loop_end;  /* Scan finished just as loop exited */
+			scan_done_time = loop_end;
 		}
 
 		loop_elapsed_ms = (loop_end.tv_sec - loop_start.tv_sec) * 1000 +
@@ -1820,8 +1804,8 @@ static void *p3_bulk_sender_thread(void *arg)
 			       thread_id, p3_total_ms, send_during_scan_ms, pages_before_scan_done,
 			       send_after_scan_ms, p3_pages - pages_before_scan_done);
 		}
-		pr_err("P3[%d] TIMING: Queue consumption done: %lu regions, %lu pages in %ld ms\n",
-		       thread_id, regions_processed, loop_total_pages, loop_elapsed_ms);
+		pr_err("P3[%d] TIMING: Queue consumption done: %lu queues, %lu regions, %lu pages in %ld ms\n",
+		       thread_id, queues_claimed, regions_processed, loop_total_pages, loop_elapsed_ms);
 	}
 
 	/* === Final: Send pages from new VMAs detected in Phase 3 === */
