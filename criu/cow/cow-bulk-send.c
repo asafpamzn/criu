@@ -97,7 +97,19 @@ static unsigned int g_nr_new_vma_ranges = 0;
  */
 
 static struct sender_queue sender_queues[COW_TOTAL_QUEUES];
-static volatile int g_next_queue = 0;  /* Atomic counter for queue distribution */
+/*
+ * Unsigned counter so __atomic_fetch_add wraps with defined behavior.
+ * A signed int here would overflow to negative on long-running dumps and
+ * turn the subsequent `% COW_TOTAL_QUEUES` into a negative array index.
+ */
+static volatile unsigned int g_next_queue = 0;
+/*
+ * Per-queue ownership. -1 means free; otherwise the thread_id of the
+ * current owning consumer. Claimed via CAS so only one consumer ever
+ * touches a queue at a time, preserving the SPSC contract (the scanner
+ * is the sole producer, the CAS owner is the sole consumer).
+ */
+static volatile int g_queue_owner[COW_TOTAL_QUEUES];
 static volatile bool g_scan_complete = false;
 static volatile bool g_scanner_freeze_signal = false;
 static pid_t g_scanner_source_pid;
@@ -212,7 +224,7 @@ int cow_init_sender_queues(void)
 			pr_err("Failed to init sender queue %d\n", i);
 			return -1;
 		}
-		/* No ownership tracking - use simple atomic counter */
+		g_queue_owner[i] = -1;
 	}
 	g_next_queue = 0;
 	g_scan_complete = false;
@@ -1692,8 +1704,7 @@ static void *p3_bulk_sender_thread(void *arg)
 				if (sent < 0) {
 					pr_err("P3[%d]: Failed to send batch at %lx\n",
 					       thread_id, vaddr);
-					ctx->error = true;
-					goto out;
+					BUG();
 				}
 
 				total_sent += sent;
@@ -1730,20 +1741,25 @@ static void *p3_bulk_sender_thread(void *arg)
 		clock_gettime(CLOCK_MONOTONIC, &loop_start);
 
 		/*
-		 * Multi-round queue processing:
-		 * - Thread gets next queue via atomic counter (modulo for wrap-around)
-		 * - Try to dequeue one item from that queue
-		 * - If got work, process it and move to next queue
-		 * - If empty AND scanner done, verify ALL queues empty before exit
-		 *
-		 * SPSC safety: multiple threads may access same queue, but only
-		 * one will win the dequeue (atomic head update). Others get NULL.
+		 * Multi-round queue processing with per-queue ownership:
+		 * - Thread picks next queue via an unsigned atomic counter
+		 *   (wraps with defined behavior) and tries to claim it by
+		 *   CAS'ing g_queue_owner[q] from -1 to its own thread_id.
+		 *   Only one consumer owns a queue at a time, preserving the
+		 *   SPSC contract (sole producer: scanner; sole consumer: CAS
+		 *   winner).
+		 * - Drains the queue until empty, then releases ownership.
+		 * - If the CAS fails, another thread owns it; skip and retry.
+		 * - Exits once the scanner is done AND every queue is both
+		 *   empty and unowned.
 		 */
 		while (1) {
-			int raw_q = __atomic_fetch_add(&g_next_queue, 1, __ATOMIC_RELAXED);
-			int q = raw_q % COW_TOTAL_QUEUES;
+			unsigned int raw_q = __atomic_fetch_add(&g_next_queue, 1,
+								__ATOMIC_RELAXED);
+			int q = (int)(raw_q % (unsigned int)COW_TOTAL_QUEUES);
 			struct dirty_region_entry *region;
-			int sent;		
+			int expected;
+			int sent;
 
 			/* Track when freeze signal was sent (Phase 3 start) */
 			if (!p3_started && g_last_scan_flag) {
@@ -1758,13 +1774,24 @@ static void *p3_bulk_sender_thread(void *arg)
 				clock_gettime(CLOCK_MONOTONIC, &scan_done_time);
 			}
 
-	
-			/* Try to get one item from this queue */
-			region = spsc_dequeue(sender_queues[q].head, sender_queues[q].size);
+			/*
+			 * Claim queue via CAS. ACQUIRE on success pairs with the
+			 * RELEASE on owner clear below, so we see any writes the
+			 * previous owner made before releasing.
+			 */
+			expected = -1;
+			if (!__atomic_compare_exchange_n(&g_queue_owner[q], &expected,
+							 thread_id, false,
+							 __ATOMIC_ACQUIRE,
+							 __ATOMIC_RELAXED))
+				goto check_exit;
 
+			queues_claimed++;
 
+			/* Drain the queue while we own it */
+			region = spsc_dequeue(sender_queues[q].head,
+					      sender_queues[q].size);
 			while (region) {
-				/* Got work - process it */
 				sent = send_dirty_region(ctx, region);
 				if (sent > 0) {
 					loop_total_pages += sent;
@@ -1773,22 +1800,33 @@ static void *p3_bulk_sender_thread(void *arg)
 						p3_pages += sent;
 				}
 				xfree(region);
-				region = spsc_dequeue(sender_queues[q].head, sender_queues[q].size);
+				region = spsc_dequeue(sender_queues[q].head,
+						      sender_queues[q].size);
 			}
-			
-			/* Queue empty - check if we should exit */
+
+			/* Release ownership (RELEASE pairs with next owner's ACQUIRE) */
+			__atomic_store_n(&g_queue_owner[q], -1, __ATOMIC_RELEASE);
+
+check_exit:
+			/* Check if we should exit */
 			if (cow_is_scan_complete()) {
-				/* Scanner done. Verify ALL queues truly empty */
+				/*
+				 * Every queue must be both empty and unowned -
+				 * a currently-owned queue may still have work
+				 * being processed.
+				 */
 				bool any_work = false;
 				int i;
 				for (i = 0; i < COW_TOTAL_QUEUES; i++) {
-					if (spsc_peek(sender_queues[i].head)) {
+					if (spsc_peek(sender_queues[i].head) ||
+					    __atomic_load_n(&g_queue_owner[i],
+							    __ATOMIC_ACQUIRE) != -1) {
 						any_work = true;
 						break;
 					}
 				}
 				if (!any_work)
-					break;  /* All queues verified empty - exit */
+					break;
 			}
 		}
 
