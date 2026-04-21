@@ -59,10 +59,6 @@ int do_pb_read_one(struct cr_img *img, void **pobj, int type, bool eof)
 		return -1;
 	}
 
-	if (type == PB_FILE) {
-		pr_err("DEBUG: do_pb_read_one called for files.img (PB_FILE), eof=%d\n", eof);
-	}
-
 	*pobj = NULL;
 
 	if (unlikely(empty_image(img)))
