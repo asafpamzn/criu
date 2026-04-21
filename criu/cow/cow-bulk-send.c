@@ -106,6 +106,11 @@ static pid_t g_scanner_source_pid;
 static unsigned long queue_pages_dist[COW_TOTAL_QUEUES];
 static unsigned long queue_regions_dist[COW_TOTAL_QUEUES];
 
+/* Atomic counter for total scanned pages (for verification) */
+static volatile unsigned long g_total_scanned_pages = 0;
+/* Atomic counter for total sent pages (for verification) */
+static volatile unsigned long g_total_sent_pages = 0;
+
 /* Dual scanner state */
 struct scanner_ctx {
 	int id;                    /* Scanner ID: 0 or 1 */
@@ -373,6 +378,7 @@ static void *dirty_scanner_thread(void *arg)
 						     entry, struct dirty_region_spsc_node);
 					__sync_fetch_and_add(&queue_pages_dist[queue_idx], pages);
 					__sync_fetch_and_add(&queue_regions_dist[queue_idx], 1);
+					__sync_fetch_and_add(&g_total_scanned_pages, pages);
 					queue_idx = (queue_idx + 1) % COW_TOTAL_QUEUES;
 				}
 				clock_gettime(CLOCK_MONOTONIC, &t3);
@@ -563,6 +569,7 @@ static void *dirty_scanner_thread(void *arg)
 						     entry, struct dirty_region_spsc_node);
 					__sync_fetch_and_add(&queue_pages_dist[queue_idx], pages);
 					__sync_fetch_and_add(&queue_regions_dist[queue_idx], 1);
+					__sync_fetch_and_add(&g_total_scanned_pages, pages);
 					queue_idx = (queue_idx + 1) % COW_TOTAL_QUEUES;
 				}
 			} while (args.walk_end < my_end);
@@ -684,6 +691,10 @@ int cow_start_scanner_thread(pid_t source_pid)
 		queue_pages_dist[i] = 0;
 		queue_regions_dist[i] = 0;
 	}
+
+	/* Reset verification counters */
+	g_total_scanned_pages = 0;
+	g_total_sent_pages = 0;
 
 #ifdef CONFIG_HAS_LIBBPF
 	/*
@@ -1530,6 +1541,7 @@ static int send_dirty_region(struct p3_thread_ctx *ctx,
 
 		total_sent += batch_pages;
 		ctx->pages_sent += batch_pages;
+		__sync_fetch_and_add(&g_total_sent_pages, batch_pages);
 	}
 
 	xfree(buffer);
@@ -1950,6 +1962,18 @@ void cow_wait_p3_threads(void)
 
 	pr_err("P3 TIMING from freeze: scanner=%ld ms, senders=%ld ms, total=%ld ms, %lu pages\n",
 	       scanner_ms, senders_ms, total_ms, total);
+
+	/* Verify all scanned pages were sent */
+	{
+		unsigned long scanned = __atomic_load_n(&g_total_scanned_pages, __ATOMIC_ACQUIRE);
+		unsigned long sent = __atomic_load_n(&g_total_sent_pages, __ATOMIC_ACQUIRE);
+		pr_err("P3 verification: scanned=%lu sent=%lu\n", scanned, sent);
+		if (sent != scanned) {
+			pr_err("BUG: scanned pages (%lu) != sent pages (%lu), missing %lu pages!\n",
+			       scanned, sent, scanned > sent ? scanned - sent : sent - scanned);
+			BUG();
+		}
+	}
 
 	if (errors > 0)
 		pr_warn("P3 threads completed with %d errors\n", errors);
