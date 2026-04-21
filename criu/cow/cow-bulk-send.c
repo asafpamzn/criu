@@ -90,23 +90,20 @@ static unsigned long *g_new_vma_ranges = NULL;  /* [start, len, start, len, ...]
 static unsigned int g_nr_new_vma_ranges = 0;
 
 /*
- * Dual Scanner + Multiple Senders Architecture
- * =============================================
- * Two scanner threads split VMA address ranges for parallel PAGEMAP_SCAN.
- * Each scanner handles half of each VMA and distributes to half the queues.
- *   Scanner 0: first half of each VMA  → queues 0-9
- *   Scanner 1: second half of each VMA → queues 10-19
+ * Multi-queue work stealing architecture:
+ * - Each P3 thread owns COW_QUEUES_PER_THREAD queues (100 queues total)
+ * - Scanners distribute round-robin across all COW_TOTAL_QUEUES
+ * - Threads process own queues first, then steal randomly from others
  */
-#define QUEUES_PER_SCANNER (COW_NUM_P3_THREADS / COW_NUM_SCANNERS)
 
-static struct sender_queue sender_queues[COW_NUM_P3_THREADS];
+static struct sender_queue sender_queues[COW_TOTAL_QUEUES];
 static volatile bool g_scan_complete = false;
 static volatile bool g_scanner_freeze_signal = false;
 static pid_t g_scanner_source_pid;
 
 /* DEBUG_PERF: Per-queue distribution stats */
-static unsigned long queue_pages_dist[COW_NUM_P3_THREADS];
-static unsigned long queue_regions_dist[COW_NUM_P3_THREADS];
+static unsigned long queue_pages_dist[COW_TOTAL_QUEUES];
+static unsigned long queue_regions_dist[COW_TOTAL_QUEUES];
 
 /* Dual scanner state */
 struct scanner_ctx {
@@ -202,7 +199,7 @@ int cow_init_sender_queues(void)
 {
 	int i;
 
-	for (i = 0; i < COW_NUM_P3_THREADS; i++) {
+	for (i = 0; i < COW_TOTAL_QUEUES; i++) {
 		if (spmc_init(sender_queues[i].head, sender_queues[i].tail,
 			      sender_queues[i].size,
 			      struct dirty_region_spmc_node)) {
@@ -212,14 +209,15 @@ int cow_init_sender_queues(void)
 	}
 	g_scan_complete = false;
 	g_scanner_freeze_signal = false;
-	pr_info("Initialized %d sender queues\n", COW_NUM_P3_THREADS);
+	pr_info("Initialized %d sender queues (%d per thread)\n",
+		COW_TOTAL_QUEUES, COW_QUEUES_PER_THREAD);
 	return 0;
 }
 
-struct sender_queue *cow_get_sender_queue(int thread_id)
+struct sender_queue *cow_get_sender_queue(int queue_id)
 {
-	BUG_ON(thread_id < 0 || thread_id >= COW_NUM_P3_THREADS);
-	return &sender_queues[thread_id];
+	BUG_ON(queue_id < 0 || queue_id >= COW_TOTAL_QUEUES);
+	return &sender_queues[queue_id];
 }
 
 bool cow_is_scan_complete(void)
@@ -243,7 +241,8 @@ static void *dirty_scanner_thread(void *arg)
 {
 	struct scanner_ctx *ctx = (struct scanner_ctx *)arg;
 	int scanner_id = ctx->id;
-	int queue_base = scanner_id * QUEUES_PER_SCANNER;  /* 0 or 10 */
+	/* Each scanner distributes round-robin across ALL queues, starting at different offset */
+	int queue_idx = scanner_id;  /* Start offset for round-robin */
 	struct list_head *lazy_vmas;
 	struct lazy_vma_entry *lve;
 	struct page_region *regs;
@@ -252,9 +251,8 @@ static void *dirty_scanner_thread(void *arg)
 	char pagemap_path[64];
 	struct timespec t_start, t_end;
 
-	pr_err("Scanner[%d] started, queues %d-%d, source_pid=%d\n",
-	       scanner_id, queue_base, queue_base + QUEUES_PER_SCANNER - 1,
-	       g_scanner_source_pid);
+	pr_err("Scanner[%d] started, distributing to %d queues, source_pid=%d\n",
+	       scanner_id, COW_TOTAL_QUEUES, g_scanner_source_pid);
 	clock_gettime(CLOCK_MONOTONIC, &t_start);
 
 	/* Wait for all sender threads to complete bulk transfer first */
@@ -372,7 +370,7 @@ static void *dirty_scanner_thread(void *arg)
 						     entry, struct dirty_region_spmc_node);
 					__sync_fetch_and_add(&queue_pages_dist[queue_idx], pages);
 					__sync_fetch_and_add(&queue_regions_dist[queue_idx], 1);
-					queue_idx = queue_base + ((queue_idx - queue_base + 1) % QUEUES_PER_SCANNER);
+					queue_idx = (queue_idx + 1) % COW_TOTAL_QUEUES;
 				}
 				clock_gettime(CLOCK_MONOTONIC, &t3);
 				dist_time_ns += (t3.tv_sec - t2.tv_sec) * 1000000000UL +
@@ -439,10 +437,10 @@ static void *dirty_scanner_thread(void *arg)
 		usleep(COW_USLEEP_1MS);
 	}
 
-	/* Final scan after freeze - each scanner handles its half */
+	/* Final scan after freeze - each scanner handles its portion */
 	{
 		unsigned long final_dirty = 0;
-		unsigned int queue_idx = queue_base;
+		/* Continue round-robin from where we left off */
 		struct timespec fs_start, fs_end;
 #ifdef CONFIG_HAS_LIBBPF
 		bool use_bpf = false;
@@ -488,7 +486,7 @@ static void *dirty_scanner_thread(void *arg)
 							     entry, struct dirty_region_spmc_node);
 						__sync_fetch_and_add(&queue_pages_dist[queue_idx], pages);
 						__sync_fetch_and_add(&queue_regions_dist[queue_idx], 1);
-						queue_idx = (queue_idx + 1) % COW_NUM_P3_THREADS;
+						queue_idx = (queue_idx + 1) % COW_TOTAL_QUEUES;
 					}
 				} else if (bpf_nr == -2) {
 					/* BPF ring drops - fall back to PAGEMAP_SCAN */
@@ -562,7 +560,7 @@ static void *dirty_scanner_thread(void *arg)
 						     entry, struct dirty_region_spmc_node);
 					__sync_fetch_and_add(&queue_pages_dist[queue_idx], pages);
 					__sync_fetch_and_add(&queue_regions_dist[queue_idx], 1);
-					queue_idx = queue_base + ((queue_idx - queue_base + 1) % QUEUES_PER_SCANNER);
+					queue_idx = (queue_idx + 1) % COW_TOTAL_QUEUES;
 				}
 			} while (args.walk_end < my_end);
 		}
@@ -640,21 +638,21 @@ out:
 			pr_err("Scanner: all scanners done, %ld ms from freeze signal\n", from_freeze_ms);
 
 			/* DEBUG_PERF: Print queue distribution summary */
-			for (q = 0; q < COW_NUM_P3_THREADS; q++) {
+			for (q = 0; q < COW_TOTAL_QUEUES; q++) {
 				unsigned long qp = queue_pages_dist[q];
 				total_pages += qp;
 				if (qp < min_pages) min_pages = qp;
 				if (qp > max_pages) max_pages = qp;
 			}
-			pr_warn("DEBUG_PERF: Queue distribution: total=%lu min=%lu max=%lu imbalance=%.1fx\n",
-			       total_pages, min_pages, max_pages,
+			pr_warn("DEBUG_PERF: Queue distribution (%d queues): total=%lu min=%lu max=%lu imbalance=%.1fx\n",
+			       COW_TOTAL_QUEUES, total_pages, min_pages, max_pages,
 			       min_pages > 0 ? (double)max_pages / min_pages : 0.0);
-			for (q = 0; q < COW_NUM_P3_THREADS; q++) {
-				pr_warn("DEBUG_PERF: Q[%02d] pages=%lu regions=%lu avg_pages_per_region=%.1f\n",
-				       q, queue_pages_dist[q],
-				       queue_regions_dist[q],
-				       queue_regions_dist[q] > 0 ?
-				       (double)queue_pages_dist[q] / queue_regions_dist[q] : 0.0);
+			/* Only print per-queue stats if not too many queues */
+			if (COW_TOTAL_QUEUES <= 20) {
+				for (q = 0; q < COW_TOTAL_QUEUES; q++) {
+					pr_warn("DEBUG_PERF: Q[%02d] pages=%lu regions=%lu\n",
+					       q, queue_pages_dist[q], queue_regions_dist[q]);
+				}
 			}
 
 			__atomic_store_n(&g_scan_complete, true, __ATOMIC_RELEASE);
@@ -679,7 +677,7 @@ int cow_start_scanner_thread(pid_t source_pid)
 	g_total_dirty_pages = 0;
 
 	/* Reset DEBUG_PERF counters */
-	for (i = 0; i < COW_NUM_P3_THREADS; i++) {
+	for (i = 0; i < COW_TOTAL_QUEUES; i++) {
 		queue_pages_dist[i] = 0;
 		queue_regions_dist[i] = 0;
 	}
@@ -1018,7 +1016,7 @@ skip_scan_merge:
 		__sync_fetch_and_add(&queue_pages_dist[queue_idx], pages);
 		__sync_fetch_and_add(&queue_regions_dist[queue_idx], 1);
 
-		queue_idx = (queue_idx + 1) % COW_NUM_P3_THREADS;
+		queue_idx = (queue_idx + 1) % COW_TOTAL_QUEUES;
 		total_regions++;
 	}
 
@@ -1028,7 +1026,7 @@ skip_scan_merge:
 	__atomic_store_n(&g_scan_complete, true, __ATOMIC_RELEASE);
 
 	pr_info("BPF drain complete: distributed %lu regions (%lu pages) to %d queues\n",
-		total_regions, total_pages, COW_NUM_P3_THREADS);
+		total_regions, total_pages, COW_TOTAL_QUEUES);
 
 	return (int)total_pages;
 }
@@ -1711,15 +1709,18 @@ static void *p3_bulk_sender_thread(void *arg)
 		unsigned long stolen_regions = 0;
 		bool p3_started = false;
 		bool scan_done_logged = false;
-		struct sender_queue *my_queue = cow_get_sender_queue(thread_id);
-		int steal_victim = (thread_id + 1) % COW_NUM_P3_THREADS;
+		/* Multi-queue: this thread owns queues [my_base, my_base + COW_QUEUES_PER_THREAD) */
+		int my_base = thread_id * COW_QUEUES_PER_THREAD;
+		int my_queue_offset = 0;  /* Cycles through own queues */
+		unsigned int rand_state = thread_id + 1;  /* Per-thread PRNG seed (non-zero) */
 
 		clock_gettime(CLOCK_MONOTONIC, &loop_start);
 
 		/* Consume dirty regions from queue until scanner completes AND all queues empty */
 		while (1) {
-			struct dirty_region_entry *region;
+			struct dirty_region_entry *region = NULL;
 			int sent;
+			int i;
 
 			/* Track when freeze signal was sent (Phase 3 start) */
 			if (!p3_started && g_last_scan_flag) {
@@ -1734,30 +1735,40 @@ static void *p3_bulk_sender_thread(void *arg)
 				clock_gettime(CLOCK_MONOTONIC, &scan_done_time);
 			}
 
-			region = spmc_dequeue(my_queue->head, my_queue->size);
+			/* Try own queues first (round-robin through all COW_QUEUES_PER_THREAD) */
+			for (i = 0; i < COW_QUEUES_PER_THREAD && !region; i++) {
+				int q = my_base + ((my_queue_offset + i) % COW_QUEUES_PER_THREAD);
+				struct sender_queue *queue = cow_get_sender_queue(q);
+				region = spmc_dequeue(queue->head, queue->size);
+			}
+			my_queue_offset = (my_queue_offset + 1) % COW_QUEUES_PER_THREAD;
+
 			if (!region) {
-				/* Try work stealing from other queues */
-				int attempts;
-				for (attempts = 0; attempts < COW_NUM_P3_THREADS - 1; attempts++) {
-					struct sender_queue *victim_queue = cow_get_sender_queue(steal_victim);
+				/* Try stealing from random other queues */
+				int num_other_queues = COW_TOTAL_QUEUES - COW_QUEUES_PER_THREAD;
+				for (i = 0; i < num_other_queues && !region; i++) {
+					/* Pick random queue outside our range */
+					int steal_q = rand_r(&rand_state) % num_other_queues;
+					struct sender_queue *victim_queue;
+					if (steal_q >= my_base)
+						steal_q += COW_QUEUES_PER_THREAD;
+					victim_queue = cow_get_sender_queue(steal_q);
 					region = spmc_dequeue(victim_queue->head, victim_queue->size);
-					steal_victim = (steal_victim + 1) % COW_NUM_P3_THREADS;
-					if (region) {
+					if (region)
 						stolen_regions++;
-						break;
-					}
 				}
-				if (!region) {
-					/* No work found anywhere */
-					if (cow_is_scan_complete()) {
-						/* Scanner done and all queues empty - we're done */
-						break;
-					}
-					/* Scanner still running, wait for more work */
-					wait_count++;
-					usleep(COW_USLEEP_100US);
-					continue;
+			}
+
+			if (!region) {
+				/* No work found anywhere */
+				if (cow_is_scan_complete()) {
+					/* Scanner done and all queues empty - we're done */
+					break;
 				}
+				/* Scanner still running, wait for more work */
+				wait_count++;
+				usleep(COW_USLEEP_100US);
+				continue;
 			}
 			wait_count = 0;
 

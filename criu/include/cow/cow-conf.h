@@ -136,6 +136,10 @@
 /* Number of parallel P3 sender/receiver threads */
 #define COW_NUM_P3_THREADS		20
 
+/* Number of queues per P3 thread for work stealing */
+#define COW_QUEUES_PER_THREAD		5
+#define COW_TOTAL_QUEUES		(COW_NUM_P3_THREADS * COW_QUEUES_PER_THREAD)
+
 /* Number of parallel scanner threads */
 #define COW_NUM_SCANNERS		20
 
