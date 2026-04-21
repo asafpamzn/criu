@@ -1763,7 +1763,7 @@ static void *p3_bulk_sender_thread(void *arg)
 			region = spsc_dequeue(sender_queues[q].head, sender_queues[q].size);
 
 
-			if (region) {
+			while (region) {
 				/* Got work - process it */
 				sent = send_dirty_region(ctx, region);
 				if (sent > 0) {
@@ -1773,23 +1773,22 @@ static void *p3_bulk_sender_thread(void *arg)
 						p3_pages += sent;
 				}
 				xfree(region);
-				queues_claimed++;
-			} else {
-				/* Queue empty - check if we should exit */
-				if (cow_is_scan_complete()) {
-					/* Scanner done. Verify ALL queues truly empty */
-					bool any_work = false;
-					int i;
-					for (i = 0; i < COW_TOTAL_QUEUES; i++) {
-						if (spsc_peek(sender_queues[i].head)) {
-							any_work = true;
-							break;
-						}
+				region = spsc_dequeue(sender_queues[q].head, sender_queues[q].size);
+			}
+			
+			/* Queue empty - check if we should exit */
+			if (cow_is_scan_complete()) {
+				/* Scanner done. Verify ALL queues truly empty */
+				bool any_work = false;
+				int i;
+				for (i = 0; i < COW_TOTAL_QUEUES; i++) {
+					if (spsc_peek(sender_queues[i].head)) {
+						any_work = true;
+						break;
 					}
-					if (!any_work)
-						break;  /* All queues verified empty - exit */
 				}
-				usleep(COW_USLEEP_100US);
+				if (!any_work)
+					break;  /* All queues verified empty - exit */
 			}
 		}
 
