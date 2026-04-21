@@ -1714,16 +1714,19 @@ static void *p3_bulk_sender_thread(void *arg)
 		clock_gettime(CLOCK_MONOTONIC, &loop_start);
 
 		/*
-		 * Claim-and-drain queue distribution:
-		 * - Thread claims a queue via atomic counter
-		 * - Thread drains that queue completely
-		 * - Thread claims next queue
-		 * - Exit when no more queues AND scan complete
+		 * Multi-round queue processing:
+		 * - Thread gets next queue via atomic counter (modulo for wrap-around)
+		 * - Try to dequeue one item from that queue
+		 * - If got work, process it and move to next queue
+		 * - If empty AND scanner done, verify ALL queues empty before exit
 		 *
-		 * SPSC is safe: each queue has exactly one consumer (the claimer).
+		 * SPSC safety: multiple threads may access same queue, but only
+		 * one will win the dequeue (atomic head update). Others get NULL.
 		 */
 		while (1) {
-			int q = __atomic_fetch_add(&g_next_queue, 1, __ATOMIC_RELAXED);
+			int q = __atomic_fetch_add(&g_next_queue, 1, __ATOMIC_RELAXED) % COW_TOTAL_QUEUES;
+			struct dirty_region_entry *region;
+			int sent;
 
 			/* Track when freeze signal was sent (Phase 3 start) */
 			if (!p3_started && g_last_scan_flag) {
@@ -1738,32 +1741,11 @@ static void *p3_bulk_sender_thread(void *arg)
 				clock_gettime(CLOCK_MONOTONIC, &scan_done_time);
 			}
 
-			if (q >= COW_TOTAL_QUEUES) {
-				/* No more queues to claim */
-				if (cow_is_scan_complete())
-					break;
-				/* Scanner still running, wait and retry */
-				usleep(COW_USLEEP_100US);
-				continue;
-			}
+			/* Try to get one item from this queue */
+			region = spsc_dequeue(sender_queues[q].head, sender_queues[q].size);
 
-			/* Successfully claimed queue q - drain it completely */
-			queues_claimed++;
-			while (1) {
-				struct dirty_region_entry *region;
-				int sent;
-
-				region = spsc_dequeue(sender_queues[q].head,
-						      sender_queues[q].size);
-				if (!region) {
-					/* Queue empty - but scanner might add more */
-					if (cow_is_scan_complete())
-						break;  /* Scanner done, queue truly empty */
-					usleep(COW_USLEEP_100US);
-					continue;
-				}
-
-				/* Send the dirty region */
+			if (region) {
+				/* Got work - process it */
 				sent = send_dirty_region(ctx, region);
 				if (sent > 0) {
 					loop_total_pages += sent;
@@ -1772,6 +1754,23 @@ static void *p3_bulk_sender_thread(void *arg)
 						p3_pages += sent;
 				}
 				xfree(region);
+				queues_claimed++;
+			} else {
+				/* Queue empty - check if we should exit */
+				if (cow_is_scan_complete()) {
+					/* Scanner done. Verify ALL queues truly empty */
+					bool any_work = false;
+					int i;
+					for (i = 0; i < COW_TOTAL_QUEUES; i++) {
+						if (spsc_peek(sender_queues[i].head)) {
+							any_work = true;
+							break;
+						}
+					}
+					if (!any_work)
+						break;  /* All queues verified empty - exit */
+				}
+				usleep(COW_USLEEP_100US);
 			}
 		}
 
