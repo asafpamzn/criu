@@ -1723,6 +1723,10 @@ static void *p3_bulk_sender_thread(void *arg)
 		bool p3_started = false;
 		bool scan_done_logged = false;
 
+		while (!__atomic_load_n(&g_scanner_freeze_signal, __ATOMIC_ACQUIRE)) {
+			usleep(COW_USLEEP_1MS);
+		}
+
 		clock_gettime(CLOCK_MONOTONIC, &loop_start);
 
 		/*
@@ -1736,9 +1740,10 @@ static void *p3_bulk_sender_thread(void *arg)
 		 * one will win the dequeue (atomic head update). Others get NULL.
 		 */
 		while (1) {
-			int q = __atomic_fetch_add(&g_next_queue, 1, __ATOMIC_RELAXED) % COW_TOTAL_QUEUES;
+			int raw_q = __atomic_fetch_add(&g_next_queue, 1, __ATOMIC_RELAXED);
+			int q = raw_q % COW_TOTAL_QUEUES;
 			struct dirty_region_entry *region;
-			int sent;
+			int sent;		
 
 			/* Track when freeze signal was sent (Phase 3 start) */
 			if (!p3_started && g_last_scan_flag) {
@@ -1753,8 +1758,10 @@ static void *p3_bulk_sender_thread(void *arg)
 				clock_gettime(CLOCK_MONOTONIC, &scan_done_time);
 			}
 
+	
 			/* Try to get one item from this queue */
 			region = spsc_dequeue(sender_queues[q].head, sender_queues[q].size);
+
 
 			if (region) {
 				/* Got work - process it */
