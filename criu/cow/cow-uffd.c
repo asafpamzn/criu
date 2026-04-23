@@ -1626,6 +1626,16 @@ int cow_process_eagain_requests(void)
 	}
 	pthread_mutex_unlock(&eagain_mutex);
 
+	{
+		bool empty = list_empty(&eagain_requests);
+		pr_err("EAGAIN_DEBUG: process_eagain done: queue_empty=%d "
+		       "processed=%lu succeeded=%lu blocked=%lu errors=%lu skipped=%lu\n",
+		       empty, uffd_stats.eagain_processed, uffd_stats.eagain_succeeded,
+		       uffd_stats.eagain_blocked, uffd_stats.eagain_errors,
+		       uffd_stats.eagain_skipped);
+	}
+	pthread_mutex_unlock(&eagain_mutex);
+
 	clock_gettime(CLOCK_MONOTONIC, &t_end);
 	uffd_stats.eagain_total_ns += (t_end.tv_sec - t_start.tv_sec) * 1000000000 + (t_end.tv_nsec - t_start.tv_nsec);
 	uffd_stats.eagain_calls++;
