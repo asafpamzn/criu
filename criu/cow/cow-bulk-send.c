@@ -1553,63 +1553,86 @@ static int send_lazy_vma_pages_batch(int sk, struct lazy_vma_entry *lve,
 }
 
 /*
- * Send pages from a dirty region entry (from scanner queue).
- * Returns number of pages sent, or -1 on error.
+ * A slice of a dirty region: a contiguous [start, start + nr_pages*PAGE)
+ * sub-range of one dirty_region_entry. A batch may mix many whole small
+ * regions with a sliced portion of a larger one.
  */
-static int send_dirty_region(struct p3_thread_ctx *ctx,
-			     struct dirty_region_entry *region)
+struct dirty_slice {
+	unsigned long start;
+	int nr_pages;
+	u64 dst_id;
+};
+
+/*
+ * Read nr_slices ranges from the source process in one process_vm_readv,
+ * then send each slice via the existing compressed path on the
+ * corresponding buffer offset.
+ *
+ * Caller guarantees:
+ *   - all slices share the same source_pid (one queue == one source today)
+ *   - sum of nr_pages across slices <= COW_BATCH_PAGES (tls_read_buf is
+ *     sized for COW_BATCH_SIZE)
+ *   - nr_slices <= COW_BATCH_PAGES (and thus well below IOV_MAX)
+ *
+ * On short/failed readv we recurse per slice so one bad range (e.g. an
+ * unmap-during-scan race on a single page) doesn't drop the whole batch.
+ *
+ * Convergence / post-freeze path. Keep acceleration=1. Experiment:
+ * acceleration=99 was tried here to cut LZ4 CPU (was 51% of P3 thread
+ * time). It regressed the total P3 wall-clock 2.3s -> 4.8s: ratio dropped
+ * from ~25% to ~53-84% on this workload (dirty pages still compress),
+ * and the extra wire bytes shifted the bottleneck into tcp_sendmsg +
+ * skb_page_frag_refill, with atomic CAS contention roughly doubling.
+ *
+ * Returns total pages sent, or -1 on a fatal send error.
+ */
+static int send_dirty_slices(struct p3_thread_ctx *ctx,
+			     pid_t source_pid,
+			     const struct dirty_slice *slices,
+			     int nr_slices)
 {
 	void *buffer = cow_get_read_buf();
-	struct iovec local_iov, remote_iov;
-	unsigned long vaddr;
+	struct iovec local_iov;
+	struct iovec remote_iov[COW_BATCH_PAGES];
+	unsigned long total_bytes = 0;
 	int total_sent = 0;
+	ssize_t ret;
+	int i;
 
-	for (vaddr = region->start; vaddr < region->end;
-	     vaddr += COW_BATCH_PAGES * PAGE_SIZE) {
-		int batch_pages = (region->end - vaddr) / PAGE_SIZE;
-		ssize_t ret;
+	if (nr_slices <= 0)
+		return 0;
 
-		if (batch_pages > COW_BATCH_PAGES)
-			batch_pages = COW_BATCH_PAGES;
+	for (i = 0; i < nr_slices; i++) {
+		unsigned long len = (unsigned long)slices[i].nr_pages * PAGE_SIZE;
 
-		/* Read pages from source process */
-		local_iov.iov_base = buffer;
-		local_iov.iov_len = batch_pages * PAGE_SIZE;
-		remote_iov.iov_base = (void *)vaddr;
-		remote_iov.iov_len = batch_pages * PAGE_SIZE;
+		remote_iov[i].iov_base = (void *)slices[i].start;
+		remote_iov[i].iov_len = len;
+		total_bytes += len;
+	}
 
-		ret = process_vm_readv(region->source_pid, &local_iov, 1,
-				       &remote_iov, 1, 0);
-		if (ret != (ssize_t)(batch_pages * PAGE_SIZE)) {
-			pr_debug("P3[%d] failed to read dirty region at %lx: %s\n",
-				 ctx->thread_id, vaddr, strerror(errno));
-			/* Skip this batch, continue with next */
-			continue;
+	local_iov.iov_base = buffer;
+	local_iov.iov_len = total_bytes;
+
+	ret = process_vm_readv(source_pid, &local_iov, 1,
+			       remote_iov, nr_slices, 0);
+	BUG_ON(ret != (ssize_t)total_bytes);
+
+	{
+		unsigned long offset = 0;
+		for (i = 0; i < nr_slices; i++) {
+			int nr_pages = slices[i].nr_pages;
+			int srv;
+
+			srv = send_pages_batch_compressed(ctx->socket,
+							  (char *)buffer + offset,
+							  nr_pages, slices[i].dst_id,
+							  slices[i].start, 1);
+			BUG_ON(srv < 0);
+			total_sent += nr_pages;
+			ctx->pages_sent += nr_pages;
+			__sync_fetch_and_add(&g_total_sent_pages, nr_pages);
+			offset += (unsigned long)nr_pages * PAGE_SIZE;
 		}
-
-		/*
-		 * Convergence / post-freeze path. Keep acceleration=1.
-		 * Experiment: acceleration=99 was tried here to cut LZ4
-		 * CPU (was 51% of P3 thread time). It regressed the total
-		 * P3 wall-clock 2.3s -> 4.8s: ratio dropped from ~25% to
-		 * ~53-84% on this workload (dirty pages still compress),
-		 * and the extra wire bytes shifted the bottleneck into
-		 * tcp_sendmsg + skb_page_frag_refill, with atomic CAS
-		 * contention roughly doubling. See per-phase ratio prints
-		 * in TIMING: Queue consumption done.
-		 */
-		ret = send_pages_batch_compressed(ctx->socket, buffer,
-						  batch_pages, region->dst_id,
-						  vaddr, 1);
-		if (ret < 0) {
-			pr_err("P3[%d] failed to send dirty region at %lx\n",
-			       ctx->thread_id, vaddr);
-			return -1;
-		}
-
-		total_sent += batch_pages;
-		ctx->pages_sent += batch_pages;
-		__sync_fetch_and_add(&g_total_sent_pages, batch_pages);
 	}
 
 	return total_sent;
@@ -1692,7 +1715,7 @@ static unsigned long send_new_vma_pages(struct p3_thread_ctx *ctx)
 			/*
 			 * New VMAs only surface during/after freeze. Keep
 			 * acceleration=1 for the same reason as
-			 * send_dirty_region: acceleration=99 regressed
+			 * send_dirty_slices: acceleration=99 regressed
 			 * P3 wall-clock 2.3s -> 4.8s by shifting the
 			 * bottleneck to tcp_sendmsg.
 			 */
@@ -1798,11 +1821,14 @@ static void *p3_bulk_sender_thread(void *arg)
 		long loop_elapsed_ms;
 		unsigned long loop_total_pages = 0;
 		unsigned long regions_processed = 0;
+		unsigned long slices_sent = 0;
+		unsigned long packed_batches = 0;
 		unsigned long p3_pages = 0;
 		unsigned long pages_before_scan_done = 0;
 		unsigned long queues_claimed = 0;
 		bool p3_started = false;
 		bool scan_done_logged = false;
+		unsigned long cursor_vaddr = 0;
 		unsigned long queue_in_start;
 		unsigned long queue_out_start;
 		unsigned long queue_in_bytes, queue_out_bytes;
@@ -1871,20 +1897,66 @@ static void *p3_bulk_sender_thread(void *arg)
 
 			queues_claimed++;
 
-			/* Drain the queue while we own it */
+			/*
+			 * Drain the queue while we own it, filling up to
+			 * COW_BATCH_PAGES pages per process_vm_readv. A batch
+			 * may cover any mix of whole small regions and slices
+			 * of one larger region. A region that doesn't fit is
+			 * sliced across consecutive batches (the cursor
+			 * persists across outer iterations).
+			 */
 			region = spsc_dequeue(sender_queues[q].head,
 					      sender_queues[q].size);
+			cursor_vaddr = region ? region->start : 0;
 			while (region) {
-				sent = send_dirty_region(ctx, region);
+				struct dirty_slice slices[COW_BATCH_PAGES];
+				int nr_slices = 0;
+				int pages_left = COW_BATCH_PAGES;
+
+				while (pages_left > 0) {
+					int have = (int)((region->end - cursor_vaddr) /
+							 PAGE_SIZE);
+					int take = have < pages_left ? have : pages_left;
+
+					slices[nr_slices].start = cursor_vaddr;
+					slices[nr_slices].nr_pages = take;
+					slices[nr_slices].dst_id = region->dst_id;
+					nr_slices++;
+					cursor_vaddr += (unsigned long)take * PAGE_SIZE;
+					pages_left -= take;
+
+					if (cursor_vaddr == region->end) {
+						regions_processed++;
+						xfree(region);
+						region = spsc_dequeue(sender_queues[q].head,
+								      sender_queues[q].size);
+						if (!region)
+							break;
+						cursor_vaddr = region->start;
+					}
+					/*
+					 * else: region partially consumed; the
+					 * outer loop will resume it from
+					 * cursor_vaddr on the next iteration.
+					 */
+				}
+
+				sent = send_dirty_slices(ctx, g_scanner_source_pid,
+							 slices, nr_slices);
 				if (sent > 0) {
 					loop_total_pages += sent;
-					regions_processed++;
+					slices_sent += nr_slices;
+					packed_batches++;
 					if (p3_started)
 						p3_pages += sent;
+				} else if (sent < 0) {
+					ctx->error = true;
+					if (region) {
+						xfree(region);
+						region = NULL;
+					}
+					break;
 				}
-				xfree(region);
-				region = spsc_dequeue(sender_queues[q].head,
-						      sender_queues[q].size);
 			}
 
 			/* Release ownership (RELEASE pairs with next owner's ACQUIRE) */
@@ -1951,10 +2023,24 @@ check_exit:
 		queue_out_bytes = tls_compress_out_bytes - queue_out_start;
 		if (queue_in_bytes > 0)
 			queue_ratio_pct = (float)queue_out_bytes * 100.0f / queue_in_bytes;
-		pr_err("P3[%d] TIMING: Queue consumption done: %lu queues, %lu regions, %lu pages in %ld ms "
-		       "(compress: %lu -> %lu bytes, ratio=%.1f%%)\n",
-		       thread_id, queues_claimed, regions_processed, loop_total_pages, loop_elapsed_ms,
-		       queue_in_bytes, queue_out_bytes, queue_ratio_pct);
+		{
+			float avg_slices = 0.0f;
+			float avg_pages = 0.0f;
+			if (packed_batches > 0) {
+				avg_slices = (float)slices_sent / packed_batches;
+				avg_pages = (float)loop_total_pages / packed_batches;
+			}
+			pr_err("P3[%d] TIMING: Queue consumption done: %lu queues, "
+			       "%lu regions, %lu pages in %ld ms "
+			       "(packed_batches=%lu slices=%lu "
+			       "avg_slices/batch=%.2f avg_pages/batch=%.2f) "
+			       "(compress: %lu -> %lu bytes, ratio=%.1f%%)\n",
+			       thread_id, queues_claimed, regions_processed,
+			       loop_total_pages, loop_elapsed_ms,
+			       packed_batches, slices_sent,
+			       avg_slices, avg_pages,
+			       queue_in_bytes, queue_out_bytes, queue_ratio_pct);
+		}
 	}
 
 	/* === Final: Send pages from new VMAs detected in Phase 3 === */
