@@ -327,19 +327,18 @@ int cow_page_buffer_thread_init(int thread_id)
  * a 256KB-aligned batch.
  *
  * @base_vaddr: 256KB-aligned start address of the batch
- * @data: pointer to a full COW_BATCH_PAGES page-pool allocation.
- *        The actual page data lives at data + page_offset * PAGE_SIZE.
- *        Caller must NOT free — ownership is always transferred.
+ * @data: page data at data + page_offset * PAGE_SIZE
  * @nr_pages: number of valid pages (1..COW_BATCH_PAGES)
  * @page_offset: index of first valid page within the batch (0..63)
- *
- * If no entry exists for base_vaddr: takes ownership of @data (zero copy).
- * If entry already exists (dirty re-send): memcpy into existing, free @data.
+ * @thread_id: pool thread id (used only when creating new entry from temp data)
+ * @owns_data: true = data is a COW_BATCH_PAGES pool allocation, ownership
+ *             transferred. false = data is a temp buffer, only read from it.
  *
  * Bitmap bits [page_offset .. page_offset+nr_pages) are set.
  */
 int cow_page_buffer_add_batch(unsigned long base_vaddr, void *data,
-			      int nr_pages, int page_offset)
+			      int nr_pages, int page_offset,
+			      int thread_id, bool owns_data)
 {
 	struct batch_buffer_entry *entry;
 	unsigned int hash;
@@ -384,33 +383,50 @@ int cow_page_buffer_add_batch(unsigned long base_vaddr, void *data,
 			}
 			pthread_spin_unlock(&hash_locks[lock_idx]);
 
-			/* Free incoming buffer — data was copied into existing */
-			for (i = 0; i < COW_BATCH_PAGES; i++)
-				page_pool_put((char *)data + i * PAGE_SIZE);
+			/* Free incoming pool buffer if caller passed ownership */
+			if (owns_data) {
+				for (i = 0; i < COW_BATCH_PAGES; i++)
+					page_pool_put((char *)data + i * PAGE_SIZE);
+			}
 			return 0;
 		}
 	}
 
-	/* New entry: take ownership of caller's buffer (zero copy) */
+	/* New entry */
+	{
+		void *batch_data;
+
+		if (owns_data) {
+			/* Take ownership of caller's pool buffer (zero copy) */
+			batch_data = data;
+		} else {
+			/* Allocate pool buffer and copy from temp data */
+			batch_data = page_pool_get_pages(thread_id, COW_BATCH_PAGES);
+			BUG_ON(!batch_data);
+			memcpy((char *)batch_data + page_offset * PAGE_SIZE,
+			       (char *)data + page_offset * PAGE_SIZE,
+			       nr_pages * PAGE_SIZE);
+		}
 
 	entry = xmalloc(sizeof(*entry));
 	BUG_ON(!entry);
 
 	entry->base_vaddr = base_vaddr;
-	entry->data = data;
+	entry->data = batch_data;
 	entry->page_bitmap = new_bitmap;
 	entry->nr_pages = nr_pages;
 	INIT_HLIST_NODE(&entry->hash);
 	INIT_LIST_HEAD(&entry->chunk_list);
-	entry->chunk_id = page_pool_get_chunk_id(data);
+	entry->chunk_id = page_pool_get_chunk_id(batch_data);
 
 	hlist_add_head(&entry->hash, &cow_buffer.hash_table[hash]);
 
 	for (i = 0; i < nr_pages; i++)
 		page_state_set_with_crc(base_vaddr + (page_offset + i) * PAGE_SIZE,
 					PAGE_STATE_IN_BUFFER,
-					(char *)data + (page_offset + i) * PAGE_SIZE);
+					(char *)batch_data + (page_offset + i) * PAGE_SIZE);
 	pthread_spin_unlock(&hash_locks[lock_idx]);
+	} /* end new entry block */
 
 	/* Add to chunk index for chunk-ordered drain */
 	if (entry->chunk_id >= 0 && entry->chunk_id < COW_MAX_POOL_CHUNKS) {
@@ -431,6 +447,83 @@ int cow_page_buffer_add_batch(unsigned long base_vaddr, void *data,
 	__sync_fetch_and_add(&cow_buffer.nr_batches, 1);
 	__sync_fetch_and_add(&cow_buffer.nr_pages, nr_pages);
 	return 0;
+}
+
+/*
+ * Get the data pointer for an existing batch entry.
+ * Returns entry->data if an entry exists for this 256KB-aligned base,
+ * NULL otherwise. Caller can decompress directly into the returned pointer.
+ *
+ * Also updates the bitmap for the given page range.
+ * Safe only when no concurrent drain/page-faults (Phase 4 pre-drain).
+ */
+void *cow_page_buffer_get_data_ptr(unsigned long base_vaddr,
+				   int page_offset, int nr_pages)
+{
+	struct batch_buffer_entry *entry;
+	unsigned int hash;
+	int lock_idx;
+	void *ptr = NULL;
+
+	if (!cow_buffer.initialized)
+		return NULL;
+
+	BUG_ON(base_vaddr != batch_align(base_vaddr));
+
+	hash = batch_buffer_hash(base_vaddr);
+	lock_idx = lock_index(hash);
+
+	pthread_spin_lock(&hash_locks[lock_idx]);
+	hlist_for_each_entry(entry, &cow_buffer.hash_table[hash], hash) {
+		if (entry->base_vaddr == base_vaddr) {
+			ptr = entry->data;
+			pthread_spin_unlock(&hash_locks[lock_idx]);
+			return ptr;
+		}
+	}
+	pthread_spin_unlock(&hash_locks[lock_idx]);
+
+	return NULL;
+}
+
+/*
+ * Mark pages as valid in an existing batch after direct decompress.
+ * Called after decompressing directly into entry->data.
+ */
+void cow_page_buffer_mark_pages(unsigned long base_vaddr,
+				int page_offset, int nr_pages)
+{
+	struct batch_buffer_entry *entry;
+	unsigned int hash;
+	int lock_idx;
+	int i;
+
+	hash = batch_buffer_hash(base_vaddr);
+	lock_idx = lock_index(hash);
+
+	pthread_spin_lock(&hash_locks[lock_idx]);
+	hlist_for_each_entry(entry, &cow_buffer.hash_table[hash], hash) {
+		if (entry->base_vaddr == base_vaddr) {
+			for (i = 0; i < nr_pages; i++) {
+				int idx = page_offset + i;
+
+				if (!(entry->page_bitmap & (1ULL << idx))) {
+					entry->page_bitmap |= (1ULL << idx);
+					entry->nr_pages++;
+					__sync_fetch_and_add(&cow_buffer.nr_pages, 1);
+				}
+				page_state_set_with_crc(base_vaddr + idx * PAGE_SIZE,
+							PAGE_STATE_IN_BUFFER,
+							(char *)entry->data + idx * PAGE_SIZE);
+			}
+			pthread_spin_unlock(&hash_locks[lock_idx]);
+			return;
+		}
+	}
+	pthread_spin_unlock(&hash_locks[lock_idx]);
+
+	pr_err("BUG: mark_pages called for non-existing entry base=0x%lx\n", base_vaddr);
+	BUG();
 }
 
 /*

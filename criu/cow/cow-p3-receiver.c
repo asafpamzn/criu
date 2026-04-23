@@ -105,67 +105,128 @@ static int p3_receive_and_buffer(struct p3_receiver_ctx *ctx)
 		unsigned long base = pi.vaddr & COW_BATCH_ALIGN_MASK;
 		int page_offset = ((pi.vaddr - base) >> PAGE_SHIFT);
 
-		if (page_offset + nr_pages > COW_BATCH_PAGES) {
+		if (page_offset == 0 && nr_pages == COW_BATCH_PAGES) {
 			/*
-			 * Batch crosses 256KB boundary. Decompress into temp
-			 * buffer, then split into two pool allocations.
+			 * Path A: Full aligned batch (bulk transfer common case).
+			 * Pool alloc → decompress → add_batch(owns_data=true).
+			 */
+			char *pool_buf = page_pool_get_pages(ctx->thread_id, COW_BATCH_PAGES);
+			BUG_ON(!pool_buf);
+
+			decomp_ret = LZ4_decompress_safe(compressed_buf, pool_buf,
+							 compressed_size, nr_pages * PAGE_SIZE);
+			BUG_ON(decomp_ret != nr_pages * (int)PAGE_SIZE);
+
+			if (cow_page_buffer_add_batch(base, pool_buf, nr_pages,
+						      0, ctx->thread_id, true) < 0) {
+				for (i = 0; i < COW_BATCH_PAGES; i++)
+					page_pool_put(pool_buf + i * PAGE_SIZE);
+				return -1;
+			}
+		} else if (page_offset + nr_pages <= COW_BATCH_PAGES) {
+			/*
+			 * Path B: Partial batch within one 256KB region.
+			 * If entry exists (dirty overwrite): decompress directly
+			 * into entry->data. Zero allocation, zero memcpy.
+			 * If new entry: decompress into temp buf, add_batch allocates.
+			 */
+			void *existing = cow_page_buffer_get_data_ptr(base,
+								      page_offset, nr_pages);
+			if (existing) {
+				decomp_ret = LZ4_decompress_safe(compressed_buf,
+								 (char *)existing + page_offset * PAGE_SIZE,
+								 compressed_size, nr_pages * PAGE_SIZE);
+				BUG_ON(decomp_ret != nr_pages * (int)PAGE_SIZE);
+
+				cow_page_buffer_mark_pages(base, page_offset, nr_pages);
+			} else {
+				decomp_ret = LZ4_decompress_safe(compressed_buf,
+								 ctx->decompressed_buf,
+								 compressed_size, nr_pages * PAGE_SIZE);
+				BUG_ON(decomp_ret != nr_pages * (int)PAGE_SIZE);
+
+				if (cow_page_buffer_add_batch(base, ctx->decompressed_buf,
+							      nr_pages, page_offset,
+							      ctx->thread_id, false) < 0)
+					return -1;
+			}
+		} else {
+			/*
+			 * Path C: Batch crosses 256KB boundary.
+			 * Decompress into temp buffer, split into two add_batch calls.
 			 */
 			int first_nr = COW_BATCH_PAGES - page_offset;
 			int second_nr = nr_pages - first_nr;
-			char *pool_buf1, *pool_buf2;
 
 			pr_err("P3_RECV_DEBUG: CROSSES BOUNDARY vaddr=0x%lx base=0x%lx "
 			       "offset=%d nr=%d first=%d second=%d thread=%d\n",
 			       (unsigned long)pi.vaddr, base, page_offset, nr_pages,
 			       first_nr, second_nr, ctx->thread_id);
 
+			/* Decompress into start of temp buffer (fits, nr_pages <= 64) */
 			decomp_ret = LZ4_decompress_safe(compressed_buf,
 							 ctx->decompressed_buf,
 							 compressed_size, nr_pages * PAGE_SIZE);
 			BUG_ON(decomp_ret != nr_pages * (int)PAGE_SIZE);
 
-			/* First part: pages [page_offset..63] in base */
-			pool_buf1 = page_pool_get_pages(ctx->thread_id, COW_BATCH_PAGES);
-			BUG_ON(!pool_buf1);
-			memcpy(pool_buf1 + page_offset * PAGE_SIZE,
-			       ctx->decompressed_buf, first_nr * PAGE_SIZE);
-
-			if (cow_page_buffer_add_batch(base, pool_buf1,
-						      first_nr, page_offset) < 0) {
-				for (i = 0; i < COW_BATCH_PAGES; i++)
-					page_pool_put(pool_buf1 + i * PAGE_SIZE);
-				return -1;
+			/*
+			 * First part: pages [page_offset..63] in base.
+			 * Decompressed data [0..first_nr) goes to entry at page_offset.
+			 * Try direct overwrite first, fall back to add_batch.
+			 */
+			{
+				void *existing1 = cow_page_buffer_get_data_ptr(base,
+									       page_offset, first_nr);
+				if (existing1) {
+					memcpy((char *)existing1 + page_offset * PAGE_SIZE,
+					       ctx->decompressed_buf, first_nr * PAGE_SIZE);
+					cow_page_buffer_mark_pages(base, page_offset, first_nr);
+				} else {
+					/*
+					 * New entry — need pool alloc. Copy first_nr pages
+					 * at the right offset in a temp pool buf.
+					 */
+					char *pool_buf = page_pool_get_pages(ctx->thread_id, COW_BATCH_PAGES);
+					BUG_ON(!pool_buf);
+					memcpy(pool_buf + page_offset * PAGE_SIZE,
+					       ctx->decompressed_buf, first_nr * PAGE_SIZE);
+					if (cow_page_buffer_add_batch(base, pool_buf,
+								      first_nr, page_offset,
+								      ctx->thread_id, true) < 0) {
+						for (i = 0; i < COW_BATCH_PAGES; i++)
+							page_pool_put(pool_buf + i * PAGE_SIZE);
+						return -1;
+					}
+				}
 			}
 
-			/* Second part: pages [0..second_nr) in base + COW_BATCH_SIZE */
-			pool_buf2 = page_pool_get_pages(ctx->thread_id, COW_BATCH_PAGES);
-			BUG_ON(!pool_buf2);
-			memcpy(pool_buf2,
-			       ctx->decompressed_buf + first_nr * PAGE_SIZE,
-			       second_nr * PAGE_SIZE);
-
-			if (cow_page_buffer_add_batch(base + COW_BATCH_SIZE, pool_buf2,
-						      second_nr, 0) < 0) {
-				for (i = 0; i < COW_BATCH_PAGES; i++)
-					page_pool_put(pool_buf2 + i * PAGE_SIZE);
-				return -1;
-			}
-		} else {
-			/* Common case: batch fits in one 256KB region */
-			char *pool_buf = page_pool_get_pages(ctx->thread_id, COW_BATCH_PAGES);
-			BUG_ON(!pool_buf);
-
-			decomp_ret = LZ4_decompress_safe(compressed_buf,
-							 pool_buf + page_offset * PAGE_SIZE,
-							 compressed_size, nr_pages * PAGE_SIZE);
-			BUG_ON(decomp_ret != nr_pages * (int)PAGE_SIZE);
-
-			if (cow_page_buffer_add_batch(base, pool_buf, nr_pages,
-						      page_offset) < 0) {
-				pr_err("P3 receive: failed to buffer batch at 0x%lx\n", base);
-				for (i = 0; i < COW_BATCH_PAGES; i++)
-					page_pool_put(pool_buf + i * PAGE_SIZE);
-				return -1;
+			/*
+			 * Second part: pages [0..second_nr) in next 256KB region.
+			 * Decompressed data [first_nr..nr_pages) goes to offset 0.
+			 */
+			{
+				void *existing2 = cow_page_buffer_get_data_ptr(
+							base + COW_BATCH_SIZE, 0, second_nr);
+				if (existing2) {
+					memcpy(existing2,
+					       ctx->decompressed_buf + first_nr * PAGE_SIZE,
+					       second_nr * PAGE_SIZE);
+					cow_page_buffer_mark_pages(base + COW_BATCH_SIZE,
+								   0, second_nr);
+				} else {
+					char *pool_buf = page_pool_get_pages(ctx->thread_id, COW_BATCH_PAGES);
+					BUG_ON(!pool_buf);
+					memcpy(pool_buf,
+					       ctx->decompressed_buf + first_nr * PAGE_SIZE,
+					       second_nr * PAGE_SIZE);
+					if (cow_page_buffer_add_batch(base + COW_BATCH_SIZE,
+								      pool_buf, second_nr, 0,
+								      ctx->thread_id, true) < 0) {
+						for (i = 0; i < COW_BATCH_PAGES; i++)
+							page_pool_put(pool_buf + i * PAGE_SIZE);
+						return -1;
+					}
+				}
 			}
 		}
 	}
