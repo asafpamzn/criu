@@ -380,7 +380,7 @@ static int read_uncompressed_data(struct ps_async_read_bulk *ar, int flags)
  */
 static int page_server_read_bulk_stream(struct ps_async_read_bulk *ar, int flags)
 {
-	pr_debug("bulk_stream: state=%d rb=%lu flags=%d\n",
+	pr_err("bulk_stream: state=%d rb=%lu flags=%d\n",
 		ar->compress_state, ar->rb, flags);
 
 	switch (ar->compress_state) {
