@@ -329,24 +329,22 @@ int cow_page_buffer_thread_init(int thread_id)
  * @base_vaddr: 256KB-aligned start address of the batch
  * @data: pointer to a full COW_BATCH_PAGES page-pool allocation.
  *        The actual page data lives at data + page_offset * PAGE_SIZE.
+ *        Caller must NOT free — ownership is always transferred.
  * @nr_pages: number of valid pages (1..COW_BATCH_PAGES)
  * @page_offset: index of first valid page within the batch (0..63)
- * @thread_id: receiver thread id for page pool allocation
- * @nocopy: if true, takes ownership of @data (must be page_pool memory,
- *          COW_BATCH_PAGES contiguous). Caller must NOT free.
- *          if false, copies into a new page pool allocation.
+ *
+ * If no entry exists for base_vaddr: takes ownership of @data (zero copy).
+ * If entry already exists (dirty re-send): memcpy into existing, free @data.
  *
  * Bitmap bits [page_offset .. page_offset+nr_pages) are set.
  */
 int cow_page_buffer_add_batch(unsigned long base_vaddr, void *data,
-			      int nr_pages, int page_offset,
-			      int thread_id, bool nocopy)
+			      int nr_pages, int page_offset)
 {
 	struct batch_buffer_entry *entry;
 	unsigned int hash;
 	int lock_idx;
 	uint64_t new_bitmap;
-	void *batch_data;
 	int i;
 
 	BUG_ON(!cow_buffer.initialized);
@@ -364,12 +362,6 @@ int cow_page_buffer_add_batch(unsigned long base_vaddr, void *data,
 	/* Check if batch entry already exists (dirty re-send) */
 	hlist_for_each_entry(entry, &cow_buffer.hash_table[hash], hash) {
 		if (entry->base_vaddr == base_vaddr) {
-			pr_err("BATCH_DEBUG: EXISTING base=0x%lx offset=%d nr=%d "
-			       "nocopy=%d existing_bitmap=0x%llx new_bitmap=0x%llx\n",
-			       base_vaddr, page_offset, nr_pages, nocopy,
-			       (unsigned long long)entry->page_bitmap,
-			       (unsigned long long)new_bitmap);
-
 			/* Overwrite pages in existing batch */
 			for (i = 0; i < nr_pages; i++) {
 				int idx = page_offset + i;
@@ -388,31 +380,14 @@ int cow_page_buffer_add_batch(unsigned long base_vaddr, void *data,
 			}
 			pthread_spin_unlock(&hash_locks[lock_idx]);
 
-			/* Free incoming data if we took ownership */
-			if (nocopy) {
-				pr_err("BATCH_DEBUG: FREEING duplicate nocopy buf %p (64 puts)\n", data);
-				for (i = 0; i < COW_BATCH_PAGES; i++)
-					page_pool_put((char *)data + i * PAGE_SIZE);
-			}
+			/* Free incoming buffer — data was copied into existing */
+			for (i = 0; i < COW_BATCH_PAGES; i++)
+				page_pool_put((char *)data + i * PAGE_SIZE);
 			return 0;
 		}
 	}
 
-	pr_debug("BATCH_DEBUG: NEW base=0x%lx offset=%d nr=%d nocopy=%d bitmap=0x%llx\n",
-		 base_vaddr, page_offset, nr_pages, nocopy,
-		 (unsigned long long)new_bitmap);
-
-	/* New batch: take ownership or copy into new 64-page allocation */
-	if (nocopy) {
-		batch_data = data;
-	} else {
-		BUG_ON(thread_id < 0);
-		batch_data = page_pool_get_pages(thread_id, COW_BATCH_PAGES);
-		BUG_ON(!batch_data);
-		memcpy((char *)batch_data + page_offset * PAGE_SIZE,
-		       (char *)data + page_offset * PAGE_SIZE,
-		       nr_pages * PAGE_SIZE);
-	}
+	/* New entry: take ownership of caller's buffer (zero copy) */
 
 	entry = xmalloc(sizeof(*entry));
 	BUG_ON(!entry);

@@ -102,20 +102,14 @@ static int p3_receive_and_buffer(struct p3_receiver_ctx *ctx)
 	}
 
 	/*
-	 * Allocate COW_BATCH_PAGES from page pool, decompress directly
-	 * at the correct offset, hand off with nocopy=true (zero memcpy).
-	 *
-	 * Works for both aligned (page_offset=0) and unaligned batches.
+	 * Allocate COW_BATCH_PAGES from page pool, decompress at the
+	 * correct offset, pass to add_batch which takes ownership.
+	 * New entry: zero-copy. Existing entry: memcpy + free.
 	 */
 	{
 		unsigned long base = pi.vaddr & COW_BATCH_ALIGN_MASK;
 		int page_offset = ((pi.vaddr - base) >> PAGE_SHIFT);
 		char *pool_buf;
-
-		if (page_offset != 0) {
-			pr_err("P3_RECV_DEBUG: UNALIGNED vaddr=0x%lx base=0x%lx offset=%d nr=%d thread=%d\n",
-			       (unsigned long)pi.vaddr, base, page_offset, nr_pages, ctx->thread_id);
-		}
 
 		pool_buf = page_pool_get_pages(ctx->thread_id, COW_BATCH_PAGES);
 		BUG_ON(!pool_buf);
@@ -126,7 +120,7 @@ static int p3_receive_and_buffer(struct p3_receiver_ctx *ctx)
 		BUG_ON(decomp_ret != nr_pages * (int)PAGE_SIZE);
 
 		if (cow_page_buffer_add_batch(base, pool_buf, nr_pages,
-					      page_offset, ctx->thread_id, true) < 0) {
+					      page_offset) < 0) {
 			pr_err("P3 receive: failed to buffer batch at 0x%lx\n", base);
 			for (i = 0; i < COW_BATCH_PAGES; i++)
 				page_pool_put(pool_buf + i * PAGE_SIZE);

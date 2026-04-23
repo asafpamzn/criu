@@ -20,14 +20,14 @@ void *cow_page_buffer_lookup_and_remove(unsigned long vaddr);
 /*
  * Add pages to a 256KB-aligned batch in the buffer.
  * base_vaddr must be 256KB-aligned.
- * data must point to a COW_BATCH_PAGES-sized page pool allocation.
+ * data must point to a COW_BATCH_PAGES page-pool allocation.
  * Pages live at data + page_offset * PAGE_SIZE.
- * nocopy: if true, takes ownership of data (full COW_BATCH_PAGES allocation)
- *         if false, copies the valid pages into a new allocation
+ * Ownership of data is always transferred — caller must not free.
+ * New entry: zero-copy (takes data directly).
+ * Existing entry: memcpy into existing, frees data.
  */
 int cow_page_buffer_add_batch(unsigned long base_vaddr, void *data,
-			      int nr_pages, int page_offset,
-			      int thread_id, bool nocopy);
+			      int nr_pages, int page_offset);
 
 /*
  * Add a single page to the buffer (legacy per-page path).
