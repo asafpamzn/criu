@@ -302,8 +302,8 @@ static int read_compressed_data(struct ps_async_read_bulk *ar, int flags)
 		}
 
 		pr_err("BULK_RECV_DEBUG: decompressed batch vaddr=0x%lx nr_pages=%u cmd=%u\n",
-		       (unsigned long)ar->pi.vaddr, ar->pi.nr_pages,
-		       decode_ps_cmd(ar->pi.cmd));
+		       (unsigned long)ar->pi.vaddr, (unsigned int)ar->pi.nr_pages,
+		       (unsigned int)decode_ps_cmd(ar->pi.cmd));
 
 		/* Invoke callback for each page in batch */
 		for (i = 0; i < ar->pi.nr_pages; i++) {
