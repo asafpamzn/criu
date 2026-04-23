@@ -101,15 +101,17 @@ static int p3_receive_and_buffer(struct p3_receiver_ctx *ctx)
 		return -1;
 	}
 
-	/*
-	 * Allocate COW_BATCH_PAGES from page pool, decompress at the
-	 * correct offset, pass to add_batch which takes ownership.
-	 * New entry: zero-copy. Existing entry: memcpy + free.
-	 */
 	{
 		unsigned long base = pi.vaddr & COW_BATCH_ALIGN_MASK;
 		int page_offset = ((pi.vaddr - base) >> PAGE_SHIFT);
 		char *pool_buf;
+
+		if (page_offset + nr_pages > COW_BATCH_PAGES) {
+			pr_err("P3_RECV_DEBUG: CROSSES BOUNDARY vaddr=0x%lx base=0x%lx "
+			       "offset=%d nr=%d sum=%d thread=%d\n",
+			       (unsigned long)pi.vaddr, base, page_offset, nr_pages,
+			       page_offset + nr_pages, ctx->thread_id);
+		}
 
 		pool_buf = page_pool_get_pages(ctx->thread_id, COW_BATCH_PAGES);
 		BUG_ON(!pool_buf);

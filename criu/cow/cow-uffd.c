@@ -350,7 +350,11 @@ int cow_page_buffer_add_batch(unsigned long base_vaddr, void *data,
 	BUG_ON(!cow_buffer.initialized);
 	BUG_ON(base_vaddr != batch_align(base_vaddr));
 	BUG_ON(nr_pages <= 0 || nr_pages > COW_BATCH_PAGES);
-	BUG_ON(page_offset < 0 || page_offset + nr_pages > COW_BATCH_PAGES);
+	if (page_offset < 0 || page_offset + nr_pages > COW_BATCH_PAGES) {
+		pr_err("BUG: add_batch overflow: base=0x%lx offset=%d nr_pages=%d sum=%d max=%d\n",
+		       base_vaddr, page_offset, nr_pages, page_offset + nr_pages, COW_BATCH_PAGES);
+		BUG();
+	}
 
 	new_bitmap = ((nr_pages == 64) ? ~0ULL : ((1ULL << nr_pages) - 1)) << page_offset;
 
