@@ -158,7 +158,7 @@ static int p3_receive_and_buffer(struct p3_receiver_ctx *ctx)
 			int first_nr = COW_BATCH_PAGES - page_offset;
 			int second_nr = nr_pages - first_nr;
 
-			pr_err("P3_RECV_DEBUG: CROSSES BOUNDARY vaddr=0x%lx base=0x%lx "
+			pr_debug("P3_RECV_DEBUG: CROSSES BOUNDARY vaddr=0x%lx base=0x%lx "
 			       "offset=%d nr=%d first=%d second=%d thread=%d\n",
 			       (unsigned long)pi.vaddr, base, page_offset, nr_pages,
 			       first_nr, second_nr, ctx->thread_id);
