@@ -1411,6 +1411,7 @@ static __thread char *tls_send_buf;
  */
 static __thread unsigned long tls_compress_in_bytes;
 static __thread unsigned long tls_compress_out_bytes;
+static __thread unsigned long tls_total_sent_pages;
 
 /*
  * Send a batch of pages with LZ4 compression.
@@ -1455,11 +1456,7 @@ int send_pages_batch_compressed(int sk, const void *data,
 		return -1;
 	}
 
-	/* Track compression statistics (atomic for multi-threaded access) */
-	__sync_fetch_and_add(&g_compress_uncompressed_bytes, total_uncompressed);
-	__sync_fetch_and_add(&g_compress_compressed_bytes, *compressed_size);
-
-	/* Thread-local counters for per-phase ratio reporting */
+	/* Thread-local counters — flushed to globals once at thread exit */
 	tls_compress_in_bytes += total_uncompressed;
 	tls_compress_out_bytes += *compressed_size;
 
@@ -1630,7 +1627,7 @@ static int send_dirty_slices(struct p3_thread_ctx *ctx,
 			BUG_ON(srv < 0);
 			total_sent += nr_pages;
 			ctx->pages_sent += nr_pages;
-			__sync_fetch_and_add(&g_total_sent_pages, nr_pages);
+			tls_total_sent_pages += nr_pages;
 			offset += (unsigned long)nr_pages * PAGE_SIZE;
 		}
 	}
@@ -2072,6 +2069,14 @@ check_exit:
 		pr_err("P3[%d] done: %lu pages, %ld ms\n",
 		       thread_id, ctx->pages_sent, elapsed_ms);
 	}
+
+	/* Flush thread-local counters to globals (one atomic per counter) */
+	__sync_fetch_and_add(&g_total_sent_pages, tls_total_sent_pages);
+	__sync_fetch_and_add(&g_compress_uncompressed_bytes, tls_compress_in_bytes);
+	__sync_fetch_and_add(&g_compress_compressed_bytes, tls_compress_out_bytes);
+	tls_total_sent_pages = 0;
+	tls_compress_in_bytes = 0;
+	tls_compress_out_bytes = 0;
 
 	ctx->active = false;
 	__sync_fetch_and_sub(&p3_threads_active, 1);
