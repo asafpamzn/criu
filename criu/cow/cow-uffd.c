@@ -393,19 +393,19 @@ int cow_page_buffer_add_batch(unsigned long base_vaddr, void *data,
 	BUG_ON(!entry);
 
 	entry->base_vaddr = base_vaddr;
-	entry->data = batch_data;
+	entry->data = data;
 	entry->page_bitmap = new_bitmap;
 	entry->nr_pages = nr_pages;
 	INIT_HLIST_NODE(&entry->hash);
 	INIT_LIST_HEAD(&entry->chunk_list);
-	entry->chunk_id = page_pool_get_chunk_id(batch_data);
+	entry->chunk_id = page_pool_get_chunk_id(data);
 
 	hlist_add_head(&entry->hash, &cow_buffer.hash_table[hash]);
 
 	for (i = 0; i < nr_pages; i++)
 		page_state_set_with_crc(base_vaddr + (page_offset + i) * PAGE_SIZE,
 					PAGE_STATE_IN_BUFFER,
-					(char *)batch_data + (page_offset + i) * PAGE_SIZE);
+					(char *)data + (page_offset + i) * PAGE_SIZE);
 	pthread_spin_unlock(&hash_locks[lock_idx]);
 
 	/* Add to chunk index for chunk-ordered drain */
