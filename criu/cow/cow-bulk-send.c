@@ -1582,81 +1582,6 @@ static int send_lazy_vma_pages_batch(int sk, struct lazy_vma_entry *lve,
 }
 
 /*
- * Read nr_slices ranges from the source process in one process_vm_readv,
- * then send each slice via the existing compressed path on the
- * corresponding buffer offset.
- *
- * Caller guarantees:
- *   - all slices share the same source_pid (one queue == one source today)
- *   - sum of nr_pages across slices <= COW_BATCH_PAGES (tls_read_buf is
- *     sized for COW_BATCH_SIZE)
- *   - nr_slices <= COW_BATCH_PAGES (and thus well below IOV_MAX)
- *
- * On short/failed readv we recurse per slice so one bad range (e.g. an
- * unmap-during-scan race on a single page) doesn't drop the whole batch.
- *
- * Convergence / post-freeze path. Keep acceleration=1. Experiment:
- * acceleration=99 was tried here to cut LZ4 CPU (was 51% of P3 thread
- * time). It regressed the total P3 wall-clock 2.3s -> 4.8s: ratio dropped
- * from ~25% to ~53-84% on this workload (dirty pages still compress),
- * and the extra wire bytes shifted the bottleneck into tcp_sendmsg +
- * skb_page_frag_refill, with atomic CAS contention roughly doubling.
- *
- * Returns total pages sent, or -1 on a fatal send error.
- */
-static int send_dirty_slices(struct p3_thread_ctx *ctx,
-			     pid_t source_pid,
-			     const struct dirty_slice *slices,
-			     int nr_slices)
-{
-	void *buffer = cow_get_read_buf();
-	struct iovec local_iov;
-	struct iovec remote_iov[COW_BATCH_PAGES];
-	unsigned long total_bytes = 0;
-	int total_sent = 0;
-	ssize_t ret;
-	int i;
-
-	if (nr_slices <= 0)
-		return 0;
-
-	for (i = 0; i < nr_slices; i++) {
-		unsigned long len = (unsigned long)slices[i].nr_pages * PAGE_SIZE;
-
-		remote_iov[i].iov_base = (void *)slices[i].start;
-		remote_iov[i].iov_len = len;
-		total_bytes += len;
-	}
-
-	local_iov.iov_base = buffer;
-	local_iov.iov_len = total_bytes;
-
-	ret = process_vm_readv(source_pid, &local_iov, 1,
-			       remote_iov, nr_slices, 0);
-	BUG_ON(ret != (ssize_t)total_bytes);
-
-	{
-		unsigned long offset = 0;
-		for (i = 0; i < nr_slices; i++) {
-			int nr_pages = slices[i].nr_pages;
-			int srv;
-
-			srv = send_pages_batch_compressed(ctx->socket,
-							  (char *)buffer + offset,
-							  nr_pages, slices[i].dst_id,
-							  slices[i].start, 1);
-			BUG_ON(srv < 0);
-			total_sent += nr_pages;
-			ctx->pages_sent += nr_pages;
-			tls_total_sent_pages += nr_pages;
-			offset += (unsigned long)nr_pages * PAGE_SIZE;
-		}
-	}
-
-	return total_sent;
-}
-
-/*
  * Compressor thread: dequeues work items from a per-pair SPSC queue,
  * LZ4-compresses and sends each slice, then frees the work item.
  * One compressor per reader thread.
@@ -1813,7 +1738,7 @@ static unsigned long send_new_vma_pages(struct p3_thread_ctx *ctx)
 			/*
 			 * New VMAs only surface during/after freeze. Keep
 			 * acceleration=1 for the same reason as
-			 * send_dirty_slices: acceleration=99 regressed
+			 * the convergence path: acceleration=99 regressed
 			 * P3 wall-clock 2.3s -> 4.8s by shifting the
 			 * bottleneck to tcp_sendmsg.
 			 */
