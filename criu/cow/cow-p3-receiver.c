@@ -104,29 +104,69 @@ static int p3_receive_and_buffer(struct p3_receiver_ctx *ctx)
 	{
 		unsigned long base = pi.vaddr & COW_BATCH_ALIGN_MASK;
 		int page_offset = ((pi.vaddr - base) >> PAGE_SHIFT);
-		char *pool_buf;
 
 		if (page_offset + nr_pages > COW_BATCH_PAGES) {
+			/*
+			 * Batch crosses 256KB boundary. Decompress into temp
+			 * buffer, then split into two pool allocations.
+			 */
+			int first_nr = COW_BATCH_PAGES - page_offset;
+			int second_nr = nr_pages - first_nr;
+			char *pool_buf1, *pool_buf2;
+
 			pr_err("P3_RECV_DEBUG: CROSSES BOUNDARY vaddr=0x%lx base=0x%lx "
-			       "offset=%d nr=%d sum=%d thread=%d\n",
+			       "offset=%d nr=%d first=%d second=%d thread=%d\n",
 			       (unsigned long)pi.vaddr, base, page_offset, nr_pages,
-			       page_offset + nr_pages, ctx->thread_id);
-		}
+			       first_nr, second_nr, ctx->thread_id);
 
-		pool_buf = page_pool_get_pages(ctx->thread_id, COW_BATCH_PAGES);
-		BUG_ON(!pool_buf);
+			decomp_ret = LZ4_decompress_safe(compressed_buf,
+							 ctx->decompressed_buf,
+							 compressed_size, nr_pages * PAGE_SIZE);
+			BUG_ON(decomp_ret != nr_pages * (int)PAGE_SIZE);
 
-		decomp_ret = LZ4_decompress_safe(compressed_buf,
-						 pool_buf + page_offset * PAGE_SIZE,
-						 compressed_size, nr_pages * PAGE_SIZE);
-		BUG_ON(decomp_ret != nr_pages * (int)PAGE_SIZE);
+			/* First part: pages [page_offset..63] in base */
+			pool_buf1 = page_pool_get_pages(ctx->thread_id, COW_BATCH_PAGES);
+			BUG_ON(!pool_buf1);
+			memcpy(pool_buf1 + page_offset * PAGE_SIZE,
+			       ctx->decompressed_buf, first_nr * PAGE_SIZE);
 
-		if (cow_page_buffer_add_batch(base, pool_buf, nr_pages,
-					      page_offset) < 0) {
-			pr_err("P3 receive: failed to buffer batch at 0x%lx\n", base);
-			for (i = 0; i < COW_BATCH_PAGES; i++)
-				page_pool_put(pool_buf + i * PAGE_SIZE);
-			return -1;
+			if (cow_page_buffer_add_batch(base, pool_buf1,
+						      first_nr, page_offset) < 0) {
+				for (i = 0; i < COW_BATCH_PAGES; i++)
+					page_pool_put(pool_buf1 + i * PAGE_SIZE);
+				return -1;
+			}
+
+			/* Second part: pages [0..second_nr) in base + COW_BATCH_SIZE */
+			pool_buf2 = page_pool_get_pages(ctx->thread_id, COW_BATCH_PAGES);
+			BUG_ON(!pool_buf2);
+			memcpy(pool_buf2,
+			       ctx->decompressed_buf + first_nr * PAGE_SIZE,
+			       second_nr * PAGE_SIZE);
+
+			if (cow_page_buffer_add_batch(base + COW_BATCH_SIZE, pool_buf2,
+						      second_nr, 0) < 0) {
+				for (i = 0; i < COW_BATCH_PAGES; i++)
+					page_pool_put(pool_buf2 + i * PAGE_SIZE);
+				return -1;
+			}
+		} else {
+			/* Common case: batch fits in one 256KB region */
+			char *pool_buf = page_pool_get_pages(ctx->thread_id, COW_BATCH_PAGES);
+			BUG_ON(!pool_buf);
+
+			decomp_ret = LZ4_decompress_safe(compressed_buf,
+							 pool_buf + page_offset * PAGE_SIZE,
+							 compressed_size, nr_pages * PAGE_SIZE);
+			BUG_ON(decomp_ret != nr_pages * (int)PAGE_SIZE);
+
+			if (cow_page_buffer_add_batch(base, pool_buf, nr_pages,
+						      page_offset) < 0) {
+				pr_err("P3 receive: failed to buffer batch at 0x%lx\n", base);
+				for (i = 0; i < COW_BATCH_PAGES; i++)
+					page_pool_put(pool_buf + i * PAGE_SIZE);
+				return -1;
+			}
 		}
 	}
 
