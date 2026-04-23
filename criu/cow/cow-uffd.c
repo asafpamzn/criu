@@ -784,7 +784,6 @@ static unsigned long drain_apply_batch(struct batch_buffer_entry *entry,
 	unsigned long base = entry->base_vaddr;
 	void *data = entry->data;
 	uint64_t bitmap = entry->page_bitmap;
-	int nr = entry->nr_pages;
 	unsigned long applied = 0;
 	int uffd, i;
 
