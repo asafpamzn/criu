@@ -844,15 +844,6 @@ next_batch:;
 	}
 }
 
-/*
- * Re-add a page to the buffer for EAGAIN retry.
- * Delegates to the per-page add path.
- */
-void cow_page_buffer_readd(unsigned long vaddr, void *data)
-{
-	cow_page_buffer_add(vaddr, data, PHASE4_POOL_ID, true);
-	page_state_set(vaddr, PAGE_STATE_EAGAIN_QUEUED);
-}
 
 /*
  * Drain a batch via UFFDIO_COPY(s) and free its data.
@@ -951,6 +942,16 @@ static void *background_drain_worker(void *arg)
 				atomic_fetch_sub(&chunk_index[chunk_id].batch_count, 1);
 				pthread_spin_unlock(&chunk_index[chunk_id].lock);
 
+				/* Remove from hash table before draining */
+				{
+					unsigned int hash = batch_buffer_hash(entry->base_vaddr);
+					int lock_idx = lock_index(hash);
+
+					pthread_spin_lock(&hash_locks[lock_idx]);
+					hlist_del(&entry->hash);
+					pthread_spin_unlock(&hash_locks[lock_idx]);
+				}
+
 				__sync_fetch_and_sub(&cow_buffer.nr_pages, nr);
 				__sync_fetch_and_sub(&cow_buffer.nr_batches, 1);
 
@@ -959,7 +960,7 @@ static void *background_drain_worker(void *arg)
 				xfree(entry);
 
 				/* Log progress every 100k pages or 10 seconds */
-				if (drained - last_progress_drained >= COW_LOG_SAMPLE_100K ||
+				if (drained - last_progress_drained >= COW_LOG_SAMPLE_1M ||
 				    time(NULL) - last_progress_time >= COW_DRAIN_PROGRESS_SEC) {
 					pr_err("Drain thread %d: drained=%lu chunk=%d remaining=%lu\n",
 					       thread_id, drained, chunk_id, cow_buffer.nr_pages);
