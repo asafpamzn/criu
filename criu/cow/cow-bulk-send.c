@@ -1588,16 +1588,19 @@ static int send_dirty_region(struct p3_thread_ctx *ctx,
 		}
 
 		/*
-		 * Convergence / post-freeze path: CPU is the bottleneck
-		 * (process is frozen - every ms here adds to downtime).
-		 * Profiling showed LZ4_compress_fast_extState at ~51% of
-		 * P3 thread time with default acceleration=1. Bump to 99
-		 * to trade ratio for speed - these pages are modified and
-		 * typically compress poorly anyway.
+		 * Convergence / post-freeze path. Keep acceleration=1.
+		 * Experiment: acceleration=99 was tried here to cut LZ4
+		 * CPU (was 51% of P3 thread time). It regressed the total
+		 * P3 wall-clock 2.3s -> 4.8s: ratio dropped from ~25% to
+		 * ~53-84% on this workload (dirty pages still compress),
+		 * and the extra wire bytes shifted the bottleneck into
+		 * tcp_sendmsg + skb_page_frag_refill, with atomic CAS
+		 * contention roughly doubling. See per-phase ratio prints
+		 * in TIMING: Queue consumption done.
 		 */
 		ret = send_pages_batch_compressed(ctx->socket, buffer,
 						  batch_pages, region->dst_id,
-						  vaddr, 99);
+						  vaddr, 1);
 		if (ret < 0) {
 			pr_err("P3[%d] failed to send dirty region at %lx\n",
 			       ctx->thread_id, vaddr);
@@ -1687,13 +1690,15 @@ static unsigned long send_new_vma_pages(struct p3_thread_ctx *ctx)
 			}
 
 			/*
-			 * New VMAs only surface during/after freeze - same
-			 * CPU-bound regime as send_dirty_region. Use fast
-			 * compression.
+			 * New VMAs only surface during/after freeze. Keep
+			 * acceleration=1 for the same reason as
+			 * send_dirty_region: acceleration=99 regressed
+			 * P3 wall-clock 2.3s -> 4.8s by shifting the
+			 * bottleneck to tcp_sendmsg.
 			 */
 			ret = send_pages_batch_compressed(ctx->socket, buffer,
 							  batch_pages, ctx->dst_id,
-							  vaddr, 99);
+							  vaddr, 1);
 			if (ret < 0) {
 				pr_err("P3[%d] failed to send new VMA pages at %lx, aborting\n",
 				       thread_id, vaddr);
