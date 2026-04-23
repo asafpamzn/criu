@@ -100,10 +100,22 @@ struct compress_work {
 
 DECLARE_SPSC_NODE(compress, struct compress_work);
 
+/*
+ * Buffer free-list: compressor returns used 256KB buffers, reader reclaims.
+ * SPSC queue (compressor produces, reader consumes). Pre-allocated at init
+ * so the hot path never calls malloc/free for buffers.
+ */
+DECLARE_SPSC_NODE(bufpool, void);
+
+#define PIPELINE_BUF_POOL_SIZE	8
+
 struct pipeline_ctx {
 	struct compress_spsc_node *head;
 	struct compress_spsc_node *tail;
 	unsigned long size;
+	struct bufpool_spsc_node *buf_head;
+	struct bufpool_spsc_node *buf_tail;
+	unsigned long buf_size;
 	struct p3_thread_ctx *p3_ctx;
 	volatile bool done;
 	pthread_t compressor;
@@ -1586,6 +1598,34 @@ static int send_lazy_vma_pages_batch(int sk, struct lazy_vma_entry *lve,
  * LZ4-compresses and sends each slice, then frees the work item.
  * One compressor per reader thread.
  */
+static inline void compress_work_process(struct pipeline_ctx *pipe,
+					 struct p3_thread_ctx *ctx,
+					 struct compress_work *work)
+{
+	unsigned long offset = 0;
+	int i, total_pages = 0;
+
+	for (i = 0; i < work->nr_slices; i++) {
+		int nr_pages = work->slices[i].nr_pages;
+		int srv;
+
+		srv = send_pages_batch_compressed(ctx->socket,
+						  (char *)work->buffer + offset,
+						  nr_pages,
+						  work->slices[i].dst_id,
+						  work->slices[i].start, 1);
+		BUG_ON(srv < 0);
+		total_pages += nr_pages;
+		offset += (unsigned long)nr_pages * PAGE_SIZE;
+	}
+	ctx->pages_sent += total_pages;
+	tls_total_sent_pages += total_pages;
+
+	spsc_enqueue(pipe->buf_tail, pipe->buf_size,
+		     work->buffer, struct bufpool_spsc_node);
+	xfree(work);
+}
+
 static void *p3_compressor_thread(void *arg)
 {
 	struct pipeline_ctx *pipe = arg;
@@ -1595,27 +1635,7 @@ static void *p3_compressor_thread(void *arg)
 	while (1) {
 		work = spsc_dequeue(pipe->head, pipe->size);
 		if (work) {
-			unsigned long offset = 0;
-			int i, total_pages = 0;
-
-			for (i = 0; i < work->nr_slices; i++) {
-				int nr_pages = work->slices[i].nr_pages;
-				int srv;
-
-				srv = send_pages_batch_compressed(ctx->socket,
-								  (char *)work->buffer + offset,
-								  nr_pages,
-								  work->slices[i].dst_id,
-								  work->slices[i].start, 1);
-				BUG_ON(srv < 0);
-				total_pages += nr_pages;
-				offset += (unsigned long)nr_pages * PAGE_SIZE;
-			}
-			ctx->pages_sent += total_pages;
-			tls_total_sent_pages += total_pages;
-
-			xfree(work->buffer);
-			xfree(work);
+			compress_work_process(pipe, ctx, work);
 			continue;
 		}
 
@@ -1626,29 +1646,8 @@ static void *p3_compressor_thread(void *arg)
 	}
 
 	/* Drain remaining items after done flag */
-	while ((work = spsc_dequeue(pipe->head, pipe->size)) != NULL) {
-		unsigned long offset = 0;
-		int i, total_pages = 0;
-
-		for (i = 0; i < work->nr_slices; i++) {
-			int nr_pages = work->slices[i].nr_pages;
-			int srv;
-
-			srv = send_pages_batch_compressed(ctx->socket,
-							  (char *)work->buffer + offset,
-							  nr_pages,
-							  work->slices[i].dst_id,
-							  work->slices[i].start, 1);
-			BUG_ON(srv < 0);
-			total_pages += nr_pages;
-			offset += (unsigned long)nr_pages * PAGE_SIZE;
-		}
-		ctx->pages_sent += total_pages;
-		tls_total_sent_pages += total_pages;
-
-		xfree(work->buffer);
-		xfree(work);
-	}
+	while ((work = spsc_dequeue(pipe->head, pipe->size)) != NULL)
+		compress_work_process(pipe, ctx, work);
 
 	/* Flush thread-local counters to globals */
 	__sync_fetch_and_add(&g_total_sent_pages, tls_total_sent_pages);
@@ -1858,11 +1857,22 @@ static void *p3_bulk_sender_thread(void *arg)
 		float queue_ratio_pct = 0.0f;
 		struct pipeline_ctx *pipe = &pipelines[thread_id];
 
-		/* Init pipeline SPSC queue and start compressor thread */
+		/* Init pipeline SPSC queues and pre-allocate buffer pool */
 		pipe->p3_ctx = ctx;
 		pipe->done = false;
 		BUG_ON(spsc_init(pipe->head, pipe->tail, pipe->size,
 				  struct compress_spsc_node));
+		BUG_ON(spsc_init(pipe->buf_head, pipe->buf_tail, pipe->buf_size,
+				  struct bufpool_spsc_node));
+		{
+			int b;
+			for (b = 0; b < PIPELINE_BUF_POOL_SIZE; b++) {
+				void *buf = xmalloc(COW_BATCH_SIZE);
+				BUG_ON(!buf);
+				spsc_enqueue(pipe->buf_tail, pipe->buf_size,
+					     buf, struct bufpool_spsc_node);
+			}
+		}
 		BUG_ON(pthread_create(&pipe->compressor, NULL,
 				      p3_compressor_thread, pipe));
 
@@ -1983,8 +1993,13 @@ static void *p3_bulk_sender_thread(void *arg)
 
 					work = xmalloc(sizeof(*work));
 					BUG_ON(!work);
-					work->buffer = xmalloc(COW_BATCH_SIZE);
-					BUG_ON(!work->buffer);
+
+					/* Reclaim buffer from pool (compressor returns them) */
+					work->buffer = spsc_dequeue(pipe->buf_head, pipe->buf_size);
+					while (!work->buffer) {
+						usleep(1);
+						work->buffer = spsc_dequeue(pipe->buf_head, pipe->buf_size);
+					}
 
 					for (si = 0; si < nr_slices; si++) {
 						unsigned long len = (unsigned long)slices[si].nr_pages * PAGE_SIZE;
@@ -2051,6 +2066,13 @@ check_exit:
 		/* Signal compressor to exit and wait for it to drain */
 		__atomic_store_n(&pipe->done, true, __ATOMIC_RELEASE);
 		pthread_join(pipe->compressor, NULL);
+
+		/* Free pre-allocated buffer pool */
+		{
+			void *buf;
+			while ((buf = spsc_dequeue(pipe->buf_head, pipe->buf_size)) != NULL)
+				xfree(buf);
+		}
 
 		clock_gettime(CLOCK_MONOTONIC, &loop_end);
 
