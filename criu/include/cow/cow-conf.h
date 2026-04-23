@@ -134,7 +134,7 @@
  * ================================================================ */
 
 /* Number of parallel P3 sender/receiver threads */
-#define COW_NUM_P3_THREADS		10
+#define COW_NUM_P3_THREADS		15
 
 /*
  * Number of queues per scanner (producer). Scanner i owns queues
