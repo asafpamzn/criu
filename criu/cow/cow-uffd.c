@@ -1557,8 +1557,8 @@ static int prebuffer_io_complete_internal(unsigned long dst_id, unsigned long va
 	void *data = priv;  /* Points to prebuffer_buf with page data */
 	unsigned long i;
 
-	pr_debug("prebuffer_io_complete: buffering %lu Phase 4 dirty pages at vaddr=0x%lx\n",
-		 nr_pages, vaddr);
+	pr_err("prebuffer_io_complete: buffering %lu Phase 4 dirty pages at vaddr=0x%lx\n",
+	       nr_pages, vaddr);
 
 	/* Buffer/overwrite each page using P3 thread 0's pool */
 	for (i = 0; i < nr_pages; i++) {
