@@ -1028,6 +1028,9 @@ static void *background_drain_worker(void *arg)
 		       atomic_load(&total_drained), cow_buffer.nr_applied,
 		       cow_buffer.nr_discarded, cow_buffer.nr_eagain, cow_buffer.nr_pages);
 
+		/* Print pool stats to check for leaks */
+		page_pool_dump_stats();
+
 		/* All pages should be drained - orphaned pages are a bug */
 		BUG_ON(cow_buffer.nr_pages > 0);
 	}

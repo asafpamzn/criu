@@ -308,6 +308,13 @@ void page_pool_put(void *page)
 
 	old_ref = atomic_fetch_sub(&hdr->refcount, 1);
 
+	if (old_ref <= 0) {
+		pr_err("BUG: page_pool_put refcount already %d for page %p "
+		       "chunk=%p[%d] — double free!\n",
+		       old_ref, page, hdr, hdr->chunk_idx);
+		BUG();
+	}
+
 	/* Track put count */
 	{
 		unsigned long put_cnt = atomic_fetch_add(&total_put_count, 1) + 1;
