@@ -36,22 +36,26 @@
  */
 #define PHASE4_POOL_ID 0
 
-/* Hash table and locking constants now in cow-conf.h */
-
-struct page_buffer_node {
-	struct {
-		unsigned long vaddr;
-		void *data;
-	} entries[COW_PAGE_NODE_ENTRIES];
-	int count;			/* Number of valid entries in this node */
+/*
+ * 256KB-aligned batch buffer entry.
+ * Each entry holds up to COW_BATCH_PAGES (64) contiguous pages.
+ * A bitmap tracks which pages within the batch are valid.
+ * Drain can issue a single UFFDIO_COPY for the entire batch.
+ */
+struct batch_buffer_entry {
+	unsigned long base_vaddr;	/* 256KB-aligned start address */
+	void *data;			/* Contiguous page pool allocation */
+	uint64_t page_bitmap;		/* 1 = page present, 0 = absent */
+	int nr_pages;			/* popcount(page_bitmap) */
 	struct hlist_node hash;
-	struct list_head chunk_list;	/* Link in chunk's page list for ordered drain */
-	int chunk_id;			/* Cached chunk ID for drain ordering */
+	struct list_head chunk_list;	/* Link in chunk's list for ordered drain */
+	int chunk_id;			/* Cached page-pool chunk ID */
 };
 
 static struct {
 	struct hlist_head *hash_table;
-	unsigned long nr_pages;
+	unsigned long nr_batches;	/* Number of batch entries */
+	unsigned long nr_pages;		/* Total individual pages buffered */
 	unsigned long nr_applied;
 	unsigned long nr_discarded;
 	unsigned long nr_eagain;
@@ -60,30 +64,28 @@ static struct {
 
 /*
  * Chunk-ordered drain index.
- * Allows draining pages grouped by their page pool chunk, so chunks
+ * Allows draining batches grouped by their page pool chunk, so chunks
  * can be freed progressively instead of all at the end.
  */
-/* COW_MAX_POOL_CHUNKS now defined as COW_MAX_POOL_CHUNKS in cow-conf.h */
-
 struct chunk_drain_entry {
-	struct list_head pages;		/* List of page_buffer_nodes in this chunk */
+	struct list_head batches;	/* List of batch_buffer_entry in this chunk */
 	pthread_spinlock_t lock;	/* Per-chunk lock for drain */
-	atomic_int page_count;		/* Number of pages in this chunk's list */
+	atomic_int batch_count;		/* Number of batches in this chunk's list */
 };
 
 static struct chunk_drain_entry chunk_index[COW_MAX_POOL_CHUNKS];
 static atomic_bool chunk_index_initialized = false;
 static atomic_int nr_active_chunks = 0;
 
-/* Fine-grained locks: 8K locks for 1M buckets */
-static pthread_spinlock_t hash_locks[COW_NUM_HASH_LOCKS];
+/* Fine-grained locks for batch buffer */
+static pthread_spinlock_t hash_locks[COW_BATCH_NUM_HASH_LOCKS];
 
 /* Pre-buffer for Phase 4 dirty pages (allocated in cow_setup_prebuffer_reader) */
 static void *prebuffer_buf = NULL;
 
 static inline int lock_index(unsigned int hash)
 {
-	return hash / COW_BUCKETS_PER_LOCK;
+	return hash / COW_BATCH_BUCKETS_PER_LOCK;
 }
 
 /*
@@ -107,9 +109,19 @@ static int max_drain_chunks = 0;  /* Total chunks to drain */
 static struct timespec drain_start_time;  /* For TIMING prefix debug */
 
 
-static inline unsigned int page_buffer_hash(unsigned long vaddr)
+static inline unsigned int batch_buffer_hash(unsigned long vaddr)
 {
-	return (vaddr >> PAGE_SHIFT) & (COW_PAGE_BUFFER_HASH_SIZE - 1);
+	return (vaddr >> COW_BATCH_SHIFT) & (COW_BATCH_BUFFER_HASH_SIZE - 1);
+}
+
+static inline unsigned long batch_align(unsigned long vaddr)
+{
+	return vaddr & COW_BATCH_ALIGN_MASK;
+}
+
+static inline int batch_page_index(unsigned long vaddr)
+{
+	return (vaddr >> PAGE_SHIFT) & (COW_BATCH_PAGES - 1);
 }
 
 /*
@@ -275,33 +287,33 @@ int cow_page_buffer_init(void)
 	if (cow_buffer.initialized)
 		return 0;
 
-	cow_buffer.hash_table = xmalloc(COW_PAGE_BUFFER_HASH_SIZE *
+	cow_buffer.hash_table = xmalloc(COW_BATCH_BUFFER_HASH_SIZE *
 					sizeof(struct hlist_head));
 	BUG_ON(!cow_buffer.hash_table);
 
-	for (i = 0; i < COW_PAGE_BUFFER_HASH_SIZE; i++)
+	for (i = 0; i < COW_BATCH_BUFFER_HASH_SIZE; i++)
 		INIT_HLIST_HEAD(&cow_buffer.hash_table[i]);
 
-	/* Initialize 8K fine-grained locks */
-	for (i = 0; i < COW_NUM_HASH_LOCKS; i++)
+	for (i = 0; i < COW_BATCH_NUM_HASH_LOCKS; i++)
 		pthread_spin_init(&hash_locks[i], PTHREAD_PROCESS_PRIVATE);
 
 	/* Initialize chunk drain index */
 	for (i = 0; i < COW_MAX_POOL_CHUNKS; i++) {
-		INIT_LIST_HEAD(&chunk_index[i].pages);
+		INIT_LIST_HEAD(&chunk_index[i].batches);
 		pthread_spin_init(&chunk_index[i].lock, PTHREAD_PROCESS_PRIVATE);
-		atomic_init(&chunk_index[i].page_count, 0);
+		atomic_init(&chunk_index[i].batch_count, 0);
 	}
 	atomic_store(&chunk_index_initialized, true);
 
+	cow_buffer.nr_batches = 0;
 	cow_buffer.nr_pages = 0;
 	cow_buffer.nr_applied = 0;
 	cow_buffer.nr_discarded = 0;
 	cow_buffer.nr_eagain = 0;
 	cow_buffer.initialized = true;
 
-	pr_info("COW page buffer initialized (buckets=%d, locks=%d, chunk_slots=%d)\n",
-		COW_PAGE_BUFFER_HASH_SIZE, COW_NUM_HASH_LOCKS, COW_MAX_POOL_CHUNKS);
+	pr_info("COW batch buffer initialized (buckets=%d, locks=%d, chunk_slots=%d)\n",
+		COW_BATCH_BUFFER_HASH_SIZE, COW_BATCH_NUM_HASH_LOCKS, COW_MAX_POOL_CHUNKS);
 	return 0;
 }
 
@@ -310,161 +322,294 @@ int cow_page_buffer_thread_init(int thread_id)
 	return page_pool_thread_init(thread_id);
 }
 
-int cow_page_buffer_add(unsigned long vaddr, void *data, int thread_id, bool nocopy)
+/*
+ * Add a contiguous run of pages to the buffer at a given offset within
+ * a 256KB-aligned batch.
+ *
+ * @base_vaddr: 256KB-aligned start address of the batch
+ * @data: pointer to a full COW_BATCH_PAGES page-pool allocation.
+ *        The actual page data lives at data + page_offset * PAGE_SIZE.
+ * @nr_pages: number of valid pages (1..COW_BATCH_PAGES)
+ * @page_offset: index of first valid page within the batch (0..63)
+ * @thread_id: receiver thread id for page pool allocation
+ * @nocopy: if true, takes ownership of @data (must be page_pool memory,
+ *          COW_BATCH_PAGES contiguous). Caller must NOT free.
+ *          if false, copies into a new page pool allocation.
+ *
+ * Bitmap bits [page_offset .. page_offset+nr_pages) are set.
+ */
+int cow_page_buffer_add_batch(unsigned long base_vaddr, void *data,
+			      int nr_pages, int page_offset,
+			      int thread_id, bool nocopy)
 {
-	struct page_buffer_node *node;
+	struct batch_buffer_entry *entry;
 	unsigned int hash;
-	enum page_state state;
-	void *page_data = NULL;
 	int lock_idx;
+	uint64_t new_bitmap;
+	void *batch_data;
 	int i;
 
 	BUG_ON(!cow_buffer.initialized);
+	BUG_ON(base_vaddr != batch_align(base_vaddr));
+	BUG_ON(nr_pages <= 0 || nr_pages > COW_BATCH_PAGES);
+	BUG_ON(page_offset < 0 || page_offset + nr_pages > COW_BATCH_PAGES);
 
-	/*
-	 * Server rule: each page is sent only once, unless dirty (re-sent with
-	 * newer data). DIRTY -> IN_BUFFER is valid (dirty page re-sent).
-	 * IN_BUFFER -> IN_BUFFER is valid (dirty page overwrites existing).
-	 * COPIED/DISCARDED -> IN_BUFFER is a bug - server sent duplicate
-	 * non-dirty page.
-	 */
-	state = page_state_get(vaddr);
-	if (state == PAGE_STATE_COPIED || state == PAGE_STATE_DISCARDED) {
-		pr_err("0x%lx already %s - server sent duplicate!\n",
-		       vaddr, page_state_name(state));
-		page_state_print_history(vaddr);
-		BUG();
-	}
-	/* PAGE_STATE_DIRTY and PAGE_STATE_IN_BUFFER are OK */
+	new_bitmap = ((nr_pages == 64) ? ~0ULL : ((1ULL << nr_pages) - 1)) << page_offset;
 
-	hash = page_buffer_hash(vaddr);
+	hash = batch_buffer_hash(base_vaddr);
 	lock_idx = lock_index(hash);
 
-	/*
-	 * Hold the lock for the entire operation to avoid race conditions
-	 * where two threads could add duplicate entries for the same vaddr.
-	 */
 	pthread_spin_lock(&hash_locks[lock_idx]);
 
-	/* Check if page already exists - if so, overwrite in place */
-	hlist_for_each_entry(node, &cow_buffer.hash_table[hash], hash) {
-		for (i = 0; i < node->count; i++) {
-			if (node->entries[i].vaddr == vaddr) {
-				memcpy(node->entries[i].data, data, PAGE_SIZE);
-				page_state_set_with_crc(vaddr, PAGE_STATE_IN_BUFFER, data);
-				pthread_spin_unlock(&hash_locks[lock_idx]);
-				return 0;
+	/* Check if batch entry already exists (dirty re-send) */
+	hlist_for_each_entry(entry, &cow_buffer.hash_table[hash], hash) {
+		if (entry->base_vaddr == base_vaddr) {
+			/* Overwrite pages in existing batch */
+			for (i = 0; i < nr_pages; i++) {
+				int idx = page_offset + i;
+
+				memcpy((char *)entry->data + idx * PAGE_SIZE,
+				       (char *)data + idx * PAGE_SIZE, PAGE_SIZE);
+
+				if (!(entry->page_bitmap & (1ULL << idx))) {
+					entry->page_bitmap |= (1ULL << idx);
+					entry->nr_pages++;
+					__sync_fetch_and_add(&cow_buffer.nr_pages, 1);
+				}
+				page_state_set_with_crc(base_vaddr + idx * PAGE_SIZE,
+							PAGE_STATE_IN_BUFFER,
+							(char *)entry->data + idx * PAGE_SIZE);
 			}
-		}
-	}
-
-	/* Page doesn't exist - allocate buffer for it */
-	if (nocopy) {
-		page_data = data;
-	} else {
-		BUG_ON(thread_id < 0);
-		page_data = page_pool_get(thread_id);
-		BUG_ON(!page_data);
-		memcpy(page_data, data, PAGE_SIZE);
-	}
-
-	/* Try to add to existing node with space */
-	hlist_for_each_entry(node, &cow_buffer.hash_table[hash], hash) {
-		if (node->count < COW_PAGE_NODE_ENTRIES) {
-			node->entries[node->count].vaddr = vaddr;
-			node->entries[node->count].data = page_data;
-			node->count++;
-			page_state_set_with_crc(vaddr, PAGE_STATE_IN_BUFFER, page_data);
 			pthread_spin_unlock(&hash_locks[lock_idx]);
-			__sync_fetch_and_add(&cow_buffer.nr_pages, 1);
+
+			/* Free incoming data if we took ownership */
+			if (nocopy) {
+				for (i = 0; i < COW_BATCH_PAGES; i++)
+					page_pool_put((char *)data + i * PAGE_SIZE);
+			}
 			return 0;
 		}
 	}
 
-	/* Need new node */
-	node = xmalloc(sizeof(*node));
-	BUG_ON(!node);
+	/* New batch: take ownership or copy into new 64-page allocation */
+	if (nocopy) {
+		batch_data = data;
+	} else {
+		BUG_ON(thread_id < 0);
+		batch_data = page_pool_get_pages(thread_id, COW_BATCH_PAGES);
+		BUG_ON(!batch_data);
+		memcpy((char *)batch_data + page_offset * PAGE_SIZE,
+		       (char *)data + page_offset * PAGE_SIZE,
+		       nr_pages * PAGE_SIZE);
+	}
 
-	node->entries[0].vaddr = vaddr;
-	node->entries[0].data = page_data;
-	node->count = 1;
-	INIT_HLIST_NODE(&node->hash);
-	INIT_LIST_HEAD(&node->chunk_list);
-	node->chunk_id = page_pool_get_chunk_id(page_data);
+	entry = xmalloc(sizeof(*entry));
+	BUG_ON(!entry);
 
-	hlist_add_head(&node->hash, &cow_buffer.hash_table[hash]);
-	page_state_set_with_crc(vaddr, PAGE_STATE_IN_BUFFER, page_data);
+	entry->base_vaddr = base_vaddr;
+	entry->data = batch_data;
+	entry->page_bitmap = new_bitmap;
+	entry->nr_pages = nr_pages;
+	INIT_HLIST_NODE(&entry->hash);
+	INIT_LIST_HEAD(&entry->chunk_list);
+	entry->chunk_id = page_pool_get_chunk_id(batch_data);
+
+	hlist_add_head(&entry->hash, &cow_buffer.hash_table[hash]);
+
+	for (i = 0; i < nr_pages; i++)
+		page_state_set_with_crc(base_vaddr + (page_offset + i) * PAGE_SIZE,
+					PAGE_STATE_IN_BUFFER,
+					(char *)batch_data + (page_offset + i) * PAGE_SIZE);
 	pthread_spin_unlock(&hash_locks[lock_idx]);
 
 	/* Add to chunk index for chunk-ordered drain */
-	if (node->chunk_id >= 0 && node->chunk_id < COW_MAX_POOL_CHUNKS) {
+	if (entry->chunk_id >= 0 && entry->chunk_id < COW_MAX_POOL_CHUNKS) {
 		int cur_max;
-		pthread_spin_lock(&chunk_index[node->chunk_id].lock);
-		list_add_tail(&node->chunk_list, &chunk_index[node->chunk_id].pages);
-		atomic_fetch_add(&chunk_index[node->chunk_id].page_count, 1);
-		pthread_spin_unlock(&chunk_index[node->chunk_id].lock);
 
-		/* Track max chunk ID seen for drain distribution */
+		pthread_spin_lock(&chunk_index[entry->chunk_id].lock);
+		list_add_tail(&entry->chunk_list, &chunk_index[entry->chunk_id].batches);
+		atomic_fetch_add(&chunk_index[entry->chunk_id].batch_count, 1);
+		pthread_spin_unlock(&chunk_index[entry->chunk_id].lock);
+
 		cur_max = atomic_load(&nr_active_chunks);
-		while (node->chunk_id >= cur_max) {
-			if (atomic_compare_exchange_weak(&nr_active_chunks, &cur_max, node->chunk_id + 1))
+		while (entry->chunk_id >= cur_max) {
+			if (atomic_compare_exchange_weak(&nr_active_chunks, &cur_max, entry->chunk_id + 1))
 				break;
 		}
 	}
 
+	__sync_fetch_and_add(&cow_buffer.nr_batches, 1);
+	__sync_fetch_and_add(&cow_buffer.nr_pages, nr_pages);
+	return 0;
+}
+
+/*
+ * Legacy per-page add wrapper.
+ * Groups the page into its 256KB-aligned batch.
+ * Used by Phase 4 dirty page path which overwrites individual pages.
+ */
+int cow_page_buffer_add(unsigned long vaddr, void *data, int thread_id, bool nocopy)
+{
+	unsigned long base = batch_align(vaddr);
+	int page_idx = batch_page_index(vaddr);
+	struct batch_buffer_entry *entry;
+	unsigned int hash;
+	int lock_idx;
+	void *batch_data;
+
+	BUG_ON(!cow_buffer.initialized);
+
+	hash = batch_buffer_hash(base);
+	lock_idx = lock_index(hash);
+
+	pthread_spin_lock(&hash_locks[lock_idx]);
+
+	/* Look for existing batch */
+	hlist_for_each_entry(entry, &cow_buffer.hash_table[hash], hash) {
+		if (entry->base_vaddr == base) {
+			/* Copy page into existing batch */
+			memcpy((char *)entry->data + page_idx * PAGE_SIZE,
+			       data, PAGE_SIZE);
+
+			if (!(entry->page_bitmap & (1ULL << page_idx))) {
+				entry->page_bitmap |= (1ULL << page_idx);
+				entry->nr_pages++;
+				__sync_fetch_and_add(&cow_buffer.nr_pages, 1);
+			}
+			page_state_set_with_crc(vaddr, PAGE_STATE_IN_BUFFER,
+						(char *)entry->data + page_idx * PAGE_SIZE);
+			pthread_spin_unlock(&hash_locks[lock_idx]);
+
+			if (nocopy)
+				page_pool_put(data);
+			return 0;
+		}
+	}
+
+	/* New batch - allocate full COW_BATCH_PAGES buffer */
+	BUG_ON(thread_id < 0);
+	batch_data = page_pool_get_pages(thread_id, COW_BATCH_PAGES);
+	BUG_ON(!batch_data);
+	memcpy((char *)batch_data + page_idx * PAGE_SIZE, data, PAGE_SIZE);
+
+	if (nocopy)
+		page_pool_put(data);
+
+	entry = xmalloc(sizeof(*entry));
+	BUG_ON(!entry);
+
+	entry->base_vaddr = base;
+	entry->data = batch_data;
+	entry->page_bitmap = (1ULL << page_idx);
+	entry->nr_pages = 1;
+	INIT_HLIST_NODE(&entry->hash);
+	INIT_LIST_HEAD(&entry->chunk_list);
+	entry->chunk_id = page_pool_get_chunk_id(batch_data);
+
+	hlist_add_head(&entry->hash, &cow_buffer.hash_table[hash]);
+	page_state_set_with_crc(vaddr, PAGE_STATE_IN_BUFFER,
+				(char *)batch_data + page_idx * PAGE_SIZE);
+	pthread_spin_unlock(&hash_locks[lock_idx]);
+
+	/* Add to chunk index for chunk-ordered drain */
+	if (entry->chunk_id >= 0 && entry->chunk_id < COW_MAX_POOL_CHUNKS) {
+		int cur_max;
+
+		pthread_spin_lock(&chunk_index[entry->chunk_id].lock);
+		list_add_tail(&entry->chunk_list, &chunk_index[entry->chunk_id].batches);
+		atomic_fetch_add(&chunk_index[entry->chunk_id].batch_count, 1);
+		pthread_spin_unlock(&chunk_index[entry->chunk_id].lock);
+
+		cur_max = atomic_load(&nr_active_chunks);
+		while (entry->chunk_id >= cur_max) {
+			if (atomic_compare_exchange_weak(&nr_active_chunks, &cur_max, entry->chunk_id + 1))
+				break;
+		}
+	}
+
+	__sync_fetch_and_add(&cow_buffer.nr_batches, 1);
 	__sync_fetch_and_add(&cow_buffer.nr_pages, 1);
 	return 0;
 }
 
+/*
+ * Look up a single page in the batch buffer.
+ * Returns a pointer to a PAGE_SIZE buffer that the caller must free
+ * via page_pool_put(), or NULL if the page is not in the buffer.
+ *
+ * The page is cleared from the batch bitmap. If the batch becomes empty,
+ * the entry is removed and its data buffer freed.
+ */
 void *cow_page_buffer_lookup_and_remove(unsigned long vaddr)
 {
-	struct page_buffer_node *node;
+	struct batch_buffer_entry *entry;
+	unsigned long base;
 	unsigned int hash;
-	int lock_idx;
-	void *data = NULL;
-	int i;
+	int lock_idx, page_idx;
+	void *page_ptr;
 
 	if (!cow_buffer.initialized)
 		return NULL;
 
-	hash = page_buffer_hash(vaddr);
+	base = batch_align(vaddr);
+	page_idx = batch_page_index(vaddr);
+	hash = batch_buffer_hash(base);
 	lock_idx = lock_index(hash);
 
 	pthread_spin_lock(&hash_locks[lock_idx]);
-	hlist_for_each_entry(node, &cow_buffer.hash_table[hash], hash) {
-		for (i = 0; i < node->count; i++) {
-			if (node->entries[i].vaddr == vaddr) {
-				data = node->entries[i].data;
-				/* Move last entry to fill gap */
-				node->count--;
-				if (i < node->count) {
-					node->entries[i] = node->entries[node->count];
-				}
-				/* Remove empty nodes */
-				if (node->count == 0) {
-					int chunk_id = node->chunk_id;
-					hlist_del(&node->hash);
-					pthread_spin_unlock(&hash_locks[lock_idx]);
-					/* Also remove from chunk list */
-					if (chunk_id >= 0 && chunk_id < COW_MAX_POOL_CHUNKS) {
-						pthread_spin_lock(&chunk_index[chunk_id].lock);
-						list_del(&node->chunk_list);
-						atomic_fetch_sub(&chunk_index[chunk_id].page_count, 1);
-						pthread_spin_unlock(&chunk_index[chunk_id].lock);
-					}
-					xfree(node);
-					__sync_fetch_and_sub(&cow_buffer.nr_pages, 1);
-					return data;
-				}
-				pthread_spin_unlock(&hash_locks[lock_idx]);
-				__sync_fetch_and_sub(&cow_buffer.nr_pages, 1);
-				return data;
-			}
+	hlist_for_each_entry(entry, &cow_buffer.hash_table[hash], hash) {
+		if (entry->base_vaddr != base)
+			continue;
+		if (!(entry->page_bitmap & (1ULL << page_idx))) {
+			pthread_spin_unlock(&hash_locks[lock_idx]);
+			return NULL;
 		}
+
+		page_ptr = (char *)entry->data + page_idx * PAGE_SIZE;
+
+		/* Clear bit and decrement count */
+		entry->page_bitmap &= ~(1ULL << page_idx);
+		entry->nr_pages--;
+		__sync_fetch_and_sub(&cow_buffer.nr_pages, 1);
+
+		if (entry->nr_pages == 0) {
+			/* Batch empty — remove entirely */
+			int chunk_id = entry->chunk_id;
+
+			hlist_del(&entry->hash);
+			pthread_spin_unlock(&hash_locks[lock_idx]);
+
+			if (chunk_id >= 0 && chunk_id < COW_MAX_POOL_CHUNKS) {
+				pthread_spin_lock(&chunk_index[chunk_id].lock);
+				list_del(&entry->chunk_list);
+				atomic_fetch_sub(&chunk_index[chunk_id].batch_count, 1);
+				pthread_spin_unlock(&chunk_index[chunk_id].lock);
+			}
+			/*
+			 * Don't free the data buffer yet — the page_ptr we're
+			 * returning points inside it. The caller will
+			 * page_pool_put(page_ptr) which decrements the chunk
+			 * refcount. We must free the remaining COW_BATCH_PAGES-1
+			 * pages that are no longer referenced.
+			 */
+			{
+				int j;
+				for (j = 0; j < COW_BATCH_PAGES; j++) {
+					if (j != page_idx)
+						page_pool_put((char *)entry->data + j * PAGE_SIZE);
+				}
+			}
+			xfree(entry);
+			__sync_fetch_and_sub(&cow_buffer.nr_batches, 1);
+			return page_ptr;
+		}
+
+		pthread_spin_unlock(&hash_locks[lock_idx]);
+		return page_ptr;
 	}
 	pthread_spin_unlock(&hash_locks[lock_idx]);
 
-	return data;
+	return NULL;
 }
 
 unsigned long cow_page_buffer_count(void)
@@ -474,7 +619,7 @@ unsigned long cow_page_buffer_count(void)
 
 void cow_page_buffer_destroy(void)
 {
-	struct page_buffer_node *node;
+	struct batch_buffer_entry *entry;
 	struct hlist_node *tmp;
 	int i, j;
 
@@ -483,16 +628,19 @@ void cow_page_buffer_destroy(void)
 
 	/* Stop drain thread first */
 	cow_stop_drain_thread();
-	/* Lock all buckets and destroy contents */
-	for (i = 0; i < COW_PAGE_BUFFER_HASH_SIZE; i++) {
+
+	/* Walk all buckets and free batch entries */
+	for (i = 0; i < COW_BATCH_BUFFER_HASH_SIZE; i++) {
 		int lock_idx = lock_index(i);
+
 		pthread_spin_lock(&hash_locks[lock_idx]);
-		hlist_for_each_entry_safe(node, tmp,
+		hlist_for_each_entry_safe(entry, tmp,
 					  &cow_buffer.hash_table[i], hash) {
-			for (j = 0; j < node->count; j++)
-				page_pool_put(node->entries[j].data);
-			hlist_del(&node->hash);
-			xfree(node);
+			/* Free all pages in the batch */
+			for (j = 0; j < COW_BATCH_PAGES; j++)
+				page_pool_put((char *)entry->data + j * PAGE_SIZE);
+			hlist_del(&entry->hash);
+			xfree(entry);
 		}
 		pthread_spin_unlock(&hash_locks[lock_idx]);
 	}
@@ -501,19 +649,19 @@ void cow_page_buffer_destroy(void)
 	cow_buffer.hash_table = NULL;
 	cow_buffer.initialized = false;
 
-	/* Destroy all fine-grained locks */
-	for (i = 0; i < COW_NUM_HASH_LOCKS; i++)
+	for (i = 0; i < COW_BATCH_NUM_HASH_LOCKS; i++)
 		pthread_spin_destroy(&hash_locks[i]);
 
 	/* Clean up chunk index */
 	for (i = 0; i < COW_MAX_POOL_CHUNKS; i++) {
 		pthread_spin_destroy(&chunk_index[i].lock);
-		INIT_LIST_HEAD(&chunk_index[i].pages);
+		INIT_LIST_HEAD(&chunk_index[i].batches);
 	}
 	atomic_store(&chunk_index_initialized, false);
 	atomic_store(&nr_active_chunks, 0);
 
-	pr_info("COW page buffer destroyed: applied=%lu discarded=%lu\n",
+	pr_info("COW batch buffer destroyed: batches=%lu pages=%lu applied=%lu discarded=%lu\n",
+		cow_buffer.nr_batches, cow_buffer.nr_pages,
 		cow_buffer.nr_applied, cow_buffer.nr_discarded);
 
 	/* Destroy all page pools last */
@@ -529,70 +677,81 @@ void cow_page_buffer_destroy(void)
 /*
  * Remove all pages in a range from the buffer.
  * Called when VMA is unmapped - no point keeping these pages.
+ * Operates at batch granularity: clears bitmap bits for affected pages.
  */
 void cow_page_buffer_remove_range(unsigned long start, unsigned long len)
 {
-	struct page_buffer_node *node;
-	unsigned long vaddr, end;
-	unsigned int hash, last_hash = UINT_MAX;
+	struct batch_buffer_entry *entry;
+	unsigned long base, end;
 	unsigned long removed = 0;
-	int i;
 
 	if (!cow_buffer.initialized)
 		return;
 
 	end = start + len;
 
-	for (vaddr = start; vaddr < end; vaddr += PAGE_SIZE) {
-		hash = page_buffer_hash(vaddr);
+	/* Iterate over 256KB-aligned batches that overlap the range */
+	for (base = batch_align(start); base < end; base += COW_BATCH_SIZE) {
+		unsigned int hash = batch_buffer_hash(base);
+		int lock_idx = lock_index(hash);
+		int first_page, last_page;
+		uint64_t clear_mask;
+		int cleared;
 
-		/* Switch locks when hash changes lock group */
-		if (lock_index(hash) != lock_index(last_hash)) {
-			if (last_hash != UINT_MAX)
-				pthread_spin_unlock(&hash_locks[lock_index(last_hash)]);
-			pthread_spin_lock(&hash_locks[lock_index(hash)]);
+		/* Which pages within this batch overlap [start, end)? */
+		first_page = (base < start) ? batch_page_index(start) : 0;
+		last_page = (base + COW_BATCH_SIZE > end)
+			    ? batch_page_index(end - 1) : (COW_BATCH_PAGES - 1);
+
+		/* Build mask of pages to clear */
+		clear_mask = 0;
+		{
+			int p;
+			for (p = first_page; p <= last_page; p++)
+				clear_mask |= (1ULL << p);
 		}
-		last_hash = hash;
 
-		/* Search for page in bucket */
-		hlist_for_each_entry(node, &cow_buffer.hash_table[hash], hash) {
-			for (i = 0; i < node->count; i++) {
-				if (node->entries[i].vaddr == vaddr) {
-					void *data = node->entries[i].data;
+		pthread_spin_lock(&hash_locks[lock_idx]);
+		hlist_for_each_entry(entry, &cow_buffer.hash_table[hash], hash) {
+			if (entry->base_vaddr != base)
+				continue;
 
-					/* Remove by moving last entry here */
-					node->count--;
-					if (i < node->count)
-						node->entries[i] = node->entries[node->count];
-
-					/* Free page data */
-					page_pool_put(data);
-					removed++;
-
-					/* Remove empty nodes */
-					if (node->count == 0) {
-						int chunk_id = node->chunk_id;
-						hlist_del(&node->hash);
-						pthread_spin_unlock(&hash_locks[lock_index(hash)]);
-						/* Also remove from chunk list */
-						if (chunk_id >= 0 && chunk_id < COW_MAX_POOL_CHUNKS) {
-							pthread_spin_lock(&chunk_index[chunk_id].lock);
-							list_del(&node->chunk_list);
-							atomic_fetch_sub(&chunk_index[chunk_id].page_count, 1);
-							pthread_spin_unlock(&chunk_index[chunk_id].lock);
-						}
-						xfree(node);
-						last_hash = UINT_MAX;  /* Force re-acquire */
-					}
-					goto next_page;
-				}
+			cleared = __builtin_popcountll(entry->page_bitmap & clear_mask);
+			if (cleared == 0) {
+				pthread_spin_unlock(&hash_locks[lock_idx]);
+				goto next_batch;
 			}
-		}
-next_page:;
-	}
 
-	if (last_hash != UINT_MAX)
-		pthread_spin_unlock(&hash_locks[lock_index(last_hash)]);
+			entry->page_bitmap &= ~clear_mask;
+			entry->nr_pages -= cleared;
+			removed += cleared;
+
+			if (entry->nr_pages == 0) {
+				int chunk_id = entry->chunk_id;
+				int j;
+
+				hlist_del(&entry->hash);
+				pthread_spin_unlock(&hash_locks[lock_idx]);
+
+				if (chunk_id >= 0 && chunk_id < COW_MAX_POOL_CHUNKS) {
+					pthread_spin_lock(&chunk_index[chunk_id].lock);
+					list_del(&entry->chunk_list);
+					atomic_fetch_sub(&chunk_index[chunk_id].batch_count, 1);
+					pthread_spin_unlock(&chunk_index[chunk_id].lock);
+				}
+				for (j = 0; j < COW_BATCH_PAGES; j++)
+					page_pool_put((char *)entry->data + j * PAGE_SIZE);
+				xfree(entry);
+				__sync_fetch_and_sub(&cow_buffer.nr_batches, 1);
+				goto next_batch;
+			}
+
+			pthread_spin_unlock(&hash_locks[lock_idx]);
+			goto next_batch;
+		}
+		pthread_spin_unlock(&hash_locks[lock_idx]);
+next_batch:;
+	}
 
 	if (removed > 0) {
 		__sync_fetch_and_sub(&cow_buffer.nr_pages, removed);
@@ -604,81 +763,64 @@ next_page:;
 
 /*
  * Re-add a page to the buffer for EAGAIN retry.
- * Called when UFFDIO_COPY fails with EAGAIN.
+ * Delegates to the per-page add path.
  */
 void cow_page_buffer_readd(unsigned long vaddr, void *data)
 {
-	struct page_buffer_node *node;
-	unsigned int hash;
-	int lock_idx;
-
-	hash = page_buffer_hash(vaddr);
-	lock_idx = lock_index(hash);
-
-	pthread_spin_lock(&hash_locks[lock_idx]);
-
-	/* Try to find space in existing node */
-	hlist_for_each_entry(node, &cow_buffer.hash_table[hash], hash) {
-		if (node->count < COW_PAGE_NODE_ENTRIES) {
-			node->entries[node->count].vaddr = vaddr;
-			node->entries[node->count].data = data;
-			node->count++;
-			pthread_spin_unlock(&hash_locks[lock_idx]);
-			__sync_fetch_and_add(&cow_buffer.nr_pages, 1);
-			page_state_set(vaddr, PAGE_STATE_EAGAIN_QUEUED);
-			return;
-		}
-	}
-
-	pthread_spin_unlock(&hash_locks[lock_idx]);
-
-	/* Need new node */
-	node = xmalloc(sizeof(*node));
-	BUG_ON(!node);
-
-	node->entries[0].vaddr = vaddr;
-	node->entries[0].data = data;
-	node->count = 1;
-	INIT_HLIST_NODE(&node->hash);
-	INIT_LIST_HEAD(&node->chunk_list);
-	node->chunk_id = page_pool_get_chunk_id(data);
-
-	pthread_spin_lock(&hash_locks[lock_idx]);
-	hlist_add_head(&node->hash, &cow_buffer.hash_table[hash]);
-	pthread_spin_unlock(&hash_locks[lock_idx]);
-
-	/* Add to chunk index for chunk-ordered drain */
-	if (node->chunk_id >= 0 && node->chunk_id < COW_MAX_POOL_CHUNKS) {
-		pthread_spin_lock(&chunk_index[node->chunk_id].lock);
-		list_add_tail(&node->chunk_list, &chunk_index[node->chunk_id].pages);
-		atomic_fetch_add(&chunk_index[node->chunk_id].page_count, 1);
-		pthread_spin_unlock(&chunk_index[node->chunk_id].lock);
-	}
-
-	__sync_fetch_and_add(&cow_buffer.nr_pages, 1);
+	cow_page_buffer_add(vaddr, data, PHASE4_POOL_ID, true);
 	page_state_set(vaddr, PAGE_STATE_EAGAIN_QUEUED);
 }
 
 /*
- * Drain a single page via UFFDIO_COPY and free it.
- * Returns 1 on success, 0 on soft handled, -1 on error.
+ * Drain a batch via UFFDIO_COPY(s) and free its data.
+ * Performs a single UFFDIO_COPY for full batches (bitmap == all-ones),
+ * or falls back to per-page copies for partial batches.
+ *
+ * Returns number of pages drained.
  */
-static int drain_apply_page(unsigned long vaddr, void *data, struct list_head *lpis)
+static unsigned long drain_apply_batch(struct batch_buffer_entry *entry,
+				       struct list_head *lpis)
 {
-	int uffd;
-	int ret;
+	unsigned long base = entry->base_vaddr;
+	void *data = entry->data;
+	uint64_t bitmap = entry->page_bitmap;
+	int nr = entry->nr_pages;
+	unsigned long applied = 0;
+	int uffd, i;
 
-	page_state_set(vaddr, PAGE_STATE_DRAIN_PENDING);
+	/* Fast path: full batch — single UFFDIO_COPY for 256KB */
+	if (bitmap == ~0ULL) {
+		for (i = 0; i < COW_BATCH_PAGES; i++)
+			page_state_set(base + i * PAGE_SIZE, PAGE_STATE_DRAIN_PENDING);
 
-	uffd = cow_get_uffd_for_vaddr(lpis, vaddr);
-	if (uffd < 0)
-		return -1;
+		uffd = cow_get_uffd_for_vaddr(lpis, base);
+		if (uffd >= 0) {
+			cow_uffd_copy(uffd, base, data, COW_BATCH_PAGES,
+				      NULL, lpis, COW_TRACK_STRICT, "DRAIN_BATCH");
+		}
+		applied = COW_BATCH_PAGES;
+	} else {
+		/* Partial batch — per-page copies for set bits */
+		while (bitmap) {
+			i = __builtin_ctzll(bitmap);
+			bitmap &= bitmap - 1;
 
-	ret = cow_uffd_copy(uffd, vaddr, data, 1,
-			    NULL, lpis, COW_TRACK_STRICT, "DRAIN");
+			page_state_set(base + i * PAGE_SIZE, PAGE_STATE_DRAIN_PENDING);
+			uffd = cow_get_uffd_for_vaddr(lpis, base + i * PAGE_SIZE);
+			if (uffd >= 0) {
+				cow_uffd_copy(uffd, base + i * PAGE_SIZE,
+					      (char *)data + i * PAGE_SIZE, 1,
+					      NULL, lpis, COW_TRACK_STRICT, "DRAIN");
+			}
+			applied++;
+		}
+	}
 
-	page_pool_put(data);
-	return ret;
+	/* Free entire batch buffer (all COW_BATCH_PAGES pages) */
+	for (i = 0; i < COW_BATCH_PAGES; i++)
+		page_pool_put((char *)data + i * PAGE_SIZE);
+
+	return applied;
 }
 
 /*
@@ -686,33 +828,26 @@ static int drain_apply_page(unsigned long vaddr, void *data, struct list_head *l
  * from buffer to reduce future page faults and free memory.
  *
  * Each worker handles a subset of CHUNKS for chunk-ordered draining.
- * By draining all pages from one chunk before moving to the next,
+ * By draining all batches from one chunk before moving to the next,
  * chunks can be freed progressively instead of all at the end.
- *
- * Thread safety is ensured by:
- *   - Per-chunk locks (chunk_index[].lock) for list iteration
- *   - Fine-grained hash bucket locks (hash_locks[]) for hash removal
- *   - Atomic counters for shared statistics
- *   - Thread-safe page_state and pf_tracker APIs
  */
 static void *background_drain_worker(void *arg)
 {
 	struct drain_thread_args *args = (struct drain_thread_args *)arg;
-	struct page_buffer_node *node, *tmp_node;
+	struct batch_buffer_entry *entry, *tmp_entry;
 	unsigned long drained = 0;
 	unsigned long last_progress_drained = 0;
 	time_t last_progress_time = 0;
 	int thread_id = args->thread_id;
 	int chunk_id;
 	int chunks_empty = 0;
-	int chunks_with_pages = 0;
+	int chunks_with_batches = 0;
 	char thread_name[16];
 
-	/* Set thread name for debugging (max 15 chars + null) */
 	snprintf(thread_name, sizeof(thread_name), "cow-drain-%d", thread_id);
 	pthread_setname_np(pthread_self(), thread_name);
 
-	pr_info("Drain thread %d started, buffered=%lu\n", thread_id, cow_buffer.nr_pages);
+	pr_info("Drain thread %d started, buffered=%lu pages\n", thread_id, cow_buffer.nr_pages);
 	last_progress_time = time(NULL);
 
 	while (!atomic_load(&drain_thread_stop) && cow_buffer.nr_pages > 0) {
@@ -723,51 +858,49 @@ static void *background_drain_worker(void *arg)
 
 		{
 			unsigned long chunk_drained = 0;
-			int i;
 
 			pthread_spin_lock(&chunk_index[chunk_id].lock);
-			list_for_each_entry_safe(node, tmp_node,
-						 &chunk_index[chunk_id].pages, chunk_list) {
-				for (i = 0; i < node->count; i++) {
-					unsigned long vaddr = node->entries[i].vaddr;
-					void *data = node->entries[i].data;
+			list_for_each_entry_safe(entry, tmp_entry,
+						 &chunk_index[chunk_id].batches, chunk_list) {
+				int nr = entry->nr_pages;
 
-					pthread_spin_unlock(&chunk_index[chunk_id].lock);
-					__sync_fetch_and_sub(&cow_buffer.nr_pages, 1);
+				/* Remove from chunk list while holding lock */
+				list_del(&entry->chunk_list);
+				atomic_fetch_sub(&chunk_index[chunk_id].batch_count, 1);
+				pthread_spin_unlock(&chunk_index[chunk_id].lock);
 
-					drain_apply_page(vaddr, data, drain_lpis);
-					drained++;
-					chunk_drained++;
+				__sync_fetch_and_sub(&cow_buffer.nr_pages, nr);
+				__sync_fetch_and_sub(&cow_buffer.nr_batches, 1);
 
-					/* Log progress every 100k pages or 10 seconds */
-					if (drained - last_progress_drained >= COW_LOG_SAMPLE_100K ||
-					    time(NULL) - last_progress_time >= COW_DRAIN_PROGRESS_SEC) {
-						pr_err("Drain thread %d: drained=%lu chunk=%d remaining=%lu\n",
-						       thread_id, drained, chunk_id, cow_buffer.nr_pages);
-						last_progress_drained = drained;
-						last_progress_time = time(NULL);
-					}
+				drained += drain_apply_batch(entry, drain_lpis);
+				chunk_drained += nr;
+				xfree(entry);
 
-					pthread_spin_lock(&chunk_index[chunk_id].lock);
+				/* Log progress every 100k pages or 10 seconds */
+				if (drained - last_progress_drained >= COW_LOG_SAMPLE_100K ||
+				    time(NULL) - last_progress_time >= COW_DRAIN_PROGRESS_SEC) {
+					pr_err("Drain thread %d: drained=%lu chunk=%d remaining=%lu\n",
+					       thread_id, drained, chunk_id, cow_buffer.nr_pages);
+					last_progress_drained = drained;
+					last_progress_time = time(NULL);
 				}
-				node->count = 0;
-				list_del(&node->chunk_list);
-				atomic_fetch_sub(&chunk_index[chunk_id].page_count, 1);
+
+				pthread_spin_lock(&chunk_index[chunk_id].lock);
 			}
 			pthread_spin_unlock(&chunk_index[chunk_id].lock);
 
 			if (chunk_drained == 0)
 				chunks_empty++;
 			else
-				chunks_with_pages++;
+				chunks_with_batches++;
 		}
 	}
 
 	/* Update global statistics */
 	atomic_fetch_add(&total_drained, drained);
 
-	pr_info("Drain thread %d finished: drained=%lu chunks_empty=%d chunks_with_pages=%d\n",
-	       thread_id, drained, chunks_empty, chunks_with_pages);
+	pr_info("Drain thread %d finished: drained=%lu chunks_empty=%d chunks_with_batches=%d\n",
+	       thread_id, drained, chunks_empty, chunks_with_batches);
 
 	/* Decrement active thread count */
 	if (atomic_fetch_sub(&drain_threads_active, 1) == 1) {

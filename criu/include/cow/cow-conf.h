@@ -185,16 +185,21 @@
  * SECTION 4: Hash Table Configuration
  * ================================================================ */
 
-/* Page buffer hash table (cow-uffd.c) */
-#define COW_PAGE_BUFFER_HASH_BITS	20
-#define COW_PAGE_BUFFER_HASH_SIZE	(1 << COW_PAGE_BUFFER_HASH_BITS)  /* 1M buckets */
+/*
+ * Batch buffer: hash table stores 256KB-aligned entries.
+ * Each entry holds 64 contiguous pages with a bitmap tracking validity.
+ * Drain can UFFDIO_COPY 256KB at once instead of per-page.
+ */
+#define COW_BATCH_SHIFT			18  /* log2(COW_BATCH_SIZE) = log2(256KB) */
+#define COW_BATCH_ALIGN_MASK		(~((1UL << COW_BATCH_SHIFT) - 1))
 
-/* Fine-grained locking for page buffer */
-#define COW_NUM_HASH_LOCKS		8192
-#define COW_BUCKETS_PER_LOCK		128  /* 1M / 8K = 128 buckets per lock */
+/* 256K buckets: ~5 entries/bucket at 300GB (1.2M entries) */
+#define COW_BATCH_BUFFER_HASH_BITS	18
+#define COW_BATCH_BUFFER_HASH_SIZE	(1 << COW_BATCH_BUFFER_HASH_BITS)
 
-/* Unrolled linked list node entry count */
-#define COW_PAGE_NODE_ENTRIES		32
+/* Fine-grained locking for batch buffer */
+#define COW_BATCH_NUM_HASH_LOCKS	4096
+#define COW_BATCH_BUCKETS_PER_LOCK	64  /* 256K / 4K */
 
 /* Page state tracker hash table */
 #define COW_PAGE_STATE_HASH_BITS	18

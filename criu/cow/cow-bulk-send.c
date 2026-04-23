@@ -1731,14 +1731,11 @@ static void *p3_bulk_sender_thread(void *arg)
 		while ((work = get_next_work_item()) != NULL) {
 			unsigned long vaddr;
 
-			for (vaddr = work->start; vaddr < work->end;
-			     vaddr += COW_BATCH_PAGES * PAGE_SIZE) {
-				int batch_pages;
+			for (vaddr = work->start; vaddr < work->end; ) {
+				unsigned long next_bound = (vaddr + COW_BATCH_SIZE) & COW_BATCH_ALIGN_MASK;
+				unsigned long batch_end = (next_bound < work->end) ? next_bound : work->end;
+				int batch_pages = (batch_end - vaddr) / PAGE_SIZE;
 				int sent;
-
-				batch_pages = (work->end - vaddr) / PAGE_SIZE;
-				if (batch_pages > COW_BATCH_PAGES)
-					batch_pages = COW_BATCH_PAGES;
 
 				sent = send_lazy_vma_pages_batch(
 					ctx->socket, work->lve, vaddr, batch_pages,
@@ -1751,6 +1748,7 @@ static void *p3_bulk_sender_thread(void *arg)
 				}
 
 				total_sent += sent;
+				vaddr += batch_pages * PAGE_SIZE;
 			}
 			chunks_processed++;
 		}

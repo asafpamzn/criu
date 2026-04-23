@@ -18,11 +18,21 @@ int cow_page_buffer_thread_init(int thread_id);
 void *cow_page_buffer_lookup_and_remove(unsigned long vaddr);
 
 /*
- * Add page to buffer (thread-safe).
- * thread_id: receiver thread id for lock-free pool allocation (0-15)
- *            must have called cow_page_buffer_thread_init(thread_id) first
- * nocopy: if true, takes ownership of data pointer (from page_pool_get_chunk)
- *         if false, copies data to new page pool allocation
+ * Add pages to a 256KB-aligned batch in the buffer.
+ * base_vaddr must be 256KB-aligned.
+ * data must point to a COW_BATCH_PAGES-sized page pool allocation.
+ * Pages live at data + page_offset * PAGE_SIZE.
+ * nocopy: if true, takes ownership of data (full COW_BATCH_PAGES allocation)
+ *         if false, copies the valid pages into a new allocation
+ */
+int cow_page_buffer_add_batch(unsigned long base_vaddr, void *data,
+			      int nr_pages, int page_offset,
+			      int thread_id, bool nocopy);
+
+/*
+ * Add a single page to the buffer (legacy per-page path).
+ * Groups the page into its 256KB-aligned batch automatically.
+ * Used by Phase 4 dirty page overwrites.
  */
 int cow_page_buffer_add(unsigned long vaddr, void *data, int thread_id, bool nocopy);
 

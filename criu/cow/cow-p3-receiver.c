@@ -68,7 +68,6 @@ static int p3_receive_and_buffer(struct p3_receiver_ctx *ctx)
 	int sk = ctx->socket;
 	int nr_pages, i, ret = -1;
 	int decomp_ret;
-	char *chunk_buf;
 
 	/* Receive header */
 	ret = page_server_recv(sk, &pi, sizeof(pi), MSG_WAITALL);
@@ -103,36 +102,29 @@ static int p3_receive_and_buffer(struct p3_receiver_ctx *ctx)
 	}
 
 	/*
-	 * Get exactly nr_pages from page pool for direct decompression.
-	 * Using page_pool_get_pages() instead of page_pool_get_chunk() to
-	 * allocate only what we need, avoiding wasted pages that would need
-	 * to be freed immediately.
+	 * Allocate COW_BATCH_PAGES from page pool, decompress directly
+	 * at the correct offset, hand off with nocopy=true (zero memcpy).
+	 *
+	 * Works for both aligned (page_offset=0) and unaligned batches.
 	 */
-	chunk_buf = page_pool_get_pages(ctx->thread_id, nr_pages);
-	BUG_ON(!chunk_buf);
+	{
+		unsigned long base = pi.vaddr & COW_BATCH_ALIGN_MASK;
+		int page_offset = ((pi.vaddr - base) >> PAGE_SHIFT);
+		char *pool_buf;
 
-	/* Decompress directly into page pool pages */
-	decomp_ret = LZ4_decompress_safe(compressed_buf, chunk_buf,
-					 compressed_size, nr_pages * PAGE_SIZE);
-	if (decomp_ret <= 0 || decomp_ret % PAGE_SIZE != 0) {
-		pr_err("BUG: P3 receive: decompression failed or not page-aligned (got %d)\n",
-		       decomp_ret);
-		BUG();
-	}
-	if (decomp_ret != nr_pages * PAGE_SIZE) {
-		pr_err("BUG: P3 receive: decompression size mismatch (expected %d, got %d)\n",
-		       nr_pages * (int)PAGE_SIZE, decomp_ret);
-		BUG();
-	}
+		pool_buf = page_pool_get_pages(ctx->thread_id, COW_BATCH_PAGES);
+		BUG_ON(!pool_buf);
 
-	/* Add each page to buffer - no copy, just store the pointer */
-	for (i = 0; i < nr_pages; i++) {
-		unsigned long vaddr = pi.vaddr + i * PAGE_SIZE;
-		if (cow_page_buffer_add(vaddr, chunk_buf + i * PAGE_SIZE, ctx->thread_id, true) < 0) {
-			pr_err("P3 receive: failed to buffer page at 0x%lx\n", vaddr);
-			/* Free remaining pages on error */
-			for (; i < nr_pages; i++)
-				page_pool_put(chunk_buf + i * PAGE_SIZE);
+		decomp_ret = LZ4_decompress_safe(compressed_buf,
+						 pool_buf + page_offset * PAGE_SIZE,
+						 compressed_size, nr_pages * PAGE_SIZE);
+		BUG_ON(decomp_ret != nr_pages * (int)PAGE_SIZE);
+
+		if (cow_page_buffer_add_batch(base, pool_buf, nr_pages,
+					      page_offset, ctx->thread_id, true) < 0) {
+			pr_err("P3 receive: failed to buffer batch at 0x%lx\n", base);
+			for (i = 0; i < COW_BATCH_PAGES; i++)
+				page_pool_put(pool_buf + i * PAGE_SIZE);
 			return -1;
 		}
 	}
