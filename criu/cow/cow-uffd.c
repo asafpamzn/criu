@@ -266,6 +266,8 @@ int cow_uffd_copy(int uffd, unsigned long vaddr, void *data,
 		if (flags & COW_TRACK_RETRY)
 			return -EAGAIN;
 		__sync_fetch_and_add(&cow_buffer.nr_eagain, 1);
+		pr_err("EAGAIN_DEBUG: %s EAGAIN at 0x%lx nr_pages=%lu\n",
+		       caller, vaddr, nr_pages);
 		if (lpis) {
 			/* Drain mode - queue copies data, caller frees original */
 			cow_queue_drain_eagain_request(lpis, vaddr, data);
@@ -1427,7 +1429,8 @@ int cow_queue_eagain_request(struct lazy_pages_info *lpi, __u64 address,
 	/* Only set page state after successfully queueing */
 	page_state_set(address, PAGE_STATE_EAGAIN_QUEUED);
 
-	pr_debug("Queued EAGAIN request 0x%llx (op=%s)\n", address, op_name);
+	pr_err("EAGAIN_DEBUG: queued 0x%llx nr_pages=%lu op=%s buf=%p buf_copy=%p\n",
+	       address, nr_pages, op_name, buf, buf_copy);
 	return 0;
 }
 /*
@@ -1583,6 +1586,9 @@ int cow_process_eagain_requests(void)
 
 		uffd_stats.eagain_processed++;
 
+		pr_err("EAGAIN_DEBUG: retrying 0x%llx nr_pages=%lu op=%s buf=%p\n",
+		       req->address, req->nr_pages, req->buf ? "copy" : "zero", req->buf);
+
 		/* Call appropriate retry function based on operation type */
 		if (req->buf)
 			ret = retry_uffd_copy(req);
@@ -1592,8 +1598,7 @@ int cow_process_eagain_requests(void)
 		if (ret == -EAGAIN) {
 			/* Still blocked - keep in queue for next attempt */
 			uffd_stats.eagain_blocked++;
-			pr_debug("EAGAIN retry still blocked for 0x%llx (op=%s)\n",
-				 req->address, req->buf ? "copy" : "zero");
+			pr_err("EAGAIN_DEBUG: still blocked 0x%llx\n", req->address);
 			continue;
 		} else if (ret < 0) {
 			/* Error - remove from queue (state already set by retry func) */
@@ -1610,6 +1615,8 @@ int cow_process_eagain_requests(void)
 
 		/* Success! */
 		uffd_stats.eagain_succeeded++;
+		pr_err("EAGAIN_DEBUG: succeeded 0x%llx nr_pages=%lu\n",
+		       req->address, req->nr_pages);
 
 		/* Clean up and remove from queue */
 		list_del(&req->l);
