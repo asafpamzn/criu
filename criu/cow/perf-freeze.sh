@@ -27,7 +27,7 @@ CRIU_PROCNAME=criu
 # Start matches freeze entry. End matches freeze exit.
 # VERIFY against your log first - see PREFLIGHT below.
 START_RE='Phase 3 freeze started|cow_wait_p3_threads starting|TIMING: cow_wait_p3_threads|freeze signal|Freezing process'
-END_RE='cow_wait_p3_threads done|Phase 3 freeze done|P3 threads done|TIMING: P3 complete|cow dump done|Dump finished'
+END_RE='TIMING: cow_wait_p3_threads took'
 
 # Safety cap: stop perf after this many seconds even if END_RE never matches.
 # Freeze window is ~3s; 30s is a generous cap.
