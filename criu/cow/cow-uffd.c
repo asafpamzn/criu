@@ -517,6 +517,7 @@ void cow_page_buffer_mark_pages(unsigned long base_vaddr,
 
 				if (!(entry->page_bitmap & (1ULL << idx))) {
 					entry->page_bitmap |= (1ULL << idx);
+					entry->initial_bitmap |= (1ULL << idx);
 					entry->nr_pages++;
 					__sync_fetch_and_add(&cow_buffer.nr_pages, 1);
 				}
