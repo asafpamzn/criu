@@ -60,9 +60,11 @@ if [ ! -r "$LOG" ]; then
 	exit 1
 fi
 
-rm -f "$OUT" "$PIDFILE"
+STAT_OUT=/tmp/criu-freeze-stat.txt
+rm -f "$OUT" "$PIDFILE" "$STAT_OUT"
 
 PERF_PID=0
+STAT_PID=0
 TAIL_PID=0
 
 cleanup() {
@@ -80,6 +82,9 @@ cleanup() {
 			kill -KILL "$pid" 2>/dev/null || true
 		fi
 		rm -f "$PIDFILE"
+	fi
+	if [ "$STAT_PID" -gt 0 ] && kill -0 "$STAT_PID" 2>/dev/null; then
+		kill -INT "$STAT_PID" 2>/dev/null || true
 	fi
 	if [ "$TAIL_PID" -gt 0 ] && kill -0 "$TAIL_PID" 2>/dev/null; then
 		kill "$TAIL_PID" 2>/dev/null || true
@@ -127,6 +132,11 @@ start_perf() {
 	echo "$PERF_PID" > "$PIDFILE"
 	echo "$pids" > /tmp/perf-freeze.criu_pids
 	echo "perf-freeze: perf record started (pid $PERF_PID)" >&2
+
+	# Also run perf stat for hardware counters (IPC, cache misses)
+	"$PERF" stat -e cycles,instructions,cache-references,cache-misses,LLC-loads,LLC-load-misses,L1-dcache-loads,L1-dcache-load-misses -p "$pids" -o "$STAT_OUT" 2>/dev/null &
+	STAT_PID=$!
+	echo "perf-freeze: perf stat started (pid $STAT_PID)" >&2
 }
 
 verify_criu_in_capture() {
@@ -162,10 +172,19 @@ stop_perf() {
 		kill -INT "$PERF_PID" 2>/dev/null
 		wait "$PERF_PID" 2>/dev/null
 	fi
+	if [ "$STAT_PID" -gt 0 ] && kill -0 "$STAT_PID" 2>/dev/null; then
+		kill -INT "$STAT_PID" 2>/dev/null
+		wait "$STAT_PID" 2>/dev/null
+	fi
 	rm -f "$PIDFILE"
 	echo "perf-freeze: stopped. Output: $OUT" >&2
 	if [ -s "$OUT" ]; then
 		verify_criu_in_capture
+	fi
+	if [ -s "$STAT_OUT" ]; then
+		echo "perf-freeze: --- hardware counters ---" >&2
+		cat "$STAT_OUT" >&2
+		echo "perf-freeze: ---" >&2
 	fi
 	echo "perf-freeze: inspect ->" >&2
 	echo "  sudo $PERF report -i $OUT -g graph,0.5,caller --stdio | head -100" >&2
