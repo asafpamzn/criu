@@ -50,6 +50,7 @@ struct batch_buffer_entry {
 	unsigned long base_vaddr;	/* 256KB-aligned start address */
 	void *data;			/* Contiguous page pool allocation */
 	uint64_t page_bitmap;		/* 1 = page present, 0 = absent */
+	uint64_t initial_bitmap;	/* Bits ever set (for drain free accounting) */
 	int nr_pages;			/* popcount(page_bitmap) */
 	struct hlist_node hash;
 	struct list_head chunk_list;	/* Link in chunk's list for ordered drain */
@@ -378,6 +379,7 @@ int cow_page_buffer_add_batch(unsigned long base_vaddr, void *data,
 
 				if (!(entry->page_bitmap & (1ULL << idx))) {
 					entry->page_bitmap |= (1ULL << idx);
+					entry->initial_bitmap |= (1ULL << idx);
 					entry->nr_pages++;
 					__sync_fetch_and_add(&cow_buffer.nr_pages, 1);
 				}
@@ -419,6 +421,7 @@ int cow_page_buffer_add_batch(unsigned long base_vaddr, void *data,
 	entry->base_vaddr = base_vaddr;
 	entry->data = batch_data;
 	entry->page_bitmap = new_bitmap;
+	entry->initial_bitmap = new_bitmap;
 	entry->nr_pages = nr_pages;
 	INIT_HLIST_NODE(&entry->hash);
 	INIT_LIST_HEAD(&entry->chunk_list);
@@ -561,6 +564,7 @@ int cow_page_buffer_add(unsigned long vaddr, void *data, int thread_id, bool noc
 
 			if (!(entry->page_bitmap & (1ULL << page_idx))) {
 				entry->page_bitmap |= (1ULL << page_idx);
+				entry->initial_bitmap |= (1ULL << page_idx);
 				entry->nr_pages++;
 				__sync_fetch_and_add(&cow_buffer.nr_pages, 1);
 			}
@@ -590,6 +594,7 @@ int cow_page_buffer_add(unsigned long vaddr, void *data, int thread_id, bool noc
 	entry->base_vaddr = base;
 	entry->data = batch_data;
 	entry->page_bitmap = (1ULL << page_idx);
+	entry->initial_bitmap = (1ULL << page_idx);
 	entry->nr_pages = 1;
 	INIT_HLIST_NODE(&entry->hash);
 	INIT_LIST_HEAD(&entry->chunk_list);
@@ -681,17 +686,24 @@ void *cow_page_buffer_lookup_and_remove(unsigned long vaddr)
 				pthread_spin_unlock(&chunk_index[chunk_id].lock);
 			}
 			/*
-			 * Don't free the data buffer yet — the page_ptr we're
-			 * returning points inside it. The caller will
-			 * page_pool_put(page_ptr) which decrements the chunk
-			 * refcount. We must free the remaining COW_BATCH_PAGES-1
-			 * pages that are no longer referenced.
+			 * Free pages we still own. Skip page_idx (caller frees)
+			 * and pages already freed by earlier page faults
+			 * (initial_bitmap bit set, page_bitmap bit clear).
+			 * page_bitmap is 0 here (entry empty), so freed_by_pf =
+			 * initial_bitmap minus the current page_idx bit.
 			 */
 			{
+				uint64_t free_bm = ~entry->initial_bitmap;
 				int j;
-				for (j = 0; j < COW_BATCH_PAGES; j++) {
-					if (j != page_idx)
-						page_pool_put((char *)entry->data + j * PAGE_SIZE);
+
+				/* Also free unused slots (never had data) */
+				/* free_bm has bits set for unused slots */
+				/* Don't free page_idx — caller will */
+				free_bm &= ~(1ULL << page_idx);
+				while (free_bm) {
+					j = __builtin_ctzll(free_bm);
+					free_bm &= free_bm - 1;
+					page_pool_put((char *)entry->data + j * PAGE_SIZE);
 				}
 			}
 			entry->magic = BATCH_ENTRY_DEAD;
@@ -732,9 +744,13 @@ void cow_page_buffer_destroy(void)
 		pthread_spin_lock(&hash_locks[lock_idx]);
 		hlist_for_each_entry_safe(entry, tmp,
 					  &cow_buffer.hash_table[i], hash) {
-			/* Free all pages in the batch */
-			for (j = 0; j < COW_BATCH_PAGES; j++)
+			/* Free pages still owned (bitmap) + unused slots (~initial) */
+			uint64_t free_bm = entry->page_bitmap | ~entry->initial_bitmap;
+			while (free_bm) {
+				j = __builtin_ctzll(free_bm);
+				free_bm &= free_bm - 1;
 				page_pool_put((char *)entry->data + j * PAGE_SIZE);
+			}
 			hlist_del(&entry->hash);
 			xfree(entry);
 		}
@@ -824,7 +840,7 @@ void cow_page_buffer_remove_range(unsigned long start, unsigned long len)
 
 			if (entry->nr_pages == 0) {
 				int chunk_id = entry->chunk_id;
-				int j;
+				uint64_t free_bm;
 
 				hlist_del(&entry->hash);
 				pthread_spin_unlock(&hash_locks[lock_idx]);
@@ -835,8 +851,13 @@ void cow_page_buffer_remove_range(unsigned long start, unsigned long len)
 					atomic_fetch_sub(&chunk_index[chunk_id].batch_count, 1);
 					pthread_spin_unlock(&chunk_index[chunk_id].lock);
 				}
-				for (j = 0; j < COW_BATCH_PAGES; j++)
+				/* Free owned + unused, skip page-fault-served */
+				free_bm = entry->page_bitmap | ~entry->initial_bitmap;
+				while (free_bm) {
+					int j = __builtin_ctzll(free_bm);
+					free_bm &= free_bm - 1;
 					page_pool_put((char *)entry->data + j * PAGE_SIZE);
+				}
 				xfree(entry);
 				__sync_fetch_and_sub(&cow_buffer.nr_batches, 1);
 				goto next_batch;
@@ -910,24 +931,31 @@ static unsigned long drain_apply_batch(struct batch_buffer_entry *entry,
 	}
 
 	/*
-	 * Free pool pages. We allocated COW_BATCH_PAGES (64) but page faults
-	 * may have already freed some via page_pool_put. Only free pages that
-	 * were NOT already freed by page fault (still set in bitmap), plus
-	 * unused slots (never had valid data but still hold a refcount).
+	 * Free pool pages. page_pool_get_pages(64) set refcount += 64.
+	 * Page faults may have already freed some (cleared bitmap bits).
 	 *
-	 * pages freed by page fault = bits that were set at creation but are
-	 * now clear. We don't track the creation bitmap, so log if bitmap != ~0
-	 * to prove the theory.
+	 * free_bitmap = pages drain owns (bitmap) | unused slots (~initial_bitmap)
+	 * Skip: pages served by page fault (initial_bitmap & ~bitmap) — already freed.
 	 */
-	if (bitmap != ~0ULL) {
-		int missing = COW_BATCH_PAGES - __builtin_popcountll(bitmap);
-		pr_err("DRAIN_FREE_DEBUG: base=0x%lx bitmap=0x%llx missing=%d pages "
-		       "(page faults served before drain) — freeing only %d of 64\n",
-		       base, (unsigned long long)bitmap, missing,
-		       COW_BATCH_PAGES - missing);
+	{
+		uint64_t free_bitmap = entry->page_bitmap | ~entry->initial_bitmap;
+		int free_count = __builtin_popcountll(free_bitmap);
+		int pf_served = __builtin_popcountll(entry->initial_bitmap & ~entry->page_bitmap);
+
+		if (pf_served > 0) {
+			pr_err("DRAIN_FREE_DEBUG: base=0x%lx bitmap=0x%llx initial=0x%llx "
+			       "pf_served=%d freeing=%d of 64\n",
+			       base, (unsigned long long)entry->page_bitmap,
+			       (unsigned long long)entry->initial_bitmap,
+			       pf_served, free_count);
+		}
+
+		while (free_bitmap) {
+			i = __builtin_ctzll(free_bitmap);
+			free_bitmap &= free_bitmap - 1;
+			page_pool_put((char *)data + i * PAGE_SIZE);
+		}
 	}
-	for (i = 0; i < COW_BATCH_PAGES; i++)
-		page_pool_put((char *)data + i * PAGE_SIZE);
 
 	return applied;
 }
