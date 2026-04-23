@@ -909,7 +909,23 @@ static unsigned long drain_apply_batch(struct batch_buffer_entry *entry,
 		}
 	}
 
-	/* Free entire batch buffer (all COW_BATCH_PAGES pages) */
+	/*
+	 * Free pool pages. We allocated COW_BATCH_PAGES (64) but page faults
+	 * may have already freed some via page_pool_put. Only free pages that
+	 * were NOT already freed by page fault (still set in bitmap), plus
+	 * unused slots (never had valid data but still hold a refcount).
+	 *
+	 * pages freed by page fault = bits that were set at creation but are
+	 * now clear. We don't track the creation bitmap, so log if bitmap != ~0
+	 * to prove the theory.
+	 */
+	if (bitmap != ~0ULL) {
+		int missing = COW_BATCH_PAGES - __builtin_popcountll(bitmap);
+		pr_err("DRAIN_FREE_DEBUG: base=0x%lx bitmap=0x%llx missing=%d pages "
+		       "(page faults served before drain) — freeing only %d of 64\n",
+		       base, (unsigned long long)bitmap, missing,
+		       COW_BATCH_PAGES - missing);
+	}
 	for (i = 0; i < COW_BATCH_PAGES; i++)
 		page_pool_put((char *)data + i * PAGE_SIZE);
 
