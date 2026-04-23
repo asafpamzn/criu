@@ -364,6 +364,12 @@ int cow_page_buffer_add_batch(unsigned long base_vaddr, void *data,
 	/* Check if batch entry already exists (dirty re-send) */
 	hlist_for_each_entry(entry, &cow_buffer.hash_table[hash], hash) {
 		if (entry->base_vaddr == base_vaddr) {
+			pr_err("BATCH_DEBUG: EXISTING base=0x%lx offset=%d nr=%d "
+			       "nocopy=%d existing_bitmap=0x%llx new_bitmap=0x%llx\n",
+			       base_vaddr, page_offset, nr_pages, nocopy,
+			       (unsigned long long)entry->page_bitmap,
+			       (unsigned long long)new_bitmap);
+
 			/* Overwrite pages in existing batch */
 			for (i = 0; i < nr_pages; i++) {
 				int idx = page_offset + i;
@@ -384,12 +390,17 @@ int cow_page_buffer_add_batch(unsigned long base_vaddr, void *data,
 
 			/* Free incoming data if we took ownership */
 			if (nocopy) {
+				pr_err("BATCH_DEBUG: FREEING duplicate nocopy buf %p (64 puts)\n", data);
 				for (i = 0; i < COW_BATCH_PAGES; i++)
 					page_pool_put((char *)data + i * PAGE_SIZE);
 			}
 			return 0;
 		}
 	}
+
+	pr_debug("BATCH_DEBUG: NEW base=0x%lx offset=%d nr=%d nocopy=%d bitmap=0x%llx\n",
+		 base_vaddr, page_offset, nr_pages, nocopy,
+		 (unsigned long long)new_bitmap);
 
 	/* New batch: take ownership or copy into new 64-page allocation */
 	if (nocopy) {

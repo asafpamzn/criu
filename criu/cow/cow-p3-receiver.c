@@ -112,6 +112,11 @@ static int p3_receive_and_buffer(struct p3_receiver_ctx *ctx)
 		int page_offset = ((pi.vaddr - base) >> PAGE_SHIFT);
 		char *pool_buf;
 
+		if (page_offset != 0) {
+			pr_err("P3_RECV_DEBUG: UNALIGNED vaddr=0x%lx base=0x%lx offset=%d nr=%d thread=%d\n",
+			       (unsigned long)pi.vaddr, base, page_offset, nr_pages, ctx->thread_id);
+		}
+
 		pool_buf = page_pool_get_pages(ctx->thread_id, COW_BATCH_PAGES);
 		BUG_ON(!pool_buf);
 
