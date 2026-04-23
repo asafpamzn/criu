@@ -79,38 +79,6 @@ static struct p3_thread_ctx p3_threads[COW_NUM_P3_THREADS];
 static volatile int p3_threads_active = 0;
 static unsigned long p3_total_pages_sent = 0;
 
-/*
- * A slice of a dirty region: a contiguous [start, start + nr_pages*PAGE)
- * sub-range of one dirty_region_entry. A batch may mix many whole small
- * regions with a sliced portion of a larger one.
- */
-struct dirty_slice {
-	unsigned long start;
-	int nr_pages;
-	u64 dst_id;
-};
-
-/* Pipeline: reader enqueues work items, compressor dequeues and sends */
-struct compress_work {
-	void *buffer;
-	struct dirty_slice slices[COW_BATCH_PAGES];
-	int nr_slices;
-	int total_pages;
-};
-
-DECLARE_SPSC_NODE(compress, struct compress_work);
-
-struct pipeline_ctx {
-	struct compress_spsc_node *head;
-	struct compress_spsc_node *tail;
-	unsigned long size;
-	struct p3_thread_ctx *p3_ctx;
-	volatile bool done;
-	pthread_t compressor;
-};
-
-static struct pipeline_ctx pipelines[COW_NUM_P3_THREADS];
-
 /* Global flag for signaling last scan (set by main thread after freeze) */
 static volatile bool g_last_scan_flag = false;
 
@@ -1582,6 +1550,17 @@ static int send_lazy_vma_pages_batch(int sk, struct lazy_vma_entry *lve,
 }
 
 /*
+ * A slice of a dirty region: a contiguous [start, start + nr_pages*PAGE)
+ * sub-range of one dirty_region_entry. A batch may mix many whole small
+ * regions with a sliced portion of a larger one.
+ */
+struct dirty_slice {
+	unsigned long start;
+	int nr_pages;
+	u64 dst_id;
+};
+
+/*
  * Read nr_slices ranges from the source process in one process_vm_readv,
  * then send each slice via the existing compressed path on the
  * corresponding buffer offset.
@@ -1654,86 +1633,6 @@ static int send_dirty_slices(struct p3_thread_ctx *ctx,
 	}
 
 	return total_sent;
-}
-
-/*
- * Compressor thread: dequeues work items from a per-pair SPSC queue,
- * LZ4-compresses and sends each slice, then frees the work item.
- * One compressor per reader thread.
- */
-static void *p3_compressor_thread(void *arg)
-{
-	struct pipeline_ctx *pipe = arg;
-	struct p3_thread_ctx *ctx = pipe->p3_ctx;
-	struct compress_work *work;
-
-	while (1) {
-		work = spsc_dequeue(pipe->head, pipe->size);
-		if (work) {
-			unsigned long offset = 0;
-			int i, total_pages = 0;
-
-			for (i = 0; i < work->nr_slices; i++) {
-				int nr_pages = work->slices[i].nr_pages;
-				int srv;
-
-				srv = send_pages_batch_compressed(ctx->socket,
-								  (char *)work->buffer + offset,
-								  nr_pages,
-								  work->slices[i].dst_id,
-								  work->slices[i].start, 1);
-				BUG_ON(srv < 0);
-				total_pages += nr_pages;
-				offset += (unsigned long)nr_pages * PAGE_SIZE;
-			}
-			ctx->pages_sent += total_pages;
-			tls_total_sent_pages += total_pages;
-
-			xfree(work->buffer);
-			xfree(work);
-			continue;
-		}
-
-		if (__atomic_load_n(&pipe->done, __ATOMIC_ACQUIRE))
-			break;
-
-		usleep(COW_USLEEP_100US);
-	}
-
-	/* Drain remaining items after done flag */
-	while ((work = spsc_dequeue(pipe->head, pipe->size)) != NULL) {
-		unsigned long offset = 0;
-		int i, total_pages = 0;
-
-		for (i = 0; i < work->nr_slices; i++) {
-			int nr_pages = work->slices[i].nr_pages;
-			int srv;
-
-			srv = send_pages_batch_compressed(ctx->socket,
-							  (char *)work->buffer + offset,
-							  nr_pages,
-							  work->slices[i].dst_id,
-							  work->slices[i].start, 1);
-			BUG_ON(srv < 0);
-			total_pages += nr_pages;
-			offset += (unsigned long)nr_pages * PAGE_SIZE;
-		}
-		ctx->pages_sent += total_pages;
-		tls_total_sent_pages += total_pages;
-
-		xfree(work->buffer);
-		xfree(work);
-	}
-
-	/* Flush thread-local counters to globals */
-	__sync_fetch_and_add(&g_total_sent_pages, tls_total_sent_pages);
-	__sync_fetch_and_add(&g_compress_uncompressed_bytes, tls_compress_in_bytes);
-	__sync_fetch_and_add(&g_compress_compressed_bytes, tls_compress_out_bytes);
-	tls_total_sent_pages = 0;
-	tls_compress_in_bytes = 0;
-	tls_compress_out_bytes = 0;
-
-	return NULL;
 }
 
 /*
@@ -1931,15 +1830,6 @@ static void *p3_bulk_sender_thread(void *arg)
 		unsigned long queue_out_start;
 		unsigned long queue_in_bytes, queue_out_bytes;
 		float queue_ratio_pct = 0.0f;
-		struct pipeline_ctx *pipe = &pipelines[thread_id];
-
-		/* Init pipeline SPSC queue and start compressor thread */
-		pipe->p3_ctx = ctx;
-		pipe->done = false;
-		BUG_ON(spsc_init(pipe->head, pipe->tail, pipe->size,
-				  struct compress_spsc_node));
-		BUG_ON(pthread_create(&pipe->compressor, NULL,
-				      p3_compressor_thread, pipe));
 
 		while (!__atomic_load_n(&g_scanner_freeze_signal, __ATOMIC_ACQUIRE)) {
 			usleep(COW_USLEEP_1MS);
@@ -1968,6 +1858,7 @@ static void *p3_bulk_sender_thread(void *arg)
 			int q = (int)(raw_q % (unsigned int)COW_TOTAL_QUEUES);
 			struct dirty_region_entry *region;
 			int expected;
+			int sent;
 
 			/* Track when freeze signal was sent (Phase 3 start) */
 			if (!p3_started && g_last_scan_flag) {
@@ -2047,48 +1938,21 @@ static void *p3_bulk_sender_thread(void *arg)
 					 */
 				}
 
-				{
-					struct compress_work *work;
-					struct iovec local_iov;
-					struct iovec remote_iov[COW_BATCH_PAGES];
-					unsigned long total_bytes = 0;
-					int batch_pages = 0;
-					int si;
-					ssize_t rv;
-
-					work = xmalloc(sizeof(*work));
-					BUG_ON(!work);
-					work->buffer = xmalloc(COW_BATCH_SIZE);
-					BUG_ON(!work->buffer);
-
-					for (si = 0; si < nr_slices; si++) {
-						unsigned long len = (unsigned long)slices[si].nr_pages * PAGE_SIZE;
-						remote_iov[si].iov_base = (void *)slices[si].start;
-						remote_iov[si].iov_len = len;
-						total_bytes += len;
-						batch_pages += slices[si].nr_pages;
-					}
-					local_iov.iov_base = work->buffer;
-					local_iov.iov_len = total_bytes;
-
-					rv = process_vm_readv(g_scanner_source_pid,
-							      &local_iov, 1,
-							      remote_iov, nr_slices, 0);
-					BUG_ON(rv != (ssize_t)total_bytes);
-
-					memcpy(work->slices, slices,
-					       nr_slices * sizeof(struct dirty_slice));
-					work->nr_slices = nr_slices;
-					work->total_pages = batch_pages;
-
-					spsc_enqueue(pipe->tail, pipe->size,
-						     work, struct compress_spsc_node);
-
-					loop_total_pages += batch_pages;
+				sent = send_dirty_slices(ctx, g_scanner_source_pid,
+							 slices, nr_slices);
+				if (sent > 0) {
+					loop_total_pages += sent;
 					slices_sent += nr_slices;
 					packed_batches++;
 					if (p3_started)
-						p3_pages += batch_pages;
+						p3_pages += sent;
+				} else if (sent < 0) {
+					ctx->error = true;
+					if (region) {
+						xfree(region);
+						region = NULL;
+					}
+					break;
 				}
 			}
 
@@ -2122,10 +1986,6 @@ check_exit:
 					break;
 			}
 		}
-
-		/* Signal compressor to exit and wait for it to drain */
-		__atomic_store_n(&pipe->done, true, __ATOMIC_RELEASE);
-		pthread_join(pipe->compressor, NULL);
 
 		clock_gettime(CLOCK_MONOTONIC, &loop_end);
 
