@@ -1406,6 +1406,13 @@ void cow_free_new_vma_ranges(void)
 static __thread char *tls_send_buf;
 
 /*
+ * Thread-local compression counters. Snapshot at phase boundaries to report
+ * per-phase compression ratio without atomics on the hot path.
+ */
+static __thread unsigned long tls_compress_in_bytes;
+static __thread unsigned long tls_compress_out_bytes;
+
+/*
  * Send a batch of pages with LZ4 compression.
  * Protocol: header (PS_IOV_ADD_F_COMPRESS) + compressed_size + compressed_data
  * Header contains nr_pages and base_vaddr.
@@ -1451,6 +1458,10 @@ int send_pages_batch_compressed(int sk, const void *data,
 	/* Track compression statistics (atomic for multi-threaded access) */
 	__sync_fetch_and_add(&g_compress_uncompressed_bytes, total_uncompressed);
 	__sync_fetch_and_add(&g_compress_compressed_bytes, *compressed_size);
+
+	/* Thread-local counters for per-phase ratio reporting */
+	tls_compress_in_bytes += total_uncompressed;
+	tls_compress_out_bytes += *compressed_size;
 
 	pr_debug("Compressed batch at %lx: %d pages, %d -> %d bytes (%.1f%%)\n",
 		 base_vaddr, nr_pages, total_uncompressed, *compressed_size,
@@ -1723,6 +1734,10 @@ static void *p3_bulk_sender_thread(void *arg)
 		struct timespec bulk_start, bulk_end;
 		long bulk_elapsed_ms;
 		struct bulk_work_item *work;
+		unsigned long bulk_in_start = tls_compress_in_bytes;
+		unsigned long bulk_out_start = tls_compress_out_bytes;
+		unsigned long bulk_in_bytes, bulk_out_bytes;
+		float bulk_ratio_pct = 0.0f;
 
 		clock_gettime(CLOCK_MONOTONIC, &bulk_start);
 		pr_err("P3[%d]: Starting bulk transfer (work-stealing)\n", thread_id);
@@ -1758,8 +1773,15 @@ static void *p3_bulk_sender_thread(void *arg)
 		clock_gettime(CLOCK_MONOTONIC, &bulk_end);
 		bulk_elapsed_ms = (bulk_end.tv_sec - bulk_start.tv_sec) * 1000 +
 				  (bulk_end.tv_nsec - bulk_start.tv_nsec) / 1000000;
-		pr_err("P3[%d] TIMING: Bulk transfer done: %lu pages, %d chunks in %ld ms\n",
-		       thread_id, total_sent, chunks_processed, bulk_elapsed_ms);
+
+		bulk_in_bytes = tls_compress_in_bytes - bulk_in_start;
+		bulk_out_bytes = tls_compress_out_bytes - bulk_out_start;
+		if (bulk_in_bytes > 0)
+			bulk_ratio_pct = (float)bulk_out_bytes * 100.0f / bulk_in_bytes;
+		pr_err("P3[%d] TIMING: Bulk transfer done: %lu pages, %d chunks in %ld ms "
+		       "(compress: %lu -> %lu bytes, ratio=%.1f%%)\n",
+		       thread_id, total_sent, chunks_processed, bulk_elapsed_ms,
+		       bulk_in_bytes, bulk_out_bytes, bulk_ratio_pct);
 
 		/* Signal scanner that this thread's bulk transfer is complete */
 		__atomic_fetch_add(&g_bulk_transfer_done_count, 1, __ATOMIC_RELEASE);
@@ -1776,12 +1798,18 @@ static void *p3_bulk_sender_thread(void *arg)
 		unsigned long queues_claimed = 0;
 		bool p3_started = false;
 		bool scan_done_logged = false;
+		unsigned long queue_in_start;
+		unsigned long queue_out_start;
+		unsigned long queue_in_bytes, queue_out_bytes;
+		float queue_ratio_pct = 0.0f;
 
 		while (!__atomic_load_n(&g_scanner_freeze_signal, __ATOMIC_ACQUIRE)) {
 			usleep(COW_USLEEP_1MS);
 		}
 
 		clock_gettime(CLOCK_MONOTONIC, &loop_start);
+		queue_in_start = tls_compress_in_bytes;
+		queue_out_start = tls_compress_out_bytes;
 
 		/*
 		 * Multi-round queue processing with per-queue ownership:
@@ -1914,8 +1942,14 @@ check_exit:
 			       thread_id, p3_total_ms, send_during_scan_ms, pages_before_scan_done,
 			       send_after_scan_ms, p3_pages - pages_before_scan_done);
 		}
-		pr_err("P3[%d] TIMING: Queue consumption done: %lu queues, %lu regions, %lu pages in %ld ms\n",
-		       thread_id, queues_claimed, regions_processed, loop_total_pages, loop_elapsed_ms);
+		queue_in_bytes = tls_compress_in_bytes - queue_in_start;
+		queue_out_bytes = tls_compress_out_bytes - queue_out_start;
+		if (queue_in_bytes > 0)
+			queue_ratio_pct = (float)queue_out_bytes * 100.0f / queue_in_bytes;
+		pr_err("P3[%d] TIMING: Queue consumption done: %lu queues, %lu regions, %lu pages in %ld ms "
+		       "(compress: %lu -> %lu bytes, ratio=%.1f%%)\n",
+		       thread_id, queues_claimed, regions_processed, loop_total_pages, loop_elapsed_ms,
+		       queue_in_bytes, queue_out_bytes, queue_ratio_pct);
 	}
 
 	/* === Final: Send pages from new VMAs detected in Phase 3 === */
