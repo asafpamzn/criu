@@ -38,10 +38,16 @@ struct sender_queue {
 /*
  * Send a batch of pages with LZ4 compression.
  * Used by bulk sender and dirty page dump.
+ *
+ * acceleration: LZ4_compress_fast acceleration parameter.
+ *   1  - best ratio (equivalent to LZ4_compress_default); use pre-freeze.
+ *   99 - minimum CPU, poorer ratio; use during Phase 2/3 convergence where
+ *        process is frozen and CPU dominates the downtime window.
  */
 int send_pages_batch_compressed(int sk, const void *data,
 				int nr_pages, u64 dst_id,
-				unsigned long base_vaddr);
+				unsigned long base_vaddr,
+				int acceleration);
 
 
 /*

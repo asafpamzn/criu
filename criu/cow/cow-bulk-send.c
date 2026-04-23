@@ -1409,10 +1409,16 @@ static __thread char *tls_send_buf;
  * Send a batch of pages with LZ4 compression.
  * Protocol: header (PS_IOV_ADD_F_COMPRESS) + compressed_size + compressed_data
  * Header contains nr_pages and base_vaddr.
+ *
+ * acceleration: LZ4_compress_fast acceleration. 1 matches LZ4_compress_default
+ * (best ratio). Larger values (e.g. 99) trade ratio for CPU - used during
+ * Phase 2/3 convergence where CPU is the bottleneck and the payload is
+ * already mostly modified (poorly-compressible) pages.
  */
 int send_pages_batch_compressed(int sk, const void *data,
 				int nr_pages, u64 dst_id,
-				unsigned long base_vaddr)
+				unsigned long base_vaddr,
+				int acceleration)
 {
 	int max_compressed = LZ4_compressBound(nr_pages * PAGE_SIZE);
 	int total_uncompressed = nr_pages * PAGE_SIZE;
@@ -1433,8 +1439,9 @@ int send_pages_batch_compressed(int sk, const void *data,
 	compressed_data = send_buf + sizeof(*pi) + sizeof(int);
 
 	/* Compress entire batch */
-	*compressed_size = LZ4_compress_default(data, compressed_data,
-						total_uncompressed, max_compressed);
+	*compressed_size = LZ4_compress_fast(data, compressed_data,
+					     total_uncompressed, max_compressed,
+					     acceleration);
 	if (*compressed_size <= 0) {
 		pr_err("LZ4 compression failed for batch at %lx (%d pages)\n",
 		       base_vaddr, nr_pages);
@@ -1522,8 +1529,12 @@ static int send_lazy_vma_pages_batch(int sk, struct lazy_vma_entry *lve,
 		return -1;
 	}
 
-	/* Compress and send batch */
-	ret = send_pages_batch_compressed(sk, buffer, nr_pages, dst_id, base_vaddr);
+	/*
+	 * Pre-freeze bulk transfer: we have CPU time to spare because the
+	 * process is still running; use best-ratio LZ4 to save network.
+	 */
+	ret = send_pages_batch_compressed(sk, buffer, nr_pages, dst_id,
+					  base_vaddr, 1);
 	if (ret < 0)
 		return -1;
 
@@ -1565,9 +1576,17 @@ static int send_dirty_region(struct p3_thread_ctx *ctx,
 			continue;
 		}
 
-		/* Compress and send */
+		/*
+		 * Convergence / post-freeze path: CPU is the bottleneck
+		 * (process is frozen - every ms here adds to downtime).
+		 * Profiling showed LZ4_compress_fast_extState at ~51% of
+		 * P3 thread time with default acceleration=1. Bump to 99
+		 * to trade ratio for speed - these pages are modified and
+		 * typically compress poorly anyway.
+		 */
 		ret = send_pages_batch_compressed(ctx->socket, buffer,
-						  batch_pages, region->dst_id, vaddr);
+						  batch_pages, region->dst_id,
+						  vaddr, 99);
 		if (ret < 0) {
 			pr_err("P3[%d] failed to send dirty region at %lx\n",
 			       ctx->thread_id, vaddr);
@@ -1656,9 +1675,14 @@ static unsigned long send_new_vma_pages(struct p3_thread_ctx *ctx)
 				continue;
 			}
 
-			/* Send compressed batch */
+			/*
+			 * New VMAs only surface during/after freeze - same
+			 * CPU-bound regime as send_dirty_region. Use fast
+			 * compression.
+			 */
 			ret = send_pages_batch_compressed(ctx->socket, buffer,
-							  batch_pages, ctx->dst_id, vaddr);
+							  batch_pages, ctx->dst_id,
+							  vaddr, 99);
 			if (ret < 0) {
 				pr_err("P3[%d] failed to send new VMA pages at %lx, aborting\n",
 				       thread_id, vaddr);
