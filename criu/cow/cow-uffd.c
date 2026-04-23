@@ -42,7 +42,11 @@
  * A bitmap tracks which pages within the batch are valid.
  * Drain can issue a single UFFDIO_COPY for the entire batch.
  */
+#define BATCH_ENTRY_MAGIC	0xBA7C4E71  /* "BATCH_ENTRY" alive */
+#define BATCH_ENTRY_DEAD	0xDEADBEEF  /* freed */
+
 struct batch_buffer_entry {
+	unsigned int magic;		/* BATCH_ENTRY_MAGIC or BATCH_ENTRY_DEAD */
 	unsigned long base_vaddr;	/* 256KB-aligned start address */
 	void *data;			/* Contiguous page pool allocation */
 	uint64_t page_bitmap;		/* 1 = page present, 0 = absent */
@@ -411,6 +415,7 @@ int cow_page_buffer_add_batch(unsigned long base_vaddr, void *data,
 	entry = xmalloc(sizeof(*entry));
 	BUG_ON(!entry);
 
+	entry->magic = BATCH_ENTRY_MAGIC;
 	entry->base_vaddr = base_vaddr;
 	entry->data = batch_data;
 	entry->page_bitmap = new_bitmap;
@@ -581,6 +586,7 @@ int cow_page_buffer_add(unsigned long vaddr, void *data, int thread_id, bool noc
 	entry = xmalloc(sizeof(*entry));
 	BUG_ON(!entry);
 
+	entry->magic = BATCH_ENTRY_MAGIC;
 	entry->base_vaddr = base;
 	entry->data = batch_data;
 	entry->page_bitmap = (1ULL << page_idx);
@@ -641,6 +647,12 @@ void *cow_page_buffer_lookup_and_remove(unsigned long vaddr)
 
 	pthread_spin_lock(&hash_locks[lock_idx]);
 	hlist_for_each_entry(entry, &cow_buffer.hash_table[hash], hash) {
+		if (entry->magic != BATCH_ENTRY_MAGIC) {
+			pr_err("RACE_DEBUG: lookup_and_remove found DEAD entry in hash! "
+			       "vaddr=0x%lx base=0x%lx magic=0x%x\n",
+			       vaddr, base, entry->magic);
+			BUG();
+		}
 		if (entry->base_vaddr != base)
 			continue;
 		if (!(entry->page_bitmap & (1ULL << page_idx))) {
@@ -682,6 +694,7 @@ void *cow_page_buffer_lookup_and_remove(unsigned long vaddr)
 						page_pool_put((char *)entry->data + j * PAGE_SIZE);
 				}
 			}
+			entry->magic = BATCH_ENTRY_DEAD;
 			xfree(entry);
 			__sync_fetch_and_sub(&cow_buffer.nr_batches, 1);
 			return page_ptr;
@@ -861,6 +874,13 @@ static unsigned long drain_apply_batch(struct batch_buffer_entry *entry,
 	unsigned long applied = 0;
 	int uffd, i;
 
+	if (entry->magic != BATCH_ENTRY_MAGIC) {
+		pr_err("RACE_DEBUG: drain_apply_batch got DEAD entry! "
+		       "base=0x%lx magic=0x%x data=%p bitmap=0x%llx\n",
+		       base, entry->magic, data, (unsigned long long)bitmap);
+		BUG();
+	}
+
 	/* Fast path: full batch — single UFFDIO_COPY for 256KB */
 	if (bitmap == ~0ULL) {
 		for (i = 0; i < COW_BATCH_PAGES; i++)
@@ -957,6 +977,7 @@ static void *background_drain_worker(void *arg)
 
 				drained += drain_apply_batch(entry, drain_lpis);
 				chunk_drained += nr;
+				entry->magic = BATCH_ENTRY_DEAD;
 				xfree(entry);
 
 				/* Log progress every 100k pages or 10 seconds */
