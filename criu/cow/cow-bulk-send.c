@@ -90,33 +90,18 @@ static unsigned long *g_new_vma_ranges = NULL;  /* [start, len, start, len, ...]
 static unsigned int g_nr_new_vma_ranges = 0;
 
 /*
- * Simple atomic queue distribution:
- * - Scanners distribute round-robin across all COW_TOTAL_QUEUES
- * - Senders get next queue via atomic increment on global counter
- * - No ownership, no stealing - just simple round-robin consumption
+ * MPMC convergence queue: scanners push dirty_region_entry pointers,
+ * consumers CAS-claim one entry at a time. Flat array + two atomic
+ * counters. One CAS per real work item, no empty-queue waste.
  */
+#define CONV_QUEUE_CAP	(8 * 1024 * 1024)
+static struct dirty_region_entry **g_conv_slots;
+static volatile unsigned long g_conv_head;
+static volatile unsigned long g_conv_tail;
 
-static struct sender_queue sender_queues[COW_TOTAL_QUEUES];
-/*
- * Unsigned counter so __atomic_fetch_add wraps with defined behavior.
- * A signed int here would overflow to negative on long-running dumps and
- * turn the subsequent `% COW_TOTAL_QUEUES` into a negative array index.
- */
-static volatile unsigned int g_next_queue = 0;
-/*
- * Per-queue ownership. -1 means free; otherwise the thread_id of the
- * current owning consumer. Claimed via CAS so only one consumer ever
- * touches a queue at a time, preserving the SPSC contract (the scanner
- * is the sole producer, the CAS owner is the sole consumer).
- */
-static volatile int g_queue_owner[COW_TOTAL_QUEUES];
 static volatile bool g_scan_complete = false;
 static volatile bool g_scanner_freeze_signal = false;
 static pid_t g_scanner_source_pid;
-
-/* DEBUG_PERF: Per-queue distribution stats */
-static unsigned long queue_pages_dist[COW_TOTAL_QUEUES];
-static unsigned long queue_regions_dist[COW_TOTAL_QUEUES];
 
 /* Atomic counter for total scanned pages (for verification) */
 static volatile unsigned long g_total_scanned_pages = 0;
@@ -215,29 +200,37 @@ static struct bulk_work_item *get_next_work_item(void)
 
 int cow_init_sender_queues(void)
 {
-	int i;
-
-	for (i = 0; i < COW_TOTAL_QUEUES; i++) {
-		if (spsc_init(sender_queues[i].head, sender_queues[i].tail,
-			      sender_queues[i].size,
-			      struct dirty_region_spsc_node)) {
-			pr_err("Failed to init sender queue %d\n", i);
-			return -1;
-		}
-		g_queue_owner[i] = -1;
-	}
-	g_next_queue = 0;
+	g_conv_slots = xzalloc(CONV_QUEUE_CAP * sizeof(g_conv_slots[0]));
+	BUG_ON(!g_conv_slots);
+	g_conv_head = 0;
+	g_conv_tail = 0;
 	g_scan_complete = false;
 	g_scanner_freeze_signal = false;
-	pr_info("Initialized %d sender queues (atomic counter distribution)\n",
-		COW_TOTAL_QUEUES);
+	pr_info("Initialized MPMC convergence queue (%d slots)\n",
+		CONV_QUEUE_CAP);
 	return 0;
 }
 
-struct sender_queue *cow_get_sender_queue(int queue_id)
+static struct dirty_region_entry *conv_queue_pop(void)
 {
-	BUG_ON(queue_id < 0 || queue_id >= COW_TOTAL_QUEUES);
-	return &sender_queues[queue_id];
+	unsigned long t, h;
+
+	t = __atomic_load_n(&g_conv_tail, __ATOMIC_RELAXED);
+	h = __atomic_load_n(&g_conv_head, __ATOMIC_ACQUIRE);
+	if (t >= h)
+		return NULL;
+	if (!__atomic_compare_exchange_n(&g_conv_tail, &t, t + 1,
+					 false, __ATOMIC_ACQUIRE,
+					 __ATOMIC_RELAXED))
+		return NULL;
+
+	{
+		struct dirty_region_entry *entry;
+		while (!(entry = g_conv_slots[t]))
+			;
+		__atomic_thread_fence(__ATOMIC_ACQUIRE);
+		return entry;
+	}
 }
 
 bool cow_is_scan_complete(void)
@@ -256,7 +249,7 @@ void cow_signal_scanner_freeze(void)
  * Scanner thread. Each scanner:
  *   - Scans its own disjoint slice of every lazy VMA's address range
  *     (slice = vma_size / COW_NUM_SCANNERS, last scanner gets the remainder).
- *   - Enqueues dirty regions into its own disjoint partition of sender_queues[],
+ *   - Enqueues dirty regions into the shared MPMC convergence queue,
  *     namely [scanner_id * COW_QUEUES_PER_THREAD, scanner_id * COW_QUEUES_PER_THREAD
  *     + COW_QUEUES_PER_THREAD). This preserves the SPSC single-producer invariant:
  *     no two scanners ever enqueue to the same queue.
@@ -265,8 +258,6 @@ static void *dirty_scanner_thread(void *arg)
 {
 	struct scanner_ctx *ctx = (struct scanner_ctx *)arg;
 	int scanner_id = ctx->id;
-	const int queue_base = scanner_id * COW_QUEUES_PER_THREAD;
-	int queue_idx = queue_base;
 	struct list_head *lazy_vmas;
 	struct lazy_vma_entry *lve;
 	struct page_region *regs;
@@ -275,9 +266,8 @@ static void *dirty_scanner_thread(void *arg)
 	char pagemap_path[64];
 	struct timespec t_start, t_end;
 
-	pr_err("Scanner[%d] started, owns queues [%d..%d), source_pid=%d\n",
-	       scanner_id, queue_base, queue_base + COW_QUEUES_PER_THREAD,
-	       g_scanner_source_pid);
+	pr_err("Scanner[%d] started, source_pid=%d\n",
+	       scanner_id, g_scanner_source_pid);
 	clock_gettime(CLOCK_MONOTONIC, &t_start);
 
 	/* Wait for all sender threads to complete bulk transfer first */
@@ -374,7 +364,6 @@ static void *dirty_scanner_thread(void *arg)
 
 				num_regions += regs_len;
 
-				/* Distribute within this scanner's partition [queue_base, queue_base + COW_QUEUES_PER_THREAD) */
 				for (i = 0; i < regs_len; i++) {
 					struct dirty_region_entry *entry;
 					unsigned long pages;
@@ -389,15 +378,13 @@ static void *dirty_scanner_thread(void *arg)
 					entry->dst_id = lve->dst_id;
 					entry->source_pid = g_scanner_source_pid;
 
-					spsc_enqueue(sender_queues[queue_idx].tail,
-						     sender_queues[queue_idx].size,
-						     entry, struct dirty_region_spsc_node);
-					__sync_fetch_and_add(&queue_pages_dist[queue_idx], pages);
-					__sync_fetch_and_add(&queue_regions_dist[queue_idx], 1);
+					{
+						unsigned long slot = __atomic_fetch_add(&g_conv_head, 1, __ATOMIC_RELAXED);
+						BUG_ON(slot >= CONV_QUEUE_CAP);
+						g_conv_slots[slot] = entry;
+						__atomic_thread_fence(__ATOMIC_RELEASE);
+					}
 					__sync_fetch_and_add(&g_total_scanned_pages, pages);
-					queue_idx = queue_base +
-						    ((queue_idx - queue_base + 1) %
-						     COW_QUEUES_PER_THREAD);
 				}
 				clock_gettime(CLOCK_MONOTONIC, &t3);
 				dist_time_ns += (t3.tv_sec - t2.tv_sec) * 1000000000UL +
@@ -508,14 +495,12 @@ static void *dirty_scanner_thread(void *arg)
 						entry->dst_id = 0;  /* Will be set per-VMA */
 						entry->source_pid = g_scanner_source_pid;
 
-						spsc_enqueue(sender_queues[queue_idx].tail,
-							     sender_queues[queue_idx].size,
-							     entry, struct dirty_region_spsc_node);
-						__sync_fetch_and_add(&queue_pages_dist[queue_idx], pages);
-						__sync_fetch_and_add(&queue_regions_dist[queue_idx], 1);
-						queue_idx = queue_base +
-							    ((queue_idx - queue_base + 1) %
-							     COW_QUEUES_PER_THREAD);
+						{
+							unsigned long slot = __atomic_fetch_add(&g_conv_head, 1, __ATOMIC_RELAXED);
+							BUG_ON(slot >= CONV_QUEUE_CAP);
+							g_conv_slots[slot] = entry;
+							__atomic_thread_fence(__ATOMIC_RELEASE);
+						}
 					}
 				} else if (bpf_nr == -2) {
 					/* BPF ring drops - fall back to PAGEMAP_SCAN */
@@ -584,15 +569,13 @@ static void *dirty_scanner_thread(void *arg)
 					entry->dst_id = lve->dst_id;
 					entry->source_pid = g_scanner_source_pid;
 
-					spsc_enqueue(sender_queues[queue_idx].tail,
-						     sender_queues[queue_idx].size,
-						     entry, struct dirty_region_spsc_node);
-					__sync_fetch_and_add(&queue_pages_dist[queue_idx], pages);
-					__sync_fetch_and_add(&queue_regions_dist[queue_idx], 1);
+					{
+						unsigned long slot = __atomic_fetch_add(&g_conv_head, 1, __ATOMIC_RELAXED);
+						BUG_ON(slot >= CONV_QUEUE_CAP);
+						g_conv_slots[slot] = entry;
+						__atomic_thread_fence(__ATOMIC_RELEASE);
+					}
 					__sync_fetch_and_add(&g_total_scanned_pages, pages);
-					queue_idx = queue_base +
-						    ((queue_idx - queue_base + 1) %
-						     COW_QUEUES_PER_THREAD);
 				}
 			} while (args.walk_end < my_end);
 		}
@@ -659,8 +642,7 @@ out:
 			}
 		}
 		if (all_done) {
-			int q;
-			unsigned long total_pages = 0, min_pages = ULONG_MAX, max_pages = 0;
+			unsigned long total_pages;
 			struct timespec now;
 			long from_freeze_ms;
 
@@ -669,23 +651,9 @@ out:
 					 (now.tv_nsec - g_freeze_signal_time.tv_nsec) / 1000000;
 			pr_err("Scanner: all scanners done, %ld ms from freeze signal\n", from_freeze_ms);
 
-			/* DEBUG_PERF: Print queue distribution summary */
-			for (q = 0; q < COW_TOTAL_QUEUES; q++) {
-				unsigned long qp = queue_pages_dist[q];
-				total_pages += qp;
-				if (qp < min_pages) min_pages = qp;
-				if (qp > max_pages) max_pages = qp;
-			}
-			pr_warn("DEBUG_PERF: Queue distribution (%d queues): total=%lu min=%lu max=%lu imbalance=%.1fx\n",
-			       COW_TOTAL_QUEUES, total_pages, min_pages, max_pages,
-			       min_pages > 0 ? (double)max_pages / min_pages : 0.0);
-			/* Only print per-queue stats if not too many queues */
-			if (COW_TOTAL_QUEUES <= 20) {
-				for (q = 0; q < COW_TOTAL_QUEUES; q++) {
-					pr_warn("DEBUG_PERF: Q[%02d] pages=%lu regions=%lu\n",
-					       q, queue_pages_dist[q], queue_regions_dist[q]);
-				}
-			}
+			total_pages = __atomic_load_n(&g_total_scanned_pages, __ATOMIC_RELAXED);
+			pr_warn("DEBUG_PERF: MPMC queue: %lu total scanned pages, %lu entries\n",
+			       total_pages, __atomic_load_n(&g_conv_head, __ATOMIC_RELAXED));
 
 			__atomic_store_n(&g_scan_complete, true, __ATOMIC_RELEASE);
 		}
@@ -707,12 +675,6 @@ int cow_start_scanner_thread(pid_t source_pid)
 	g_scanner_freeze_signal = false;
 	g_scanners_iter_done = 0;
 	g_total_dirty_pages = 0;
-
-	/* Reset DEBUG_PERF counters */
-	for (i = 0; i < COW_TOTAL_QUEUES; i++) {
-		queue_pages_dist[i] = 0;
-		queue_regions_dist[i] = 0;
-	}
 
 	/* Reset verification counters */
 	g_total_scanned_pages = 0;
@@ -794,7 +756,6 @@ int cow_bpf_drain_to_queues(void)
 	unsigned long total_pages = 0;
 	unsigned long total_regions = 0;
 	int bpf_nr, i;
-	unsigned int queue_idx = 0;
 	u64 drops, event_count;
 	int max_regions;
 	/* For PAGEMAP_SCAN merge */
@@ -1046,13 +1007,12 @@ skip_scan_merge:
 		entry->dst_id = 0;  /* Will use lve->dst_id when processing */
 		entry->source_pid = g_scanner_source_pid;
 
-		spsc_enqueue(sender_queues[queue_idx].tail,
-			     sender_queues[queue_idx].size,
-			     entry, struct dirty_region_spsc_node);
-		__sync_fetch_and_add(&queue_pages_dist[queue_idx], pages);
-		__sync_fetch_and_add(&queue_regions_dist[queue_idx], 1);
-
-		queue_idx = (queue_idx + 1) % COW_TOTAL_QUEUES;
+		{
+			unsigned long slot = __atomic_fetch_add(&g_conv_head, 1, __ATOMIC_RELAXED);
+			BUG_ON(slot >= CONV_QUEUE_CAP);
+			g_conv_slots[slot] = entry;
+			__atomic_thread_fence(__ATOMIC_RELEASE);
+		}
 		total_regions++;
 	}
 
@@ -1061,8 +1021,8 @@ skip_scan_merge:
 	/* Signal scan complete so sender threads process their queues */
 	__atomic_store_n(&g_scan_complete, true, __ATOMIC_RELEASE);
 
-	pr_info("BPF drain complete: distributed %lu regions (%lu pages) to %d queues\n",
-		total_regions, total_pages, COW_TOTAL_QUEUES);
+	pr_info("BPF drain complete: %lu regions (%lu pages) to MPMC queue\n",
+		total_regions, total_pages);
 
 	return (int)total_pages;
 }
@@ -1822,7 +1782,6 @@ static void *p3_bulk_sender_thread(void *arg)
 		unsigned long packed_batches = 0;
 		unsigned long p3_pages = 0;
 		unsigned long pages_before_scan_done = 0;
-		unsigned long queues_claimed = 0;
 		bool p3_started = false;
 		bool scan_done_logged = false;
 		unsigned long cursor_vaddr = 0;
@@ -1840,79 +1799,44 @@ static void *p3_bulk_sender_thread(void *arg)
 		queue_out_start = tls_compress_out_bytes;
 
 		/*
-		 * Multi-round queue processing with per-queue ownership:
-		 * - Thread picks next queue via an unsigned atomic counter
-		 *   (wraps with defined behavior) and tries to claim it by
-		 *   CAS'ing g_queue_owner[q] from -1 to its own thread_id.
-		 *   Only one consumer owns a queue at a time, preserving the
-		 *   SPSC contract (sole producer: scanner; sole consumer: CAS
-		 *   winner).
-		 * - Drains the queue until empty, then releases ownership.
-		 * - If the CAS fails, another thread owns it; skip and retry.
-		 * - Exits once the scanner is done AND every queue is both
-		 *   empty and unowned.
+		 * MPMC consumer: CAS-claim one entry at a time from the
+		 * shared convergence queue. Pack entries into 64-page
+		 * batches for readv + compress + send.
 		 */
-		while (1) {
-			unsigned int raw_q = __atomic_fetch_add(&g_next_queue, 1,
-								__ATOMIC_RELAXED);
-			int q = (int)(raw_q % (unsigned int)COW_TOTAL_QUEUES);
-			struct dirty_region_entry *region;
-			int expected;
-			int sent;
+		{
+			struct dirty_region_entry *region = NULL;
 
-			/* Track when freeze signal was sent (Phase 3 start) */
-			if (!p3_started && g_last_scan_flag) {
-				p3_started = true;
-				clock_gettime(CLOCK_MONOTONIC, &p3_start);
-			}
-
-			/* Track when scan completes */
-			if (!scan_done_logged && cow_is_scan_complete()) {
-				scan_done_logged = true;
-				pages_before_scan_done = p3_pages;
-				clock_gettime(CLOCK_MONOTONIC, &scan_done_time);
-			}
-
-			/*
-			 * Claim queue via CAS. ACQUIRE on success pairs with the
-			 * RELEASE on owner clear below, so we see any writes the
-			 * previous owner made before releasing.
-			 *
-			 * Note: we intentionally do NOT spsc_peek() before the
-			 * CAS - peek dereferences `head`, but the current owner
-			 * mutates `head` and xfree()s the old node inside
-			 * spsc_dequeue(). A non-owner peek would race with that
-			 * free (use-after-free). Only the CAS winner may touch
-			 * the queue's head.
-			 */
-			expected = -1;
-			if (!__atomic_compare_exchange_n(&g_queue_owner[q], &expected,
-							 thread_id, false,
-							 __ATOMIC_ACQUIRE,
-							 __ATOMIC_RELAXED))
-				goto check_exit;
-
-			queues_claimed++;
-
-			/*
-			 * Drain the queue while we own it, filling up to
-			 * COW_BATCH_PAGES pages per process_vm_readv. A batch
-			 * may cover any mix of whole small regions and slices
-			 * of one larger region. A region that doesn't fit is
-			 * sliced across consecutive batches (the cursor
-			 * persists across outer iterations).
-			 */
-			region = spsc_dequeue(sender_queues[q].head,
-					      sender_queues[q].size);
-			cursor_vaddr = region ? region->start : 0;
-			while (region) {
+			while (1) {
 				struct dirty_slice slices[COW_BATCH_PAGES];
 				int nr_slices = 0;
 				int pages_left = COW_BATCH_PAGES;
+				int sent;
 
-				while (pages_left > 0) {
-					int have = (int)((region->end - cursor_vaddr) /
-							 PAGE_SIZE);
+				if (!p3_started && g_last_scan_flag) {
+					p3_started = true;
+					clock_gettime(CLOCK_MONOTONIC, &p3_start);
+				}
+				if (!scan_done_logged && cow_is_scan_complete()) {
+					scan_done_logged = true;
+					pages_before_scan_done = p3_pages;
+					clock_gettime(CLOCK_MONOTONIC, &scan_done_time);
+				}
+
+				if (!region) {
+					region = conv_queue_pop();
+					if (!region) {
+						if (cow_is_scan_complete() &&
+						    __atomic_load_n(&g_conv_tail, __ATOMIC_RELAXED) >=
+						    __atomic_load_n(&g_conv_head, __ATOMIC_ACQUIRE))
+							break;
+						usleep(COW_USLEEP_100US);
+						continue;
+					}
+					cursor_vaddr = region->start;
+				}
+
+				while (pages_left > 0 && region) {
+					int have = (int)((region->end - cursor_vaddr) / PAGE_SIZE);
 					int take = have < pages_left ? have : pages_left;
 
 					slices[nr_slices].start = cursor_vaddr;
@@ -1925,66 +1849,27 @@ static void *p3_bulk_sender_thread(void *arg)
 					if (cursor_vaddr == region->end) {
 						regions_processed++;
 						xfree(region);
-						region = spsc_dequeue(sender_queues[q].head,
-								      sender_queues[q].size);
-						if (!region)
-							break;
-						cursor_vaddr = region->start;
+						region = conv_queue_pop();
+						if (region)
+							cursor_vaddr = region->start;
 					}
-					/*
-					 * else: region partially consumed; the
-					 * outer loop will resume it from
-					 * cursor_vaddr on the next iteration.
-					 */
 				}
+
+				if (nr_slices == 0)
+					continue;
 
 				sent = send_dirty_slices(ctx, g_scanner_source_pid,
 							 slices, nr_slices);
-				if (sent > 0) {
-					loop_total_pages += sent;
-					slices_sent += nr_slices;
-					packed_batches++;
-					if (p3_started)
-						p3_pages += sent;
-				} else if (sent < 0) {
-					ctx->error = true;
-					if (region) {
-						xfree(region);
-						region = NULL;
-					}
-					break;
-				}
+				BUG_ON(sent <= 0);
+				loop_total_pages += sent;
+				slices_sent += nr_slices;
+				packed_batches++;
+				if (p3_started)
+					p3_pages += sent;
 			}
 
-			/* Release ownership (RELEASE pairs with next owner's ACQUIRE) */
-			__atomic_store_n(&g_queue_owner[q], -1, __ATOMIC_RELEASE);
-
-check_exit:
-			/* Check if we should exit */
-			if (cow_is_scan_complete()) {
-				/*
-				 * Every queue must be both empty and unowned.
-				 * Use spsc_size (relaxed atomic load on the
-				 * counter) rather than spsc_peek: peek reads
-				 * head->next, but head is mutated and xfree'd
-				 * by the current owner inside spsc_dequeue, so
-				 * a non-owner peek would race with that free.
-				 * size may transiently lag, but that only
-				 * delays exit - we loop again.
-				 */
-				bool any_work = false;
-				int i;
-				for (i = 0; i < COW_TOTAL_QUEUES; i++) {
-					if (spsc_size(sender_queues[i].size) > 0 ||
-					    __atomic_load_n(&g_queue_owner[i],
-							    __ATOMIC_ACQUIRE) != -1) {
-						any_work = true;
-						break;
-					}
-				}
-				if (!any_work)
-					break;
-			}
+			if (region)
+				xfree(region);
 		}
 
 		clock_gettime(CLOCK_MONOTONIC, &loop_end);
@@ -2027,12 +1912,12 @@ check_exit:
 				avg_slices = (float)slices_sent / packed_batches;
 				avg_pages = (float)loop_total_pages / packed_batches;
 			}
-			pr_err("P3[%d] TIMING: Queue consumption done: %lu queues, "
+			pr_err("P3[%d] TIMING: Queue consumption done: "
 			       "%lu regions, %lu pages in %ld ms "
 			       "(packed_batches=%lu slices=%lu "
 			       "avg_slices/batch=%.2f avg_pages/batch=%.2f) "
 			       "(compress: %lu -> %lu bytes, ratio=%.1f%%)\n",
-			       thread_id, queues_claimed, regions_processed,
+			       thread_id, regions_processed,
 			       loop_total_pages, loop_elapsed_ms,
 			       packed_batches, slices_sent,
 			       avg_slices, avg_pages,
