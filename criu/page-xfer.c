@@ -312,6 +312,9 @@ static int write_pages_loc(struct page_xfer *xfer, int p, unsigned long len)
 	ssize_t ret;
 	ssize_t curr = 0;
 
+	pr_err("VMA_TRACE: phase=LOC_WRITE_PAGES pi_fd=%d len=%lu\n",
+	       xfer->pi ? img_raw_fd(xfer->pi) : -1, len);
+
 	while (1) {
 		ret = splice(p, NULL, img_raw_fd(xfer->pi), NULL, len - curr, SPLICE_F_MOVE);
 		if (ret == -1) {
@@ -383,6 +386,12 @@ static int write_pagemap_loc(struct page_xfer *xfer, struct iovec *iov, u32 flag
 	pe.has_flags = true;
 	pe.flags = flags;
 	pe.has_nr_pages = true;
+
+	pr_err("VMA_TRACE: phase=LOC_WRITE_PAGEMAP pi_fd=%d vaddr=0x%lx nr_pages=%u flags=0x%x has_parent=%d\n",
+	       xfer->pi ? img_raw_fd(xfer->pi) : -1,
+	       (unsigned long)iov->iov_base,
+	       (unsigned int)pe.nr_pages, flags,
+	       xfer->parent ? 1 : 0);
 
 	if (flags & PE_PRESENT) {
 		if (opts.auto_dedup && xfer->parent != NULL) {
@@ -475,6 +484,12 @@ out:
 	xfer->write_pagemap = write_pagemap_loc;
 	xfer->write_pages = write_pages_loc;
 	xfer->close = close_page_xfer;
+
+	pr_err("VMA_TRACE: phase=LOC_XFER_OPEN fd_type=%d img_id=%lu pmi_fd=%d pi_fd=%d has_parent=%d\n",
+	       fd_type, img_id,
+	       xfer->pmi ? img_raw_fd(xfer->pmi) : -1,
+	       xfer->pi ? img_raw_fd(xfer->pi) : -1,
+	       xfer->parent ? 1 : 0);
 	return 0;
 
 err_pi:
