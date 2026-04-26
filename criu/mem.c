@@ -836,7 +836,19 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	 * skeleton (while frozen).
 	 */
 	if (mdc->cow_lazy_build_only) {
-		/* leave xfer uninitialized; the rest of the code gates on this flag */
+		/*
+		 * Create an empty pagemap image so the replica's
+		 * discover_tasks_from_pagemaps() (cow-lazy-pages.c) can find
+		 * this task at Phase-2 startup. No page entries are written
+		 * here — Phase-3 skeleton reopens with O_DUMP|O_TRUNC and
+		 * fills in the real content.
+		 */
+		ret = open_page_xfer(&xfer, CR_FD_PAGEMAP, vpid(item));
+		if (ret < 0)
+			goto out_pp;
+		xfer.close(&xfer);
+		/* Reset xfer so later code knows it's not open */
+		memset(&xfer, 0, sizeof(xfer));
 	} else if (!mdc->pre_dump) {
 		/*
 		 * Regular dump -- create xfer object and send pages to it
