@@ -485,9 +485,12 @@ out:
 	xfer->write_pages = write_pages_loc;
 	xfer->close = close_page_xfer;
 
-	pr_err("VMA_TRACE: phase=LOC_XFER_OPEN fd_type=%d img_id=%lu pmi_fd=%d pi_fd=%d has_parent=%d\n",
+	/*
+	 * Do not call img_raw_fd() on the pagemap image — it's protobuf-buffered
+	 * and BUG_ON's there. Only the pages image (xfer->pi) is raw/splice-ok.
+	 */
+	pr_err("VMA_TRACE: phase=LOC_XFER_OPEN fd_type=%d img_id=%lu pi_fd=%d has_parent=%d\n",
 	       fd_type, img_id,
-	       xfer->pmi ? img_raw_fd(xfer->pmi) : -1,
 	       xfer->pi ? img_raw_fd(xfer->pi) : -1,
 	       xfer->parent ? 1 : 0);
 	return 0;
