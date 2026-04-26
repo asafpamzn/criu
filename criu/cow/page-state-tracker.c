@@ -301,6 +301,45 @@ void page_state_print_history(unsigned long vaddr)
 	pthread_spin_unlock(&bucket->lock);
 }
 
+/*
+ * Returns true if this page's history ever passed through a page-fault
+ * or urgent-request state. Such pages are owned by the replica process
+ * after UFFDIO_COPY and may legitimately diverge from the primary's
+ * snapshot by the time compare runs — callers can use this to suppress
+ * expected diffs.
+ */
+bool page_state_was_pf_served(unsigned long vaddr)
+{
+	struct page_state_entry *entry;
+	struct page_state_bucket *bucket;
+	unsigned int hash;
+	bool served = false;
+	int i;
+
+	if (!g_page_state.initialized)
+		return false;
+
+	hash = page_state_hash(vaddr);
+	bucket = &g_page_state.buckets[hash];
+
+	pthread_spin_lock(&bucket->lock);
+	entry = page_state_find_in_bucket(bucket, vaddr);
+	if (entry) {
+		for (i = 0; i < entry->history_count; i++) {
+			enum page_state s = entry->history[i].state;
+
+			if (s == PAGE_STATE_PF_PENDING ||
+			    s == PAGE_STATE_URGENT_PENDING) {
+				served = true;
+				break;
+			}
+		}
+	}
+	pthread_spin_unlock(&bucket->lock);
+
+	return served;
+}
+
 int page_state_set(unsigned long vaddr, enum page_state new_state)
 {
 	struct page_state_entry *entry;

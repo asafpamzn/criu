@@ -57,6 +57,14 @@ extern u32 page_state_get_buffer_count(unsigned long vaddr);
 /* Get stored CRC for a page */
 extern u32 page_state_get_crc(unsigned long vaddr);
 
+/*
+ * True if the page's history ever went through PF_PENDING or
+ * URGENT_PENDING. These pages were served to the replica process via
+ * UFFDIO_COPY and are owned by it afterwards — they may legitimately
+ * differ from the primary snapshot when compare runs.
+ */
+extern bool page_state_was_pf_served(unsigned long vaddr);
+
 #else /* !CONFIG_PAGE_STATE_TRACKER */
 
 static inline int page_state_init(void) { return 0; }
@@ -117,6 +125,11 @@ static inline u32 page_state_get_crc(unsigned long vaddr)
 {
 	(void)vaddr;
 	return 0;
+}
+static inline bool page_state_was_pf_served(unsigned long vaddr)
+{
+	(void)vaddr;
+	return false;
 }
 
 #endif /* CONFIG_PAGE_STATE_TRACKER */

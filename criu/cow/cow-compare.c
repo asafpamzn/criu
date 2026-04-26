@@ -374,6 +374,7 @@ int cow_compare_receive_and_verify(int sk, pid_t pid)
 	uint64_t total_uncovered = 0;
 #ifdef CONFIG_COW_COMPARE_PAGES
 	int page_diffs = 0, pages_checked = 0;
+	int pf_skipped = 0;
 	uint64_t bytes_checked = 0;
 	void *page_buf;
 #endif
@@ -576,19 +577,29 @@ int cow_compare_receive_and_verify(int sk, pid_t pid)
 			}
 
 			if (local_crc != remote_phi.crc32) {
-				page_diffs++;
-				if (page_diffs <= 100) {  /* Log first 100 */
-					pr_err("COMPARE_DIFF: Page 0x%lx hash mismatch: "
-					       "remote=%08x local=%08x\n",
-					       (unsigned long)remote_phi.vaddr,
-					       remote_phi.crc32, local_crc);
-					/*
-					 * Dump the page's state-transition history from
-					 * the lazy-pages tracker so we can see whether it
-					 * was COPIED/DISCARDED/DIRTY/UNMAPPED before diverging.
-					 * No-op if CONFIG_PAGE_STATE_TRACKER is disabled.
-					 */
-					page_state_print_history((unsigned long)remote_phi.vaddr);
+				/*
+				 * Pages served via UFFDIO_COPY from a page fault are
+				 * owned by the replica process afterwards. Writes by
+				 * the replica between the COPY and compare are
+				 * expected — don't count or log those as diffs.
+				 */
+				if (page_state_was_pf_served((unsigned long)remote_phi.vaddr)) {
+					pf_skipped++;
+				} else {
+					page_diffs++;
+					if (page_diffs <= 100) {  /* Log first 100 */
+						pr_err("COMPARE_DIFF: Page 0x%lx hash mismatch: "
+						       "remote=%08x local=%08x\n",
+						       (unsigned long)remote_phi.vaddr,
+						       remote_phi.crc32, local_crc);
+						/*
+						 * Dump the page's state-transition history from
+						 * the lazy-pages tracker so we can see whether it
+						 * was COPIED/DISCARDED/DIRTY/UNMAPPED before diverging.
+						 * No-op if CONFIG_PAGE_STATE_TRACKER is disabled.
+						 */
+						page_state_print_history((unsigned long)remote_phi.vaddr);
+					}
 				}
 			}
 
@@ -609,8 +620,8 @@ int cow_compare_receive_and_verify(int sk, pid_t pid)
 	xfree(remote_vmas);
 
 #ifdef CONFIG_COW_COMPARE_PAGES
-	pr_err("COMPARE_RESULT: Checked %d pages, coverage gaps=%d, %d page diffs (exact-boundary: %d PRIMARY-only, %d REPLICA-only)\n",
-	       pages_checked, uncovered_ranges, page_diffs, vma_diffs, replica_only);
+	pr_err("COMPARE_RESULT: Checked %d pages, coverage gaps=%d, %d page diffs, %d PF-served skipped (exact-boundary: %d PRIMARY-only, %d REPLICA-only)\n",
+	       pages_checked, uncovered_ranges, page_diffs, pf_skipped, vma_diffs, replica_only);
 #else
 	pr_err("COMPARE_RESULT: coverage gaps=%d (exact-boundary: %d PRIMARY-only, %d REPLICA-only; page comparison disabled)\n",
 	       uncovered_ranges, vma_diffs, replica_only);
