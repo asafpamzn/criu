@@ -429,6 +429,19 @@ int cow_page_buffer_add_batch(unsigned long base_vaddr, void *data,
 	INIT_LIST_HEAD(&entry->chunk_list);
 	entry->chunk_id = page_pool_get_chunk_id(batch_data);
 
+	/*
+	 * Publish the entry to both indices under the hash lock so a concurrent
+	 * lookup_and_remove can never observe it in the hash before it exists
+	 * in the chunk list. Lock order: hash_lock -> chunk_index.lock (matches
+	 * lookup_and_remove and remove_range).
+	 */
+	if (entry->chunk_id >= 0 && entry->chunk_id < COW_MAX_POOL_CHUNKS) {
+		pthread_spin_lock(&chunk_index[entry->chunk_id].lock);
+		list_add_tail(&entry->chunk_list, &chunk_index[entry->chunk_id].batches);
+		atomic_fetch_add(&chunk_index[entry->chunk_id].batch_count, 1);
+		pthread_spin_unlock(&chunk_index[entry->chunk_id].lock);
+	}
+
 	hlist_add_head(&entry->hash, &cow_buffer.hash_table[hash]);
 
 	for (i = 0; i < nr_pages; i++)
@@ -438,16 +451,9 @@ int cow_page_buffer_add_batch(unsigned long base_vaddr, void *data,
 	pthread_spin_unlock(&hash_locks[lock_idx]);
 	} /* end new entry block */
 
-	/* Add to chunk index for chunk-ordered drain */
 	if (entry->chunk_id >= 0 && entry->chunk_id < COW_MAX_POOL_CHUNKS) {
-		int cur_max;
+		int cur_max = atomic_load(&nr_active_chunks);
 
-		pthread_spin_lock(&chunk_index[entry->chunk_id].lock);
-		list_add_tail(&entry->chunk_list, &chunk_index[entry->chunk_id].batches);
-		atomic_fetch_add(&chunk_index[entry->chunk_id].batch_count, 1);
-		pthread_spin_unlock(&chunk_index[entry->chunk_id].lock);
-
-		cur_max = atomic_load(&nr_active_chunks);
 		while (entry->chunk_id >= cur_max) {
 			if (atomic_compare_exchange_weak(&nr_active_chunks, &cur_max, entry->chunk_id + 1))
 				break;
@@ -603,21 +609,25 @@ int cow_page_buffer_add(unsigned long vaddr, void *data, int thread_id, bool noc
 	INIT_LIST_HEAD(&entry->chunk_list);
 	entry->chunk_id = page_pool_get_chunk_id(batch_data);
 
+	/*
+	 * Publish to both indices under the hash lock (see add_batch).
+	 * Lock order: hash_lock -> chunk_index.lock.
+	 */
+	if (entry->chunk_id >= 0 && entry->chunk_id < COW_MAX_POOL_CHUNKS) {
+		pthread_spin_lock(&chunk_index[entry->chunk_id].lock);
+		list_add_tail(&entry->chunk_list, &chunk_index[entry->chunk_id].batches);
+		atomic_fetch_add(&chunk_index[entry->chunk_id].batch_count, 1);
+		pthread_spin_unlock(&chunk_index[entry->chunk_id].lock);
+	}
+
 	hlist_add_head(&entry->hash, &cow_buffer.hash_table[hash]);
 	page_state_set_with_crc(vaddr, PAGE_STATE_IN_BUFFER,
 				(char *)batch_data + page_idx * PAGE_SIZE);
 	pthread_spin_unlock(&hash_locks[lock_idx]);
 
-	/* Add to chunk index for chunk-ordered drain */
 	if (entry->chunk_id >= 0 && entry->chunk_id < COW_MAX_POOL_CHUNKS) {
-		int cur_max;
+		int cur_max = atomic_load(&nr_active_chunks);
 
-		pthread_spin_lock(&chunk_index[entry->chunk_id].lock);
-		list_add_tail(&entry->chunk_list, &chunk_index[entry->chunk_id].batches);
-		atomic_fetch_add(&chunk_index[entry->chunk_id].batch_count, 1);
-		pthread_spin_unlock(&chunk_index[entry->chunk_id].lock);
-
-		cur_max = atomic_load(&nr_active_chunks);
 		while (entry->chunk_id >= cur_max) {
 			if (atomic_compare_exchange_weak(&nr_active_chunks, &cur_max, entry->chunk_id + 1))
 				break;
@@ -1623,8 +1633,7 @@ int cow_process_eagain_requests(void)
 		if (req->buf)
 			xfree(req->buf);
 		xfree(req);
-	}
-	pthread_mutex_unlock(&eagain_mutex);
+	}	
 
 	{
 		bool empty = list_empty(&eagain_requests);
