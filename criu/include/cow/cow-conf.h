@@ -27,7 +27,7 @@
  * Tracks all state transitions and validates them to detect bugs.
  * Adds overhead, use only for debugging.
  */
-// #define CONFIG_PAGE_STATE_TRACKER
+#define CONFIG_PAGE_STATE_TRACKER
 
 /*
  * SCAN_COMPARE - Debug mode to compare BPF vs PAGEMAP_SCAN at freeze time.

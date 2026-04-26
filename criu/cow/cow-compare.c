@@ -34,6 +34,9 @@
 
 #define COMPARE_PORT 27020  /* Different from page-server port */
 
+/* Emit a progress line every time this many bytes of page data are processed. */
+#define COMPARE_PROGRESS_STEP (1ULL << 30)  /* 1 GB */
+
 /* Message types */
 #define MSG_VMA_LIST      1
 #define MSG_VMA_END       2
@@ -259,6 +262,7 @@ int cow_compare_send_state(int sk, pid_t pid)
 #ifdef CONFIG_COW_COMPARE_PAGES
 	void *page_buf;
 	int total_pages = 0, sent_hashes = 0;
+	uint64_t bytes_hashed = 0;
 #endif
 
 	pr_warn("COMPARE: Starting state send for PID %d\n", pid);
@@ -322,9 +326,13 @@ int cow_compare_send_state(int sk, pid_t pid)
 				break;
 			}
 			sent_hashes++;
+			bytes_hashed += PAGE_SIZE;
 
-			if (sent_hashes % 100000 == 0)
-				pr_info("COMPARE: Sent %d page hashes...\n", sent_hashes);
+			if (bytes_hashed / COMPARE_PROGRESS_STEP !=
+			    (bytes_hashed - PAGE_SIZE) / COMPARE_PROGRESS_STEP)
+				pr_warn("COMPARE: PRIMARY hashed %lu GB (%d pages)\n",
+					(unsigned long)(bytes_hashed / COMPARE_PROGRESS_STEP),
+					sent_hashes);
 		}
 	}
 
@@ -365,6 +373,7 @@ int cow_compare_receive_and_verify(int sk, pid_t pid)
 	uint64_t total_uncovered = 0;
 #ifdef CONFIG_COW_COMPARE_PAGES
 	int page_diffs = 0, pages_checked = 0;
+	uint64_t bytes_checked = 0;
 	void *page_buf;
 #endif
 	int i, j;
@@ -575,8 +584,12 @@ int cow_compare_receive_and_verify(int sk, pid_t pid)
 				}
 			}
 
-			if (pages_checked % 100000 == 0)
-				pr_warn("COMPARE: Checked %d pages, %d diffs so far\n",
+			bytes_checked += PAGE_SIZE;
+
+			if (bytes_checked / COMPARE_PROGRESS_STEP !=
+			    (bytes_checked - PAGE_SIZE) / COMPARE_PROGRESS_STEP)
+				pr_warn("COMPARE: REPLICA checked %lu GB (%d pages, %d diffs)\n",
+					(unsigned long)(bytes_checked / COMPARE_PROGRESS_STEP),
 					pages_checked, page_diffs);
 		}
 	}
