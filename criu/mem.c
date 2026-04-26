@@ -723,7 +723,7 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	struct page_pipe *pp;
 	struct vma_area *vma_area;
 	struct page_xfer xfer = { .parent = NULL };
-	int ret, exit_code = -1;
+	int ret = 0, exit_code = -1;
 	unsigned cpp_flags = 0;
 	unsigned long pmc_size;
 	int possible_pid_reuse = 0;
