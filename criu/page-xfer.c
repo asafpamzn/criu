@@ -224,6 +224,9 @@ static int write_pages_to_server(struct page_xfer *xfer, int p, unsigned long le
 {
 	ssize_t ret, left = len;
 
+	pr_err("VMA_TRACE: phase=PS_WRITE_PAGES dst_id=0x%lx len=%lu\n",
+	       (unsigned long)xfer->dst_id, len);
+
 	if (opts.tls) {
 		pr_debug("Sending %lx bytes\n", len);
 
@@ -255,6 +258,11 @@ static int write_pagemap_to_server(struct page_xfer *xfer, struct iovec *iov, u3
 		.vaddr = encode_pointer(iov->iov_base),
 		.dst_id = xfer->dst_id,
 	};
+
+	pr_err("VMA_TRACE: phase=PS_WRITE_PAGEMAP dst_id=0x%lx vaddr=0x%lx nr_pages=%u flags=0x%x\n",
+	       (unsigned long)xfer->dst_id,
+	       (unsigned long)iov->iov_base,
+	       (unsigned int)pi.nr_pages, flags);
 
 	return send_psi(xfer->sk, &pi);
 }
@@ -480,6 +488,10 @@ int open_page_xfer(struct page_xfer *xfer, int fd_type, unsigned long img_id)
 {
 	xfer->offset = 0;
 	xfer->transfer_lazy = true;
+
+	pr_err("VMA_TRACE: phase=OPEN_PAGE_XFER fd_type=%d img_id=%lu use_page_server=%d cow_dump=%d\n",
+	       fd_type, img_id, opts.use_page_server ? 1 : 0,
+	       opts.cow_dump ? 1 : 0);
 
 	if (opts.use_page_server)
 		return open_page_server_xfer(xfer, fd_type, img_id);
@@ -1155,6 +1167,10 @@ static int page_server_add(int sk, struct page_server_iov *pi, u32 flags)
 	size_t len;
 	struct page_xfer *lxfer = &cxfer.loc_xfer;
 	struct iovec iov;
+
+	pr_err("VMA_TRACE: phase=PS_RECV_ADD dst_id=0x%lx vaddr=0x%lx nr_pages=%u flags=0x%x\n",
+	       (unsigned long)pi->dst_id, (unsigned long)pi->vaddr,
+	       (unsigned int)pi->nr_pages, flags);
 
 	if (prep_loc_xfer(pi))
 		return -1;
