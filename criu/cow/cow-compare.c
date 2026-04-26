@@ -28,6 +28,7 @@
 #include "page.h"
 #include "xmalloc.h"
 #include "cow/cow-conf.h"
+#include "cow/page-state-tracker.h"
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "cow-compare: "
@@ -581,6 +582,13 @@ int cow_compare_receive_and_verify(int sk, pid_t pid)
 					       "remote=%08x local=%08x\n",
 					       (unsigned long)remote_phi.vaddr,
 					       remote_phi.crc32, local_crc);
+					/*
+					 * Dump the page's state-transition history from
+					 * the lazy-pages tracker so we can see whether it
+					 * was COPIED/DISCARDED/DIRTY/UNMAPPED before diverging.
+					 * No-op if CONFIG_PAGE_STATE_TRACKER is disabled.
+					 */
+					page_state_print_history((unsigned long)remote_phi.vaddr);
 				}
 			}
 
