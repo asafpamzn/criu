@@ -989,8 +989,14 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 			if (ret)
 				return ret;
 
-			/* Write any lazy VMAs that should come before this segment */
-			if (opts.cow_dump) {
+			/*
+			 * Write any lazy VMAs that should come before this segment.
+			 * Only applies to the task pagemap (xfer->offset == 0).
+			 * Shmem pagemap xfer sets xfer->offset to the shmem VMA's
+			 * vaddr (shmem.c: do_dump_one_shmem), and shmem pagemap
+			 * entries must not be interleaved with lazy-VMA metadata.
+			 */
+			if (opts.cow_dump && xfer->offset == 0) {
 				ret = cow_write_lazy_vmas_before(xfer, seg_vaddr, &cur_lve);
 				if (ret)
 					return ret;
@@ -1017,8 +1023,12 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 	if (ret)
 		return ret;
 
-	/* Write any remaining lazy VMAs after all pipe entries */
-	if (opts.cow_dump) {
+	/*
+	 * Write any remaining lazy VMAs after all pipe entries.
+	 * Task pagemap only — see comment on the first cow_write_lazy_vmas_before
+	 * call above. Shmem pagemap must not carry lazy-VMA metadata.
+	 */
+	if (opts.cow_dump && xfer->offset == 0) {
 		ret = cow_write_lazy_vmas_before(xfer, ULONG_MAX, &cur_lve);
 		if (ret)
 			return ret;
