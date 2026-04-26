@@ -470,8 +470,10 @@ int cow_page_buffer_add_batch(unsigned long base_vaddr, void *data,
  * Returns entry->data if an entry exists for this 256KB-aligned base,
  * NULL otherwise. Caller can decompress directly into the returned pointer.
  *
- * Also updates the bitmap for the given page range.
- * Safe only when no concurrent drain/page-faults (Phase 4 pre-drain).
+ * LOCKING: On success the hash lock is held on return and must be released
+ * by a matching call to cow_page_buffer_mark_pages(). This keeps the entry
+ * and its data buffer stable across the caller's decompress/memcpy so
+ * concurrent producers cannot clobber bytes mid-write.
  */
 void *cow_page_buffer_get_data_ptr(unsigned long base_vaddr,
 				   int page_offset, int nr_pages)
@@ -479,7 +481,6 @@ void *cow_page_buffer_get_data_ptr(unsigned long base_vaddr,
 	struct batch_buffer_entry *entry;
 	unsigned int hash;
 	int lock_idx;
-	void *ptr = NULL;
 
 	if (!cow_buffer.initialized)
 		return NULL;
@@ -491,11 +492,8 @@ void *cow_page_buffer_get_data_ptr(unsigned long base_vaddr,
 
 	pthread_spin_lock(&hash_locks[lock_idx]);
 	hlist_for_each_entry(entry, &cow_buffer.hash_table[hash], hash) {
-		if (entry->base_vaddr == base_vaddr) {
-			ptr = entry->data;
-			pthread_spin_unlock(&hash_locks[lock_idx]);
-			return ptr;
-		}
+		if (entry->base_vaddr == base_vaddr)
+			return entry->data;  /* lock held — released by mark_pages */
 	}
 	pthread_spin_unlock(&hash_locks[lock_idx]);
 
@@ -505,6 +503,10 @@ void *cow_page_buffer_get_data_ptr(unsigned long base_vaddr,
 /*
  * Mark pages as valid in an existing batch after direct decompress.
  * Called after decompressing directly into entry->data.
+ *
+ * LOCKING: The hash lock is expected to be held by a prior successful
+ * cow_page_buffer_get_data_ptr() on the same base_vaddr. This function
+ * releases that lock before returning.
  */
 void cow_page_buffer_mark_pages(unsigned long base_vaddr,
 				int page_offset, int nr_pages)
@@ -517,7 +519,6 @@ void cow_page_buffer_mark_pages(unsigned long base_vaddr,
 	hash = batch_buffer_hash(base_vaddr);
 	lock_idx = lock_index(hash);
 
-	pthread_spin_lock(&hash_locks[lock_idx]);
 	hlist_for_each_entry(entry, &cow_buffer.hash_table[hash], hash) {
 		if (entry->base_vaddr == base_vaddr) {
 			for (i = 0; i < nr_pages; i++) {

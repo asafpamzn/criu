@@ -6,6 +6,7 @@
 #include <sys/ioctl.h>
 #include <errno.h>
 #include <stdbool.h>
+#include <inttypes.h>
 #include <linux/userfaultfd.h>
 #include <pthread.h>
 #include <time.h>
@@ -327,20 +328,31 @@ static int cow_register_vmas(struct cow_dump_info *cdi,
 	list_for_each_entry(vma, &vma_area_list->h, list) {
 		unsigned long start = vma->e->start;
 		unsigned long len = vma->e->end - start;
+		const char *skip_reason = NULL;
+		int ioctl_ret;
 
 		if (!vma_entry_can_be_lazy(vma->e))
+			skip_reason = "can_be_lazy";
+		else if (vma_area_is(vma, VMA_AREA_GUARD))
+			skip_reason = "guard";
+		else if (!(vma->e->prot & PROT_WRITE))
+			skip_reason = "not_writable";
+		else if (!vma_area_is_private(vma, kdat.task_size) &&
+			 !vma_area_is(vma, VMA_ANON_SHARED))
+			skip_reason = "not_private";
+		else if (vma_entry_is(vma->e, VMA_AREA_VVAR))
+			skip_reason = "vvar";
+		else if (vma->e->flags & MAP_DROPPABLE)
+			skip_reason = "droppable";
+
+		if (skip_reason) {
+			pr_err("VMA_TRACE: phase=WP_REGISTER vma=0x%lx-0x%lx flags=0x%x prot=0x%x status=0x%x shmid=%" PRIu64
+			       " skipped_by=%s\n",
+			       start, start + len,
+			       vma->e->flags, vma->e->prot, vma->e->status,
+			       (uint64_t)vma->e->shmid, skip_reason);
 			continue;
-		if (vma_area_is(vma, VMA_AREA_GUARD))
-			continue;
-		if (!(vma->e->prot & PROT_WRITE))
-			continue;
-		if (!vma_area_is_private(vma, kdat.task_size) &&
-		    !vma_area_is(vma, VMA_ANON_SHARED))
-			continue;
-		if (vma_entry_is(vma->e, VMA_AREA_VVAR))
-			continue;
-		if (vma->e->flags & MAP_DROPPABLE)
-			continue;
+		}
 
 		/*
 		 * In WP_ASYNC mode, UFFDIO_REGISTER may fail - that's OK.
@@ -349,7 +361,14 @@ static int cow_register_vmas(struct cow_dump_info *cdi,
 		reg.range.start = start;
 		reg.range.len = len;
 		reg.mode = UFFDIO_REGISTER_MODE_WP;
-		(void)ioctl(cdi->uffd, UFFDIO_REGISTER, &reg);
+		ioctl_ret = ioctl(cdi->uffd, UFFDIO_REGISTER, &reg);
+
+		pr_err("VMA_TRACE: phase=WP_REGISTER vma=0x%lx-0x%lx flags=0x%x prot=0x%x status=0x%x shmid=%" PRIu64
+		       " registered ioctl_ret=%d errno=%d pages=%lu\n",
+		       start, start + len,
+		       vma->e->flags, vma->e->prot, vma->e->status,
+		       (uint64_t)vma->e->shmid,
+		       ioctl_ret, ioctl_ret < 0 ? errno : 0, len / PAGE_SIZE);
 
 		tvmas[i].start = start;
 		tvmas[i].end = start + len;
@@ -912,17 +931,31 @@ int cow_detect_new_vmas(struct vm_area_list *vmas,
 	list_for_each_entry(vma, &vmas->h, list) {
 		unsigned long start = vma->e->start;
 		unsigned long end = vma->e->end;
+		unsigned int before;
 
 		/* Use same filtering as cow_register_vmas */
-		if (!cow_is_vma_trackable(vma))
+		if (!cow_is_vma_trackable(vma)) {
+			pr_err("VMA_TRACE: phase=PHASE3_NEW_VMA_DETECT vma=0x%lx-0x%lx flags=0x%x prot=0x%x status=0x%x shmid=%" PRIu64
+			       " trackable=0 skipped\n",
+			       start, end,
+			       vma->e->flags, vma->e->prot, vma->e->status,
+			       (uint64_t)vma->e->shmid);
 			continue;
+		}
 
 		pr_info("Checking VMA 0x%lx-0x%lx\n", start, end);
 
+		before = nr_ranges;
 		if (cow_region_subtract(start, end, &ranges, &nr_ranges, &capacity)) {
 			xfree(ranges);
 			return -1;
 		}
+		pr_err("VMA_TRACE: phase=PHASE3_NEW_VMA_DETECT vma=0x%lx-0x%lx flags=0x%x prot=0x%x status=0x%x shmid=%" PRIu64
+		       " trackable=1 new_ranges_emitted=%u\n",
+		       start, end,
+		       vma->e->flags, vma->e->prot, vma->e->status,
+		       (uint64_t)vma->e->shmid,
+		       nr_ranges - before);
 	}
 
 	*new_ranges = ranges;

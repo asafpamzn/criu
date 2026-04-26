@@ -33,11 +33,20 @@ int cow_page_buffer_add_batch(unsigned long base_vaddr, void *data,
 /*
  * Get data pointer for an existing batch entry.
  * Returns entry->data or NULL. Caller can decompress directly into it.
+ *
+ * LOCKING: On success (non-NULL return) the entry's hash lock is held
+ * on return. The caller MUST call cow_page_buffer_mark_pages() for the
+ * same base_vaddr to release it. Do not block between these calls.
+ * On NULL return no lock is held.
  */
 void *cow_page_buffer_get_data_ptr(unsigned long base_vaddr,
 				   int page_offset, int nr_pages);
 
-/* Mark pages valid after direct decompress into entry->data */
+/*
+ * Mark pages valid after direct decompress into entry->data.
+ * LOCKING: Must be called after a successful cow_page_buffer_get_data_ptr().
+ * Releases the hash lock held by get_data_ptr().
+ */
 void cow_page_buffer_mark_pages(unsigned long base_vaddr,
 				int page_offset, int nr_pages);
 

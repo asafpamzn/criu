@@ -21,6 +21,7 @@
 #include <errno.h>
 #include <time.h>
 #include <string.h>
+#include <inttypes.h>
 #include <lz4.h>
 
 #include "int.h"
@@ -669,6 +670,19 @@ static bool g_using_bpf_mode = false;
 int cow_start_scanner_thread(pid_t source_pid)
 {
 	int i;
+	struct list_head *lazy_vmas = get_global_lazy_vmas();
+	struct lazy_vma_entry *lve;
+	unsigned int lve_count = 0;
+
+	list_for_each_entry(lve, lazy_vmas, list) {
+		pr_err("VMA_TRACE: phase=SCANNER_START_LIST idx=%u vma=0x%" PRIx64 "-0x%" PRIx64
+		       " pages=%lu dst_id=%" PRIu64 "\n",
+		       lve_count, lve->start, lve->end, lve->total_pages,
+		       (uint64_t)lve->dst_id);
+		lve_count++;
+	}
+	pr_err("VMA_TRACE: phase=SCANNER_START total_lazy_vmas=%u pid=%d\n",
+	       lve_count, source_pid);
 
 	g_scanner_source_pid = source_pid;
 	g_scan_complete = false;
@@ -825,6 +839,7 @@ int cow_bpf_drain_to_queues(void)
 		struct pm_scan_arg args;
 		long regs_len;
 		int r;
+		unsigned long before_vma = scan_addr_count;
 
 		memset(&args, 0, sizeof(args));
 		args.size = sizeof(args);
@@ -860,6 +875,9 @@ int cow_bpf_drain_to_queues(void)
 				}
 			}
 		} while (args.walk_end < lve->end);
+
+		pr_err("VMA_TRACE: phase=SCAN_MERGE vma=0x%" PRIx64 "-0x%" PRIx64 " dirty_found=%lu\n",
+		       lve->start, lve->end, scan_addr_count - before_vma);
 	}
 
 done_scan:
@@ -1646,6 +1664,8 @@ static unsigned long send_new_vma_pages(struct p3_thread_ctx *ctx)
 
 		pr_debug("P3[%d] new VMA %lx-%lx (%lu pages)\n",
 			 thread_id, start, start + len, len / PAGE_SIZE);
+		pr_err("VMA_TRACE: phase=PHASE3_SEND_NEW thread_id=%d range=0x%lx-0x%lx pages=%lu\n",
+		       thread_id, start, start + len, len / PAGE_SIZE);
 
 		for (vaddr = start; vaddr < start + len; ) {
 			int batch_pages = (start + len - vaddr) / PAGE_SIZE;

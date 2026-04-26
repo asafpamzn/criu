@@ -1846,6 +1846,9 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	 * In COW phased migration Phase 3 (skeleton dump), pages have already
 	 * been transferred during Phase 2. Skip page dumping and COW init.
 	 */
+	pr_err("VMA_TRACE: phase=PHASE3_SKELETON pid=%d cow_is_phased_skeleton_dump=%d will_dump_pages=%d\n",
+	       pid, cow_is_phased_skeleton_dump() ? 1 : 0,
+	       cow_is_phased_skeleton_dump() ? 0 : 1);
 	if (!cow_is_phased_skeleton_dump()) {
 		mdc.pre_dump = false;
 		mdc.lazy = opts.lazy_pages;

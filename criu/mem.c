@@ -251,14 +251,15 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 		cow_tracked;
 
 	if (opts.cow_dump && !lazy_capable) {
-		pr_debug("LAZY_DEBUG: VMA 0x%llx-0x%llx NOT lazy_capable: "
-		       "can_be_lazy=%d guard=%d prot=0x%x private=%d droppable=%d "
-		       "stack=%d cow_tracked=%d\n",
+		pr_err("VMA_TRACE: phase=LAZY_LIST_SKIP vma=0x%llx-0x%llx flags=0x%x prot=0x%x status=0x%x shmid=%" PRIu64
+		       " can_be_lazy=%d guard=%d writable=%d private=%d droppable=%d stack=%d cow_tracked=%d\n",
 		       (unsigned long long)vma->e->start,
 		       (unsigned long long)vma->e->end,
+		       vma->e->flags, vma->e->prot, vma->e->status,
+		       (uint64_t)vma->e->shmid,
 		       vma_entry_can_be_lazy(vma->e),
 		       vma_area_is(vma, VMA_AREA_GUARD),
-		       vma->e->prot,
+		       !!(vma->e->prot & PROT_WRITE),
 		       vma_area_is_private(vma, kdat.task_size),
 		       !!(vma->e->flags & MAP_DROPPABLE),
 		       is_stack(item, vma_start),
@@ -298,6 +299,11 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 		 * dst_id with the pmi/pi pointers, so xfer->dst_id
 		 * contains a raw pointer value — garbage.
 		 */
+		pr_err("VMA_TRACE: phase=LAZY_LIST_ADD vma=0x%llx-0x%llx flags=0x%x prot=0x%x status=0x%x shmid=%" PRIu64 " pages=%lu dst_id=%d\n",
+		       (unsigned long long)vma->e->start,
+		       (unsigned long long)vma->e->end,
+		       vma->e->flags, vma->e->prot, vma->e->status,
+		       (uint64_t)vma->e->shmid, nr_pages, vpid(item));
 		return cow_mem_add_lazy_vma(vma, nr_pages, vpid(item),
 					    item->pid->real);
 	}
@@ -406,6 +412,15 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 	cnt_add(CNT_PAGES_SKIPPED_PARENT, pages[0]);
 	cnt_add(CNT_PAGES_LAZY, pages[1]);
 	cnt_add(CNT_PAGES_WRITTEN, pages[2]);
+
+	pr_err("VMA_TRACE: phase=GENERATE_IOVS vma=0x%llx-0x%llx flags=0x%x prot=0x%x status=0x%x shmid=%" PRIu64
+	       " scanned=%lu holes=%lu lazy=%lu written=%lu cow_tracked=%d lazy_capable=%d\n",
+	       (unsigned long long)vma->e->start,
+	       (unsigned long long)vma->e->end,
+	       vma->e->flags, vma->e->prot, vma->e->status,
+	       (uint64_t)vma->e->shmid,
+	       nr_scanned, pages[0], pages[1], pages[2],
+	       cow_tracked, lazy_capable);
 
 	if (collect_timing) {
 		struct timeval loop_end, total_loop_time;
@@ -703,6 +718,10 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	pr_info("\n");
 	pr_info("Dumping pages (type: %d pid: %d)\n", CR_FD_PAGES, item->pid->real);
 	pr_info("----------------------------------------\n");
+
+	pr_err("VMA_TRACE: phase=DUMP_PAGES_ENTRY pid=%d pre_dump=%d lazy=%d cow_dump=%d nr_vmas=%u\n",
+	       item->pid->real, mdc->pre_dump, mdc->lazy, opts.cow_dump ? 1 : 0,
+	       vma_area_list->nr);
 
 	gettimeofday(&t_start, NULL);
 	timing_start(TIME_MEMDUMP);
