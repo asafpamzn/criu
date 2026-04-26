@@ -231,36 +231,57 @@ int cow_uffd_copy(int uffd, unsigned long vaddr, void *data,
 	res = cow_uffd_copy_pages(uffd, vaddr, data, nr_pages, NULL);
 
 	switch (res) {
-	case COW_COPY_OK:
+	case COW_COPY_OK: {
+		unsigned long i;
+
 		if (!(flags & COW_TRACK_RETRY))
 			__sync_fetch_and_add(&cow_buffer.nr_applied, 1);
 		pf_tracker_set_state(vaddr, PF_STATE_COMPLETED);
-		page_state_set(vaddr, PAGE_STATE_COPIED);
+		/*
+		 * UFFDIO_COPY installed all nr_pages; transition every page in
+		 * the range so the tracker reflects reality (drain fast path
+		 * copies 64 pages in one call — marking only the base leaves
+		 * the other 63 stuck at DRAIN_PENDING).
+		 */
+		for (i = 0; i < nr_pages; i++)
+			page_state_set(vaddr + i * PAGE_SIZE, PAGE_STATE_COPIED);
 		if (lpi)
 			lpi->copied_pages += nr_pages;
 		return 1;
+	}
 
-	case COW_COPY_EEXIST:
+	case COW_COPY_EEXIST: {
+		unsigned long i;
+
 		if (!(flags & COW_TRACK_RETRY))
 			__sync_fetch_and_add(&cow_buffer.nr_discarded, 1);
-		if (!unmapped_tracker_is_unmapped(vaddr) &&
-		    page_state_get(vaddr) != PAGE_STATE_DIRTY)
-			page_state_set(vaddr, PAGE_STATE_DISCARDED);
+		for (i = 0; i < nr_pages; i++) {
+			unsigned long addr = vaddr + i * PAGE_SIZE;
+
+			if (!unmapped_tracker_is_unmapped(addr) &&
+			    page_state_get(addr) != PAGE_STATE_DIRTY)
+				page_state_set(addr, PAGE_STATE_DISCARDED);
+		}
 		if (flags & COW_TRACK_STRICT) {
 			pr_err("BUG: %s EEXIST at 0x%lx - duplicate copy!\n", caller, vaddr);
 			page_state_print_history(vaddr);
 			BUG();
 		}
 		return 0;  /* soft handled - drain already did it */
+	}
 
-	case COW_COPY_ENOENT:
+	case COW_COPY_ENOENT: {
+		unsigned long i;
+
 		if (!(flags & COW_TRACK_RETRY))
 			__sync_fetch_and_add(&cow_buffer.nr_discarded, 1);
 		if (!unmapped_tracker_is_unmapped(vaddr)) {
-			page_state_set(vaddr, PAGE_STATE_DISCARDED);
+			for (i = 0; i < nr_pages; i++)
+				page_state_set(vaddr + i * PAGE_SIZE, PAGE_STATE_DISCARDED);
 			unmapped_tracker_mark_range(vaddr, nr_pages * PAGE_SIZE);
 		}
 		return 0;
+	}
 
 	case COW_COPY_EAGAIN:
 		if (flags & COW_TRACK_RETRY)
