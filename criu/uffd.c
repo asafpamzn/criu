@@ -1241,7 +1241,7 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 	 */
 	if (opts.cow_dump) {
 		void *page_data;
-		struct uffdio_copy uffdio_copy;
+		int ret;
 
 		pr_err("PAGE_FAULT_COW: vaddr=0x%llx pid=%d drain_running=%d\n",
 		       address, lpi->pid, cow_drain_thread_running());
@@ -1249,19 +1249,24 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 		/* Try to get page from buffer */
 		page_data = cow_page_buffer_lookup_and_remove(address);
 		if (page_data) {
-			/* Found in buffer - copy to process */
-			uffdio_copy.dst = address;
-			uffdio_copy.src = (unsigned long)page_data;
-			uffdio_copy.len = PAGE_SIZE;
-			uffdio_copy.mode = 0;
-			uffdio_copy.copy = 0;
-
-			if (ioctl(lpi->lpfd.fd, UFFDIO_COPY, &uffdio_copy) < 0) {
-				pr_perror("PAGE_FAULT: UFFDIO_COPY failed for 0x%llx", address);
-				page_pool_put(page_data);
+			/*
+			 * Route through cow_uffd_copy so page-state, pf_tracker,
+			 * and EEXIST/EAGAIN/ENOENT handling all go through the
+			 * unified path. Transition IN_BUFFER -> PF_PENDING first;
+			 * cow_uffd_copy will move it to COPIED / DISCARDED /
+			 * EAGAIN_QUEUED depending on UFFDIO_COPY result. On EAGAIN
+			 * cow_queue_eagain_request() copies the buffer, so we can
+			 * always return the page to the pool after the call.
+			 */
+			page_state_set(address, PAGE_STATE_PF_PENDING);
+			ret = cow_uffd_copy(lpi->lpfd.fd, address, page_data, 1,
+					    lpi, NULL, 0, "PAGE_FAULT");
+			page_pool_put(page_data);
+			if (ret < 0) {
+				pr_err("PAGE_FAULT: cow_uffd_copy failed for 0x%llx\n",
+				       address);
 				return -1;
 			}
-			page_pool_put(page_data);
 			pr_err("PAGE_FAULT: Served 0x%llx from buffer\n", address);
 			return 0;
 		}
