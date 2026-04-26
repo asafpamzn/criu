@@ -2400,8 +2400,7 @@ static int cr_dump_finish(int ret)
 			pr_err("TIMING: Phase 3 total freeze time: %ld.%06ld seconds\n",
 			       freeze_delta.tv_sec, freeze_delta.tv_usec);
 		}
-		pr_err("COW: Unfreezing process\n");
-		pstree_switch_state(root_item, TASK_ALIVE);
+
 
 #ifdef CONFIG_COW_COMPARE
 		/*
@@ -2434,7 +2433,13 @@ static int cr_dump_finish(int ret)
 			}
 			pr_err("COMPARE: PRIMARY comparison done\n");
 		}
+
+		pr_err("COW: Unfreezing process\n");
+		pstree_switch_state(root_item, TASK_ALIVE);
 #else
+
+		pr_err("COW: Unfreezing process\n");
+		pstree_switch_state(root_item, TASK_ALIVE);
 		/* Wait for ACK AFTER unfreeze - not on critical path */
 		gettimeofday(&t_start, NULL);
 		if (!ret && sk >= 0) {
