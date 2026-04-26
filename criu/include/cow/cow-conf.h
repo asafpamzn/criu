@@ -71,7 +71,7 @@
  * This is very slow for large processes. Disable to only compare VMAs.
  * Requires CONFIG_COW_COMPARE to be enabled.
  */
-// #define CONFIG_COW_COMPARE_PAGES
+#define CONFIG_COW_COMPARE_PAGES
 
 /*
  * CONFIG_COW_WAIT_REPLICA_TOUCH - Wait for touch file before proceeding.
