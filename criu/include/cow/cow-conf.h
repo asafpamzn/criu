@@ -63,7 +63,7 @@
  * When enabled, PRIMARY and REPLICA compare process state after freeze.
  * Useful for debugging memory divergence issues.
  */
-// #define CONFIG_COW_COMPARE
+#define CONFIG_COW_COMPARE
 
 /*
  * CONFIG_COW_COMPARE_PAGES - Enable page hash comparison (slow).
