@@ -141,7 +141,7 @@ static int p3_receive_and_buffer(struct p3_receiver_ctx *ctx)
 				cow_page_buffer_mark_pages(base, page_offset, nr_pages);
 			} else {
 				decomp_ret = LZ4_decompress_safe(compressed_buf,
-								 ctx->decompressed_buf,
+								 ctx->decompressed_buf + page_offset * PAGE_SIZE,
 								 compressed_size, nr_pages * PAGE_SIZE);
 				BUG_ON(decomp_ret != nr_pages * (int)PAGE_SIZE);
 
