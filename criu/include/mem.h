@@ -18,6 +18,19 @@ struct pstree_item;
 struct mem_dump_ctl {
 	bool pre_dump;
 	bool lazy;
+	/*
+	 * COW pre-dump: populate global_lazy_vmas only. No page pipe,
+	 * no xfer, no pagemap/pages file is written. Disk writes for COW
+	 * mode happen only in Phase-3 skeleton dump (while frozen).
+	 */
+	bool cow_lazy_build_only;
+	/*
+	 * COW Phase-3 skeleton dump: write non-lazy VMAs only. Lazy VMAs
+	 * have already streamed via the P3 sender threads, so generate_iovs
+	 * short-circuits them without pushing into the page pipe and
+	 * without re-adding them to global_lazy_vmas.
+	 */
+	bool cow_skeleton_non_lazy;
 	struct proc_pid_stat *stat;
 	InventoryEntry *parent_ie;
 };

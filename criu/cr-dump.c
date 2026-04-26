@@ -1547,7 +1547,7 @@ static int pre_dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie
 	struct parasite_ctl *parasite_ctl;
 	int ret = -1;
 	struct parasite_dump_misc misc;
-	struct mem_dump_ctl mdc;
+	struct mem_dump_ctl mdc = {};
 
 	vm_area_list_init(&vmas);
 
@@ -1629,9 +1629,15 @@ static int pre_dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie
 	 *   pre_dump = false: treat as real dump for page collection
 	 *   lazy = true: use lazy VMA path in generate_iovs() to mark pages
 	 *                for deferred transfer instead of immediate dump
+	 *   cow_lazy_build_only = true: populate global_lazy_vmas only,
+	 *                do NOT write any pagemap/pages image. All disk
+	 *                writes for COW mode happen in Phase-3 skeleton
+	 *                (while frozen). Pre-dump is planning-only.
 	 */
 	mdc.pre_dump = !opts.cow_dump;
 	mdc.lazy = opts.cow_dump;
+	mdc.cow_lazy_build_only = opts.cow_dump;
+	mdc.cow_skeleton_non_lazy = false;
 	mdc.stat = NULL;
 	mdc.parent_ie = parent_ie;
 
@@ -1662,7 +1668,7 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	struct cr_imgset *cr_imgset = NULL;
 	struct parasite_drain_fd *dfds = NULL;
 	struct proc_posix_timers_stat proc_args;
-	struct mem_dump_ctl mdc;
+	struct mem_dump_ctl mdc = {};
 	struct timeval t_start, t_checkpoint, t_now, t_delta;
 
 	vm_area_list_init(&vmas);
@@ -1843,15 +1849,22 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	}
 
 	/*
-	 * In COW phased migration Phase 3 (skeleton dump), pages have already
-	 * been transferred during Phase 2. Skip page dumping and COW init.
+	 * Phase-3 skeleton dump:
+	 *   - Non-COW: standard dump — run parasite_dump_pages_seized to dump
+	 *     all page data.
+	 *   - COW: pre-dump was planning-only; lazy VMAs have already streamed
+	 *     via P3 sender threads; we still need to dump *non-lazy* VMAs
+	 *     (file-backed private writable, etc.) now, while frozen.
+	 *     cow_skeleton_non_lazy=true makes generate_iovs short-circuit
+	 *     lazy VMAs so we only write non-lazy ones to pagemap/pages images.
 	 */
-	pr_err("VMA_TRACE: phase=PHASE3_SKELETON pid=%d cow_is_phased_skeleton_dump=%d will_dump_pages=%d\n",
-	       pid, cow_is_phased_skeleton_dump() ? 1 : 0,
-	       cow_is_phased_skeleton_dump() ? 0 : 1);
-	if (!cow_is_phased_skeleton_dump()) {
+	pr_err("VMA_TRACE: phase=PHASE3_SKELETON pid=%d cow_is_phased_skeleton_dump=%d will_dump_pages=1\n",
+	       pid, cow_is_phased_skeleton_dump() ? 1 : 0);
+	{
 		mdc.pre_dump = false;
-		mdc.lazy = opts.lazy_pages;
+		mdc.lazy = cow_is_phased_skeleton_dump() ? false : opts.lazy_pages;
+		mdc.cow_lazy_build_only = false;
+		mdc.cow_skeleton_non_lazy = cow_is_phased_skeleton_dump();
 		mdc.stat = &pps_buf;
 		mdc.parent_ie = parent_ie;
 
