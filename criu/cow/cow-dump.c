@@ -346,7 +346,7 @@ static int cow_register_vmas(struct cow_dump_info *cdi,
 			skip_reason = "droppable";
 
 		if (skip_reason) {
-			pr_err("VMA_TRACE: phase=WP_REGISTER vma=0x%lx-0x%lx flags=0x%x prot=0x%x status=0x%x shmid=%" PRIu64
+			pr_debug("VMA_TRACE: phase=WP_REGISTER vma=0x%lx-0x%lx flags=0x%x prot=0x%x status=0x%x shmid=%" PRIu64
 			       " skipped_by=%s\n",
 			       start, start + len,
 			       vma->e->flags, vma->e->prot, vma->e->status,
@@ -363,7 +363,7 @@ static int cow_register_vmas(struct cow_dump_info *cdi,
 		reg.mode = UFFDIO_REGISTER_MODE_WP;
 		ioctl_ret = ioctl(cdi->uffd, UFFDIO_REGISTER, &reg);
 
-		pr_err("VMA_TRACE: phase=WP_REGISTER vma=0x%lx-0x%lx flags=0x%x prot=0x%x status=0x%x shmid=%" PRIu64
+		pr_debug("VMA_TRACE: phase=WP_REGISTER vma=0x%lx-0x%lx flags=0x%x prot=0x%x status=0x%x shmid=%" PRIu64
 		       " registered ioctl_ret=%d errno=%d pages=%lu\n",
 		       start, start + len,
 		       vma->e->flags, vma->e->prot, vma->e->status,
@@ -935,7 +935,7 @@ int cow_detect_new_vmas(struct vm_area_list *vmas,
 
 		/* Use same filtering as cow_register_vmas */
 		if (!cow_is_vma_trackable(vma)) {
-			pr_err("VMA_TRACE: phase=PHASE3_NEW_VMA_DETECT vma=0x%lx-0x%lx flags=0x%x prot=0x%x status=0x%x shmid=%" PRIu64
+			pr_debug("VMA_TRACE: phase=PHASE3_NEW_VMA_DETECT vma=0x%lx-0x%lx flags=0x%x prot=0x%x status=0x%x shmid=%" PRIu64
 			       " trackable=0 skipped\n",
 			       start, end,
 			       vma->e->flags, vma->e->prot, vma->e->status,
@@ -950,7 +950,7 @@ int cow_detect_new_vmas(struct vm_area_list *vmas,
 			xfree(ranges);
 			return -1;
 		}
-		pr_err("VMA_TRACE: phase=PHASE3_NEW_VMA_DETECT vma=0x%lx-0x%lx flags=0x%x prot=0x%x status=0x%x shmid=%" PRIu64
+		pr_debug("VMA_TRACE: phase=PHASE3_NEW_VMA_DETECT vma=0x%lx-0x%lx flags=0x%x prot=0x%x status=0x%x shmid=%" PRIu64
 		       " trackable=1 new_ranges_emitted=%u\n",
 		       start, end,
 		       vma->e->flags, vma->e->prot, vma->e->status,

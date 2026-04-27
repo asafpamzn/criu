@@ -14,6 +14,7 @@
 #include "page.h"
 #include "cow/cow-uffd.h"
 #include "cow/cow-bulk-send.h"
+#include "cow/cow-bulk-recv.h"
 #include "uffd.h"
 #include "uffd-internal.h"
 #include "page-xfer.h"
@@ -85,8 +86,6 @@ static atomic_int nr_active_chunks = 0;
 /* Fine-grained locks for batch buffer */
 static pthread_spinlock_t hash_locks[COW_BATCH_NUM_HASH_LOCKS];
 
-/* Pre-buffer for Phase 4 dirty pages (allocated in cow_setup_prebuffer_reader) */
-static void *prebuffer_buf = NULL;
 
 static inline int lock_index(unsigned int hash)
 {
@@ -814,11 +813,6 @@ void cow_page_buffer_destroy(void)
 	/* Destroy all page pools last */
 	page_pool_destroy_all();
 
-	/* Free prebuffer if allocated */
-	if (prebuffer_buf) {
-		xfree(prebuffer_buf);
-		prebuffer_buf = NULL;
-	}
 }
 
 /*
@@ -1725,13 +1719,7 @@ int cow_get_uffd_for_vaddr(struct list_head *lpis, unsigned long vaddr)
  * in the hash table until the uffd is available.
  */
 
-/* Pre-buffer state (prebuffer_buf declared at top of file for destroy access) */
 static bool phase3_active_flag = false;
-
-
-/* Forward declarations for page server async reader */
-extern int page_server_start_async_read_bulk(void *buf, unsigned long nr_pages,
-					     ps_async_read_complete complete, void *priv);
 
 void cow_set_phase3_active(bool active)
 {
@@ -1743,53 +1731,14 @@ bool cow_is_phase3_active(void)
 	return phase3_active_flag;
 }
 
-void *cow_get_prebuffer_buf(void)
-{
-	return prebuffer_buf;
-}
-
 /*
- * Pre-buffer callback: Phase 4 dirty pages arrive on main socket.
- * P3 receivers handle Phase 2 bulk pages, but Phase 4 pages flow here.
- * These pages overwrite existing buffered pages (dirty page updates).
- * Handles batches of pages (compressed transfers send up to 64 pages).
+ * Initialize the control message reader on the main page server socket.
+ * All page data flows through P3 receiver threads; the main socket only
+ * carries control messages (end-of-transfer marker, PS_IOV_ALL_PAGES_SENT).
  */
-static int prebuffer_io_complete_internal(unsigned long dst_id, unsigned long vaddr,
-					  unsigned long nr_pages, void *priv)
-{
-	void *data = priv;  /* Points to prebuffer_buf with page data */
-	unsigned long i;
-
-	pr_err("prebuffer_io_complete: buffering %lu Phase 4 dirty pages at vaddr=0x%lx\n",
-	       nr_pages, vaddr);
-
-	/* Buffer/overwrite each page using P3 thread 0's pool */
-	for (i = 0; i < nr_pages; i++) {
-		unsigned long page_vaddr = vaddr + i * PAGE_SIZE;
-		void *page_data = (char *)data + i * PAGE_SIZE;
-
-		BUG_ON(cow_page_buffer_add(page_vaddr, page_data, PHASE4_POOL_ID, false) < 0);
-	}
-	return 0;
-}
-
 int cow_setup_prebuffer_reader(void)
 {
-	/*
-	 * Allocate buffer for batch reception (up to 64 pages = 256KB).
-	 * Compressed batches from P3 senders can contain multiple pages.
-	 */
-	prebuffer_buf = xmalloc(COW_BATCH_SIZE);
-	BUG_ON(!prebuffer_buf);
-
-	/*
-	 * Initialize pool 0 for Phase 4 dirty pages. P3 receivers will also
-	 * init this pool later, but cow_page_buffer_thread_init is idempotent.
-	 */
-	BUG_ON(cow_page_buffer_thread_init(PHASE4_POOL_ID) < 0);
-
-	return page_server_start_async_read_bulk(
-		prebuffer_buf, COW_BATCH_PAGES, prebuffer_io_complete_internal, prebuffer_buf);
+	return page_server_start_async_read_bulk();
 }
 
 

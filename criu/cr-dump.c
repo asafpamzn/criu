@@ -1858,7 +1858,7 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	 *     cow_skeleton_non_lazy=true makes generate_iovs short-circuit
 	 *     lazy VMAs so we only write non-lazy ones to pagemap/pages images.
 	 */
-	pr_err("VMA_TRACE: phase=PHASE3_SKELETON pid=%d cow_is_phased_skeleton_dump=%d will_dump_pages=1\n",
+	pr_debug("VMA_TRACE: phase=PHASE3_SKELETON pid=%d cow_is_phased_skeleton_dump=%d will_dump_pages=1\n",
 	       pid, cow_is_phased_skeleton_dump() ? 1 : 0);
 	{
 		mdc.pre_dump = false;

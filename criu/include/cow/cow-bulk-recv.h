@@ -2,24 +2,25 @@
 #define __CR_COW_BULK_RECV_H__
 
 #include <stdbool.h>
-#include "page-xfer.h"
 
 struct epoll_rfd;
 
 /*
- * COW bulk stream receiver (REPLICA side).
+ * COW control message receiver (REPLICA side).
  *
- * This module handles continuous bulk page reception from the primary
- * during COW phased migration. It processes headers and compressed/
- * uncompressed pages as they arrive without correlation to requests.
+ * All page data is transferred via P3 receiver threads. This module
+ * only handles control messages on the main page server socket:
+ * - End-of-transfer marker (nr_pages == 0)
+ * - PS_IOV_ALL_PAGES_SENT signal
  */
 
-/* Bulk stream reader entry points */
+/* Epoll callback for main socket control messages */
 extern int page_server_async_read_bulk(struct epoll_rfd *f);
-extern int page_server_start_async_read_bulk(void *buf, unsigned long nr_pages,
-					     ps_async_read_complete complete, void *priv);
 
-/* Cleanup async bulk reader state (call before closing socket) */
+/* Initialize the control message reader */
+extern int page_server_start_async_read_bulk(void);
+
+/* Cleanup reader state (call before closing socket) */
 extern void page_server_cleanup_async_bulk(void);
 
 /* TCP helper (implemented in page-xfer.c) */

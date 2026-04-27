@@ -251,7 +251,7 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 		cow_tracked;
 
 	if (opts.cow_dump && !lazy_capable) {
-		pr_err("VMA_TRACE: phase=LAZY_LIST_SKIP vma=0x%llx-0x%llx flags=0x%x prot=0x%x status=0x%x shmid=%" PRIu64
+		pr_debug("VMA_TRACE: phase=LAZY_LIST_SKIP vma=0x%llx-0x%llx flags=0x%x prot=0x%x status=0x%x shmid=%" PRIu64
 		       " can_be_lazy=%d guard=%d writable=%d private=%d droppable=%d stack=%d cow_tracked=%d\n",
 		       (unsigned long long)vma->e->start,
 		       (unsigned long long)vma->e->end,
@@ -296,7 +296,7 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 		 * re-add to global_lazy_vmas — the list was built at pre-dump.
 		 */
 		if (cow_skeleton_non_lazy) {
-			pr_err("VMA_TRACE: phase=LAZY_LIST_SKIP_PHASE3 vma=0x%llx-0x%llx flags=0x%x prot=0x%x status=0x%x shmid=%" PRIu64 "\n",
+			pr_debug("VMA_TRACE: phase=LAZY_LIST_SKIP_PHASE3 vma=0x%llx-0x%llx flags=0x%x prot=0x%x status=0x%x shmid=%" PRIu64 "\n",
 			       (unsigned long long)vma->e->start,
 			       (unsigned long long)vma->e->end,
 			       vma->e->flags, vma->e->prot, vma->e->status,
@@ -314,7 +314,7 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 		 * dst_id with the pmi/pi pointers, so xfer->dst_id
 		 * contains a raw pointer value — garbage.
 		 */
-		pr_err("VMA_TRACE: phase=LAZY_LIST_ADD vma=0x%llx-0x%llx flags=0x%x prot=0x%x status=0x%x shmid=%" PRIu64 " pages=%lu dst_id=%d\n",
+		pr_debug("VMA_TRACE: phase=LAZY_LIST_ADD vma=0x%llx-0x%llx flags=0x%x prot=0x%x status=0x%x shmid=%" PRIu64 " pages=%lu dst_id=%d\n",
 		       (unsigned long long)vma->e->start,
 		       (unsigned long long)vma->e->end,
 		       vma->e->flags, vma->e->prot, vma->e->status,
@@ -428,7 +428,7 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 	cnt_add(CNT_PAGES_LAZY, pages[1]);
 	cnt_add(CNT_PAGES_WRITTEN, pages[2]);
 
-	pr_err("VMA_TRACE: phase=GENERATE_IOVS vma=0x%llx-0x%llx flags=0x%x prot=0x%x status=0x%x shmid=%" PRIu64
+	pr_debug("VMA_TRACE: phase=GENERATE_IOVS vma=0x%llx-0x%llx flags=0x%x prot=0x%x status=0x%x shmid=%" PRIu64
 	       " scanned=%lu holes=%lu lazy=%lu written=%lu cow_tracked=%d lazy_capable=%d\n",
 	       (unsigned long long)vma->e->start,
 	       (unsigned long long)vma->e->end,
@@ -736,7 +736,7 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	pr_info("Dumping pages (type: %d pid: %d)\n", CR_FD_PAGES, item->pid->real);
 	pr_info("----------------------------------------\n");
 
-	pr_err("VMA_TRACE: phase=DUMP_PAGES_ENTRY pid=%d pre_dump=%d lazy=%d cow_dump=%d nr_vmas=%u cow_lazy_build_only=%d cow_skeleton_non_lazy=%d\n",
+	pr_debug("VMA_TRACE: phase=DUMP_PAGES_ENTRY pid=%d pre_dump=%d lazy=%d cow_dump=%d nr_vmas=%u cow_lazy_build_only=%d cow_skeleton_non_lazy=%d\n",
 	       item->pid->real, mdc->pre_dump, mdc->lazy, opts.cow_dump ? 1 : 0,
 	       vma_area_list->nr,
 	       mdc->cow_lazy_build_only ? 1 : 0,
@@ -910,7 +910,7 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	 * dumped in Phase-3 skeleton while frozen.
 	 */
 	if (mdc->cow_lazy_build_only) {
-		pr_err("VMA_TRACE: phase=LAZY_BUILD_ONLY_DONE pid=%d\n", item->pid->real);
+		pr_debug("VMA_TRACE: phase=LAZY_BUILD_ONLY_DONE pid=%d\n", item->pid->real);
 		exit_code = 0;
 		ret = 0;
 		goto out_pp;

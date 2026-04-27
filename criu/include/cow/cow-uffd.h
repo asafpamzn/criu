@@ -124,12 +124,8 @@ extern int cow_get_uffd_for_vaddr(struct list_head *lpis, unsigned long vaddr);
  * These functions handle the pre-buffering and convergence phases.
  */
 
-/* Initialize prebuffer reader for COW mode */
+/* Initialize control message reader for COW mode */
 extern int cow_setup_prebuffer_reader(void);
-
-
-/* Get prebuffer buf pointer (for convergence callback) */
-extern void *cow_get_prebuffer_buf(void);
 
 
 /* Handle lazy accept in COW mode */

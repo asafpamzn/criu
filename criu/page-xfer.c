@@ -65,10 +65,6 @@ void wait_for_page_server_thread(void)
 	cow_wait_for_page_server_thread();
 }
 
-#define BULK_STREAM_WOULD_BLOCK 0
-#define BULK_STREAM_PROGRESS 1
-#define BULK_STREAM_COMPLETE 2
-/* No ACK on bulk close: end-of-stream marker is enough. */
 
 /* Compression statistics are in cow-page-xfer.c */
 
@@ -224,7 +220,7 @@ static int write_pages_to_server(struct page_xfer *xfer, int p, unsigned long le
 {
 	ssize_t ret, left = len;
 
-	pr_err("VMA_TRACE: phase=PS_WRITE_PAGES dst_id=0x%lx len=%lu\n",
+	pr_debug("VMA_TRACE: phase=PS_WRITE_PAGES dst_id=0x%lx len=%lu\n",
 	       (unsigned long)xfer->dst_id, len);
 
 	if (opts.tls) {
@@ -259,7 +255,7 @@ static int write_pagemap_to_server(struct page_xfer *xfer, struct iovec *iov, u3
 		.dst_id = xfer->dst_id,
 	};
 
-	pr_err("VMA_TRACE: phase=PS_WRITE_PAGEMAP dst_id=0x%lx vaddr=0x%lx nr_pages=%u flags=0x%x\n",
+	pr_debug("VMA_TRACE: phase=PS_WRITE_PAGEMAP dst_id=0x%lx vaddr=0x%lx nr_pages=%u flags=0x%x\n",
 	       (unsigned long)xfer->dst_id,
 	       (unsigned long)iov->iov_base,
 	       (unsigned int)pi.nr_pages, flags);
@@ -312,7 +308,7 @@ static int write_pages_loc(struct page_xfer *xfer, int p, unsigned long len)
 	ssize_t ret;
 	ssize_t curr = 0;
 
-	pr_err("VMA_TRACE: phase=LOC_WRITE_PAGES pi_fd=%d len=%lu\n",
+	pr_debug("VMA_TRACE: phase=LOC_WRITE_PAGES pi_fd=%d len=%lu\n",
 	       xfer->pi ? img_raw_fd(xfer->pi) : -1, len);
 
 	while (1) {
@@ -387,7 +383,7 @@ static int write_pagemap_loc(struct page_xfer *xfer, struct iovec *iov, u32 flag
 	pe.flags = flags;
 	pe.has_nr_pages = true;
 
-	pr_err("VMA_TRACE: phase=LOC_WRITE_PAGEMAP pi_fd=%d vaddr=0x%lx nr_pages=%u flags=0x%x has_parent=%d\n",
+	pr_debug("VMA_TRACE: phase=LOC_WRITE_PAGEMAP pi_fd=%d vaddr=0x%lx nr_pages=%u flags=0x%x has_parent=%d\n",
 	       xfer->pi ? img_raw_fd(xfer->pi) : -1,
 	       (unsigned long)iov->iov_base,
 	       (unsigned int)pe.nr_pages, flags,
@@ -489,7 +485,7 @@ out:
 	 * Do not call img_raw_fd() on the pagemap image — it's protobuf-buffered
 	 * and BUG_ON's there. Only the pages image (xfer->pi) is raw/splice-ok.
 	 */
-	pr_err("VMA_TRACE: phase=LOC_XFER_OPEN fd_type=%d img_id=%lu pi_fd=%d has_parent=%d\n",
+	pr_debug("VMA_TRACE: phase=LOC_XFER_OPEN fd_type=%d img_id=%lu pi_fd=%d has_parent=%d\n",
 	       fd_type, img_id,
 	       xfer->pi ? img_raw_fd(xfer->pi) : -1,
 	       xfer->parent ? 1 : 0);
@@ -507,7 +503,7 @@ int open_page_xfer(struct page_xfer *xfer, int fd_type, unsigned long img_id)
 	xfer->offset = 0;
 	xfer->transfer_lazy = true;
 
-	pr_err("VMA_TRACE: phase=OPEN_PAGE_XFER fd_type=%d img_id=%lu use_page_server=%d cow_dump=%d\n",
+	pr_debug("VMA_TRACE: phase=OPEN_PAGE_XFER fd_type=%d img_id=%lu use_page_server=%d cow_dump=%d\n",
 	       fd_type, img_id, opts.use_page_server ? 1 : 0,
 	       opts.cow_dump ? 1 : 0);
 
@@ -1196,7 +1192,7 @@ static int page_server_add(int sk, struct page_server_iov *pi, u32 flags)
 	struct page_xfer *lxfer = &cxfer.loc_xfer;
 	struct iovec iov;
 
-	pr_err("VMA_TRACE: phase=PS_RECV_ADD dst_id=0x%lx vaddr=0x%lx nr_pages=%u flags=0x%x\n",
+	pr_debug("VMA_TRACE: phase=PS_RECV_ADD dst_id=0x%lx vaddr=0x%lx nr_pages=%u flags=0x%x\n",
 	       (unsigned long)pi->dst_id, (unsigned long)pi->vaddr,
 	       (unsigned int)pi->nr_pages, flags);
 
@@ -1802,9 +1798,8 @@ static int page_server_start_async_read(void *buf, unsigned long nr_pages, ps_as
 	return 0;
 }
 
-/* Bulk stream reader code (bulk_recv, bulk_stats, page_server_async_read_bulk,
- * page_server_start_async_read_bulk, page_server_update_async_callback, etc.)
- * is now in cow-bulk-recv.c */
+/* COW control message reader (page_server_async_read_bulk, etc.)
+ * is in cow-bulk-recv.c */
 
 
 /*
@@ -1976,12 +1971,12 @@ int page_server_start_read(void *buf, unsigned long nr, ps_async_read_complete c
 	pr_debug("page_server_start_read\n");
 
 	if (opts.cow_dump) {
-		if (flags & PR_ASYNC)
-			return page_server_start_async_read_bulk(buf, nr, complete, priv);
-		else {
-			pr_err("Bulk mode doesn't support synchronous reads\n");
-			return -1;
-		}
+		/*
+		 * COW mode: reader is already initialized by
+		 * cow_setup_prebuffer_reader(). Pages come via P3 threads,
+		 * not through this path.
+		 */
+		return 0;
 	}
 	
 	/* On-demand mode: traditional request/response */

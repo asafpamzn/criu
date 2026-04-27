@@ -16,14 +16,6 @@
 #define PS_IOV_ALL_PAGES_SENT     16  /* Primary -> Replica: all pages sent, zero-fill rest */
 #define PS_IOV_ALL_PAGES_SENT_ACK 17  /* Replica -> Primary: ACK, safe to close connection */
 
-/* Compression state machine states for bulk stream reader */
-enum compress_read_state {
-	COMPRESS_STATE_READING_HEADER = 0,    /* Reading page_server_iov header */
-	COMPRESS_STATE_READING_SIZE,          /* Reading compressed_size (4 bytes) */
-	COMPRESS_STATE_READING_COMPRESSED,    /* Reading compressed data */
-	COMPRESS_STATE_READING_UNCOMPRESSED,  /* Reading uncompressed page data */
-};
-
 /* Global compression statistics (used by cow-bulk-send.c) */
 extern unsigned long g_compress_uncompressed_bytes;
 extern unsigned long g_compress_compressed_bytes;
