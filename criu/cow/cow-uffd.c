@@ -972,7 +972,7 @@ static unsigned long drain_apply_batch(struct batch_buffer_entry *entry,
 		int pf_served = __builtin_popcountll(entry->initial_bitmap & ~entry->page_bitmap);
 
 		if (pf_served > 0) {
-			pr_err("DRAIN_FREE_DEBUG: base=0x%lx bitmap=0x%llx initial=0x%llx "
+			pr_debug("DRAIN_FREE_DEBUG: base=0x%lx bitmap=0x%llx initial=0x%llx "
 			       "pf_served=%d freeing=%d of 64\n",
 			       base, (unsigned long long)entry->page_bitmap,
 			       (unsigned long long)entry->initial_bitmap,
