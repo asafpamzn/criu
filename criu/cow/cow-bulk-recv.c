@@ -152,8 +152,8 @@ static int read_bulk_header(struct ps_async_read_bulk *ar, int flags)
 	 * through P3 receiver threads. Log details for debugging.
 	 */
 	pr_err("BUG: page data arrived on main socket!\n");
-	pr_err("  cmd=%u nr_pages=%u vaddr=0x%lx dst_id=%lu\n",
-	       cmd, ar->pi.nr_pages,
+	pr_err("  cmd=%u nr_pages=%lu vaddr=0x%lx dst_id=%lu\n",
+	       cmd, (unsigned long)ar->pi.nr_pages,
 	       (unsigned long)ar->pi.vaddr,
 	       (unsigned long)ar->pi.dst_id);
 	pr_err("  bulk_stream_done=%d all_pages_sent=%d\n",
