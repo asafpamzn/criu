@@ -27,7 +27,7 @@
  * Tracks all state transitions and validates them to detect bugs.
  * Adds overhead, use only for debugging.
  */
-#define CONFIG_PAGE_STATE_TRACKER
+// #define CONFIG_PAGE_STATE_TRACKER
 
 /*
  * SCAN_COMPARE - Debug mode to compare BPF vs PAGEMAP_SCAN at freeze time.
@@ -63,7 +63,7 @@
  * When enabled, PRIMARY and REPLICA compare process state after freeze.
  * Useful for debugging memory divergence issues.
  */
-#define CONFIG_COW_COMPARE
+// #define CONFIG_COW_COMPARE
 
 /*
  * CONFIG_COW_COMPARE_PAGES - Enable page hash comparison (slow).
@@ -71,7 +71,7 @@
  * This is very slow for large processes. Disable to only compare VMAs.
  * Requires CONFIG_COW_COMPARE to be enabled.
  */
-#define CONFIG_COW_COMPARE_PAGES
+// #define CONFIG_COW_COMPARE_PAGES
 
 /*
  * CONFIG_COW_WAIT_REPLICA_TOUCH - Wait for touch file before proceeding.
