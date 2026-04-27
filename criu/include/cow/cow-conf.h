@@ -149,7 +149,7 @@
 #define COW_NUM_SCANNERS		20
 
 /* Number of background drain threads */
-#define COW_NUM_DRAIN_THREADS		20
+#define COW_NUM_DRAIN_THREADS		10
 
 /* Maximum threads for page pool (must exceed COW_NUM_P3_THREADS - 1) */
 #define COW_MAX_THREADS			33
