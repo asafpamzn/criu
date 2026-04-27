@@ -23,13 +23,13 @@
 set -u
 
 PERF=/usr/lib/linux-tools/6.17.0-1012-aws/perf
-LOG=/fsx/lazy/lazy-primary.log
+LOG=/fsx/lazy/lazy-server.log
 OUT=/tmp/criu-drain.data
 PIDFILE=/tmp/criu-drain-perf.pid
 CRIU_PROCNAME=criu
 
 # Start matches first drain thread start. End matches drain timing log.
-START_RE='Drain thread [0-9]+ started'
+START_RE='cow-uffd: Drain thread'
 END_RE='TIMING: drain took'
 
 # Safety cap: stop perf after this many seconds even if END_RE never matches.
