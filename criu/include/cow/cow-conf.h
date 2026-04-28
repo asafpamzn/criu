@@ -125,8 +125,8 @@
  * SECTION 1: Batch Transfer Configuration
  * ================================================================ */
 
-/* Pages per batch for bulk transfer (256KB when PAGE_SIZE=4KB) */
-#define COW_BATCH_PAGES			64
+/* Pages per batch for bulk transfer (1MB when PAGE_SIZE=4KB) */
+#define COW_BATCH_PAGES			256
 #define COW_BATCH_SIZE			(COW_BATCH_PAGES * PAGE_SIZE)
 
 /* ================================================================
@@ -167,7 +167,7 @@
 #define COW_CHUNK_ALIGN_MASK		(~(COW_CHUNK_ALIGN - 1))
 
 /* Allocation batching */
-#define COW_ALLOC_BATCH			64  /* Pages per allocation batch (256KB) */
+#define COW_ALLOC_BATCH			256  /* Pages per allocation batch (1MB) */
 
 /* Maximum chunks (8192 * 64MB = 512GB max memory) */
 #define COW_MAX_POOL_CHUNKS		8192
@@ -186,11 +186,11 @@
  * ================================================================ */
 
 /*
- * Batch buffer: hash table stores 256KB-aligned entries.
- * Each entry holds 64 contiguous pages with a bitmap tracking validity.
- * Drain can UFFDIO_COPY 256KB at once instead of per-page.
+ * Batch buffer: hash table stores 1MB-aligned entries.
+ * Each entry holds 256 contiguous pages with a bitmap tracking validity.
+ * Drain can UFFDIO_COPY 1MB at once instead of per-page.
  */
-#define COW_BATCH_SHIFT			18  /* log2(COW_BATCH_SIZE) = log2(256KB) */
+#define COW_BATCH_SHIFT			20  /* log2(COW_BATCH_SIZE) = log2(1MB) */
 #define COW_BATCH_ALIGN_MASK		(~((1UL << COW_BATCH_SHIFT) - 1))
 
 /* 256K buckets: ~5 entries/bucket at 300GB (1.2M entries) */
