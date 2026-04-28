@@ -239,6 +239,10 @@ static void *p3_receiver_thread_func(void *arg)
 	struct p3_receiver_ctx *ctx = (struct p3_receiver_ctx *)arg;
 	unsigned long pages = 0;
 	int ret = 0;
+	char thread_name[16];
+
+	snprintf(thread_name, sizeof(thread_name), "cow-p3rcv-%d", ctx->thread_id);
+	pthread_setname_np(pthread_self(), thread_name);
 
 	pr_info("P3 receiver[%d] started on socket %d\n", ctx->thread_id, ctx->socket);
 

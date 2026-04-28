@@ -3,9 +3,9 @@
 # perf_p3_rec.sh - Profile CRIU COW restore during P3 (bulk receive) phase.
 #
 # Usage:
-#   Shell A:  sudo ./perf_p3_rec.sh              # starts immediately, stops on END regex
-#   Shell A:  sudo ./perf_p3_rec.sh -d 30        # fixed 30s recording
-#   Shell A:  sudo ./perf_p3_rec.sh -P           # per-pid mode (criu PIDs only)
+#   sudo ./perf_p3_rec.sh -l /path/to/log    # required: specify log file
+#   sudo ./perf_p3_rec.sh -l /path/to/log -d 30   # fixed 30s recording
+#   sudo ./perf_p3_rec.sh -l /path/to/log -P      # per-pid mode (criu PIDs only)
 #
 # The script starts profiling IMMEDIATELY (no waiting for START marker).
 # It stops when it sees the END marker in the log, or after MAX_SECONDS.
@@ -14,13 +14,13 @@
 set -u
 
 PERF=/usr/lib/linux-tools/6.17.0-1012-aws/perf
-LOG=/fsx/lazy/lazy-server.log
+LOG=""
 OUT=/tmp/criu-p3-recv.data
 PIDFILE=/tmp/criu-p3-recv-perf.pid
 CRIU_PROCNAME=criu
 
 # End: bulk transfer complete
-END_RE='cow-bulk-recv: === REPLICA PHASE 2: Bulk transfer complete ==='
+END_RE='REPLICA PHASE 2: Bulk transfer complete'
 
 # Safety cap: stop perf after this many seconds even if END_RE never matches.
 MAX_SECONDS=120
@@ -28,16 +28,23 @@ MAX_SECONDS=120
 FIXED_DURATION=0
 # -P switches from system-wide (-a) to per-pid (-p CRIU_PIDS)
 PER_PID_MODE=0
-while getopts "d:Ph" opt; do
+while getopts "d:Pl:h" opt; do
 	case "$opt" in
 	d) FIXED_DURATION=$OPTARG ;;
 	P) PER_PID_MODE=1 ;;
+	l) LOG=$OPTARG ;;
 	h)
-		sed -n '2,17p' "$0"
+		sed -n '2,12p' "$0"
 		exit 0
 		;;
 	esac
 done
+
+if [ -z "$LOG" ]; then
+	echo "perf_p3_rec: -l <logfile> is required" >&2
+	echo "Usage: sudo $0 -l /path/to/log [-d SEC] [-P]" >&2
+	exit 1
+fi
 
 if [ "$(id -u)" -ne 0 ]; then
 	echo "perf_p3_rec: must run as root (sudo $0)" >&2
