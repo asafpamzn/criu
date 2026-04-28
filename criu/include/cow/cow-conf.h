@@ -197,9 +197,9 @@
 #define COW_BATCH_BUFFER_HASH_BITS	18
 #define COW_BATCH_BUFFER_HASH_SIZE	(1 << COW_BATCH_BUFFER_HASH_BITS)
 
-/* Fine-grained locking for batch buffer */
-#define COW_BATCH_NUM_HASH_LOCKS	4096
-#define COW_BATCH_BUCKETS_PER_LOCK	64  /* 256K / 4K */
+/* Fine-grained locking for batch buffer - 1:1 lock per bucket to minimize contention */
+#define COW_BATCH_NUM_HASH_LOCKS	COW_BATCH_BUFFER_HASH_SIZE
+#define COW_BATCH_BUCKETS_PER_LOCK	1
 
 /* Page state tracker hash table */
 #define COW_PAGE_STATE_HASH_BITS	18
