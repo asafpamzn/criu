@@ -189,6 +189,7 @@ stop_perf() {
 # ---- START PROFILING IMMEDIATELY ----
 echo "perf_p3_rec: starting profiling immediately..." >&2
 START_EPOCH=$(date +%s)
+
 if ! start_perf; then
 	echo "perf_p3_rec: start_perf failed - aborting" >&2
 	exit 2
@@ -210,6 +211,15 @@ while :; do
 		echo "perf_p3_rec: MAX_SECONDS ($MAX_SECONDS) reached without END match - stopping anyway" >&2
 		stop_perf
 		break
+	fi
+
+	# Check entire log file for END marker
+	if [ "$FIXED_DURATION" -eq 0 ]; then
+		if grep -qF "$END_RE" "$LOG" 2>/dev/null; then
+			echo "perf_p3_rec: END matched (found in log file)" >&2
+			stop_perf
+			break
+		fi
 	fi
 
 	# Read with 1s timeout so we can re-check timeouts
