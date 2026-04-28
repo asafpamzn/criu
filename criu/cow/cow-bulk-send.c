@@ -1745,32 +1745,42 @@ static void *p3_bulk_sender_thread(void *arg)
 		float bulk_ratio_pct = 0.0f;
 
 		clock_gettime(CLOCK_MONOTONIC, &bulk_start);
-		pr_err("P3[%d]: Starting bulk transfer (work-stealing)\n", thread_id);
 
-		/* Pull work items from shared queue until exhausted */
-		while ((work = get_next_work_item()) != NULL) {
-			unsigned long vaddr;
+		/*
+		 * Only COW_NUM_P3_THREADS_BULK threads participate in bulk transfer.
+		 * Other threads skip to phase 2 (dirty scanning) where all threads
+		 * are needed to keep up with parallel scanners.
+		 */
+		if (thread_id < COW_NUM_P3_THREADS_BULK) {
+			pr_err("P3[%d]: Starting bulk transfer (work-stealing)\n", thread_id);
 
-			for (vaddr = work->start; vaddr < work->end; ) {
-				unsigned long next_bound = (vaddr + COW_BATCH_SIZE) & COW_BATCH_ALIGN_MASK;
-				unsigned long batch_end = (next_bound < work->end) ? next_bound : work->end;
-				int batch_pages = (batch_end - vaddr) / PAGE_SIZE;
-				int sent;
+			/* Pull work items from shared queue until exhausted */
+			while ((work = get_next_work_item()) != NULL) {
+				unsigned long vaddr;
 
-				sent = send_lazy_vma_pages_batch(
-					ctx->socket, work->lve, vaddr, batch_pages,
-					ctx->dst_id, ctx->source_pid);
+				for (vaddr = work->start; vaddr < work->end; ) {
+					unsigned long next_bound = (vaddr + COW_BATCH_SIZE) & COW_BATCH_ALIGN_MASK;
+					unsigned long batch_end = (next_bound < work->end) ? next_bound : work->end;
+					int batch_pages = (batch_end - vaddr) / PAGE_SIZE;
+					int sent;
 
-				if (sent < 0) {
-					pr_err("P3[%d]: Failed to send batch at %lx\n",
-					       thread_id, vaddr);
-					BUG();
+					sent = send_lazy_vma_pages_batch(
+						ctx->socket, work->lve, vaddr, batch_pages,
+						ctx->dst_id, ctx->source_pid);
+
+					if (sent < 0) {
+						pr_err("P3[%d]: Failed to send batch at %lx\n",
+						       thread_id, vaddr);
+						BUG();
+					}
+
+					total_sent += sent;
+					vaddr += batch_pages * PAGE_SIZE;
 				}
-
-				total_sent += sent;
-				vaddr += batch_pages * PAGE_SIZE;
+				chunks_processed++;
 			}
-			chunks_processed++;
+		} else {
+			pr_err("P3[%d]: Skipping bulk (idle until phase 2)\n", thread_id);
 		}
 
 		clock_gettime(CLOCK_MONOTONIC, &bulk_end);

@@ -133,8 +133,27 @@
  * SECTION 2: Thread Count Configuration
  * ================================================================ */
 
-/* Number of parallel P3 sender/receiver threads */
+/*
+ * Machine profiles - uncomment ONE to select thread counts.
+ * SMALL: 4-core machines (4 scanners, 4 drain, 4 P3 but 1 active in bulk)
+ * LARGE: 32+ core machines (20 scanners, 10 drain, 15 P3)
+ */
+/* #define COW_PROFILE_LARGE */
+#define COW_PROFILE_SMALL
+
+#ifdef COW_PROFILE_SMALL
+#define COW_NUM_P3_THREADS		4
+#define COW_NUM_P3_THREADS_BULK		1   /* Active P3 threads during bulk transfer */
+#define COW_NUM_SCANNERS		4
+#define COW_NUM_DRAIN_THREADS		4
+#define COW_MAX_THREADS			16
+#else /* COW_PROFILE_LARGE (default) */
 #define COW_NUM_P3_THREADS		15
+#define COW_NUM_P3_THREADS_BULK		15
+#define COW_NUM_SCANNERS		20
+#define COW_NUM_DRAIN_THREADS		10
+#define COW_MAX_THREADS			33
+#endif
 
 /*
  * Number of queues per scanner (producer). Scanner i owns queues
@@ -144,15 +163,6 @@
  */
 #define COW_QUEUES_PER_THREAD		5
 #define COW_TOTAL_QUEUES		(COW_NUM_SCANNERS * COW_QUEUES_PER_THREAD)
-
-/* Number of parallel scanner threads */
-#define COW_NUM_SCANNERS		20
-
-/* Number of background drain threads */
-#define COW_NUM_DRAIN_THREADS		10
-
-/* Maximum threads for page pool (must exceed COW_NUM_P3_THREADS - 1) */
-#define COW_MAX_THREADS			33
 
 /* Maximum epoll fds for COW lazy-pages */
 #define COW_MAX_EPOLL_FDS		128
