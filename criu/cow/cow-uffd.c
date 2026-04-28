@@ -736,6 +736,7 @@ void *cow_page_buffer_lookup_and_remove(unsigned long vaddr)
 			/* free_bm has bits set for unused slots */
 			/* Don't free page_idx — caller will */
 			cow_batch_bitmap_not(&free_bm, &entry->initial_bitmap);
+			cow_batch_bitmap_mask(&free_bm, COW_BATCH_PAGES);
 			cow_batch_bitmap_clear(&free_bm, page_idx);
 			COW_BATCH_BITMAP_FOR_EACH_SET(&free_bm, j) {
 				page_pool_put((char *)entry->data + j * PAGE_SIZE);
@@ -781,6 +782,7 @@ void cow_page_buffer_destroy(void)
 			/* Free pages still owned (bitmap) + unused slots (~initial) */
 			cow_batch_bitmap_t free_bm;
 			cow_batch_bitmap_not(&free_bm, &entry->initial_bitmap);
+			cow_batch_bitmap_mask(&free_bm, COW_BATCH_PAGES);
 			cow_batch_bitmap_or(&free_bm, &free_bm, &entry->page_bitmap);
 			COW_BATCH_BITMAP_FOR_EACH_SET(&free_bm, j) {
 				page_pool_put((char *)entry->data + j * PAGE_SIZE);
@@ -882,6 +884,7 @@ void cow_page_buffer_remove_range(unsigned long start, unsigned long len)
 				}
 				/* Free owned + unused, skip page-fault-served */
 				cow_batch_bitmap_not(&free_bm, &entry->initial_bitmap);
+				cow_batch_bitmap_mask(&free_bm, COW_BATCH_PAGES);
 				cow_batch_bitmap_or(&free_bm, &free_bm, &entry->page_bitmap);
 				COW_BATCH_BITMAP_FOR_EACH_SET(&free_bm, j) {
 					page_pool_put((char *)entry->data + j * PAGE_SIZE);
@@ -967,10 +970,12 @@ static unsigned long drain_apply_batch(struct batch_buffer_entry *entry,
 		int free_count, pf_served;
 
 		cow_batch_bitmap_not(&free_bitmap, &entry->initial_bitmap);
+		cow_batch_bitmap_mask(&free_bitmap, COW_BATCH_PAGES);
 		cow_batch_bitmap_or(&free_bitmap, &free_bitmap, &entry->page_bitmap);
 		free_count = cow_batch_bitmap_popcount(&free_bitmap);
 
 		cow_batch_bitmap_not(&pf_served_bm, &entry->page_bitmap);
+		cow_batch_bitmap_mask(&pf_served_bm, COW_BATCH_PAGES);
 		cow_batch_bitmap_and(&pf_served_bm, &pf_served_bm, &entry->initial_bitmap);
 		pf_served = cow_batch_bitmap_popcount(&pf_served_bm);
 

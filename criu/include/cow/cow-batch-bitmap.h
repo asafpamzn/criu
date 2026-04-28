@@ -110,6 +110,26 @@ static inline void cow_batch_bitmap_not(cow_batch_bitmap_t *dst,
 	dst->words[3] = ~src->words[3];
 }
 
+/*
+ * Mask bitmap to only include bits [0, limit).
+ * Use after NOT operations when batch size < 256 pages.
+ */
+static inline void cow_batch_bitmap_mask(cow_batch_bitmap_t *bm, int limit)
+{
+	int full_words = limit >> 6;
+	int remaining_bits = limit & 63;
+	int i;
+
+	if (remaining_bits > 0) {
+		uint64_t mask = (1ULL << remaining_bits) - 1;
+		bm->words[full_words] &= mask;
+		full_words++;
+	}
+
+	for (i = full_words; i < COW_BITMAP_WORDS; i++)
+		bm->words[i] = 0;
+}
+
 static inline void cow_batch_bitmap_copy(cow_batch_bitmap_t *dst,
 					 const cow_batch_bitmap_t *src)
 {
