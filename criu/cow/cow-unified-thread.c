@@ -217,7 +217,11 @@ static void *unified_page_server_thread(void *arg)
 		goto out;
 	}
 
-	pr_info("P3 threads started successfully\n");
+	pr_err("P3 threads started successfully, waiting for completion...\n");
+
+	/* Wait for all P3 threads to complete before sending end-of-transfer */
+	cow_wait_p3_threads();
+	pr_err("P3 threads completed, sending end-of-transfer marker\n");
 
 out:
 	print_compress_stats();
