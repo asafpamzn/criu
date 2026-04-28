@@ -24,6 +24,7 @@
 #include "common/bug.h"
 #include "cow/pf-tracker.h"
 #include "cow/page-pool.h"
+#include "cow/cow-batch-bitmap.h"
 #include "cow/unmapped-tracker.h"
 #include "cow/page-state-tracker.h"
 #include "pstree.h"
@@ -50,8 +51,8 @@ struct batch_buffer_entry {
 	unsigned int magic;		/* BATCH_ENTRY_MAGIC or BATCH_ENTRY_DEAD */
 	unsigned long base_vaddr;	/* 256KB-aligned start address */
 	void *data;			/* Contiguous page pool allocation */
-	uint64_t page_bitmap;		/* 1 = page present, 0 = absent */
-	uint64_t initial_bitmap;	/* Bits ever set (for drain free accounting) */
+	cow_batch_bitmap_t page_bitmap;	/* 1 = page present, 0 = absent */
+	cow_batch_bitmap_t initial_bitmap; /* Bits ever set (for drain free accounting) */
 	int nr_pages;			/* popcount(page_bitmap) */
 	struct hlist_node hash;
 	struct list_head chunk_list;	/* Link in chunk's list for ordered drain */
@@ -370,7 +371,7 @@ int cow_page_buffer_add_batch(unsigned long base_vaddr, void *data,
 	struct batch_buffer_entry *entry;
 	unsigned int hash;
 	int lock_idx;
-	uint64_t new_bitmap;
+	cow_batch_bitmap_t new_bitmap;
 	int i;
 
 	BUG_ON(!cow_buffer.initialized);
@@ -382,7 +383,8 @@ int cow_page_buffer_add_batch(unsigned long base_vaddr, void *data,
 		BUG();
 	}
 
-	new_bitmap = ((nr_pages == 64) ? ~0ULL : ((1ULL << nr_pages) - 1)) << page_offset;
+	cow_batch_bitmap_zero(&new_bitmap);
+	cow_batch_bitmap_set_range(&new_bitmap, page_offset, nr_pages);
 
 	hash = batch_buffer_hash(base_vaddr);
 	lock_idx = lock_index(hash);
@@ -399,9 +401,9 @@ int cow_page_buffer_add_batch(unsigned long base_vaddr, void *data,
 				memcpy((char *)entry->data + idx * PAGE_SIZE,
 				       (char *)data + idx * PAGE_SIZE, PAGE_SIZE);
 
-				if (!(entry->page_bitmap & (1ULL << idx))) {
-					entry->page_bitmap |= (1ULL << idx);
-					entry->initial_bitmap |= (1ULL << idx);
+				if (!cow_batch_bitmap_test(&entry->page_bitmap, idx)) {
+					cow_batch_bitmap_set(&entry->page_bitmap, idx);
+					cow_batch_bitmap_set(&entry->initial_bitmap, idx);
 					entry->nr_pages++;
 					__sync_fetch_and_add(&cow_buffer.nr_pages, 1);
 				}
@@ -442,8 +444,8 @@ int cow_page_buffer_add_batch(unsigned long base_vaddr, void *data,
 	entry->magic = BATCH_ENTRY_MAGIC;
 	entry->base_vaddr = base_vaddr;
 	entry->data = batch_data;
-	entry->page_bitmap = new_bitmap;
-	entry->initial_bitmap = new_bitmap;
+	cow_batch_bitmap_copy(&entry->page_bitmap, &new_bitmap);
+	cow_batch_bitmap_copy(&entry->initial_bitmap, &new_bitmap);
 	entry->nr_pages = nr_pages;
 	INIT_HLIST_NODE(&entry->hash);
 	INIT_LIST_HEAD(&entry->chunk_list);
@@ -544,9 +546,9 @@ void cow_page_buffer_mark_pages(unsigned long base_vaddr,
 			for (i = 0; i < nr_pages; i++) {
 				int idx = page_offset + i;
 
-				if (!(entry->page_bitmap & (1ULL << idx))) {
-					entry->page_bitmap |= (1ULL << idx);
-					entry->initial_bitmap |= (1ULL << idx);
+				if (!cow_batch_bitmap_test(&entry->page_bitmap, idx)) {
+					cow_batch_bitmap_set(&entry->page_bitmap, idx);
+					cow_batch_bitmap_set(&entry->initial_bitmap, idx);
 					entry->nr_pages++;
 					__sync_fetch_and_add(&cow_buffer.nr_pages, 1);
 				}
@@ -592,9 +594,9 @@ int cow_page_buffer_add(unsigned long vaddr, void *data, int thread_id, bool noc
 			memcpy((char *)entry->data + page_idx * PAGE_SIZE,
 			       data, PAGE_SIZE);
 
-			if (!(entry->page_bitmap & (1ULL << page_idx))) {
-				entry->page_bitmap |= (1ULL << page_idx);
-				entry->initial_bitmap |= (1ULL << page_idx);
+			if (!cow_batch_bitmap_test(&entry->page_bitmap, page_idx)) {
+				cow_batch_bitmap_set(&entry->page_bitmap, page_idx);
+				cow_batch_bitmap_set(&entry->initial_bitmap, page_idx);
 				entry->nr_pages++;
 				__sync_fetch_and_add(&cow_buffer.nr_pages, 1);
 			}
@@ -623,8 +625,10 @@ int cow_page_buffer_add(unsigned long vaddr, void *data, int thread_id, bool noc
 	entry->magic = BATCH_ENTRY_MAGIC;
 	entry->base_vaddr = base;
 	entry->data = batch_data;
-	entry->page_bitmap = (1ULL << page_idx);
-	entry->initial_bitmap = (1ULL << page_idx);
+	cow_batch_bitmap_zero(&entry->page_bitmap);
+	cow_batch_bitmap_set(&entry->page_bitmap, page_idx);
+	cow_batch_bitmap_zero(&entry->initial_bitmap);
+	cow_batch_bitmap_set(&entry->initial_bitmap, page_idx);
 	entry->nr_pages = 1;
 	INIT_HLIST_NODE(&entry->hash);
 	INIT_LIST_HEAD(&entry->chunk_list);
@@ -694,7 +698,7 @@ void *cow_page_buffer_lookup_and_remove(unsigned long vaddr)
 		}
 		if (entry->base_vaddr != base)
 			continue;
-		if (!(entry->page_bitmap & (1ULL << page_idx))) {
+		if (!cow_batch_bitmap_test(&entry->page_bitmap, page_idx)) {
 			pthread_spin_unlock(&hash_locks[lock_idx]);
 			return NULL;
 		}
@@ -702,13 +706,15 @@ void *cow_page_buffer_lookup_and_remove(unsigned long vaddr)
 		page_ptr = (char *)entry->data + page_idx * PAGE_SIZE;
 
 		/* Clear bit and decrement count */
-		entry->page_bitmap &= ~(1ULL << page_idx);
+		cow_batch_bitmap_clear(&entry->page_bitmap, page_idx);
 		entry->nr_pages--;
 		__sync_fetch_and_sub(&cow_buffer.nr_pages, 1);
 
 		if (entry->nr_pages == 0) {
 			/* Batch empty — remove entirely */
 			int chunk_id = entry->chunk_id;
+			cow_batch_bitmap_t free_bm;
+			int j;
 
 			hlist_del(&entry->hash);
 			pthread_spin_unlock(&hash_locks[lock_idx]);
@@ -726,19 +732,13 @@ void *cow_page_buffer_lookup_and_remove(unsigned long vaddr)
 			 * page_bitmap is 0 here (entry empty), so freed_by_pf =
 			 * initial_bitmap minus the current page_idx bit.
 			 */
-			{
-				uint64_t free_bm = ~entry->initial_bitmap;
-				int j;
-
-				/* Also free unused slots (never had data) */
-				/* free_bm has bits set for unused slots */
-				/* Don't free page_idx — caller will */
-				free_bm &= ~(1ULL << page_idx);
-				while (free_bm) {
-					j = __builtin_ctzll(free_bm);
-					free_bm &= free_bm - 1;
-					page_pool_put((char *)entry->data + j * PAGE_SIZE);
-				}
+			/* Also free unused slots (never had data) */
+			/* free_bm has bits set for unused slots */
+			/* Don't free page_idx — caller will */
+			cow_batch_bitmap_not(&free_bm, &entry->initial_bitmap);
+			cow_batch_bitmap_clear(&free_bm, page_idx);
+			COW_BATCH_BITMAP_FOR_EACH_SET(&free_bm, j) {
+				page_pool_put((char *)entry->data + j * PAGE_SIZE);
 			}
 			entry->magic = BATCH_ENTRY_DEAD;
 			xfree(entry);
@@ -779,10 +779,10 @@ void cow_page_buffer_destroy(void)
 		hlist_for_each_entry_safe(entry, tmp,
 					  &cow_buffer.hash_table[i], hash) {
 			/* Free pages still owned (bitmap) + unused slots (~initial) */
-			uint64_t free_bm = entry->page_bitmap | ~entry->initial_bitmap;
-			while (free_bm) {
-				j = __builtin_ctzll(free_bm);
-				free_bm &= free_bm - 1;
+			cow_batch_bitmap_t free_bm;
+			cow_batch_bitmap_not(&free_bm, &entry->initial_bitmap);
+			cow_batch_bitmap_or(&free_bm, &free_bm, &entry->page_bitmap);
+			COW_BATCH_BITMAP_FOR_EACH_SET(&free_bm, j) {
 				page_pool_put((char *)entry->data + j * PAGE_SIZE);
 			}
 			hlist_del(&entry->hash);
@@ -836,7 +836,8 @@ void cow_page_buffer_remove_range(unsigned long start, unsigned long len)
 		unsigned int hash = batch_buffer_hash(base);
 		int lock_idx = lock_index(hash);
 		int first_page, last_page;
-		uint64_t clear_mask;
+		cow_batch_bitmap_t clear_mask;
+		cow_batch_bitmap_t masked;
 		int cleared;
 
 		/* Which pages within this batch overlap [start, end)? */
@@ -845,31 +846,30 @@ void cow_page_buffer_remove_range(unsigned long start, unsigned long len)
 			    ? batch_page_index(end - 1) : (COW_BATCH_PAGES - 1);
 
 		/* Build mask of pages to clear */
-		clear_mask = 0;
-		{
-			int p;
-			for (p = first_page; p <= last_page; p++)
-				clear_mask |= (1ULL << p);
-		}
+		cow_batch_bitmap_zero(&clear_mask);
+		cow_batch_bitmap_set_range(&clear_mask, first_page, last_page - first_page + 1);
 
 		pthread_spin_lock(&hash_locks[lock_idx]);
 		hlist_for_each_entry(entry, &cow_buffer.hash_table[hash], hash) {
 			if (entry->base_vaddr != base)
 				continue;
 
-			cleared = __builtin_popcountll(entry->page_bitmap & clear_mask);
+			cow_batch_bitmap_and(&masked, &entry->page_bitmap, &clear_mask);
+			cleared = cow_batch_bitmap_popcount(&masked);
 			if (cleared == 0) {
 				pthread_spin_unlock(&hash_locks[lock_idx]);
 				goto next_batch;
 			}
 
-			entry->page_bitmap &= ~clear_mask;
+			cow_batch_bitmap_clear_range(&entry->page_bitmap, first_page,
+						     last_page - first_page + 1);
 			entry->nr_pages -= cleared;
 			removed += cleared;
 
 			if (entry->nr_pages == 0) {
 				int chunk_id = entry->chunk_id;
-				uint64_t free_bm;
+				cow_batch_bitmap_t free_bm;
+				int j;
 
 				hlist_del(&entry->hash);
 				pthread_spin_unlock(&hash_locks[lock_idx]);
@@ -881,10 +881,9 @@ void cow_page_buffer_remove_range(unsigned long start, unsigned long len)
 					pthread_spin_unlock(&chunk_index[chunk_id].lock);
 				}
 				/* Free owned + unused, skip page-fault-served */
-				free_bm = entry->page_bitmap | ~entry->initial_bitmap;
-				while (free_bm) {
-					int j = __builtin_ctzll(free_bm);
-					free_bm &= free_bm - 1;
+				cow_batch_bitmap_not(&free_bm, &entry->initial_bitmap);
+				cow_batch_bitmap_or(&free_bm, &free_bm, &entry->page_bitmap);
+				COW_BATCH_BITMAP_FOR_EACH_SET(&free_bm, j) {
 					page_pool_put((char *)entry->data + j * PAGE_SIZE);
 				}
 				xfree(entry);
@@ -920,19 +919,18 @@ static unsigned long drain_apply_batch(struct batch_buffer_entry *entry,
 {
 	unsigned long base = entry->base_vaddr;
 	void *data = entry->data;
-	uint64_t bitmap = entry->page_bitmap;
 	unsigned long applied = 0;
 	int uffd, i;
 
 	if (entry->magic != BATCH_ENTRY_MAGIC) {
 		pr_err("RACE_DEBUG: drain_apply_batch got DEAD entry! "
-		       "base=0x%lx magic=0x%x data=%p bitmap=0x%llx\n",
-		       base, entry->magic, data, (unsigned long long)bitmap);
+		       "base=0x%lx magic=0x%x data=%p\n",
+		       base, entry->magic, data);
 		BUG();
 	}
 
 	/* Fast path: full batch — single UFFDIO_COPY for 256KB */
-	if (bitmap == ~0ULL) {
+	if (cow_batch_bitmap_is_full_upto(&entry->page_bitmap, COW_BATCH_PAGES)) {
 		for (i = 0; i < COW_BATCH_PAGES; i++)
 			page_state_set(base + i * PAGE_SIZE, PAGE_STATE_DRAIN_PENDING);
 
@@ -944,10 +942,7 @@ static unsigned long drain_apply_batch(struct batch_buffer_entry *entry,
 		applied = COW_BATCH_PAGES;
 	} else {
 		/* Partial batch — per-page copies for set bits */
-		while (bitmap) {
-			i = __builtin_ctzll(bitmap);
-			bitmap &= bitmap - 1;
-
+		COW_BATCH_BITMAP_FOR_EACH_SET(&entry->page_bitmap, i) {
 			page_state_set(base + i * PAGE_SIZE, PAGE_STATE_DRAIN_PENDING);
 			uffd = cow_get_uffd_for_vaddr(lpis, base + i * PAGE_SIZE);
 			if (uffd >= 0) {
@@ -960,28 +955,32 @@ static unsigned long drain_apply_batch(struct batch_buffer_entry *entry,
 	}
 
 	/*
-	 * Free pool pages. page_pool_get_pages(64) set refcount += 64.
+	 * Free pool pages. page_pool_get_pages(COW_BATCH_PAGES) set refcount.
 	 * Page faults may have already freed some (cleared bitmap bits).
 	 *
 	 * free_bitmap = pages drain owns (bitmap) | unused slots (~initial_bitmap)
 	 * Skip: pages served by page fault (initial_bitmap & ~bitmap) — already freed.
 	 */
 	{
-		uint64_t free_bitmap = entry->page_bitmap | ~entry->initial_bitmap;
-		int free_count = __builtin_popcountll(free_bitmap);
-		int pf_served = __builtin_popcountll(entry->initial_bitmap & ~entry->page_bitmap);
+		cow_batch_bitmap_t free_bitmap;
+		cow_batch_bitmap_t pf_served_bm;
+		int free_count, pf_served;
+
+		cow_batch_bitmap_not(&free_bitmap, &entry->initial_bitmap);
+		cow_batch_bitmap_or(&free_bitmap, &free_bitmap, &entry->page_bitmap);
+		free_count = cow_batch_bitmap_popcount(&free_bitmap);
+
+		cow_batch_bitmap_not(&pf_served_bm, &entry->page_bitmap);
+		cow_batch_bitmap_and(&pf_served_bm, &pf_served_bm, &entry->initial_bitmap);
+		pf_served = cow_batch_bitmap_popcount(&pf_served_bm);
 
 		if (pf_served > 0) {
-			pr_debug("DRAIN_FREE_DEBUG: base=0x%lx bitmap=0x%llx initial=0x%llx "
-			       "pf_served=%d freeing=%d of 64\n",
-			       base, (unsigned long long)entry->page_bitmap,
-			       (unsigned long long)entry->initial_bitmap,
-			       pf_served, free_count);
+			pr_debug("DRAIN_FREE_DEBUG: base=0x%lx "
+			       "pf_served=%d freeing=%d of %d\n",
+			       base, pf_served, free_count, COW_BATCH_PAGES);
 		}
 
-		while (free_bitmap) {
-			i = __builtin_ctzll(free_bitmap);
-			free_bitmap &= free_bitmap - 1;
+		COW_BATCH_BITMAP_FOR_EACH_SET(&free_bitmap, i) {
 			page_pool_put((char *)data + i * PAGE_SIZE);
 		}
 	}
