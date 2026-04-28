@@ -1,5 +1,7 @@
 # COW Dump - Minimized Downtime Live Migration
 
+```echo 1 | sudo tee /proc/sys/vm/unprivileged_userfaultfd
+```
 ## What is COW Dump?
 
 COW (Copy-on-Write) dump is an experimental CRIU feature that minimizes source process downtime during live migration. Traditional CRIU dump freezes the process for the entire duration while saving memory to disk. COW dump uses Linux's userfaultfd write-protect mechanism to track memory writes while the process continues running.

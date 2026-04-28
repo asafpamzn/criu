@@ -143,8 +143,8 @@
 
 #ifdef COW_PROFILE_SMALL
 #define COW_NUM_P3_THREADS		4
-#define COW_NUM_P3_THREADS_BULK		2   /* Active P3 threads during bulk transfer */
-#define COW_P3_SENDER_CPU		40   /* CPU to pin bulk senders to (share 1 core) */
+#define COW_NUM_P3_THREADS_BULK		1   /* Active P3 threads during bulk transfer */
+//#define COW_P3_SENDER_CPU		40   /* CPU to pin bulk senders to (share 1 core) */
 #define COW_NUM_SCANNERS		4
 #define COW_NUM_DRAIN_THREADS		4
 #define COW_MAX_THREADS			16
