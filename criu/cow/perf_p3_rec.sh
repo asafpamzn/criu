@@ -20,7 +20,7 @@ PIDFILE=/tmp/criu-p3-recv-perf.pid
 CRIU_PROCNAME=criu
 
 # End: bulk transfer complete
-END_RE='REPLICA PHASE 2: Bulk transfer complete'
+END_RE='REPLICA PHASE 4: All pages sent signal received'
 
 # Safety cap: stop perf after this many seconds even if END_RE never matches.
 MAX_SECONDS=120
