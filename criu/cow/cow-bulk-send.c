@@ -11,6 +11,8 @@
  * - Queue consumption: threads can steal from other threads' queues when idle
  */
 
+#define _GNU_SOURCE
+#include <sched.h>
 #include <sys/uio.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
@@ -46,6 +48,35 @@
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "cow-bulk: "
+
+/*
+ * CPU affinity helpers for bulk transfer phase.
+ * During bulk transfer, sender threads are pinned to one CPU to avoid
+ * using multiple cores (receiver is the bottleneck, not sender).
+ * After bulk transfer, threads are unpinned to use all available CPUs.
+ */
+#ifdef COW_P3_SENDER_CPU
+static void pin_to_cpu(int cpu)
+{
+	cpu_set_t cpuset;
+
+	CPU_ZERO(&cpuset);
+	CPU_SET(cpu, &cpuset);
+	pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+}
+
+static void unpin_cpu(void)
+{
+	cpu_set_t cpuset;
+	int i, ncpus;
+
+	ncpus = sysconf(_SC_NPROCESSORS_ONLN);
+	CPU_ZERO(&cpuset);
+	for (i = 0; i < ncpus; i++)
+		CPU_SET(i, &cpuset);
+	pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+}
+#endif
 
 /*
  * Protocol structs, constants, and helpers are now in page-xfer.h:
@@ -1752,6 +1783,9 @@ static void *p3_bulk_sender_thread(void *arg)
 		 * are needed to keep up with parallel scanners.
 		 */
 		if (thread_id < COW_NUM_P3_THREADS_BULK) {
+#ifdef COW_P3_SENDER_CPU
+			pin_to_cpu(COW_P3_SENDER_CPU);
+#endif
 			pr_err("P3[%d]: Starting bulk transfer (work-stealing)\n", thread_id);
 
 			/* Pull work items from shared queue until exhausted */
@@ -1798,6 +1832,12 @@ static void *p3_bulk_sender_thread(void *arg)
 
 		/* Signal scanner that this thread's bulk transfer is complete */
 		__atomic_fetch_add(&g_bulk_transfer_done_count, 1, __ATOMIC_RELEASE);
+
+#ifdef COW_P3_SENDER_CPU
+		/* Unpin CPU for phase 2 - all threads need full CPU access */
+		if (thread_id < COW_NUM_P3_THREADS_BULK)
+			unpin_cpu();
+#endif
 	}
 
 	/* === Phase 2: Consume dirty regions from scanner queue === */
