@@ -3,17 +3,12 @@
 # perf_p3_rec.sh - Profile CRIU COW restore during P3 (bulk receive) phase.
 #
 # Usage:
-#   Shell A:  sudo ./perf_p3_rec.sh              # default: system-wide + END regex
-#   Shell A:  sudo ./perf_p3_rec.sh -d 30        # fixed 30s recording after START
+#   Shell A:  sudo ./perf_p3_rec.sh              # starts immediately, stops on END regex
+#   Shell A:  sudo ./perf_p3_rec.sh -d 30        # fixed 30s recording
 #   Shell A:  sudo ./perf_p3_rec.sh -P           # per-pid mode (criu PIDs only)
-#   Shell B:  run your criu restore.
 #
-# At START the script:
-#   - resolves criu PIDs via pgrep and aborts if none are running
-#   - logs the PIDs so you can confirm perf is targeting the right run
-#   - records system-wide (-a) by default, or per-pid (-p) with -P
-# After stop it prints a per-process sample summary so you can verify
-# criu actually appears in the capture.
+# The script starts profiling IMMEDIATELY (no waiting for START marker).
+# It stops when it sees the END marker in the log, or after MAX_SECONDS.
 #
 
 set -u
@@ -24,9 +19,7 @@ OUT=/tmp/criu-p3-recv.data
 PIDFILE=/tmp/criu-p3-recv-perf.pid
 CRIU_PROCNAME=criu
 
-# Start: page-xfer connect to page server
 # End: bulk transfer complete
-START_RE='page-xfer: DEBUG_FD: connect_to_page_server setup_tcp_client returned page_server_sk='
 END_RE='cow-bulk-recv: === REPLICA PHASE 2: Bulk transfer complete ==='
 
 # Safety cap: stop perf after this many seconds even if END_RE never matches.
@@ -91,15 +84,10 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# ---- PREFLIGHT: show candidate markers from recent log ----
-echo "perf_p3_rec: preflight - recent P3-related lines in log:" >&2
-grep -nE 'page-xfer.*connect_to_page_server|cow-bulk-recv.*Bulk transfer' "$LOG" 2>/dev/null | tail -10 >&2 || true
-echo "---" >&2
-echo "perf_p3_rec: START regex: $START_RE" >&2
-echo "perf_p3_rec: END   regex: $END_RE" >&2
+# ---- PREFLIGHT ----
+echo "perf_p3_rec: END regex: $END_RE" >&2
 echo "perf_p3_rec: MAX_SECONDS (safety stop): $MAX_SECONDS" >&2
 [ "$FIXED_DURATION" -gt 0 ] && echo "perf_p3_rec: FIXED_DURATION override: ${FIXED_DURATION}s" >&2
-echo "perf_p3_rec: waiting for START..." >&2
 
 resolve_criu_pids() {
 	# Comma-separated list of criu PIDs, or empty string if none.
@@ -191,51 +179,42 @@ stop_perf() {
 	echo "  sudo $PERF script -i $OUT | ~/FlameGraph/stackcollapse-perf.pl | ~/FlameGraph/flamegraph.pl > /tmp/p3-recv.svg" >&2
 }
 
-# ---- MAIN LOOP using process substitution ----
-# Process substitution keeps break/exit in the main shell (not a subshell),
-# so cleanup runs reliably and tail is a tracked child we can kill.
+# ---- START PROFILING IMMEDIATELY ----
+echo "perf_p3_rec: starting profiling immediately..." >&2
+START_EPOCH=$(date +%s)
+if ! start_perf; then
+	echo "perf_p3_rec: start_perf failed - aborting" >&2
+	exit 2
+fi
+
+# ---- MAIN LOOP: wait for END marker ----
 exec 3< <(exec tail -n0 -F "$LOG")
 TAIL_PID=$!
 
-START_EPOCH=0
 while :; do
-	# If perf is running, enforce MAX_SECONDS cap
-	if [ "$PERF_PID" -gt 0 ]; then
-		now=$(date +%s)
-		elapsed=$((now - START_EPOCH))
-		if [ "$FIXED_DURATION" -gt 0 ] && [ "$elapsed" -ge "$FIXED_DURATION" ]; then
-			echo "perf_p3_rec: fixed ${FIXED_DURATION}s duration reached" >&2
-			stop_perf
-			break
-		fi
-		if [ "$elapsed" -ge "$MAX_SECONDS" ]; then
-			echo "perf_p3_rec: MAX_SECONDS ($MAX_SECONDS) reached without END match - stopping anyway" >&2
-			stop_perf
-			break
-		fi
+	now=$(date +%s)
+	elapsed=$((now - START_EPOCH))
+	if [ "$FIXED_DURATION" -gt 0 ] && [ "$elapsed" -ge "$FIXED_DURATION" ]; then
+		echo "perf_p3_rec: fixed ${FIXED_DURATION}s duration reached" >&2
+		stop_perf
+		break
+	fi
+	if [ "$elapsed" -ge "$MAX_SECONDS" ]; then
+		echo "perf_p3_rec: MAX_SECONDS ($MAX_SECONDS) reached without END match - stopping anyway" >&2
+		stop_perf
+		break
 	fi
 
-	# Read with 1s timeout so we can re-check MAX_SECONDS
+	# Read with 1s timeout so we can re-check timeouts
 	if ! IFS= read -r -t 1 -u 3 line; then
 		continue
 	fi
 
-	if [ "$PERF_PID" -eq 0 ]; then
-		if echo "$line" | grep -qF "$START_RE"; then
-			echo "perf_p3_rec: START matched: $line" >&2
-			START_EPOCH=$(date +%s)
-			if ! start_perf; then
-				echo "perf_p3_rec: start_perf failed - aborting" >&2
-				exit 2
-			fi
-		fi
-	else
-		# If -d was given, ignore END_RE; stop only on duration.
-		if [ "$FIXED_DURATION" -eq 0 ] && echo "$line" | grep -qF "$END_RE"; then
-			echo "perf_p3_rec: END matched: $line" >&2
-			stop_perf
-			break
-		fi
+	# If -d was given, ignore END_RE; stop only on duration.
+	if [ "$FIXED_DURATION" -eq 0 ] && echo "$line" | grep -qF "$END_RE"; then
+		echo "perf_p3_rec: END matched: $line" >&2
+		stop_perf
+		break
 	fi
 done
 
