@@ -11,7 +11,6 @@
  * - Queue consumption: threads can steal from other threads' queues when idle
  */
 
-#define _GNU_SOURCE
 #include <sched.h>
 #include <sys/uio.h>
 #include <sys/socket.h>
