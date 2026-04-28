@@ -88,7 +88,7 @@ if ! sudo "$CRIU_BIN" restore \
   --skip-file-rwx-check \
   --skip-file-size-check \
   --file-validation filesize \
-  -v2 -o "$IMAGES_DIR/lazy-restore.log"; then
+  -v1 -o "$IMAGES_DIR/lazy-restore.log"; then
   echo "ERROR: restore failed"
   sudo tail -n 120 "$IMAGES_DIR/lazy-restore.log" 2>/dev/null || true
   exit 1
