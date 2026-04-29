@@ -64,7 +64,7 @@ if [ ! -f "$READY_FILE" ]; then
   exit 1
 fi
 
-# Step 4: CRIU dump
+# Step 4: CRIU dump (run in background)
 log_timing "Step 4: Starting CRIU dump for PID $PID..."
 echo "Step 4: Starting CRIU dump for PID $PID..."
 START_TIME=$(date +%s%3N)
@@ -81,17 +81,16 @@ sudo "$CRIU_BIN" dump \
   --ext-unix-sk \
   --leave-running \
   --display-stats \
-  -v2 -o "$IMAGES_DIR/lazy-primary.log"
+  -v2 -o "$IMAGES_DIR/lazy-primary.log" &
+DUMP_PID=$!
+log_timing "Step 4: CRIU dump started in background (PID: $DUMP_PID)"
 
-DUMP_END_TIME=$(date +%s%3N)
-DUMP_ELAPSED=$((DUMP_END_TIME - START_TIME))
-log_timing "Step 4: CRIU dump completed (took ${DUMP_ELAPSED}ms)"
-
-# Step 5: Wait for replica master_link_status:up
-log_timing "Step 5: Waiting for replica master_link_status:up..."
+# Step 5: Wait for replica master_link_status:up (while dump runs)
+log_timing "Step 5: Polling for replica master_link_status:up..."
 echo "Step 5: Waiting for replica master_link_status:up..."
 REPLICA_PORT="${REPLICA_PORT:-6379}"
-for i in $(seq 1 30); do
+STATUS=""
+for i in $(seq 1 120); do
   STATUS=$($SSH ubuntu@$REPLICA_SSH_HOST "valkey-cli -p $REPLICA_PORT info replication 2>/dev/null | grep master_link_status" || true)
   if [[ "$STATUS" == *"master_link_status:up"* ]]; then
     END_TIME=$(date +%s%3N)
@@ -106,6 +105,20 @@ done
 if [[ "$STATUS" != *"master_link_status:up"* ]]; then
   log_timing "Step 5: WARNING - master_link_status:up not reached within 60s"
   echo "WARNING: master_link_status:up not reached within 60s"
+fi
+
+# Wait for CRIU dump to finish
+log_timing "Step 6: Waiting for CRIU dump to complete..."
+wait $DUMP_PID
+DUMP_EXIT_CODE=$?
+DUMP_END_TIME=$(date +%s%3N)
+DUMP_ELAPSED=$((DUMP_END_TIME - START_TIME))
+if [ $DUMP_EXIT_CODE -eq 0 ]; then
+  log_timing "Step 6: CRIU dump completed successfully (took ${DUMP_ELAPSED}ms total)"
+else
+  log_timing "Step 6: ERROR - CRIU dump failed with exit code $DUMP_EXIT_CODE"
+  echo "ERROR: CRIU dump failed"
+  exit 1
 fi
 
 log_timing "Migration complete"
