@@ -2093,7 +2093,7 @@ int cow_start_p3_threads(int *sockets, int num_sockets, u64 dst_id, pid_t source
 		}
 	}
 
-	pr_info("Started %d P3 bulk sender threads (%d sockets)\n",
+	pr_err("Started %d P3 bulk sender threads (%d sockets)\n",
 		p3_threads_active, threads_to_start);
 	return p3_threads_active > 0 ? 0 : -1;
 }

@@ -128,7 +128,7 @@ void cow_wait_for_page_server_thread(void)
 		return;
 	}
 
-	pr_info("Waiting for page server thread to finish...\n");
+	pr_err("Waiting for page server thread to finish...\n");
 	pthread_join(g_unified_thread, NULL);
 	g_unified_thread_running = false;
 	pr_info("Page server thread finished\n");
