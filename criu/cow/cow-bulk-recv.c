@@ -3,8 +3,7 @@
  *
  * All page data is transferred via P3 receiver threads. This module
  * only handles control messages on the main page server socket:
- * - End-of-transfer marker (nr_pages == 0)
- * - PS_IOV_ALL_PAGES_SENT signal
+ * - PS_IOV_ALL_PAGES_SENT signal (primary done sending pages)
  */
 
 #include <errno.h>
@@ -61,49 +60,8 @@ static int bulk_recv(void *buf, int need, int flags)
 }
 
 /*
- * Handle end-of-transfer marker: send ACK and handle COW mode continuation.
- */
-static int handle_end_of_transfer(struct ps_async_read_bulk *ar, u32 cmd)
-{
-	struct page_server_iov ack = {
-		.cmd = PS_IOV_BULK_COMPLETE_ACK,
-		.nr_pages = 0,
-		.vaddr = 0,
-		.dst_id = 0,
-	};
-	int sk = get_page_server_sk();
-
-	pr_err("=== REPLICA PHASE 2: Bulk transfer complete ===\n");
-	pr_info("Received end-of-transfer marker (cmd=%u dst_id=%lu)\n", cmd,
-		(unsigned long)ar->pi.dst_id);
-	set_bulk_stream_done();
-
-	/*
-	 * Send ACK back to primary so it can break out of
-	 * page_server_serve() and proceed to Phase 3 (skeleton dump).
-	 */
-	page_server_tcp_nodelay(sk, true);
-	if (page_server_send(sk, &ack, sizeof(ack), 0) != sizeof(ack))
-		pr_perror("Failed to send bulk complete ACK");
-	else
-		pr_info("Sent bulk complete ACK to primary\n");
-
-	/*
-	 * COW mode: don't return BULK_STREAM_COMPLETE yet.
-	 * Wait for PS_IOV_ALL_PAGES_SENT signal. Reset to read next header.
-	 */
-	if (opts.cow_dump && !cow_is_all_pages_sent_received()) {
-		pr_err("=== REPLICA: Waiting for PHASE 3-4 (skeleton + dirty pages) ===\n");
-		ar->rb = 0;
-		return BULK_STREAM_PROGRESS;
-	}
-
-	return BULK_STREAM_COMPLETE;
-}
-
-/*
  * Read control message header from main socket.
- * Only end-of-transfer markers and PS_IOV_ALL_PAGES_SENT are expected.
+ * Only PS_IOV_ALL_PAGES_SENT is expected on this socket.
  * Page data on this socket is a bug — all data goes via P3 threads.
  */
 static int read_bulk_header(struct ps_async_read_bulk *ar, int flags)
@@ -131,10 +89,6 @@ static int read_bulk_header(struct ps_async_read_bulk *ar, int flags)
 	/* Header complete — reset for next header */
 	ar->rb = 0;
 	cmd = decode_ps_cmd(ar->pi.cmd);
-
-	/* End-of-transfer marker: nr_pages == 0, not ALL_PAGES_SENT */
-	if (ar->pi.nr_pages == 0 && cmd != PS_IOV_ALL_PAGES_SENT)
-		return handle_end_of_transfer(ar, cmd);
 
 	if (cmd == PS_IOV_ALL_PAGES_SENT) {
 		/* Primary signals all pages sent - replica can zero-fill rest */

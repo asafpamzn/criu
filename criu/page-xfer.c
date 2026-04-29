@@ -1442,6 +1442,13 @@ static int page_server_serve(int sk)
 		if (pi.cmd == PS_IOV_CLOSE || pi.cmd == PS_IOV_FORCE_CLOSE ||
 		    decode_ps_cmd(pi.cmd) == PS_IOV_BULK_COMPLETE_ACK)
 			break;
+		/*
+		 * COW mode: break immediately after PS_IOV_GET_ALL.
+		 * Unified thread starts P3 senders, we store socket and return.
+		 * Main dump loop will send PS_IOV_ALL_PAGES_SENT later.
+		 */
+		if (opts.cow_dump && decode_ps_cmd(pi.cmd) == PS_IOV_GET_ALL)
+			break;
 	}
 
 	if (receiving_pages && !ret && !flushed) {
@@ -1450,9 +1457,16 @@ static int page_server_serve(int sk)
 	}
 
 	/*
-	 * COW phased migration: after receiving bulk complete ACK,
-	 * keep the socket open for Phase 4 dirty bitmap transfer.
+	 * COW mode: store socket after PS_IOV_GET_ALL and return.
+	 * No need to wait for ACK - main socket only carries control signals.
 	 */
+	if (opts.cow_dump && decode_ps_cmd(pi.cmd) == PS_IOV_GET_ALL) {
+		pr_err("COW mode: storing socket (sk=%d) after PS_IOV_GET_ALL\n", sk);
+		page_server_sk = sk;
+		return 0;
+	}
+
+	/* Legacy path: wait for bulk ACK (kept for backwards compatibility) */
 	if (opts.cow_dump && bulk_ack_received) {
 		pr_info("Bulk ACK received, storing socket (sk=%d) for dirty bitmap\n", sk);
 		page_server_sk = sk;

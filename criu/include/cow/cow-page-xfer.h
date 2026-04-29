@@ -52,9 +52,6 @@ extern int cow_request_all_remote_pages(unsigned long img_id);
 /* COW server-side socket close */
 extern void cow_close_page_server_socket(void);
 
-/* Send end-of-transfer marker to replica */
-extern int send_image_complete(int sk, u64 dst_id);
-
 /* COW lazy VMA pagemap writing */
 struct page_xfer;
 struct lazy_vma_entry;

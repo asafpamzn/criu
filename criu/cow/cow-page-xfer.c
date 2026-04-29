@@ -100,32 +100,6 @@ int send_all_pages_sent_signal(int sk)
 }
 
 /*
- * Send end-of-transfer marker (PS_IOV_CLOSE) to replica.
- * Called by primary after all P3 threads complete bulk + dirty transfer.
- */
-int send_image_complete(int sk, u64 dst_id)
-{
-	struct page_server_iov close_cmd = {
-		.cmd = PS_IOV_CLOSE,
-		.nr_pages = 0,
-		.vaddr = 0,
-		.dst_id = dst_id,
-	};
-
-	pr_info("Image dst_id=%lu complete\n", dst_id);
-
-	if (send_psi(sk, &close_cmd)) {
-		if (errno == EPIPE || errno == ECONNRESET) {
-			pr_info("Receiver closed after close marker, treating as completion\n");
-			return 0;
-		}
-		pr_err("Failed to send close command\n");
-		return -1;
-	}
-	return 0;
-}
-
-/*
  * Send ACK for all_pages_sent signal (COW phased migration).
  * Called by replica after drain thread finishes, so primary knows
  * it's safe to close the connection.

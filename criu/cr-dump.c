@@ -3200,12 +3200,6 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 	}
 	pr_err("P3 threads completed: %lu total pages sent\n", cow_p3_pages_sent());
 
-	/* Send end-of-transfer marker to replica now that all P3 pages are sent */
-	if (send_image_complete(get_page_server_sk(), 0) < 0)
-		pr_warn("Failed to send end-of-transfer marker\n");
-	else
-		pr_err("Sent end-of-transfer marker to replica\n");
-
 	/* Free new VMA ranges after P3 threads are done using them */
 	cow_free_new_vma_ranges();
 
