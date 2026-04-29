@@ -1319,6 +1319,7 @@ static int page_server_serve(int sk)
 	bool flushed = false;
 	bool bulk_ack_received = false;
 	bool receiving_pages = !opts.lazy_pages;
+	u32 last_cmd = 0;
 
 	if (receiving_pages) {
 		/*
@@ -1439,6 +1440,7 @@ static int page_server_serve(int sk)
 
 		if (ret)
 			break;
+		last_cmd = cmd;
 		if (pi.cmd == PS_IOV_CLOSE || pi.cmd == PS_IOV_FORCE_CLOSE ||
 		    decode_ps_cmd(pi.cmd) == PS_IOV_BULK_COMPLETE_ACK)
 			break;
@@ -1447,7 +1449,7 @@ static int page_server_serve(int sk)
 		 * Unified thread starts P3 senders, we store socket and return.
 		 * Main dump loop will send PS_IOV_ALL_PAGES_SENT later.
 		 */
-		if (opts.cow_dump && decode_ps_cmd(pi.cmd) == PS_IOV_GET_ALL)
+		if (opts.cow_dump && cmd == PS_IOV_GET_ALL)
 			break;
 	}
 
@@ -1460,7 +1462,7 @@ static int page_server_serve(int sk)
 	 * COW mode: store socket after PS_IOV_GET_ALL and return.
 	 * No need to wait for ACK - main socket only carries control signals.
 	 */
-	if (opts.cow_dump && decode_ps_cmd(pi.cmd) == PS_IOV_GET_ALL) {
+	if (opts.cow_dump && last_cmd == PS_IOV_GET_ALL) {
 		pr_err("COW mode: storing socket (sk=%d) after PS_IOV_GET_ALL\n", sk);
 		page_server_sk = sk;
 		return 0;
