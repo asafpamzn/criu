@@ -14,7 +14,8 @@ SCRIPT_START_MS=$(date +%s%3N)
 log_timing() {
   local now=$(date +%s%3N)
   local elapsed=$((now - SCRIPT_START_MS))
-  echo "[${elapsed}ms] $1" | sudo tee -a "$TIMING_LOG"
+  local timestamp=$(date '+%H:%M:%S.%3N')
+  echo "[$timestamp +${elapsed}ms] $1" | sudo tee -a "$TIMING_LOG"
 }
 
 PID=$(pgrep -x valkey-server | head -n1)

@@ -14,7 +14,8 @@ START_MS=$(date +%s%3N)
 log_timing() {
   local now=$(date +%s%3N)
   local elapsed=$((now - START_MS))
-  echo "[${elapsed}ms] $1" | sudo tee -a "$TIMING_LOG"
+  local timestamp=$(date '+%H:%M:%S.%3N')
+  echo "[$timestamp +${elapsed}ms] $1" | sudo tee -a "$TIMING_LOG"
 }
 
 sudo rm -f "$TIMING_LOG"

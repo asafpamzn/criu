@@ -36,7 +36,7 @@ for i in $(seq 1 "$MAX_WAIT"); do
     WAIT_END=$(date +%s%3N)
     WAIT_ELAPSED=$((WAIT_END - WAIT_START))
     echo "Valkey is responsive after ${WAIT_ELAPSED}ms (iter $i)"
-    echo "[+${WAIT_ELAPSED}ms] (wait_replicate) Valkey responsive after iter $i" | sudo tee -a "$TIMING_LOG"
+    echo "[$(date '+%H:%M:%S.%3N') +${WAIT_ELAPSED}ms] (wait_replicate) Valkey responsive after iter $i" | sudo tee -a "$TIMING_LOG"
     break
   fi
   sleep 0.1
@@ -52,6 +52,6 @@ REPL_START=$(date +%s%3N)
 valkey-cli replicaof "$PRIMARY_IP" "$VALKEY_PORT"
 REPL_END=$(date +%s%3N)
 REPL_ELAPSED=$((REPL_END - REPL_START))
-echo "[+${REPL_ELAPSED}ms] (wait_replicate) replicaof command done" | sudo tee -a "$TIMING_LOG"
+echo "[$(date '+%H:%M:%S.%3N') +${REPL_ELAPSED}ms] (wait_replicate) replicaof command done" | sudo tee -a "$TIMING_LOG"
 
 echo "Replica configured"
