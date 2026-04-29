@@ -127,7 +127,10 @@ log_timing "Migration complete"
 MIGRATION_TIME_MS=$ELAPSED
 MIGRATION_TIME_SEC=$(echo "scale=2; $MIGRATION_TIME_MS / 1000" | bc)
 
-# Print big summary
+SUMMARY_LOG="$IMAGES_DIR/migrate_summary.log"
+
+# Print big summary (to both stdout and file)
+{
 echo ""
 echo "=================================================================="
 echo ""
@@ -149,7 +152,6 @@ echo "    MIGRATION TIME:  ${MIGRATION_TIME_SEC}s  (${MIGRATION_TIME_MS}ms)"
 echo ""
 echo "=================================================================="
 echo ""
-
-# Print timing summary
 echo "=== DETAILED TIMING LOG ==="
 cat "$TIMING_LOG"
+} | sudo tee "$SUMMARY_LOG"
