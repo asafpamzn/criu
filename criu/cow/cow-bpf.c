@@ -157,7 +157,7 @@ static unsigned long debug_scan_dirty_pages(pid_t pid, unsigned long **out_addrs
 		args.walk_end = vma_start;
 		args.vec = (u64)(unsigned long)regs;
 		args.vec_len = 1024;
-		args.max_pages = 0;
+		args.max_pages = COW_PAGEMAP_SCAN_MAX_PAGES_ITER1;
 		args.category_anyof_mask = PAGE_IS_WRITTEN;
 		args.return_mask = PAGE_IS_WRITTEN;
 

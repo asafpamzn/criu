@@ -279,6 +279,10 @@
 /* PAGEMAP_SCAN max regions per call */
 #define COW_PAGEMAP_SCAN_VEC_LEN	1000
 
+/* PAGEMAP_SCAN max pages per call - first iteration vs subsequent iterations */
+#define COW_PAGEMAP_SCAN_MAX_PAGES_ITER1	16384
+#define COW_PAGEMAP_SCAN_MAX_PAGES_ITER_N	512
+
 /* Initial capacity for ranges arrays */
 #define COW_INITIAL_RANGES_CAPACITY	64
 
