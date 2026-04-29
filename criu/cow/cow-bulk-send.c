@@ -352,13 +352,13 @@ static void *dirty_scanner_thread(void *arg)
 			long regs_len;
 			unsigned long vma_size = lve->end - lve->start;
 			unsigned long total_pages = vma_size / PAGE_SIZE;
-			unsigned long pages_per_scanner = total_pages / COW_NUM_SCANNERS;
+			unsigned long pages_per_scanner = total_pages / COW_NUM_PRE_SCANNERS;
 			unsigned long my_start, my_end;
 
 			/* Calculate this scanner's range (page-aligned) */
 			my_start = lve->start + (scanner_id * pages_per_scanner * PAGE_SIZE);
-			if (scanner_id == COW_NUM_SCANNERS - 1)
-				my_end = lve->end;  /* Last scanner gets remainder */
+			if (scanner_id == COW_NUM_PRE_SCANNERS - 1)
+				my_end = lve->end;  /* Last pre-scanner gets remainder */
 			else
 				my_end = my_start + (pages_per_scanner * PAGE_SIZE);
 
