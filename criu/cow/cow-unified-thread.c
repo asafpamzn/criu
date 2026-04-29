@@ -150,28 +150,6 @@ static void print_compress_stats(void)
 	g_compress_compressed_bytes = 0;
 }
 
-static int send_image_complete(int sk, u64 dst_id)
-{
-	struct page_server_iov close_cmd = {
-		.cmd = PS_IOV_CLOSE,
-		.nr_pages = 0,
-		.vaddr = 0,
-		.dst_id = dst_id,
-	};
-
-	pr_info("Image dst_id=%lu complete\n", dst_id);
-
-	if (send_psi(sk, &close_cmd)) {
-		if (errno == EPIPE || errno == ECONNRESET) {
-			pr_info("Receiver closed after close marker, treating as completion\n");
-			return 0;
-		}
-		pr_err("Failed to send close command\n");
-		return -1;
-	}
-	return 0;
-}
-
 /* ========== Unified Thread ========== */
 
 static void *unified_page_server_thread(void *arg)
@@ -217,15 +195,14 @@ static void *unified_page_server_thread(void *arg)
 		goto out;
 	}
 
-	pr_err("P3 threads started successfully, waiting for completion...\n");
-
-	/* Wait for all P3 threads to complete before sending end-of-transfer */
-	cow_wait_p3_threads();
-	pr_err("P3 threads completed, sending end-of-transfer marker\n");
+	pr_info("P3 threads started successfully\n");
 
 out:
 	print_compress_stats();
-	BUG_ON(send_image_complete(args->sk, args->dst_id) < 0);
+	/*
+	 * Don't send PS_IOV_CLOSE here - P3 threads are still running.
+	 * Main dump loop will send end-of-transfer after cow_wait_p3_threads().
+	 */
 
 	xfree(args);
 	g_unified_thread_running = false;
