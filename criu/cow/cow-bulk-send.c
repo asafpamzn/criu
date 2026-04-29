@@ -374,7 +374,7 @@ static void *dirty_scanner_thread(void *arg)
 			args.walk_end = my_start;
 			args.vec = (u64)(unsigned long)regs;
 			args.vec_len = max_regs;
-			args.max_pages = 0;
+			args.max_pages = 16384;
 			args.category_anyof_mask = PAGE_IS_WRITTEN;
 			args.return_mask = PAGE_IS_WRITTEN;
 
@@ -609,7 +609,7 @@ wait_for_freeze:
 			args.walk_end = my_start;
 			args.vec = (u64)(unsigned long)regs;
 			args.vec_len = max_regs;
-			args.max_pages = 0;
+			args.max_pages = 16384;
 			args.category_anyof_mask = PAGE_IS_WRITTEN;
 			args.return_mask = PAGE_IS_WRITTEN;
 
@@ -916,7 +916,7 @@ int cow_bpf_drain_to_queues(void)
 		args.walk_end = lve->start;
 		args.vec = (u64)(unsigned long)regs;
 		args.vec_len = COW_PAGEMAP_SCAN_VEC_LEN;
-		args.max_pages = 0;
+		args.max_pages = 16384;
 		args.category_anyof_mask = PAGE_IS_WRITTEN;
 		args.return_mask = PAGE_IS_WRITTEN;
 
