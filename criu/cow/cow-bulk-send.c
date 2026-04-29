@@ -331,6 +331,10 @@ static void *dirty_scanner_thread(void *arg)
 	lazy_vmas = get_global_lazy_vmas();
 
 #ifdef COW_PRE_SCAN
+	/* Only first COW_NUM_PRE_SCANNERS participate in pre-scan */
+	if (scanner_id >= COW_NUM_PRE_SCANNERS)
+		goto wait_for_freeze;
+
 	/* Iterative dirty scanning until freeze signal */
 	while (!__atomic_load_n(&g_scanner_freeze_signal, __ATOMIC_ACQUIRE)) {
 		unsigned long my_dirty_pages = 0;
@@ -428,15 +432,15 @@ static void *dirty_scanner_thread(void *arg)
 		/* Store this scanner's dirty count */
 		ctx->dirty_count = my_dirty_pages;
 
-		/* Synchronize with other scanner - wait for both to complete iteration */
+		/* Synchronize with other pre-scanners */
 		pthread_mutex_lock(&g_scanner_mutex);
 		g_scanners_iter_done++;
-		if (g_scanners_iter_done == COW_NUM_SCANNERS) {
-			/* Last scanner to finish - calculate total and reset */
+		if (g_scanners_iter_done == COW_NUM_PRE_SCANNERS) {
+			/* Last pre-scanner to finish - calculate total and reset */
 			int s;
 
 			g_total_dirty_pages = 0;
-			for (s = 0; s < COW_NUM_SCANNERS; s++)
+			for (s = 0; s < COW_NUM_PRE_SCANNERS; s++)
 				g_total_dirty_pages += scanners[s].dirty_count;
 			g_scanners_iter_done = 0;
 			pthread_cond_broadcast(&g_scanner_cond);
@@ -460,7 +464,7 @@ static void *dirty_scanner_thread(void *arg)
 			       iteration, g_total_dirty_pages);
 		}
 
-		/* Check convergence - both scanners check the combined total */
+		/* Check convergence - pre-scanners check the combined total */
 		if (g_total_dirty_pages < COW_DIRTY_SCAN_FREEZE_THRESHOLD) {
 			if (scanner_id == 0) {
 				pr_err("Scanner: %lu pages < %d threshold, requesting freeze\n",
@@ -470,8 +474,19 @@ static void *dirty_scanner_thread(void *arg)
 			break;
 		}
 
+		/* Check max iterations limit */
+		if (COW_PRE_SCAN_MAX_ITERATIONS > 0 && iteration >= COW_PRE_SCAN_MAX_ITERATIONS) {
+			if (scanner_id == 0) {
+				pr_err("Scanner: max iterations (%u) reached, requesting freeze\n", iteration);
+				g_last_scan_flag = true;
+			}
+			break;
+		}
+
 		usleep(COW_USLEEP_1MS);
 	}
+
+wait_for_freeze:
 #endif /* COW_PRE_SCAN */
 
 	/* Wait for freeze signal from main thread */

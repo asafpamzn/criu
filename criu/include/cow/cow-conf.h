@@ -49,7 +49,7 @@
  *               bulk transfer completes, then do a single final PAGEMAP_SCAN
  *               on the frozen process. This is faster and simpler.
  */
-// #define COW_PRE_SCAN
+#define COW_PRE_SCAN
 
 /*
  * CONFIG_HUNG_PAGE_TRACKER - Enable hung page detection.
@@ -146,12 +146,14 @@
 #define COW_NUM_P3_THREADS_BULK		1   /* Active P3 threads during bulk transfer */
 //#define COW_P3_SENDER_CPU		40   /* CPU to pin bulk senders to (share 1 core) */
 #define COW_NUM_SCANNERS		4
+#define COW_NUM_PRE_SCANNERS		1   /* Scanners active during pre-scan (before freeze) */
 #define COW_NUM_DRAIN_THREADS		4
 #define COW_MAX_THREADS			16
 #else /* COW_PROFILE_LARGE (default) */
 #define COW_NUM_P3_THREADS		15
 #define COW_NUM_P3_THREADS_BULK		15
 #define COW_NUM_SCANNERS		20
+#define COW_NUM_PRE_SCANNERS		1   /* Scanners active during pre-scan (before freeze) */
 #define COW_NUM_DRAIN_THREADS		10
 #define COW_MAX_THREADS			33
 #endif
@@ -237,6 +239,9 @@
 
 /* Max iterations before extended sleep */
 #define COW_MAX_DIRTY_ITERATIONS	3
+
+/* Maximum pre-scan iterations before forcing freeze (0 = unlimited) */
+#define COW_PRE_SCAN_MAX_ITERATIONS	1
 
 /* ================================================================
  * SECTION 6: Pre-read Configuration
