@@ -467,9 +467,8 @@ static void *dirty_scanner_thread(void *arg)
 		/* Check convergence - pre-scanners check the combined total */
 		if (g_total_dirty_pages < COW_DIRTY_SCAN_FREEZE_THRESHOLD) {
 			if (scanner_id == 0) {
-				pr_err("Scanner: %lu pages < %d threshold, requesting freeze\n",
+				pr_err("Scanner: %lu pages < %d threshold, will request freeze after queue drain\n",
 				       g_total_dirty_pages, COW_DIRTY_SCAN_FREEZE_THRESHOLD);
-				g_last_scan_flag = true;
 			}
 			break;
 		}
@@ -477,13 +476,36 @@ static void *dirty_scanner_thread(void *arg)
 		/* Check max iterations limit */
 		if (COW_PRE_SCAN_MAX_ITERATIONS > 0 && iteration >= COW_PRE_SCAN_MAX_ITERATIONS) {
 			if (scanner_id == 0) {
-				pr_err("Scanner: max iterations (%u) reached, requesting freeze\n", iteration);
-				g_last_scan_flag = true;
+				pr_err("Scanner: max iterations (%u) reached, will request freeze after queue drain\n", iteration);
 			}
 			break;
 		}
 
 		usleep(COW_USLEEP_1MS);
+	}
+
+	/* Wait for P3 senders to drain the queue before requesting freeze */
+	if (scanner_id == 0) {
+		unsigned long head, tail;
+		struct timespec drain_start, drain_end;
+		long drain_ms;
+
+		clock_gettime(CLOCK_MONOTONIC, &drain_start);
+		pr_err("Scanner: waiting for queue drain before freeze...\n");
+
+		while (1) {
+			head = __atomic_load_n(&g_conv_head, __ATOMIC_ACQUIRE);
+			tail = __atomic_load_n(&g_conv_tail, __ATOMIC_RELAXED);
+			if (tail >= head)
+				break;
+			usleep(COW_USLEEP_1MS);
+		}
+
+		clock_gettime(CLOCK_MONOTONIC, &drain_end);
+		drain_ms = (drain_end.tv_sec - drain_start.tv_sec) * 1000 +
+			   (drain_end.tv_nsec - drain_start.tv_nsec) / 1000000;
+		pr_err("Scanner: queue drained in %ld ms, requesting freeze\n", drain_ms);
+		g_last_scan_flag = true;
 	}
 
 wait_for_freeze:
@@ -1872,9 +1894,13 @@ static void *p3_bulk_sender_thread(void *arg)
 		unsigned long queue_in_bytes, queue_out_bytes;
 		float queue_ratio_pct = 0.0f;
 
+#ifndef COW_PRE_SCAN
+		/* Without pre-scan, wait for freeze signal before consuming queue */
 		while (!__atomic_load_n(&g_scanner_freeze_signal, __ATOMIC_ACQUIRE)) {
 			usleep(COW_USLEEP_1MS);
 		}
+#endif
+		/* With pre-scan, start consuming immediately - don't wait for freeze */
 
 		clock_gettime(CLOCK_MONOTONIC, &loop_start);
 		queue_in_start = tls_compress_in_bytes;
