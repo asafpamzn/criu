@@ -122,9 +122,34 @@ else
 fi
 
 log_timing "Migration complete"
-echo "Migration complete"
+
+# Calculate migration time (from dump start to replication up)
+MIGRATION_TIME_MS=$ELAPSED
+MIGRATION_TIME_SEC=$(echo "scale=2; $MIGRATION_TIME_MS / 1000" | bc)
+
+# Print big summary
+echo ""
+echo "=================================================================="
+echo ""
+echo "  __  __ ___ ____ ____      _  _____ ___ ___  _   _ "
+echo " |  \/  |_ _/ ___|  _ \    / \|_   _|_ _/ _ \| \ | |"
+echo " | |\/| || | |  _| |_) |  / _ \ | |  | | | | |  \| |"
+echo " | |  | || | |_| |  _ <  / ___ \| |  | | |_| | |\  |"
+echo " |_|  |_|___\____|_| \_\/_/   \_\_| |___\___/|_| \_|"
+echo ""
+echo "   ____ ___  __  __ ____  _     _____ _____ _____ "
+echo "  / ___/ _ \|  \/  |  _ \| |   | ____|_   _| ____|"
+echo " | |  | | | | |\/| | |_) | |   |  _|   | | |  _|  "
+echo " | |__| |_| | |  | |  __/| |___| |___  | | | |___ "
+echo "  \____\___/|_|  |_|_|   |_____|_____| |_| |_____|"
+echo ""
+echo "=================================================================="
+echo ""
+echo "    MIGRATION TIME:  ${MIGRATION_TIME_SEC}s  (${MIGRATION_TIME_MS}ms)"
+echo ""
+echo "=================================================================="
+echo ""
 
 # Print timing summary
-echo ""
-echo "=== TIMING SUMMARY (primary) ==="
+echo "=== DETAILED TIMING LOG ==="
 cat "$TIMING_LOG"
