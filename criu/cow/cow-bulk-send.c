@@ -366,67 +366,77 @@ static void *dirty_scanner_thread(void *arg)
 			if (my_end <= my_start)
 				continue;
 
-			memset(&args, 0, sizeof(args));
-			args.size = sizeof(args);
-			args.flags = PM_SCAN_WP_MATCHING;
-			args.start = my_start;
-			args.end = my_end;
-			args.walk_end = my_start;
-			args.vec = (u64)(unsigned long)regs;
-			args.vec_len = max_regs;
-			args.max_pages = (iteration == 1) ?
-				COW_PAGEMAP_SCAN_MAX_PAGES_ITER1 :
-				COW_PAGEMAP_SCAN_MAX_PAGES_ITER_N;
-			args.category_anyof_mask = PAGE_IS_WRITTEN;
-			args.return_mask = PAGE_IS_WRITTEN;
+			/* Range-based chunking: iterate in COW_PAGEMAP_SCAN_RANGE_SIZE chunks
+			 * to bound mmap_lock hold time regardless of dirty page density */
+			for (unsigned long chunk_start = my_start; chunk_start < my_end;) {
+				unsigned long chunk_end = chunk_start + COW_PAGEMAP_SCAN_RANGE_SIZE;
+				if (chunk_end > my_end)
+					chunk_end = my_end;
 
-			do {
-				struct timespec t1, t2, t3;
-				int i;
-				args.start = args.walk_end;
+				memset(&args, 0, sizeof(args));
+				args.size = sizeof(args);
+				args.flags = PM_SCAN_WP_MATCHING;
+				args.start = chunk_start;
+				args.end = chunk_end;
+				args.walk_end = chunk_start;
+				args.vec = (u64)(unsigned long)regs;
+				args.vec_len = max_regs;
+				args.max_pages = (iteration == 1) ?
+					COW_PAGEMAP_SCAN_MAX_PAGES_ITER1 :
+					COW_PAGEMAP_SCAN_MAX_PAGES_ITER_N;
+				args.category_anyof_mask = PAGE_IS_WRITTEN;
+				args.return_mask = PAGE_IS_WRITTEN;
 
-				clock_gettime(CLOCK_MONOTONIC, &t1);
-				regs_len = ioctl(ctx->pagemap_fd, PAGEMAP_SCAN, &args);
-				clock_gettime(CLOCK_MONOTONIC, &t2);
-				scan_time_ns += (t2.tv_sec - t1.tv_sec) * 1000000000UL +
-						(t2.tv_nsec - t1.tv_nsec);
+				do {
+					struct timespec t1, t2, t3;
+					int i;
+					args.start = args.walk_end;
 
-				if (regs_len < 0) {
-					pr_perror("Scanner[%d]: PAGEMAP_SCAN failed", scanner_id);
-					break;
-				}
+					clock_gettime(CLOCK_MONOTONIC, &t1);
+					regs_len = ioctl(ctx->pagemap_fd, PAGEMAP_SCAN, &args);
+					clock_gettime(CLOCK_MONOTONIC, &t2);
+					scan_time_ns += (t2.tv_sec - t1.tv_sec) * 1000000000UL +
+							(t2.tv_nsec - t1.tv_nsec);
 
-				if (regs_len == 0)
-					break;
-
-				num_regions += regs_len;
-
-				for (i = 0; i < regs_len; i++) {
-					struct dirty_region_entry *entry;
-					unsigned long pages;
-
-					pages = (regs[i].end - regs[i].start) / PAGE_SIZE;
-					my_dirty_pages += pages;
-
-					entry = xmalloc(sizeof(*entry));
-					BUG_ON(!entry);
-					entry->start = regs[i].start;
-					entry->end = regs[i].end;
-					entry->dst_id = lve->dst_id;
-					entry->source_pid = g_scanner_source_pid;
-
-					{
-						unsigned long slot = __atomic_fetch_add(&g_conv_head, 1, __ATOMIC_RELAXED);
-						BUG_ON(slot >= CONV_QUEUE_CAP);
-						g_conv_slots[slot] = entry;
-						__atomic_thread_fence(__ATOMIC_RELEASE);
+					if (regs_len < 0) {
+						pr_perror("Scanner[%d]: PAGEMAP_SCAN failed", scanner_id);
+						break;
 					}
-					__sync_fetch_and_add(&g_total_scanned_pages, pages);
-				}
-				clock_gettime(CLOCK_MONOTONIC, &t3);
-				dist_time_ns += (t3.tv_sec - t2.tv_sec) * 1000000000UL +
-						(t3.tv_nsec - t2.tv_nsec);
-			} while (args.walk_end < my_end);
+
+					if (regs_len == 0)
+						break;
+
+					num_regions += regs_len;
+
+					for (i = 0; i < regs_len; i++) {
+						struct dirty_region_entry *entry;
+						unsigned long pages;
+
+						pages = (regs[i].end - regs[i].start) / PAGE_SIZE;
+						my_dirty_pages += pages;
+
+						entry = xmalloc(sizeof(*entry));
+						BUG_ON(!entry);
+						entry->start = regs[i].start;
+						entry->end = regs[i].end;
+						entry->dst_id = lve->dst_id;
+						entry->source_pid = g_scanner_source_pid;
+
+						{
+							unsigned long slot = __atomic_fetch_add(&g_conv_head, 1, __ATOMIC_RELAXED);
+							BUG_ON(slot >= CONV_QUEUE_CAP);
+							g_conv_slots[slot] = entry;
+							__atomic_thread_fence(__ATOMIC_RELEASE);
+						}
+						__sync_fetch_and_add(&g_total_scanned_pages, pages);
+					}
+					clock_gettime(CLOCK_MONOTONIC, &t3);
+					dist_time_ns += (t3.tv_sec - t2.tv_sec) * 1000000000UL +
+							(t3.tv_nsec - t2.tv_nsec);
+				} while (args.walk_end < chunk_end);
+
+				chunk_start = chunk_end;
+			}
 		}
 
 		clock_gettime(CLOCK_MONOTONIC, &iter_end);
@@ -603,6 +613,7 @@ wait_for_freeze:
 			if (my_end <= my_start)
 				continue;
 
+			/* No range chunking needed - process is frozen */
 			memset(&args, 0, sizeof(args));
 			args.size = sizeof(args);
 			args.flags = 0;  /* No WP_MATCHING - just read dirty state */

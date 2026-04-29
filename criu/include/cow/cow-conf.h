@@ -283,6 +283,12 @@
 #define COW_PAGEMAP_SCAN_MAX_PAGES_ITER1	16384
 #define COW_PAGEMAP_SCAN_MAX_PAGES_ITER_N	512
 
+/* PAGEMAP_SCAN max address range per ioctl call (4MB = 2 PMDs)
+ * This bounds mmap_lock hold time regardless of dirty page density.
+ * Unlike max_pages which only limits output, this limits actual scan work.
+ */
+#define COW_PAGEMAP_SCAN_RANGE_SIZE	(4UL * 1024 * 1024)
+
 /* Initial capacity for ranges arrays */
 #define COW_INITIAL_RANGES_CAPACITY	64
 
