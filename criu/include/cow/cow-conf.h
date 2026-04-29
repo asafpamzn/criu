@@ -229,7 +229,7 @@
  * ================================================================ */
 
 /* Dirty page scan freeze threshold (request freeze when below this) */
-#define COW_DIRTY_SCAN_FREEZE_THRESHOLD	10000000
+#define COW_DIRTY_SCAN_FREEZE_THRESHOLD	500000
 
 /* Legacy per-thread convergence threshold */
 #define COW_DIRTY_CONVERGENCE_THRESHOLD	50000
@@ -241,7 +241,7 @@
 #define COW_MAX_DIRTY_ITERATIONS	3
 
 /* Maximum pre-scan iterations before forcing freeze (0 = unlimited) */
-#define COW_PRE_SCAN_MAX_ITERATIONS	1
+#define COW_PRE_SCAN_MAX_ITERATIONS	2
 
 /* ================================================================
  * SECTION 6: Pre-read Configuration
