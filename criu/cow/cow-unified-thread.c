@@ -29,29 +29,6 @@
 #undef LOG_PREFIX
 #define LOG_PREFIX "cow-thread: "
 
-/* ========== Page Request Queue (SPSC) ========== */
-
-struct page_request_entry {
-	unsigned long vaddr;
-	unsigned long nr_pages;
-	int sk;
-	u64 dst_id;
-
-	/* Location info (filled on first access) */
-	struct page_pipe_buf *ppb;
-	unsigned int seg_idx;
-	unsigned long page_idx_in_seg;
-	bool location_found;
-};
-
-DECLARE_SPSC_NODE(page_request, struct page_request_entry);
-
-static struct page_request_spsc_node *page_request_head;
-static char _page_req_pad[COW_SPSC_PADDING - sizeof(struct page_request_spsc_node *)] __attribute__((unused));
-static struct page_request_spsc_node *page_request_tail;
-static unsigned long page_request_queue_size;
-static bool page_request_queue_initialized = false;
-
 
 /* ========== Thread State ========== */
 
