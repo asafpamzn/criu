@@ -52,7 +52,6 @@ struct p3_receiver_ctx {
 
 static struct p3_receiver_ctx p3_receivers[MAX_P3_RECEIVERS];
 static volatile int p3_receivers_active = 0;
-static pthread_t p3_acceptor_thread;
 
 /*
  * Receive one compressed batch from socket and add to page buffer.
