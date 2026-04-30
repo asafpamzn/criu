@@ -358,35 +358,169 @@ Notable compile-time feature flags (also in `cow-conf.h`):
   `CONFIG_COW_COMPARE`, `CONFIG_COW_COMPARE_PAGES` — diagnostics, off by
   default.
 
-## Protocol Extensions (`cow-page-xfer.h`)
+## Protocol
+
+Three distinct message channels are in use:
+
+1. **Page-server TCP** — PRIMARY (dumper) ↔ REPLICA (lazy-pages daemon),
+   over the network. One main control socket plus `COW_NUM_P3_THREADS`
+   parallel P3 data sockets. Frames are `struct page_server_iov` headers
+   with optional trailing payload.
+2. **Lazy-pages UNIX socket** — REPLICA lazy-pages daemon ↔ REPLICA
+   `criu restore`, same host. Carries fixed-size `uint32_t` signal
+   values.
+3. **Parasite compel RPC** — `criu dump` ↔ parasite thread injected
+   into the target process (same host). Used during Phase 1 only.
+
+### Page-server protocol messages (`cow-page-xfer.h`)
 
 ```c
-#define PS_IOV_GET_ALL              8
-#define PS_IOV_ADD_F_PF             9
-#define PS_IOV_ADD_F_COMPRESS      10
-#define PS_IOV_START_RESTORE       12   /* unused in current flow */
-#define PS_IOV_BULK_COMPLETE_ACK   13
-#define PS_IOV_ALL_PAGES_SENT      16   /* primary → replica */
-#define PS_IOV_ALL_PAGES_SENT_ACK  17   /* replica → primary */
+#define PS_IOV_GET_ALL             8  /* replica → primary  */
+#define PS_IOV_ADD_F_PF            9  /* reserved — unused  */
+#define PS_IOV_ADD_F_COMPRESS     10  /* primary → replica  */
+#define PS_IOV_START_RESTORE      12  /* reserved — unused  */
+#define PS_IOV_ALL_PAGES_SENT     16  /* primary → replica  */
+#define PS_IOV_ALL_PAGES_SENT_ACK 17  /* replica → primary  */
 ```
 
-`PS_IOV_ADD_F_COMPRESS` wire format:
+| Cmd | Dir | Socket | Sent during | Purpose |
+|---|---|---|---|---|
+| `PS_IOV_GET_ALL` (8) | R → P | main | Phase 2a start (once per task, from `cow_phase2` in `cow-lazy-pages.c:196-198`) | Replica requests bulk transfer for `dst_id`. Header-only (no payload). |
+| `PS_IOV_ADD_F_COMPRESS` (10) | P → R | P3 (×N) | Phase 2a (bulk), Phase 2b (pre-scan dirty re-sends), Phase 3 (frozen final-scan dirty + new-VMA pages) | Compressed page batch. Header + 4-byte `compressed_size` + LZ4 payload. |
+| `PS_IOV_ALL_PAGES_SENT` (16) | P → R | main | Phase 4 start — `send_all_pages_sent_signal()` from `cr_dump_finish` (`cr-dump.c:2401`) | Primary tells replica: no more pages will be sent. Replica may now transition from receiving into the drain/restore stage. Header-only. |
+| `PS_IOV_ALL_PAGES_SENT_ACK` (17) | R → P | main | When replica's Phase-2 event loop observes `cow_is_all_pages_sent_received()` (`cow-lazy-pages.c:294`) | ACK back to primary so it can close the page-server connection. Header-only. |
+
+Reserved/not used in the COW path:
+
+- `PS_IOV_ADD_F_PF` (9) — placeholder for per-fault push; current COW flow
+  uses `PS_IOV_ADD_F_COMPRESS` batches exclusively.
+- `PS_IOV_START_RESTORE` (12) — defined in the header, never sent on the
+  wire in the COW path (`// unused` in `cow-page-xfer.h`).
+
+`PS_IOV_ADD_F_COMPRESS` wire format (`cow-bulk-send.c:send_pages_batch_compressed`):
 
 ```
 struct page_server_iov {
     u32 cmd;            /* encode_ps_cmd(PS_IOV_ADD_F_COMPRESS, PE_PRESENT) */
-    u32 nr_pages;       /* ≤ COW_BATCH_PAGES */
-    u64 vaddr;          /* base address (may not be batch-aligned) */
-    u64 dst_id;
+    u32 nr_pages;       /* ≤ COW_BATCH_PAGES (256)                          */
+    u64 vaddr;          /* base address (may not be batch-aligned)          */
+    u64 dst_id;         /* task id (== source pid in COW path)              */
 };
-int compressed_size;    /* 4 bytes */
-char data[compressed_size]; /* LZ4-compressed page payload */
+int  compressed_size;   /* 4 bytes, little-endian                           */
+char data[compressed_size]; /* LZ4-compressed page payload                  */
 ```
 
 LZ4 acceleration: **1** on both the pre-freeze bulk path and the frozen
 convergence/new-VMA path. An experiment with acceleration=99 during
 convergence regressed total P3 wall-clock from 2.3s → 4.8s (larger wire
 size shifted the bottleneck to `tcp_sendmsg`/`skb_page_frag_refill`).
+
+### Lazy-pages UNIX socket signals (`criu/uffd.c`)
+
+Single-direction `uint32_t` values over the in-host UNIX socket between
+the lazy-pages daemon and `criu restore`. All three are cookie magic
+numbers.
+
+```c
+#define LAZY_PAGES_RESTORE_FINISHED 0x52535446 /* "RSTF" */
+#define LAZY_PAGES_TASKS_FROZEN     0x54534B46 /* "TSKF"   (COW only) */
+#define LAZY_PAGES_DRAIN_COMPLETE   0x44524E43 /* "DRNC"   (COW only) */
+```
+
+| Signal | Dir | Sent during | Purpose |
+|---|---|---|---|
+| `LAZY_PAGES_TASKS_FROZEN` | restore → lazy-pages | Phase 4 (after restore catches all tasks via `PTRACE_INTERRUPT`) — `uffd.c:1470` | Tells the lazy-pages daemon it is safe to start drain threads. Daemon responds by calling `cow_start_drain_thread()` (`uffd.c:1545-1551`, `cow-uffd.c:1842`). |
+| `LAZY_PAGES_DRAIN_COMPLETE` | lazy-pages → restore | Phase 4, once the batch buffer is empty — `uffd.c:1866` | Tells restore it is safe to unfreeze the task tree. Restore was blocked in `lazy_pages_finish_restore()` on this signal (`uffd.c:1478-1489`). |
+| `LAZY_PAGES_RESTORE_FINISHED` | restore → lazy-pages | End of restore — `uffd.c:1449, 1492` | Normal restore-completion signal (non-COW as well). Terminates the lazy-pages event loop. |
+
+### Parasite compel RPC (`criu/pie/parasite.c`)
+
+| Cmd | Caller | Phase | Purpose |
+|---|---|---|---|
+| `PARASITE_CMD_COW_DUMP_INIT` | `cow_dump_init_async()` in `cow-dump.c` | Phase 1 | Inside the target process, open a userfaultfd with `UFFD_FEATURE_WP_ASYNC` and return the fd over the compel socket via `compel_util_recv_fd()`. |
+
+### Per-phase message exchange
+
+```
+       PRIMARY                              REPLICA
+   (criu dump)                      (lazy-pages) ── UNIX ── (criu restore)
+       │                                  │                      │
+┌──────┴──────┐                           │                      │
+│  Phase 1    │  parasite RPC             │                      │
+│             │  PARASITE_CMD_COW_DUMP_   │                      │
+│             │    INIT (→ target proc)   │                      │
+└──────┬──────┘  UFFDIO_WRITEPROTECT      │                      │
+       │         (local to primary)       │                      │
+       │                                  │                      │
+       │         TCP accept (main sk)     │                      │
+       │  ◄────────────────────────────── │                      │
+       │                                  │  connect             │
+       │                                  │                      │
+┌──────┴──────┐                           │                      │
+│  Phase 2a   │                           │                      │
+│             │                           │                      │
+│             │  ◄── PS_IOV_GET_ALL ─────                         │
+│             │      (main sk)            │                      │
+│             │                           │                      │
+│             │         TCP accept (N × P3 sk)                   │
+│             │  ◄──────────────────────── │                      │
+│             │                           │                      │
+│             │  ──── PS_IOV_ADD_F_COMPRESS ───►                  │
+│             │      (P3 sk × N, bulk batches, LZ4)              │
+│             │      [× many]             │                      │
+└──────┬──────┘                           │                      │
+       │                                  │                      │
+┌──────┴──────┐                           │                      │
+│  Phase 2b   │                           │                      │
+│             │  ──── PS_IOV_ADD_F_COMPRESS ───►                  │
+│             │      (P3 sk × N, dirty re-sends → overwrite)     │
+│             │      [× iterations]       │                      │
+└──────┬──────┘                           │                      │
+       │                                  │                      │
+┌──────┴──────┐                           │                      │
+│  Phase 3    │  ── PS_IOV_ADD_F_COMPRESS ───►                    │
+│  (frozen)   │     (final frozen scan +  │                      │
+│             │      new-VMA pages)       │                      │
+└──────┬──────┘                           │                      │
+       │                                  │                      │
+┌──────┴──────┐                           │                      │
+│  Phase 4    │  ── PS_IOV_ALL_PAGES_SENT ───►                    │
+│             │     (main sk)             │                      │
+│             │                           │  AF_UNIX accept       │
+│             │                           │ ◄──────────────────── │
+│             │                           │         connect       │
+│             │                           │                       │
+│             │                           │    (restore catches   │
+│             │                           │    tasks via          │
+│             │                           │    PTRACE_INTERRUPT)  │
+│             │                           │                       │
+│             │                           │ ◄── LAZY_PAGES_       │
+│             │                           │     TASKS_FROZEN ──── │
+│             │                           │                       │
+│             │                           │   drain threads       │
+│             │                           │   run: UFFDIO_COPY    │
+│             │                           │   1MB batches         │
+│             │  ◄── PS_IOV_ALL_PAGES_    │                       │
+│             │        SENT_ACK ──────    │                       │
+│             │      (main sk)            │                       │
+│             │                           │                       │
+│             │                           │   (drain done,        │
+│             │                           │    buffer empty)      │
+│             │                           │                       │
+│             │                           │ ── LAZY_PAGES_        │
+│             │                           │    DRAIN_COMPLETE ──► │
+│             │                           │                       │
+│             │                           │                       │
+│             │                           │                       │ restore
+│             │                           │                       │ unfreezes
+│             │                           │                       │ tasks
+│             │                           │                       │
+│             │                           │ ◄── LAZY_PAGES_       │
+│             │                           │     RESTORE_FINISHED─ │
+│             │                           │                       │
+│             │    (primary closes sockets)                       │
+└─────────────┘                           │                       │
+```
 
 ## Soft Error Handling (UFFDIO_COPY on replica)
 

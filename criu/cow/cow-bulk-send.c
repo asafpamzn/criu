@@ -257,9 +257,8 @@ static struct dirty_region_entry *conv_queue_pop(void)
 
 	{
 		struct dirty_region_entry *entry;
-		while (!(entry = g_conv_slots[t]))
+		while (!(entry = __atomic_load_n(&g_conv_slots[t], __ATOMIC_ACQUIRE)))
 			;
-		__atomic_thread_fence(__ATOMIC_ACQUIRE);
 		return entry;
 	}
 }
@@ -425,8 +424,7 @@ static void *dirty_scanner_thread(void *arg)
 						{
 							unsigned long slot = __atomic_fetch_add(&g_conv_head, 1, __ATOMIC_RELAXED);
 							BUG_ON(slot >= CONV_QUEUE_CAP);
-							g_conv_slots[slot] = entry;
-							__atomic_thread_fence(__ATOMIC_RELEASE);
+							__atomic_store_n(&g_conv_slots[slot], entry, __ATOMIC_RELEASE);
 						}
 						__sync_fetch_and_add(&g_total_scanned_pages, pages);
 					}
@@ -578,8 +576,7 @@ wait_for_freeze:
 						{
 							unsigned long slot = __atomic_fetch_add(&g_conv_head, 1, __ATOMIC_RELAXED);
 							BUG_ON(slot >= CONV_QUEUE_CAP);
-							g_conv_slots[slot] = entry;
-							__atomic_thread_fence(__ATOMIC_RELEASE);
+							__atomic_store_n(&g_conv_slots[slot], entry, __ATOMIC_RELEASE);
 						}
 					}
 				} else if (bpf_nr == -2) {
@@ -653,8 +650,7 @@ wait_for_freeze:
 					{
 						unsigned long slot = __atomic_fetch_add(&g_conv_head, 1, __ATOMIC_RELAXED);
 						BUG_ON(slot >= CONV_QUEUE_CAP);
-						g_conv_slots[slot] = entry;
-						__atomic_thread_fence(__ATOMIC_RELEASE);
+						__atomic_store_n(&g_conv_slots[slot], entry, __ATOMIC_RELEASE);
 					}
 					__sync_fetch_and_add(&g_total_scanned_pages, pages);
 				}
@@ -1108,8 +1104,7 @@ skip_scan_merge:
 		{
 			unsigned long slot = __atomic_fetch_add(&g_conv_head, 1, __ATOMIC_RELAXED);
 			BUG_ON(slot >= CONV_QUEUE_CAP);
-			g_conv_slots[slot] = entry;
-			__atomic_thread_fence(__ATOMIC_RELEASE);
+			__atomic_store_n(&g_conv_slots[slot], entry, __ATOMIC_RELEASE);
 		}
 		total_regions++;
 	}
