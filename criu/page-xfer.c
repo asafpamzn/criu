@@ -52,7 +52,6 @@
 
 static int page_server_sk = -1;
 
-/* COW state (bulk_stream_done, all_pages_sent_ack_received) is in cow-page-xfer.c */
 
 int get_page_server_sk(void)
 {
@@ -1262,15 +1261,6 @@ static int page_server_get_pages(int sk, struct page_server_iov *pi)
 	unsigned long len, nr_pages;
 	int ret;
 
-	/* COW mode: enqueue for background processing */
-	if (opts.cow_dump) {
-		cow_enqueue_page_requests(pi->vaddr, pi->nr_pages, sk, pi->dst_id);
-		pr_debug("Enqueued %lu page requests starting at vaddr=%lx\n",
-			 (unsigned long)pi->nr_pages, (unsigned long)pi->vaddr);
-		return 0;
-	}
-
-	/* Non-COW mode: original synchronous page serving */
 	item = pstree_item_by_virt(pi->dst_id);
 	pp = dmpi(item)->mem_pp;
 
@@ -1341,10 +1331,6 @@ static int page_server_serve(int sk)
 		pipe_read_dest_init(&pipe_read_dest);
 		tcp_cork(sk, true);
 	}
-
-	/* Initialize page request queue on first use (COW unified thread) */
-	if (opts.cow_dump)
-		cow_init_page_request_queue();
 
 	while (1) {
 		struct page_server_iov pi;
@@ -1418,7 +1404,6 @@ static int page_server_serve(int sk)
 			break;
 		case PS_IOV_GET_ALL:
 		case PS_IOV_START_RESTORE:
-		case PS_IOV_BULK_COMPLETE_ACK:
 		case PS_IOV_ALL_PAGES_SENT_ACK:
 			/* COW-specific commands handled in cow-page-xfer.c */
 			if (!opts.cow_dump) {
@@ -1441,8 +1426,7 @@ static int page_server_serve(int sk)
 		if (ret)
 			break;
 		last_cmd = cmd;
-		if (pi.cmd == PS_IOV_CLOSE || pi.cmd == PS_IOV_FORCE_CLOSE ||
-		    decode_ps_cmd(pi.cmd) == PS_IOV_BULK_COMPLETE_ACK)
+		if (pi.cmd == PS_IOV_CLOSE || pi.cmd == PS_IOV_FORCE_CLOSE)
 			break;
 		/*
 		 * COW mode: break immediately after PS_IOV_GET_ALL.
@@ -1674,9 +1658,6 @@ no_server:
 	if (ask >= 0)
 		ret = page_server_serve(ask);
 
-	/* Clean up P3 parallel receiver threads */
-	stop_p3_acceptor_thread();
-
 	if (daemon_mode)
 		exit(ret);
 
@@ -1887,22 +1868,14 @@ static int page_server_async_read(struct epoll_rfd *f)
 
 static int page_server_hangup_event(struct epoll_rfd *rfd)
 {
-	pr_err("DEBUG_CALLBACK: page_server_hangup_event called fd=%d cow_dump=%d all_pages_sent=%d bulk_done=%d\n",
-	       rfd->fd, opts.cow_dump, cow_is_all_pages_sent_received(), page_server_bulk_stream_done());
+	pr_err("DEBUG_CALLBACK: page_server_hangup_event called fd=%d cow_dump=%d all_pages_sent=%d\n",
+	       rfd->fd, opts.cow_dump, cow_is_all_pages_sent_received());
 
 	if (opts.cow_dump && cow_is_all_pages_sent_received()) {
 		pr_err("Page server closed connection after all pages sent\n");
 		return 1;
 	}
-	if (opts.cow_dump && page_server_bulk_stream_done()) {
-		/*
-		 * Bulk stream done but all_pages_sent not yet received.
-		 * The data might still be in the socket buffer - let the
-		 * read handler drain it before we give up.
-		 */
-		pr_err("Page server closed, continuing to drain remaining data\n");
-		return 1;
-	}
+
 	pr_err("Remote side closed connection\n");
 	return -1;
 }
@@ -1913,9 +1886,6 @@ int connect_to_page_server_to_recv(int epfd)
 {
 	if (connect_to_page_server())
 		return -1;
-
-	if (opts.cow_dump)
-		reset_bulk_stream_done();
 
 	ps_rfd.fd = page_server_sk;
 	/* Use bulk stream reader in bulk mode, regular reader in on-demand mode */

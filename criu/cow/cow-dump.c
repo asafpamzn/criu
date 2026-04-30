@@ -251,33 +251,6 @@ void cow_set_dst_id(u64 dst_id)
 }
 
 /* ------------------------------------------------------------------ */
-/*  Kernel support check                                               */
-/* ------------------------------------------------------------------ */
-
-bool cow_check_kernel_support(void)
-{
-	unsigned long features = UFFD_FEATURE_PAGEFAULT_FLAG_WP;
-	int uffd, err = 0;
-
-	uffd = uffd_open(0, &features, &err);
-	if (uffd < 0) {
-		if (err == ENOSYS)
-			pr_info("userfaultfd not supported by kernel\n");
-		else if (err == EPERM)
-			pr_info("userfaultfd requires CAP_SYS_PTRACE or sysctl vm.unprivileged_userfaultfd=1\n");
-		return false;
-	}
-	if (!(features & UFFD_FEATURE_PAGEFAULT_FLAG_WP)) {
-		pr_info("userfaultfd WP pagefault flag not supported (need kernel 5.7+)\n");
-		close(uffd);
-		return false;
-	}
-	close(uffd);
-	pr_info("COW dump kernel support detected\n");
-	return true;
-}
-
-/* ------------------------------------------------------------------ */
 /*  VMA registration                                                   */
 /* ------------------------------------------------------------------ */
 
@@ -346,7 +319,7 @@ static int cow_register_vmas(struct cow_dump_info *cdi,
 			skip_reason = "droppable";
 
 		if (skip_reason) {
-			pr_debug("VMA_TRACE: phase=WP_REGISTER vma=0x%lx-0x%lx flags=0x%x prot=0x%x status=0x%x shmid=%" PRIu64
+			pr_err("VMA_TRACE: phase=WP_REGISTER vma=0x%lx-0x%lx flags=0x%x prot=0x%x status=0x%x shmid=%" PRIu64
 			       " skipped_by=%s\n",
 			       start, start + len,
 			       vma->e->flags, vma->e->prot, vma->e->status,
@@ -363,7 +336,7 @@ static int cow_register_vmas(struct cow_dump_info *cdi,
 		reg.mode = UFFDIO_REGISTER_MODE_WP;
 		ioctl_ret = ioctl(cdi->uffd, UFFDIO_REGISTER, &reg);
 
-		pr_debug("VMA_TRACE: phase=WP_REGISTER vma=0x%lx-0x%lx flags=0x%x prot=0x%x status=0x%x shmid=%" PRIu64
+		pr_err("VMA_TRACE: phase=WP_REGISTER vma=0x%lx-0x%lx flags=0x%x prot=0x%x status=0x%x shmid=%" PRIu64
 		       " registered ioctl_ret=%d errno=%d pages=%lu\n",
 		       start, start + len,
 		       vma->e->flags, vma->e->prot, vma->e->status,
@@ -434,31 +407,6 @@ bool cow_dump_is_vma_tracked(pid_t source_pid, unsigned long start,
 	return false;
 }
 
-/*
- * Page queue API stubs - kept for API compatibility with cow-unified-thread.c
- * The MPSC queue was removed as nothing produces to it (WP_ASYNC uses PAGEMAP_SCAN
- * instead of fault-driven page capture).
- */
-
-struct cow_page_queue_entry *cow_get_next_page(void)
-{
-	return NULL;
-}
-
-bool cow_has_pending_pages(void)
-{
-	return false;
-}
-
-void cow_put_back_page(struct cow_page_queue_entry *entry)
-{
-	(void)entry;
-}
-
-unsigned long cow_get_pages_queue_size(void)
-{
-	return 0;
-}
 
 /* ------------------------------------------------------------------ */
 /*  Phase management                                                   */
@@ -587,135 +535,6 @@ err:
 	xfree(cdi);
 	g_cow_info = NULL;
 	return -1;
-}
-
-int cow_scan_dirty_pages(unsigned long **dirty_ranges,
-			 unsigned int *nr_dirty_ranges,
-			 unsigned long *total_dirty_pages)
-{
-	struct cow_dump_info *cdi = g_cow_info;
-	int pagemap_fd = -1;
-	struct page_region *regs = NULL;
-	unsigned long *ranges = NULL;
-	unsigned int nr_ranges = 0;
-	unsigned int ranges_capacity = 0;
-	unsigned long total_pages = 0;
-	unsigned int i, j;
-	int ret = -1;
-	char path[64];
-
-	struct pm_scan_arg args = {
-		.size = sizeof(struct pm_scan_arg),
-		.flags = PM_SCAN_WP_MATCHING,
-		.start = 0,
-		.end = 0,
-		.walk_end = 0,
-		.vec_len = COW_PAGEMAP_SCAN_VEC_LEN,
-		.max_pages = 0,
-		.category_anyof_mask = PAGE_IS_WRITTEN,
-		.return_mask = PAGE_IS_WRITTEN | PAGE_IS_WPALLOWED,
-	};
-
-	if (!cdi) {
-		pr_err("COW dump not initialized\n");
-		return -1;
-	}
-
-	*dirty_ranges = NULL;
-	*nr_dirty_ranges = 0;
-	*total_dirty_pages = 0;
-
-	snprintf(path, sizeof(path), "/proc/%d/pagemap", cdi->source_pid);
-	pagemap_fd = open(path, O_RDWR);
-	if (pagemap_fd < 0) {
-		pr_perror("Cannot open %s", path);
-		return -1;
-	}
-
-	regs = xmalloc(args.vec_len * sizeof(struct page_region));
-	BUG_ON(!regs);
-	args.vec = (u64)(unsigned long)regs;
-
-	/* Scan each tracked VMA for dirty pages */
-	for (i = 0; i < cdi->nr_tracked_vmas; i++) {
-		unsigned long vma_start = cdi->tracked_vmas[i].start;
-		unsigned long vma_end = cdi->tracked_vmas[i].end;
-		long regs_len;
-
-		args.start = vma_start;
-		args.end = vma_end;
-		args.walk_end = vma_start;
-
-		do {
-			args.start = args.walk_end;
-			pr_debug("PAGEMAP_SCAN: scanning VMA 0x%lx-0x%lx "
-				"(start=0x%lx walk_end=0x%lx)\n",
-				vma_start, vma_end,
-				(unsigned long)args.start,
-				(unsigned long)args.walk_end);
-			regs_len = ioctl(pagemap_fd, PAGEMAP_SCAN, &args);
-			if (regs_len == -1) {
-				pr_perror("PAGEMAP_SCAN for VMA 0x%lx-0x%lx",
-					  vma_start, vma_end);
-				goto out;
-			}
-
-			pr_debug("PAGEMAP_SCAN: returned %ld regions, "
-				"walk_end=0x%lx (vma_end=0x%lx)\n",
-				regs_len,
-				(unsigned long)args.walk_end, vma_end);
-
-			/* Safety: if no regions returned, avoid infinite loop */
-			if (regs_len == 0)
-				break;
-
-			for (j = 0; j < (unsigned int)regs_len; j++) {
-				unsigned long start = regs[j].start;
-				unsigned long len = regs[j].end - regs[j].start;
-				unsigned long pages = len / PAGE_SIZE;
-
-				pr_debug("  dirty region[%u]: 0x%lx-0x%lx "
-					"(%lu pages, categories=0x%llx)\n",
-					j, start, start + len, pages,
-					(unsigned long long)regs[j].categories);
-
-				/* Grow ranges array if needed */
-				if (nr_ranges >= ranges_capacity) {
-					unsigned int new_cap = ranges_capacity ?
-							       ranges_capacity * 2 : COW_INITIAL_RANGES_CAPACITY;
-					unsigned long *new_ranges;
-
-					new_ranges = xrealloc(ranges,
-							      new_cap * 2 * sizeof(unsigned long));
-					BUG_ON(!new_ranges);
-					ranges = new_ranges;
-					ranges_capacity = new_cap;
-				}
-
-				ranges[nr_ranges * 2] = start;
-				ranges[nr_ranges * 2 + 1] = len;
-				nr_ranges++;
-				total_pages += pages;
-			}
-		} while (args.walk_end != vma_end);
-	}
-
-	*dirty_ranges = ranges;
-	*nr_dirty_ranges = nr_ranges;
-	*total_dirty_pages = total_pages;
-	ranges = NULL; /* Caller owns it now */
-
-	cdi->phase = COW_PHASE_SCAN;
-	pr_info("Scanned %u dirty ranges, %lu pages total\n",
-		nr_ranges, total_pages);
-	ret = 0;
-
-out:
-	xfree(regs);
-	xfree(ranges);
-	if (pagemap_fd >= 0)
-		close(pagemap_fd);
-	return ret;
 }
 
 /*
@@ -935,7 +754,7 @@ int cow_detect_new_vmas(struct vm_area_list *vmas,
 
 		/* Use same filtering as cow_register_vmas */
 		if (!cow_is_vma_trackable(vma)) {
-			pr_debug("VMA_TRACE: phase=PHASE3_NEW_VMA_DETECT vma=0x%lx-0x%lx flags=0x%x prot=0x%x status=0x%x shmid=%" PRIu64
+			pr_err("VMA_TRACE: phase=PHASE3_NEW_VMA_DETECT vma=0x%lx-0x%lx flags=0x%x prot=0x%x status=0x%x shmid=%" PRIu64
 			       " trackable=0 skipped\n",
 			       start, end,
 			       vma->e->flags, vma->e->prot, vma->e->status,
@@ -950,7 +769,7 @@ int cow_detect_new_vmas(struct vm_area_list *vmas,
 			xfree(ranges);
 			return -1;
 		}
-		pr_debug("VMA_TRACE: phase=PHASE3_NEW_VMA_DETECT vma=0x%lx-0x%lx flags=0x%x prot=0x%x status=0x%x shmid=%" PRIu64
+		pr_err("VMA_TRACE: phase=PHASE3_NEW_VMA_DETECT vma=0x%lx-0x%lx flags=0x%x prot=0x%x status=0x%x shmid=%" PRIu64
 		       " trackable=1 new_ranges_emitted=%u\n",
 		       start, end,
 		       vma->e->flags, vma->e->prot, vma->e->status,

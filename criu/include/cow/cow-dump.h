@@ -46,17 +46,6 @@ extern void cow_dump_fini(void);
  */
 extern void cow_set_dst_id(u64 dst_id);
 
-/**
- * cow_check_kernel_support - Check if kernel supports COW dump
- *
- * Verifies that the kernel has necessary userfaultfd write-protect
- * features (requires Linux 5.7+).
- *
- * Returns: true if supported, false otherwise
- */
-extern bool cow_check_kernel_support(void);
-
-
 
 
 /**
@@ -73,42 +62,6 @@ extern bool cow_dump_is_vma_tracked(pid_t source_pid,
 
 struct cow_page_queue_entry;
 
-/**
- * cow_get_next_page - Get next COW page from the queue
- *
- * Thread-safe dequeue of the next COW page that needs to be sent.
- * The caller is responsible for freeing the returned entry.
- *
- * Returns: cow_page_queue_entry on success, NULL if queue is empty
- */
-extern struct cow_page_queue_entry *cow_get_next_page(void);
-
-/**
- * cow_has_pending_pages - Check if there are pending COW pages
- *
- * Thread-safe check for whether the COW page queue has any entries.
- *
- * Returns: true if there are pending pages, false otherwise
- */
-extern bool cow_has_pending_pages(void);
-
-/**
- * cow_put_back_page - Put a COW page back in the queue
- * @entry: Queue entry to re-queue
- *
- * Thread-safe re-insertion of a COW page at the head of the queue.
- * Used when a page doesn't belong to the current image being processed.
- */
-extern void cow_put_back_page(struct cow_page_queue_entry *entry);
-
-/**
- * cow_get_pages_queue_size - Get the number of pending COW pages in the queue
- *
- * Thread-safe count of COW pages waiting to be sent.
- *
- * Returns: Number of entries in the COW page queue
- */
-extern unsigned long cow_get_pages_queue_size(void);
 
 /**
  * cow_dump_init_async - Initialize COW dump with WP_ASYNC mode
@@ -125,22 +78,6 @@ extern unsigned long cow_get_pages_queue_size(void);
 extern int cow_dump_init_async(struct pstree_item *item,
 			       struct vm_area_list *vma_area_list,
 			       struct parasite_ctl *ctl);
-
-/**
- * cow_scan_dirty_pages - Scan for pages written during WP_ASYNC phase
- * @dirty_ranges: Output array of [start, len, start, len, ...] pairs
- * @nr_dirty_ranges: Output count of ranges
- * @total_dirty_pages: Output total number of dirty pages
- *
- * Uses PAGEMAP_SCAN with PAGE_IS_WRITTEN to find pages dirtied
- * during the WP_ASYNC bulk transfer phase.
- * Caller must xfree() the dirty_ranges array.
- *
- * Returns: 0 on success, -1 on error
- */
-extern int cow_scan_dirty_pages(unsigned long **dirty_ranges,
-				unsigned int *nr_dirty_ranges,
-				unsigned long *total_dirty_pages);
 
 
 /**

@@ -52,63 +52,6 @@ static struct page_request_spsc_node *page_request_tail;
 static unsigned long page_request_queue_size;
 static bool page_request_queue_initialized = false;
 
-void cow_init_page_request_queue(void)
-{
-	if (page_request_queue_initialized)
-		return;
-
-	if (spsc_init(page_request_head, page_request_tail,
-		      page_request_queue_size,
-		      struct page_request_spsc_node)) {
-		pr_err("Failed to allocate dummy node for page request queue\n");
-		return;
-	}
-
-	page_request_queue_initialized = true;
-}
-
-void cow_add_page_request(unsigned long vaddr, unsigned long nr_pages, int sk, u64 dst_id)
-{
-	struct page_request_entry *entry;
-
-	entry = xmalloc(sizeof(*entry));
-	BUG_ON(!entry);
-
-	entry->vaddr = vaddr;
-	entry->nr_pages = nr_pages;
-	entry->sk = sk;
-	entry->dst_id = dst_id;
-	entry->ppb = NULL;
-	entry->seg_idx = 0;
-	entry->page_idx_in_seg = 0;
-	entry->location_found = false;
-
-	pr_debug("Requesting page at %lx (nr_pages=%lu, dst_id=%lu)\n",
-		 vaddr, nr_pages, dst_id);
-
-	BUG_ON(spsc_enqueue(page_request_tail, page_request_queue_size,
-			    entry, struct page_request_spsc_node));
-}
-
-bool cow_has_page_requests(void)
-{
-	return spsc_peek(page_request_head);
-}
-
-unsigned long cow_get_page_request_queue_size(void)
-{
-	return spsc_size(page_request_queue_size);
-}
-
-void cow_enqueue_page_requests(unsigned long vaddr, unsigned long nr_pages, int sk, u64 dst_id)
-{
-	unsigned long i;
-	for (i = 0; i < nr_pages; i++) {
-		cow_add_page_request(vaddr + (i * PAGE_SIZE), 1, sk, dst_id);
-	}
-	pr_debug("Enqueued %lu page requests starting at vaddr=%lx\n",
-		 nr_pages, vaddr);
-}
 
 /* ========== Thread State ========== */
 
@@ -185,7 +128,7 @@ static void *unified_page_server_thread(void *arg)
 		goto out;
 	}
 
-	pr_info("Starting %d P3 bulk sender threads for dst_id=%lu\n",
+	pr_err("Starting %d P3 bulk sender threads for dst_id=%lu\n",
 		num_sockets, args->dst_id);
 
 	if (cow_start_p3_threads(p3_sockets, num_sockets,

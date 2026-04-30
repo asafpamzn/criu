@@ -30,23 +30,8 @@ unsigned long g_compress_uncompressed_bytes = 0;
 unsigned long g_compress_compressed_bytes = 0;
 
 /* COW state flags for phased migration */
-static bool bulk_stream_done = false;
 static bool all_pages_sent_ack_received = false;
 
-bool page_server_bulk_stream_done(void)
-{
-	return bulk_stream_done;
-}
-
-void set_bulk_stream_done(void)
-{
-	bulk_stream_done = true;
-}
-
-void reset_bulk_stream_done(void)
-{
-	bulk_stream_done = false;
-}
 
 void set_all_pages_sent_ack_received(void)
 {
@@ -221,34 +206,6 @@ int cow_handle_protocol_cmd(u32 cmd, struct page_server_iov *pi, int sk,
 	switch (cmd) {
 	case PS_IOV_GET_ALL:		
 		*ret_val = cow_page_server_get_all_pages(sk, pi->dst_id);
-		return 0;
-
-	case PS_IOV_START_RESTORE:
-		pr_info("Received start restore signal\n");
-		*ret_val = 0;
-		return 0;
-
-	case PS_IOV_BULK_COMPLETE_ACK:
-		/*
-		 * Replica acknowledges all bulk pages received.
-		 * Break out of the serve loop so the primary can
-		 * proceed to Phase 3 (skeleton dump + dirty scan).
-		 */
-		pr_info("Received bulk complete ACK from replica\n");
-		*ret_val = 0;
-		*flushed = true;
-		*bulk_ack = true;
-		return 0;
-
-	case PS_IOV_ALL_PAGES_SENT_ACK:
-		/*
-		 * Replica acknowledges all_pages_sent signal received.
-		 * Set flag so unified_page_server_thread can continue.
-		 */
-		pr_info("Received all_pages_sent ACK from replica\n");
-		set_all_pages_sent_ack_received();
-		*ret_val = 0;
-		*flushed = true;
 		return 0;
 
 	default:

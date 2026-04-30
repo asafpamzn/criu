@@ -110,8 +110,7 @@ static int read_bulk_header(struct ps_async_read_bulk *ar, int flags)
 	       cmd, (unsigned long)ar->pi.nr_pages,
 	       (unsigned long)ar->pi.vaddr,
 	       (unsigned long)ar->pi.dst_id);
-	pr_err("  bulk_stream_done=%d all_pages_sent=%d\n",
-	       page_server_bulk_stream_done(),
+	pr_err("  all_pages_sent=%d\n",	       
 	       cow_is_all_pages_sent_received());
 	BUG();
 	return -1; /* unreachable */
@@ -123,8 +122,7 @@ int page_server_async_read_bulk(struct epoll_rfd *f)
 	int ret;
 
 	if (list_empty(&bulk_async_reads)) {
-		if (opts.cow_dump && page_server_bulk_stream_done())
-			return 0;
+
 		pr_err("Bulk async read with empty queue\n");
 		BUG();
 	}

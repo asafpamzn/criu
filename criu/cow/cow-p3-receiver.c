@@ -53,7 +53,6 @@ struct p3_receiver_ctx {
 static struct p3_receiver_ctx p3_receivers[MAX_P3_RECEIVERS];
 static volatile int p3_receivers_active = 0;
 static pthread_t p3_acceptor_thread;
-static volatile bool p3_acceptor_running = false;
 
 /*
  * Receive one compressed batch from socket and add to page buffer.
@@ -317,43 +316,6 @@ int accept_p3_connections(int *sockets, int max_connections, int timeout_ms)
 
 	pr_info("Accepted %d/%d P3 connections\n", num_accepted, max_connections);
 	return num_accepted;
-}
-
-void stop_p3_acceptor_thread(void)
-{
-	int i;
-	unsigned long total_pages = 0;
-
-	if (!p3_acceptor_running)
-		return;
-
-	p3_acceptor_running = false;
-	pthread_join(p3_acceptor_thread, NULL);
-
-	/* Wait for all receiver threads */
-	for (i = 0; i < MAX_P3_RECEIVERS; i++) {
-		if (p3_receivers[i].thread) {
-			pthread_join(p3_receivers[i].thread, NULL);
-			total_pages += p3_receivers[i].pages_received;
-			if (p3_receivers[i].socket >= 0) {
-				close(p3_receivers[i].socket);
-				p3_receivers[i].socket = -1;
-			}
-			/* Free pre-allocated buffers */
-			if (p3_receivers[i].compressed_buf) {
-				munmap(p3_receivers[i].compressed_buf, P3_COMPRESS_BUF_SIZE);
-				p3_receivers[i].compressed_buf = NULL;
-			}
-			if (p3_receivers[i].decompressed_buf) {
-				munmap(p3_receivers[i].decompressed_buf, P3_DECOMPRESS_BUF_SIZE);
-				p3_receivers[i].decompressed_buf = NULL;
-			}
-			p3_receivers[i].thread = 0;
-		}
-	}
-
-	close_listen_socket();
-	pr_info("P3 acceptor stopped: %lu total pages\n", total_pages);
 }
 
 /*

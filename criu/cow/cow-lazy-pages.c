@@ -279,7 +279,6 @@ err_tasks:
 int cow_phase2_handle_pages(int epollfd, struct epoll_event *events, int nr_fds)
 {
 	int ret;
-	bool bulk_done = false;
 
 	while (1) {
 		ret = epoll_run_rfds(epollfd, events, nr_fds, -1);
@@ -288,11 +287,6 @@ int cow_phase2_handle_pages(int epollfd, struct epoll_event *events, int nr_fds)
 			return -1;
 		}
 
-		/* Track bulk transfer completion */
-		if (!bulk_done && page_server_bulk_stream_done()) {
-			pr_info("Bulk page transfer complete, waiting for skeleton dump...\n");
-			bulk_done = true;
-		}
 
 		/* All pages sent = completion signal, ready for restore */
 		if (cow_is_all_pages_sent_received()) {

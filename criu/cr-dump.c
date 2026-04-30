@@ -2963,8 +2963,6 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 	cow_debug_scan_compare();	
 #endif
 
-	/* P3 threads do dirty scanning - no need for cow_scan_dirty_pages here. */
-
 	/*
 	 * Collect pstree IDs now so vpid(item) is valid for the VMA detection.
 	 * This must happen before cow_detect_new_vmas() which uses dst_id.

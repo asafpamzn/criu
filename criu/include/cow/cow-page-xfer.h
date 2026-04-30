@@ -12,7 +12,6 @@
 #define PS_IOV_ADD_F_PF           9
 #define PS_IOV_ADD_F_COMPRESS     10
 #define PS_IOV_START_RESTORE      12  /* Signal replica to start process */
-#define PS_IOV_BULK_COMPLETE_ACK  13  /* Replica -> Primary: all bulk pages received */
 #define PS_IOV_ALL_PAGES_SENT     16  /* Primary -> Replica: all pages sent, zero-fill rest */
 #define PS_IOV_ALL_PAGES_SENT_ACK 17  /* Replica -> Primary: ACK, safe to close connection */
 
@@ -20,10 +19,7 @@
 extern unsigned long g_compress_uncompressed_bytes;
 extern unsigned long g_compress_compressed_bytes;
 
-/* COW bulk stream state */
-extern bool page_server_bulk_stream_done(void);
-extern void set_bulk_stream_done(void);
-extern void reset_bulk_stream_done(void);
+
 
 /* COW all-pages-sent ACK state */
 extern void set_all_pages_sent_ack_received(void);
@@ -44,7 +40,6 @@ extern int wait_for_all_pages_sent_ack(int sk);
 /* P3 parallel receiver functions (cow-p3-receiver.c) */
 extern int accept_p3_connections(int *sockets, int max_connections, int timeout_ms);
 extern void close_p3_sockets(int *sockets, int num_sockets);
-extern void stop_p3_acceptor_thread(void);
 
 /* COW request all pages (batch mode) */
 extern int cow_request_all_remote_pages(unsigned long img_id);
