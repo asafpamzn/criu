@@ -1,134 +1,104 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
+<meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>How CRIU Copies a Process</title>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@4.6.1/dist/reveal.min.css">
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@4.6.1/dist/theme/black.min.css">
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@4.6.1/plugin/highlight/monokai.min.css">
-<link rel="stylesheet" href="styles.css">
-</head>
-<body>
-<div class="reveal">
-<div class="slides">
-  <!-- Each slide is loaded from its own HTML file -->
-  <section data-external="slides/01-title.html"></section>
-  <section data-external="slides/02-what-is-a-process.html"></section>
-  <section data-external="slides/03-two-dump-modes.html"></section>
-  <section data-external="slides/04-predump-walkthrough.html"></section>
-  <section data-external="slides/05-full-dump-overview.html"></section>
-  <section data-external="slides/06-process-identity.html"></section>
-  <section data-external="slides/06a1-process-identity.html"></section>
-  <section data-external="slides/06a2-memory-layout.html"></section>
-  <section data-external="slides/06b1-zombies.html"></section>
-  <section data-external="slides/06b2-misc-fields.html"></section>
-  <section data-external="slides/06c1-personality-basics.html"></section>
-  <section data-external="slides/06c2-personality-flags.html"></section>
-  <section data-external="slides/07-memory-mappings.html"></section>
-  <section data-external="slides/07a-maps-vs-smaps.html"></section>
-  <section data-external="slides/07a3a-dirty-bit.html"></section>
-  <section data-external="slides/07a3b-dirty-tracking.html"></section>
-  <section data-external="slides/07a4a-smaps-axes.html"></section>
-  <section data-external="slides/07a4b-smaps-examples.html"></section>
-  <section data-external="slides/07a5a-page-states.html"></section>
-  <section data-external="slides/07a5b-vmflags.html"></section>
-  <section data-external="slides/07a2a-maps-vs-smaps-cost.html"></section>
-  <section data-external="slides/07a2b-why-cow-skips-smaps.html"></section>
-  <section data-external="slides/07b-vdso-vvar-vsyscall.html"></section>
-  <section data-external="slides/07c1-guard-pages-what.html"></section>
-  <section data-external="slides/07c2-guard-pages-criu.html"></section>
-  <section data-external="slides/08-file-descriptors.html"></section>
-  <section data-external="slides/08a1-fd-drain-pipeline.html"></section>
-  <section data-external="slides/08a2-fd-classification-tree.html"></section>
-  <section data-external="slides/08b1-fd-types-basic.html"></section>
-  <section data-external="slides/08b2-fd-types-special.html"></section>
-  <section data-external="slides/08c1-socket-tcp-udp.html"></section>
-  <section data-external="slides/08c2-socket-unix-netlink.html"></section>
-  <section data-external="slides/08d1-file-fd-metadata.html"></section>
-  <section data-external="slides/08d2-file-offset-mismatch.html"></section>
-  <section data-external="slides/08e1a-tcp-4tuple-problem.html"></section>
-  <section data-external="slides/08e1b-tcp-migration-solutions.html"></section>
-  <section data-external="slides/08e2a-tls-state-layers.html"></section>
-  <section data-external="slides/08e2b-tls-survival.html"></section>
-  <section data-external="slides/08e3a-aws-secondary-ip.html"></section>
-  <section data-external="slides/08e3b-aws-eni-move.html"></section>
-  <section data-external="slides/09-parasite-mechanism.html"></section>
-  <section data-external="slides/10-memory-pages.html"></section>
-  <section data-external="slides/11a1-hardware-interrupts.html"></section>
-  <section data-external="slides/11a2-software-signals.html"></section>
-  <section data-external="slides/11-signals.html"></section>
-  <section data-external="slides/12-timers.html"></section>
-  <section data-external="slides/13-threads.html"></section>
-  <section data-external="slides/14-core-dump.html"></section>
-  <section data-external="slides/15-filesystem-cleanup.html"></section>
-  <section data-external="slides/16-summary-timeline.html"></section>
-  <section data-external="slides/20a1-predump-pipeline.html"></section>
-  <section data-external="slides/20a2-drain-modes.html"></section>
-  <section data-external="slides/20b-pagemap-pipeline.html"></section>
-  <section data-external="slides/20c1-page-categories.html"></section>
-  <section data-external="slides/20c2a-layer-stacking.html"></section>
-  <section data-external="slides/20c2b-parent-holes-semantics.html"></section>
-  <section data-external="slides/21a1-cow-fast-path.html"></section>
-  <section data-external="slides/21a2-cow-tracking-flow.html"></section>
-  <section data-external="slides/21b1a-cow-unmapped-discovery.html"></section>
-  <section data-external="slides/21b1b-cow-why-send-zeros.html"></section>
-  <section data-external="slides/21b2a-zero-rss-bloat.html"></section>
-  <section data-external="slides/21b2b-vma-shrink-fix.html"></section>
-  <section data-external="slides/21c-freeze-comparison.html"></section>
-  <section data-external="slides/18a-not-recaptured.html"></section>
-  <section data-external="slides/18b-recaptured-at-convergence.html"></section>
-  <section data-external="slides/19-cow-convergence-timeline.html"></section>
-  <section data-external="slides/17-deep-dive-topics.html"></section>
-</div>
-</div>
-
-<script src="https://cdn.jsdelivr.net/npm/reveal.js@4.6.1/dist/reveal.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/reveal.js@4.6.1/plugin/highlight/highlight.min.js"></script>
-<script>
-  // Load external slide files
-  async function loadExternalSlides() {
-    const sections = document.querySelectorAll('section[data-external]');
-    for (const section of sections) {
-      const url = section.getAttribute('data-external');
-      try {
-        const response = await fetch(url);
-        if (response.ok) {
-          const html = await response.text();
-          // Parse the loaded HTML to extract the inner <section> content
-          const parser = new DOMParser();
-          const doc = parser.parseFromString(html, 'text/html');
-          const loadedSection = doc.querySelector('section');
-          if (loadedSection) {
-            // Copy attributes from loaded section to our section
-            for (const attr of loadedSection.attributes) {
-              section.setAttribute(attr.name, attr.value);
-            }
-            section.innerHTML = loadedSection.innerHTML;
-          } else {
-            section.innerHTML = html;
-          }
-        } else {
-          section.innerHTML = '<h2 style="color:#f87171;">Failed to load: ' + url + '</h2>';
-        }
-      } catch (e) {
-        section.innerHTML = '<h2 style="color:#f87171;">Error loading: ' + url + '</h2><p>' + e.message + '</p>';
-      }
+<title>CRIU COW Dump — Documentation</title>
+<style>
+  :root {
+    --fg: #1f2328;
+    --muted: #656d76;
+    --bg: #ffffff;
+    --panel: #f6f8fa;
+    --panel-border: #d0d7de;
+    --accent: #0969da;
+    --accent-hover: #0550ae;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fg: #e6edf3;
+      --muted: #8b949e;
+      --bg: #0d1117;
+      --panel: #161b22;
+      --panel-border: #30363d;
+      --accent: #58a6ff;
+      --accent-hover: #79c0ff;
     }
   }
-
-  loadExternalSlides().then(() => {
-    Reveal.initialize({
-      hash: true,
-      slideNumber: true,
-      transition: 'slide',
-      backgroundTransition: 'fade',
-      width: 1200,
-      height: 700,
-      margin: 0.04,
-      plugins: [RevealHighlight]
-    });
-  });
-</script>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans",
+                 Helvetica, Arial, sans-serif;
+    font-size: 16px;
+    line-height: 1.6;
+    min-height: 100vh;
+  }
+  .container {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 80px 24px;
+  }
+  h1 {
+    font-size: 2em;
+    font-weight: 700;
+    margin-bottom: 8px;
+  }
+  .subtitle {
+    color: var(--muted);
+    font-size: 1.1em;
+    margin-bottom: 48px;
+  }
+  .cards {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+  a.card {
+    display: block;
+    padding: 24px;
+    border: 1px solid var(--panel-border);
+    border-radius: 8px;
+    background: var(--panel);
+    text-decoration: none;
+    color: var(--fg);
+    transition: border-color 0.15s, box-shadow 0.15s;
+  }
+  a.card:hover {
+    border-color: var(--accent);
+    box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+  }
+  a.card .card-title {
+    font-size: 1.2em;
+    font-weight: 600;
+    color: var(--accent);
+    margin-bottom: 4px;
+  }
+  a.card .card-desc {
+    color: var(--muted);
+    font-size: 0.95em;
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>CRIU COW Dump</h1>
+  <p class="subtitle">Near-zero-interruption live migration for Valkey</p>
+  <div class="cards">
+    <a class="card" href="cow-dump-high-level-design.html">
+      <div class="card-title">High-Level Design</div>
+      <div class="card-desc">Architecture overview, migration timeline, and key design decisions.</div>
+    </a>
+    <a class="card" href="cow-dump-design.html">
+      <div class="card-title">Detailed Design</div>
+      <div class="card-desc">Code-level walkthrough of dump, restore, page transfer, and convergence.</div>
+    </a>
+    <a class="card" href="presentation.html">
+      <div class="card-title">Presentation</div>
+      <div class="card-desc">Interactive slide deck covering how CRIU copies a process.</div>
+    </a>
+  </div>
+</div>
 </body>
 </html>
