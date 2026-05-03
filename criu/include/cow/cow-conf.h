@@ -49,7 +49,9 @@
  *               bulk transfer completes, then do a single final PAGEMAP_SCAN
  *               on the frozen process. This is faster and simpler.
  */
-#define COW_PRE_SCAN
+#ifdef COW_PROFILE_SMALL
+//#define COW_PRE_SCAN
+#endif
 
 /*
  * CONFIG_HUNG_PAGE_TRACKER - Enable hung page detection.
