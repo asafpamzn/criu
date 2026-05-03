@@ -50,7 +50,7 @@
  *               on the frozen process. This is faster and simpler.
  */
 #ifdef COW_PROFILE_SMALL
-//#define COW_PRE_SCAN
+#define COW_PRE_SCAN
 #endif
 
 /*
