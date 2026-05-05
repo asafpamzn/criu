@@ -41,7 +41,8 @@ endif
 ifeq ($(CONTAINER_RUNTIME),podman)
 	# Podman limits the number of processes in a container using cgroups.
 	# Disable it as it breaks the thread-bomb test
-	CONTAINER_OPTS += --pids-limit=0
+	CONTAINER_OPTS += --pids-limit=-1
+	CONTAINER_OPTS += --ulimit nproc=-1:-1
 endif
 
 export ZDTM_OPTS
@@ -78,6 +79,7 @@ vagrant-fedora-non-root: setup-vagrant
 .PHONY: setup-vagrant vagrant-fedora-no-vdso vagrant-fedora-rawhide vagrant-fedora-non-root
 
 check-commit:
+	(cd ../.. && git clean -dfx)
 	($(MAKE) -j $$(nproc) -C ../.. && \
 		echo "Commit $$(git rev-parse --short HEAD) built successfully") || \
 		(echo "Build failed for $$(git rev-list -n 1 --pretty HEAD)" && \

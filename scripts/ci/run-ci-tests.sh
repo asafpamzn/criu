@@ -195,6 +195,9 @@ fi
 # umask has to be called before a first criu run, so that .gcda (coverage data)
 # files are created with read-write permissions for all.
 umask 0000
+# Also fix permissions on .gcda files already created during the build (owned
+# by root). Restored processes run as non-root and must be able to write them.
+find . -name '*.gcda' -exec chmod a+rw {} +
 ./criu/criu check
 ./criu/criu check --all || echo $?
 if [ "$UNAME_M" == "x86_64" ]; then
@@ -340,6 +343,9 @@ make -C test/others/criu-coredump run
 
 # libcriu testing
 make -C test/others/libcriu run
+
+# criu-service-client testing
+make -C contrib/criu-service-client/test run
 
 # external namespace testing
 make -C test/others/ns_ext run

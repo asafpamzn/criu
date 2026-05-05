@@ -96,20 +96,19 @@ int __amdgpu_plugin_dmabuf_dump(int dmabuf_fd, int id)
 int amdgpu_plugin_dmabuf_restore(int id)
 {
 	char path[PATH_MAX];
+	int fd_id, img_fd;
 	size_t img_size;
-	FILE *img_fp = NULL;
 	int ret = 0;
 	CriuDmabufNode *rd = NULL;
 	unsigned char *buf = NULL;
-	int fd_id;
 
 	snprintf(path, sizeof(path), IMG_DMABUF_FILE, id);
 
 	/* Read serialized metadata */
-	img_fp = open_img_file(path, false, &img_size);
-	if (!img_fp) {
+	img_fd = open_img_file(path, false, &img_size, true);
+	if (img_fd < 0) {
 		pr_err("Failed to open dmabuf metadata file: %s\n", path);
-		return -EINVAL;
+		return img_fd;
 	}
 
 	pr_debug("dmabuf Image file size:%ld\n", img_size);
@@ -119,9 +118,9 @@ int amdgpu_plugin_dmabuf_restore(int id)
 		return -ENOMEM;
 	}
 
-	ret = read_fp(img_fp, buf, img_size);
+	ret = img_read(img_fd, buf, img_size);
+	close(img_fd);
 	if (ret) {
-		pr_perror("Unable to read from %s", path);
 		xfree(buf);
 		return ret;
 	}
@@ -130,21 +129,23 @@ int amdgpu_plugin_dmabuf_restore(int id)
 	if (rd == NULL) {
 		pr_perror("Unable to parse the dmabuf message %d", id);
 		xfree(buf);
-		fclose(img_fp);
 		return -1;
 	}
-	fclose(img_fp);
 
 	/* Match GEM handle with shared_dmabuf list */
 	fd_id = amdgpu_id_for_handle(rd->gem_handle);
 	if (fd_id == -1) {
 		pr_err("Failed to find dmabuf_fd for GEM handle = %d\n", rd->gem_handle);
+		criu_dmabuf_node__free_unpacked(rd, NULL);
+		xfree(buf);
 		return 1;
 	}
 
 	int dmabuf_fd = fdstore_get(fd_id);
 	if (dmabuf_fd == -1) {
 		pr_err("Failed to find dmabuf_fd for GEM handle = %d\n", rd->gem_handle);
+		criu_dmabuf_node__free_unpacked(rd, NULL);
+		xfree(buf);
 		return 1; /* Retry needed */
 	}
 
@@ -160,6 +161,8 @@ int amdgpu_plugin_dmabuf_restore(int id)
 int amdgpu_plugin_dmabuf_dump(int dmabuf_fd, int id)
 {
 	int ret;
+
+	pr_info("Dumping dmabuf fd %d\n", dmabuf_fd);
 
 	ret = __amdgpu_plugin_dmabuf_dump(dmabuf_fd, id);
 	if (ret == -EAGAIN) {

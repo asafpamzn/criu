@@ -199,9 +199,6 @@ static inline void _setup_sas(struct rt_sigframe *sigframe, ThreadSasEntry *sas)
 int restore_gpregs(struct rt_sigframe *f, UserX86RegsEntry *r);
 int restore_nonsigframe_gpregs(UserX86RegsEntry *r);
 
-int ptrace_set_breakpoint(pid_t pid, void *addr);
-int ptrace_flush_breakpoints(pid_t pid);
-
 extern int arch_map_vdso(unsigned long map_at, bool compatible);
 
 #endif

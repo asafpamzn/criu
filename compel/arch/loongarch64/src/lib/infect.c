@@ -175,19 +175,6 @@ int arch_fetch_sas(struct parasite_ctl *ctl, struct rt_sigframe *s)
 }
 
 /*
- * TODO: add feature
- */
-int ptrace_set_breakpoint(pid_t pid, void *addr)
-{
-	return 0;
-}
-
-int ptrace_flush_breakpoints(pid_t pid)
-{
-	return 0;
-}
-
-/*
  * Refer to Linux kernel arch/loongarch/include/asm/processor.h
  */
 #define TASK_SIZE32	(1UL) << 31

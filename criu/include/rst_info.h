@@ -85,8 +85,6 @@ struct rst_info {
 	futex_t shstk_enable;
 	futex_t shstk_unlock;
 
-	void *breakpoint;
-
 	struct rst_arch_info arch_info;
 };
 

@@ -120,8 +120,17 @@ static int dump_scm_rights(struct cmsghdr *ch, SkPacketEntry *pe)
 /*
  * Maximum size of the control messages. XXX -- is there any
  * way to get this value out of the kernel?
- * */
-#define CMSG_MAX_SIZE 1024
+ *
+ * The kernel limits SCM_RIGHTS to SCM_MAX_FD (253) file descriptors,
+ * defined in include/net/scm.h. A single packet can carry multiple
+ * SCM types simultaneously:
+ *   - SCM_RIGHTS:      CMSG_SPACE(253 * sizeof(int)) = 1032 bytes
+ *   - SCM_CREDENTIALS: CMSG_SPACE(sizeof(struct ucred)) = 32 bytes
+ *   - SCM_PIDFD:       CMSG_SPACE(sizeof(int)) = 24 bytes
+ *
+ * Total worst case: ~1088 bytes. Round up to 2048 for safety.
+ */
+#define CMSG_MAX_SIZE 2048
 
 static int dump_packet_cmsg(struct msghdr *mh, SkPacketEntry *pe)
 {

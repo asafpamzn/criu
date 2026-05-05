@@ -153,7 +153,6 @@ static noinline __used unsigned long parasite_init_daemon(void *data)
 	struct parasite_init_args *args = data;
 	int ret;
 
-	args->sigreturn_addr = (uint64_t)(uintptr_t)fini_sigreturn;
 	sigframe = (void *)(uintptr_t)args->sigframe;
 #ifdef ARCH_HAS_LONG_PAGES
 	__page_size = args->page_size;

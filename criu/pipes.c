@@ -305,6 +305,13 @@ int open_pipe(struct file_desc *d, int *new_fd)
 		return -1;
 	}
 
+	if (pi->pe->has_uid && pi->pe->has_gid) {
+		if (cr_fchown(pfd[0], pi->pe->uid, pi->pe->gid) < 0) {
+			pr_perror("Can't change pipe ownership");
+			return -1;
+		}
+	}
+
 	ret = restore_pipe_data(CR_FD_PIPES_DATA, pfd[1], pi->pe->pipe_id, pd_hash_pipes);
 	if (ret)
 		return -1;
@@ -495,6 +502,10 @@ static int dump_one_pipe(int lfd, u32 id, const struct fd_parms *p)
 	pe.pipe_id = pipe_id(p);
 	pe.flags = p->flags & ~O_DIRECT;
 	pe.fown = (FownEntry *)&p->fown;
+	pe.uid = userns_uid(p->stat.st_uid);
+	pe.gid = userns_gid(p->stat.st_gid);
+	pe.has_uid = true;
+	pe.has_gid = true;
 
 	fe.type = FD_TYPES__PIPE;
 	fe.id = pe.id;

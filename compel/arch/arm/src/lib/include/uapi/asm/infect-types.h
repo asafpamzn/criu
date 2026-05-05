@@ -2,6 +2,7 @@
 #define UAPI_COMPEL_ASM_TYPES_H__
 
 #include <stdint.h>
+#include <signal.h>
 #include <sys/mman.h>
 
 #define SIGMAX	   64

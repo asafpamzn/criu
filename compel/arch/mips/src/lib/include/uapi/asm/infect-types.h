@@ -8,6 +8,7 @@
 #include <linux/types.h>
 #define SIGMAX	   64
 #define SIGMAX_OLD 31
+#define ARCH_SI_TRAP	TRAP_BRKPT
 
 /*
  * Copied from the Linux kernel header arch/mips/include/asm/ptrace.h

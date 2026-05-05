@@ -53,6 +53,9 @@ jobs:
 
   archlinux-test:
     needs: [alpine-test]
+    # archlinux:latest + pacman -Syu is a rolling-release build; failures
+    # caused by upstream package churn are outside CRIU's control.
+    continue-on-error: true
     runs-on: ubuntu-22.04
     steps:
     - uses: actions/checkout@v4
@@ -82,7 +85,6 @@ jobs:
           armv7-stable-cross,
           aarch64-stable-cross,
           ppc64-stable-cross,
-          mips64el-stable-cross,
           riscv64-stable-cross,
         ]
         include:
@@ -92,8 +94,6 @@ jobs:
             target: aarch64-unstable-cross
           - experimental: true
             target: ppc64-unstable-cross
-          - experimental: true
-            target: mips64el-unstable-cross
     steps:
     - uses: actions/checkout@v4
     - name: Run Cross Compilation Targets
@@ -120,8 +120,16 @@ jobs:
       run: sudo -E make -C scripts/ci fedora-asan
 
   fedora-rawhide-test:
+    name: ${{ matrix.name }}
     needs: [alpine-test]
-    runs-on: ubuntu-22.04
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            name: x86_64 Fedora Rawhide
+          - os: ubuntu-24.04-arm
+            name: aarch64 Fedora Rawhide
     steps:
     - uses: actions/checkout@v4
     - name: Run Fedora Rawhide Test
@@ -131,6 +139,49 @@ jobs:
       # FIXME: https://github.com/containers/podman/issues/14920
       run: sudo -E XDG_RUNTIME_DIR= make -C scripts/ci fedora-rawhide CONTAINER_RUNTIME=podman BUILD_OPTIONS="--security-opt seccomp=unconfined"
 
+  vagrant-fedora-rawhide-test:
+    name: Vagrant Fedora ${{ matrix.name }} based test
+    needs: [alpine-test]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: fedora-stable
+            name: Stable
+          - variant: fedora-next
+            name: Next
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install Lima
+      uses: lima-vm/lima-actions/setup@v1
+    - name: Cache Lima images
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/lima
+        key: lima-fedora-${{ github.sha }}
+        restore-keys: lima-fedora-
+    - name: Start Fedora VM
+      run: limactl start --plain --name=default --cpus=4 --memory=12 template://fedora
+    - name: Copy source into VM
+      run: |
+        lima sudo mkdir -p /home/criu
+        lima sudo chown "$(lima whoami)" /home/criu
+        limactl copy -r . default:/home/criu
+    - name: Setup VM
+      run: lima sudo /home/criu/scripts/ci/lima.sh ${{ matrix.variant }}-setup
+    - name: Reboot VM to activate new kernel
+      run: |
+        limactl stop default
+        limactl start default
+    - name: Show VM info
+      run: |
+        lima uname -a
+        lima cat /proc/cmdline
+    - name: Run tests
+      run: ssh -tt lima-default sudo -i /home/criu/scripts/ci/lima.sh ${{ matrix.variant }}-test
+
   gcov-test:
     needs: [alpine-test]
     runs-on: ubuntu-22.04
@@ -139,9 +190,11 @@ jobs:
     - name: Run Coverage Tests
       run: sudo -E make -C scripts/ci local GCOV=1
     - name: Run gcov
-      run: sudo -E find . -name '*gcda' -type f -print0 | sudo -E xargs --null --max-args 128 --max-procs 4 gcov
-    - name: Run Coverage Analysis
-      run: sudo -E make codecov
+      run: sudo -E find . -name '*gcda' -type f -print0 | sudo -E xargs --null --max-args 128 gcov
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v5
+      with:
+        token: ${{ secrets.CODECOV_TOKEN }}
 
   java-test:
     needs: [alpine-test]

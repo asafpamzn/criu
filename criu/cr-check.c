@@ -1589,16 +1589,6 @@ static int check_overlayfs_maps(void)
 	return status == 0 ? 0 : -1;
 }
 
-static int check_breakpoints(void)
-{
-	if (!kdat.has_breakpoints) {
-		pr_warn("Hardware breakpoints don't seem to work\n");
-		return -1;
-	}
-
-	return 0;
-}
-
 static int check_pagemap_scan_guard_pages(void)
 {
 	kerndat_warn_about_madv_guards();
@@ -1746,7 +1736,6 @@ int cr_check(void)
 	/*
 	 * Category 4 - optional.
 	 */
-	check_breakpoints();
 
 	pr_msg("%s\n", ret ? CHECK_MAYBE : CHECK_GOOD);
 	return ret;
@@ -1869,7 +1858,6 @@ static struct feature_list feature_list[] = {
 	{ "pagemap_scan", check_pagemap_scan },
 	{ "timer_cr_ids", check_timer_cr_ids },
 	{ "overlayfs_maps", check_overlayfs_maps },
-	{ "breakpoints", check_breakpoints },
 	{ "pagemap_scan_guard_pages", check_pagemap_scan_guard_pages },
 	{ "binfmt_misc_sandboxing", check_binfmt_misc_sandboxing },
 	{ NULL, NULL },
