@@ -141,7 +141,7 @@
  * LARGE: 32+ core machines (20 scanners, 10 drain, 15 P3)
  */
 /* #define COW_PROFILE_LARGE */
-#define COW_PROFILE_SMALL
+//#define COW_PROFILE_SMALL
 
 #ifdef COW_PROFILE_SMALL
 #define COW_NUM_P3_THREADS		4
