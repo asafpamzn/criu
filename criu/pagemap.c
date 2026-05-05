@@ -483,15 +483,13 @@ static int read_page_complete(unsigned long img_id, unsigned long vaddr, unsigne
 int bulk_page_complete(unsigned long img_id, unsigned long vaddr, unsigned long int nr_pages, void *priv)
 {
 	struct page_read *pr = priv;
-	
-	/* 
-	 * In bulk mode, pages arrive automatically in order from background thread.
-	 * No need for img_id validation - just call uffd_copy() directly via io_complete.
-	 */
+
+	pr_err("DEAD CODE HIT: bulk_page_complete(img_id=%lu, vaddr=%lx, nr=%lu)\n",
+	       img_id, vaddr, nr_pages);
 
 	if (pr->io_complete)
 		return pr->io_complete(pr, vaddr, nr_pages);
-	
+
 	pr_err("Bulk mode without io_complete callback!\n");
 	return -1;
 }
@@ -499,12 +497,11 @@ int bulk_page_complete(unsigned long img_id, unsigned long vaddr, unsigned long 
 /* Bulk transfer mode: pages arrive automatically from background thread */
 static int maybe_read_page_remote_bulk(struct page_read *pr, unsigned long vaddr, unsigned long nr, void *buf, unsigned flags)
 {
-	/* 
-	 * In bulk mode, the background thread sends all pages automatically.
-	 * We don't send individual requests - just wait for pages to arrive.
-	 * Use simpler callback that skips img_id validation.
-	 */
 	int ret = 0;
+
+	pr_err("DEAD CODE HIT: maybe_read_page_remote_bulk(vaddr=%lx, nr=%lu, flags=%x)\n",
+	       vaddr, nr, flags);
+
 	if (flags & PR_ASAP) {
 		pr_debug("pr%lu-%u Read %lx %lu maybe_read_page_remote_bulk\n", pr->img_id, pr->id, vaddr, nr);
 		ret = request_remote_pages(pr->img_id, vaddr, nr);

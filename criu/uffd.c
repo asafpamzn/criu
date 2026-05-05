@@ -954,6 +954,9 @@ static int uffd_io_complete(struct page_read *pr, unsigned long img_addr, unsign
 static int uffd_io_complete_bulk(struct page_read *pr, unsigned long vaddr, unsigned long nr)
 {
 	struct lazy_pages_info *lpi = container_of(pr, struct lazy_pages_info, pr);
+
+	pr_err("DEAD CODE HIT: uffd_io_complete_bulk(vaddr=%lx, nr=%lu)\n", vaddr, nr);
+
 	return cow_uffd_io_complete_bulk(lpi, vaddr, nr);
 }
 
