@@ -719,7 +719,6 @@ free_mm:
 }
 
 static int uffd_io_complete(struct page_read *pr, unsigned long vaddr, unsigned long nr);
-static int uffd_io_complete_bulk(struct page_read *pr, unsigned long vaddr, unsigned long nr);
 
 static int ud_open(int client, struct lazy_pages_info **_lpi)
 {
@@ -763,14 +762,8 @@ static int ud_open(int client, struct lazy_pages_info **_lpi)
 		goto out;
 	}
 
-	if (opts.cow_dump) {
-		/* Bulk mode: pages arrive automatically from background thread */
-		lpi->pr.io_complete = uffd_io_complete_bulk;
-	} else {
-		/* On-demand mode: manage individual page requests */
-		lpi->pr.io_complete = uffd_io_complete;
-	}
-
+	lpi->pr.io_complete = uffd_io_complete;
+	
 	/*
 	 * Find the memory pages belonging to the restored process
 	 * so that it is trackable when all pages have been transferred.
@@ -945,19 +938,6 @@ static int uffd_io_complete(struct page_read *pr, unsigned long img_addr, unsign
 	 */
 	iov_list_insert(req, &lpi->iovs);
 	return drop_iovs(lpi, addr, nr * PAGE_SIZE);
-}
-
-/*
- * COW bulk mode io_complete callback.
- * Used when opts.cow_dump is true.
- */
-static int uffd_io_complete_bulk(struct page_read *pr, unsigned long vaddr, unsigned long nr)
-{
-	struct lazy_pages_info *lpi = container_of(pr, struct lazy_pages_info, pr);
-
-	pr_err("DEAD CODE HIT: uffd_io_complete_bulk(vaddr=%lx, nr=%lu)\n", vaddr, nr);
-
-	return cow_uffd_io_complete_bulk(lpi, vaddr, nr);
 }
 
 static int uffd_zero(struct lazy_pages_info *lpi, __u64 address, unsigned long nr_pages)

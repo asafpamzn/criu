@@ -1255,9 +1255,6 @@ static struct {
 	unsigned long total_pages;
 
 	/* Timing statistics (nanoseconds) */
-	unsigned long io_complete_bulk_total_ns;
-	unsigned long io_complete_bulk_count;
-	unsigned long io_complete_bulk_count_start;
 	unsigned long uffd_copy_total_ns;
 	unsigned long uffd_copy_count;
 	unsigned long drop_iovs_total_ns;
@@ -1322,16 +1319,7 @@ static const char *get_bucket_label(int bucket)
 	}
 }
 
-void cow_uffd_stats_add_io_bulk(unsigned long ns)
-{
-	uffd_stats.io_complete_bulk_total_ns += ns;
-	uffd_stats.io_complete_bulk_count++;
-}
 
-void cow_uffd_stats_inc_io_bulk_start(void)
-{
-	uffd_stats.io_complete_bulk_count_start++;
-}
 
 void cow_uffd_stats_add_copy(unsigned long ns)
 {
@@ -1380,17 +1368,6 @@ void check_and_print_uffd_stats(void)
 		}
 		pr_debug("\n");
 
-		/* Print timing stats */
-		if (uffd_stats.io_complete_bulk_count_start > 0) {
-			pr_err("  TIMING: io_bulk=%lu ns (%lu, %lu ops) copy=%lu ns (%lu ops) drop=%lu ns (%lu ops)\n",
-				uffd_stats.io_complete_bulk_total_ns / uffd_stats.io_complete_bulk_count,
-				uffd_stats.io_complete_bulk_count,
-				uffd_stats.io_complete_bulk_count_start,
-				uffd_stats.uffd_copy_count > 0 ? uffd_stats.uffd_copy_total_ns / uffd_stats.uffd_copy_count : 0,
-				uffd_stats.uffd_copy_count,
-				uffd_stats.drop_iovs_count > 0 ? uffd_stats.drop_iovs_total_ns / uffd_stats.drop_iovs_count : 0,
-				uffd_stats.drop_iovs_count);
-		}
 
 		/* Print EAGAIN stats */
 		if (uffd_stats.eagain_processed > 0 || uffd_stats.eagain_skipped > 0 || uffd_stats.eagain_calls > 0) {
@@ -1761,77 +1738,6 @@ void cow_handle_remove_event(unsigned long start, unsigned long len)
 	/* Remove these pages from buffer - no point draining them */
 	cow_page_buffer_remove_range(start, len);
 }
-
-
-
-/*
- * COW bulk IO complete callback.
- * Called when a bulk page read completes in COW mode (without page server Phase 2/3).
- *
- * NOTE: In COW Phase 2/3 mode (opts.cow_dump && opts.use_page_server),
- * This callback is for COW mode without the page server phased approach.
- */
-int cow_uffd_io_complete_bulk(struct lazy_pages_info *lpi,
-			      unsigned long vaddr, unsigned long nr_pages)
-{
-	struct lazy_iov *iov;
-	unsigned long pages = nr_pages;
-	unsigned long tracked_pages;
-	int ret;
-	struct timespec t_start, t_end;
-
-	cow_uffd_stats_inc_io_bulk_start();
-	clock_gettime(CLOCK_MONOTONIC, &t_start);
-
-	/* Process may exit while pages are in flight */
-	if (lpi->exited) {
-		lp_debug(lpi, "Page at 0x%lx no longer needed (exited)\n", vaddr);
-		return 0;
-	}
-
-	/* Check if address is still tracked */
-	iov = cow_find_iov(lpi, vaddr);
-
-	/* Also check requests list */
-	if (!iov) {
-		struct lazy_iov *req;
-		list_for_each_entry(req, &lpi->reqs, l) {
-			if (vaddr >= req->start && vaddr < req->end) {
-				lp_debug(lpi, "Page at 0x%lx found in requests list\n", vaddr);
-				iov = req;
-				break;
-			}
-		}
-	}
-
-	if (!iov) {
-		lp_debug(lpi, "Page at 0x%lx no longer needed (unmapped), dropping\n", vaddr);
-		return 0;
-	}
-
-	tracked_pages = (iov->end - vaddr) / PAGE_SIZE;
-	pages = min(pages, tracked_pages);
-	if (!pages)
-		return 0;
-
-	ret = cow_uffd_copy(lpi->lpfd.fd, vaddr, lpi->buf, pages,
-			    lpi, NULL, 0, "BULK_IO");
-
-	/* Only record timing for successful copies */
-	if (ret > 0) {
-		clock_gettime(CLOCK_MONOTONIC, &t_end);
-		cow_uffd_stats_add_io_bulk((t_end.tv_sec - t_start.tv_sec) * 1000000000 +
-					   (t_end.tv_nsec - t_start.tv_nsec));
-	}
-
-	/* If process exited during error, treat as success */
-	if (ret < 0 && lpi->exited)
-		return 0;
-
-	/* Return 0 for success or soft-handled, -1 for error */
-	return ret >= 0 ? 0 : -1;
-}
-
 
 /*
  * COW post-connect initialization in handle_lazy_accept.

@@ -479,40 +479,6 @@ static int read_page_complete(unsigned long img_id, unsigned long vaddr, unsigne
 	return ret;
 }
 
-/* Bulk mode callback: simpler, no img_id validation needed */
-int bulk_page_complete(unsigned long img_id, unsigned long vaddr, unsigned long int nr_pages, void *priv)
-{
-	struct page_read *pr = priv;
-
-	pr_err("DEAD CODE HIT: bulk_page_complete(img_id=%lu, vaddr=%lx, nr=%lu)\n",
-	       img_id, vaddr, nr_pages);
-
-	if (pr->io_complete)
-		return pr->io_complete(pr, vaddr, nr_pages);
-
-	pr_err("Bulk mode without io_complete callback!\n");
-	return -1;
-}
-
-/* Bulk transfer mode: pages arrive automatically from background thread */
-static int maybe_read_page_remote_bulk(struct page_read *pr, unsigned long vaddr, unsigned long nr, void *buf, unsigned flags)
-{
-	int ret = 0;
-
-	pr_err("DEAD CODE HIT: maybe_read_page_remote_bulk(vaddr=%lx, nr=%lu, flags=%x)\n",
-	       vaddr, nr, flags);
-
-	if (flags & PR_ASAP) {
-		pr_debug("pr%lu-%u Read %lx %lu maybe_read_page_remote_bulk\n", pr->img_id, pr->id, vaddr, nr);
-		ret = request_remote_pages(pr->img_id, vaddr, nr);
-	}
-
-	if (!ret) {
-		ret = page_server_start_read(buf, nr, bulk_page_complete, pr, flags);
-	}
-	return ret;
-}
-
 /* On-demand transfer mode: request individual pages as needed */
 static int maybe_read_page_remote(struct page_read *pr, unsigned long vaddr, unsigned long nr, void *buf, unsigned flags)
 {
@@ -919,16 +885,8 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 	pr->id = ids++;
 	pr->img_id = img_id;
 
-	if (remote) {
-		
-		/* Choose appropriate page read function based on mode */
-		if (opts.cow_dump) {
-			/* Bulk mode: pages arrive automatically from background thread */
-			pr->maybe_read_page = maybe_read_page_remote_bulk;
-		} else {
-			/* On-demand mode: request pages individually as needed */
-			pr->maybe_read_page = maybe_read_page_remote;
-		}
+	if (remote) {		
+		pr->maybe_read_page = maybe_read_page_remote;
 	} else if (opts.stream) {
 		pr->maybe_read_page = maybe_read_page_img_streamer;
 	} else {

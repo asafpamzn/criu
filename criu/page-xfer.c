@@ -1761,7 +1761,6 @@ struct ps_async_read {
 	void *priv;
 
 	struct list_head l;
-	/* COW compression/dirty bitmap fields are in cow-bulk-recv.c (ps_async_read_bulk) */
 };
 
 static LIST_HEAD(async_reads);
@@ -1794,10 +1793,6 @@ static int page_server_start_async_read(void *buf, unsigned long nr_pages, ps_as
 	list_add_tail(&ar->l, &async_reads);
 	return 0;
 }
-
-/* COW control message reader (page_server_async_read_bulk, etc.)
- * is in cow-bulk-recv.c */
-
 
 /*
  * There are two possible event types we need to handle:
