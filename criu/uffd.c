@@ -735,46 +735,41 @@ static int ud_open(int client, struct lazy_pages_info **_lpi)
 	int ret = -1;
 	int pr_flags = PR_TASK;
 
-	pr_err("DIAG: ud_open entry client=%d\n", client);
 	lpi = lpi_init();
-	if (!lpi) {
-		pr_err("DIAG: ud_open lpi_init FAILED\n");
+	if (!lpi)
 		goto out;
-	}
 
 	/* The "transfer protocol" is first the pid as int and then
 	 * the FD for UFFD */
 	ret = recv(client, &lpi->pid, sizeof(lpi->pid), 0);
 	if (ret != sizeof(lpi->pid)) {
 		if (ret < 0)
-			pr_perror("DIAG: ud_open PID recv error");
+			pr_perror("PID recv error");
 		else
-			pr_err("DIAG: ud_open PID recv short read ret=%d\n", ret);
+			pr_err("PID recv: short read\n");
 		goto out;
 	}
-	pr_err("DIAG: ud_open received PID=%d\n", lpi->pid);
 
 	if (lpi->pid < 0) {
-		pr_err("DIAG: ud_open zombie PID=%d\n", lpi->pid);
+		pr_debug("Zombie PID: %d\n", lpi->pid);
 		lpi_fini(lpi);
 		return 0;
 	}
 
 	lpi->lpfd.fd = recv_fd(client);
 	if (lpi->lpfd.fd < 0) {
-		pr_err("DIAG: ud_open recv_fd FAILED\n");
+		pr_err("recv_fd error\n");
 		goto out;
 	}
-	pr_err("DIAG: ud_open received uffd=%d\n", lpi->lpfd.fd);
+	pr_debug("Received PID: %d, uffd: %d\n", lpi->pid, lpi->lpfd.fd);
 
 	if (opts.use_page_server)
 		pr_flags |= PR_REMOTE;
 	ret = open_page_read(lpi->pid, &lpi->pr, pr_flags);
 	if (ret <= 0) {
-		pr_err("DIAG: ud_open open_page_read FAILED ret=%d pid=%d\n", ret, lpi->pid);
+		lp_err(lpi, "Failed to open pagemap\n");
 		goto out;
 	}
-	pr_err("DIAG: ud_open open_page_read OK pid=%d\n", lpi->pid);
 
 	lpi->pr.io_complete = uffd_io_complete;
 
@@ -783,13 +778,11 @@ static int ud_open(int client, struct lazy_pages_info **_lpi)
 	 * so that it is trackable when all pages have been transferred.
 	 */
 	ret = collect_iovs(lpi);
-	if (ret < 0) {
-		pr_err("DIAG: ud_open collect_iovs FAILED ret=%d pid=%d\n", ret, lpi->pid);
+	if (ret < 0)
 		goto out;
-	}
 	lpi->total_pages = ret;
-	pr_err("DIAG: ud_open collect_iovs OK pid=%d total_pages=%ld\n",
-	       lpi->pid, lpi->total_pages);
+
+	lp_debug(lpi, "Found %ld pages to be handled by UFFD\n", lpi->total_pages);
 
 	list_add_tail(&lpi->l, &lpis);
 	*_lpi = lpi;
@@ -797,7 +790,6 @@ static int ud_open(int client, struct lazy_pages_info **_lpi)
 	return 0;
 
 out:
-	pr_err("DIAG: ud_open OUT path (failure) lpi=%p\n", lpi);
 	lpi_fini(lpi);
 	return -1;
 }
@@ -1560,18 +1552,13 @@ static int handle_lazy_accept(struct epoll_rfd *rfd)
 	struct sockaddr_un saddr;
 	socklen_t len = sizeof(saddr);
 
-	pr_err("DIAG: handle_lazy_accept entry rfd->fd=%d\n", rfd->fd);
 	client = accept(rfd->fd, (struct sockaddr *)&saddr, &len);
 	if (client < 0) {
-		if (errno == EAGAIN || errno == EWOULDBLOCK) {
-			pr_err("DIAG: handle_lazy_accept accept EAGAIN\n");
+		if (errno == EAGAIN || errno == EWOULDBLOCK)
 			return 0;
-		}
-		pr_perror("DIAG: handle_lazy_accept accept failed");
+		pr_perror("accept failed");
 		return -1;
 	}
-	pr_err("DIAG: handle_lazy_accept accepted client=%d nr_tasks=%d\n",
-	       client, task_entries->nr_tasks);
 
 	/* Set up lpi for each task (reads uffd from restore) */
 	{
@@ -1579,25 +1566,17 @@ static int handle_lazy_accept(struct epoll_rfd *rfd)
 		for (i = 0; i < task_entries->nr_tasks; i++) {
 			struct lazy_pages_info *lpi = NULL;
 
-			pr_err("DIAG: handle_lazy_accept ud_open task %d/%d\n",
-			       i, task_entries->nr_tasks);
-			if (ud_open(client, &lpi)) {
-				pr_err("DIAG: handle_lazy_accept ud_open FAILED task %d\n", i);
+			if (ud_open(client, &lpi))
 				goto err;
-			}
-			if (lpi == NULL) {
-				pr_err("DIAG: handle_lazy_accept ud_open task %d returned NULL lpi (zombie)\n", i);
+			if (lpi == NULL)
 				continue;
-			}
 			/*
 			 * Always add UFFD to epoll, even in COW mode.
 			 * Page faults can still occur (e.g., during comparison)
 			 * and need to be handled by serving from buffer.
 			 */
-			if (epoll_add_rfd(epollfd, &lpi->lpfd)) {
-				pr_err("DIAG: handle_lazy_accept epoll_add_rfd(lpfd) FAILED task %d\n", i);
+			if (epoll_add_rfd(epollfd, &lpi->lpfd))
 				goto err;
-			}
 
 			lp_debug(lpi, "registered UFFD handler (fd=%d)\n", lpi->lpfd.fd);
 			uffd_count++;
@@ -1609,10 +1588,8 @@ static int handle_lazy_accept(struct epoll_rfd *rfd)
 	lazy_sk_rfd.fd = client;
 	lazy_sk_rfd.read_event = lazy_sk_read_event;
 	lazy_sk_rfd.hangup_event = lazy_sk_hangup_event;
-	if (epoll_add_rfd(epollfd, &lazy_sk_rfd)) {
-		pr_err("DIAG: handle_lazy_accept epoll_add_rfd(lazy_sk_rfd) FAILED\n");
+	if (epoll_add_rfd(epollfd, &lazy_sk_rfd))
 		goto err;
-	}
 
 	/* Remove listen socket from epoll — only one connection needed */
 	epoll_del_rfd(epollfd, rfd);
@@ -1636,7 +1613,6 @@ static int handle_lazy_accept(struct epoll_rfd *rfd)
 	return 0;
 
 err:
-	pr_err("DIAG: handle_lazy_accept err path, closing client=%d\n", client);
 	close(client);
 	return -1;
 }
