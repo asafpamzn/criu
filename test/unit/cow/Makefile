@@ -10,10 +10,12 @@ CFLAGS := -Wall -Wextra -g -O2 -pthread -std=gnu11 \
 LDFLAGS := -pthread
 
 # Header-only tests (portable, work on macOS + Linux)
-TESTS_PORTABLE := test_batch_bitmap test_spsc_queue test_mpsc_queue
+TESTS_PORTABLE := test_batch_bitmap test_spsc_queue test_mpsc_queue \
+		  test_spmc_queue test_atomic_bitmap
 
 # Tests linking real COW .c files (Linux-only: need pthread_spinlock_t, mmap alignment)
-TESTS_LINUX := test_unmapped_tracker test_page_pool test_page_state_tracker
+TESTS_LINUX := test_unmapped_tracker test_page_pool test_page_state_tracker \
+	       test_hung_page_tracker
 
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Linux)
@@ -34,6 +36,12 @@ test_spsc_queue: test_spsc_queue.c test_harness.h shims/page.h shims/criu-log.h 
 test_mpsc_queue: test_mpsc_queue.c test_harness.h shims/page.h shims/criu-log.h shims/xmalloc.h
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
+test_spmc_queue: test_spmc_queue.c test_harness.h shims/page.h shims/criu-log.h shims/xmalloc.h
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
+test_atomic_bitmap: test_atomic_bitmap.c test_harness.h
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
 # Tests linking against COW source files (Linux-only)
 test_unmapped_tracker: test_unmapped_tracker.c $(CRIU_SRC)/cow/unmapped-tracker.c \
 		       test_harness.h shims/page.h shims/int.h shims/criu-log.h shims/xmalloc.h
@@ -47,6 +55,11 @@ test_page_state_tracker: test_page_state_tracker.c $(CRIU_SRC)/cow/page-state-tr
 			 test_harness.h shims/page.h shims/int.h shims/criu-log.h shims/xmalloc.h shims/util.h
 	$(CC) $(CFLAGS) -DCONFIG_PAGE_STATE_TRACKER -o $@ \
 		test_page_state_tracker.c $(CRIU_SRC)/cow/page-state-tracker.c $(LDFLAGS)
+
+test_hung_page_tracker: test_hung_page_tracker.c $(CRIU_SRC)/cow/hung-page-tracker.c \
+			test_harness.h shims/page.h shims/int.h shims/criu-log.h shims/xmalloc.h
+	$(CC) $(CFLAGS) -DCONFIG_HUNG_PAGE_TRACKER -o $@ \
+		test_hung_page_tracker.c $(CRIU_SRC)/cow/hung-page-tracker.c $(LDFLAGS)
 
 check: all
 	@echo "=== COW Unit Tests ==="; \
