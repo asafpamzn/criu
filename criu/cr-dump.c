@@ -148,27 +148,17 @@ void free_mappings(struct vm_area_list *vma_area_list)
 int collect_mappings(pid_t pid, struct vm_area_list *vma_area_list, dump_filemap_t dump_file)
 {
 	int ret = -1;
-	struct timeval t_start, t_checkpoint, t_now, t_delta;
 	bool use_maps;
 
-	gettimeofday(&t_start, NULL);
-	t_checkpoint = t_start;
-
-	pr_err("\n");
-	pr_err("Collecting mappings (pid: %d)\n", pid);
-	pr_err("----------------------------------------\n");
+	pr_info("\n");
+	pr_info("Collecting mappings (pid: %d)\n", pid);
+	pr_info("----------------------------------------\n");
 
 	use_maps = opts.cow_dump && opts.lazy_pages;
 	ret = use_maps ? parse_maps(pid, vma_area_list, dump_file) : parse_smaps(pid, vma_area_list, dump_file);
-	gettimeofday(&t_now, NULL);
-	timersub(&t_now, &t_checkpoint, &t_delta);
-	pr_err("TIMING: parse_%s took %ld.%06ld seconds\n", use_maps ? "maps" : "smaps", t_delta.tv_sec,
-	       t_delta.tv_usec);
-	t_checkpoint = t_now;
 	if (ret < 0)
 		goto err;
 
-	pr_err("parse_%s ended (pid: %d)\n", use_maps ? "maps" : "smaps", pid);
 	/*
 	 * In addition to real process VMAs we should keep an info about
 	 * madvise(MADV_GUARD_INSTALL) pages. While these are not represented
@@ -178,53 +168,18 @@ int collect_mappings(pid_t pid, struct vm_area_list *vma_area_list, dump_filemap
 	 *
 	 * Also, we don't need to dump them during pre-dump.
 	 */
-
-	 /*
-		 * TODO(Avi): collect_madv_guards - Guard pages for COW mode
-		 *
-		 * Guard pages (MADV_GUARD_INSTALL) are page-level metadata that mark
-		 * memory regions as "guard pages". They are NOT represented as VMAs
-		 * in the kernel, but CRIU treats them as pseudo-VMAs with VMA_AREA_GUARD.
-		 *
-		 * Why we need them:
-		 * 1. Security: Guard pages catch buffer/stack overflows (SIGSEGV).
-		 *    Without them, overflows silently corrupt memory.
-		 * 2. Heap allocators: jemalloc/tcmalloc use guards between arenas.
-		 * 3. Stack protection: Applications may install stack boundary guards.
-		 *
-		 * Since REPLICA runs for hours, missing guard pages means silent
-		 * memory corruption instead of clean crashes on overflow bugs.
-		 *
-		 * Data stored: just {start, end, VMA_AREA_GUARD} - address ranges.
-		 * Restore: sys_madvise(start, len, MADV_GUARD_INSTALL)
-		 *
-		 * We collect at T3 (freeze) because that's when we capture consistent
-		 * metadata. T1 is just for data transfer setup.
-		 */
 	if (dump_file) {
 		ret = collect_madv_guards(pid, vma_area_list);
-		gettimeofday(&t_now, NULL);
-		timersub(&t_now, &t_checkpoint, &t_delta);
-		pr_err("TIMING: collect_madv_guards took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
-		t_checkpoint = t_now;
 		if (ret < 0) {
 			pr_err("Collect MADV_GUARD_INSTALL pages (pid: %d) failed with %d\n", pid, ret);
 			goto err;
 		}
 	}
 
-	pr_err("Collected, longest area occupies %lu pages\n", vma_area_list->nr_priv_pages_longest);
+	pr_info("Collected, longest area occupies %lu pages\n", vma_area_list->nr_priv_pages_longest);
 	pr_info_vma_list(&vma_area_list->h);
-	gettimeofday(&t_now, NULL);
-	timersub(&t_now, &t_checkpoint, &t_delta);
-	pr_err("TIMING: pr_info_vma_list took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
-	t_checkpoint = t_now;
 
-	gettimeofday(&t_now, NULL);
-	timersub(&t_now, &t_start, &t_delta);
-	pr_err("TIMING: collect_mappings TOTAL took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
-
-	pr_err("----------------------------------------\n");
+	pr_info("----------------------------------------\n");
 err:
 	return ret;
 }
@@ -1671,16 +1626,12 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	struct parasite_drain_fd *dfds = NULL;
 	struct proc_posix_timers_stat proc_args;
 	struct mem_dump_ctl mdc = {};
-	struct timeval t_start, t_checkpoint, t_now, t_delta;
 
 	vm_area_list_init(&vmas);
 
-	gettimeofday(&t_start, NULL);
-	t_checkpoint = t_start;
-
-	pr_err("========================================\n");
-	pr_err("Dumping task (pid: %d comm: %s)\n", pid, __task_comm_info(pid));
-	pr_err("========================================\n");
+	pr_info("========================================\n");
+	pr_info("Dumping task (pid: %d comm: %s)\n", pid, __task_comm_info(pid));
+	pr_info("========================================\n");
 
 	if (item->pid->state == TASK_DEAD)
 		/*
@@ -1688,20 +1639,12 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 		 */
 		return 0;
 
-	pr_err("Obtaining task stat ... \n");
+	pr_info("Obtaining task stat ... \n");
 	ret = parse_pid_stat(pid, &pps_buf);
-	gettimeofday(&t_now, NULL);
-	timersub(&t_now, &t_checkpoint, &t_delta);
-	pr_err("TIMING: parse_pid_stat took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
-	t_checkpoint = t_now;
 	if (ret < 0)
 		goto err;
 
 	ret = collect_mappings(pid, &vmas, dump_filemap);
-	gettimeofday(&t_now, NULL);
-	timersub(&t_now, &t_checkpoint, &t_delta);
-	pr_err("TIMING: collect_mappings took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
-	t_checkpoint = t_now;
 	if (ret) {
 		pr_err("Collect mappings (pid: %d) failed with %d\n", pid, ret);
 		goto err;
@@ -1713,10 +1656,6 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 			goto err;
 
 		ret = collect_fds(pid, &dfds);
-		gettimeofday(&t_now, NULL);
-		timersub(&t_now, &t_checkpoint, &t_delta);
-		pr_err("TIMING: collect_fds took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
-		t_checkpoint = t_now;
 		if (ret) {
 			pr_err("Collect fds (pid: %d) failed with %d\n", pid, ret);
 			goto err;
@@ -1726,10 +1665,6 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	}
 
 	ret = parse_posix_timers(pid, &proc_args);
-	gettimeofday(&t_now, NULL);
-	timersub(&t_now, &t_checkpoint, &t_delta);
-	pr_err("TIMING: parse_posix_timers took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
-	t_checkpoint = t_now;
 	if (ret < 0) {
 		pr_err("Can't read posix timers file (pid: %d)\n", pid);
 		goto err;
@@ -1738,40 +1673,24 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	parasite_ensure_args_size(posix_timers_dump_size(proc_args.timer_n));
 
 	ret = dump_task_signals(pid, item);
-	gettimeofday(&t_now, NULL);
-	timersub(&t_now, &t_checkpoint, &t_delta);
-	pr_err("TIMING: dump_task_signals took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
-	t_checkpoint = t_now;
 	if (ret) {
 		pr_err("Dump %d signals failed %d\n", pid, ret);
 		goto err;
 	}
 
 	ret = dump_task_rseq(pid, item);
-	gettimeofday(&t_now, NULL);
-	timersub(&t_now, &t_checkpoint, &t_delta);
-	pr_err("TIMING: dump_task_rseq took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
-	t_checkpoint = t_now;
 	if (ret) {
 		pr_err("Dump %d rseq failed %d\n", pid, ret);
 		goto err;
 	}
 
 	parasite_ctl = parasite_infect_seized(pid, item, &vmas);
-	gettimeofday(&t_now, NULL);
-	timersub(&t_now, &t_checkpoint, &t_delta);
-	pr_err("TIMING: parasite_infect_seized took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
-	t_checkpoint = t_now;
 	if (!parasite_ctl) {
 		pr_err("Can't infect (pid: %d) with parasite\n", pid);
 		goto err;
 	}
 
 	ret = fixup_thread_rseq(item, 0);
-	gettimeofday(&t_now, NULL);
-	timersub(&t_now, &t_checkpoint, &t_delta);
-	pr_err("TIMING: fixup_thread_rseq took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
-	t_checkpoint = t_now;
 	if (ret) {
 		pr_err("Fixup rseq for %d failed %d\n", pid, ret);
 		goto err;
@@ -1819,7 +1738,7 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	item->sid = misc.sid;
 	item->pgid = misc.pgid;
 
-	pr_err("sid=%d pgid=%d pid=%d\n", item->sid, item->pgid, vpid(item));
+	pr_info("sid=%d pgid=%d pid=%d\n", item->sid, item->pgid, vpid(item));
 
 	if (item->sid == 0) {
 		pr_err("A session leader of %d(%d) is outside of its pid namespace\n", item->pid->real, vpid(item));
@@ -1842,7 +1761,6 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 			pr_err("Dump files (pid: %d) failed with %d\n", pid, ret);
 			goto err_cure;
 		}
-		pr_err("DEBUG: dump_task_files_seized completed for pid %d (standard dump)\n", pid);
 		ret = flush_eventpoll_dinfo_queue();
 		if (ret) {
 			pr_err("Dump eventpoll (pid: %d) failed with %d\n", pid, ret);
@@ -1862,68 +1780,42 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	 */
 	pr_debug("VMA_TRACE: phase=PHASE3_SKELETON pid=%d cow_is_phased_skeleton_dump=%d will_dump_pages=1\n",
 	       pid, cow_is_phased_skeleton_dump() ? 1 : 0);
-	{
-		mdc.pre_dump = false;
-		mdc.lazy = cow_is_phased_skeleton_dump() ? false : opts.lazy_pages;
-		mdc.cow_lazy_build_only = false;
-		mdc.cow_skeleton_non_lazy = cow_is_phased_skeleton_dump();
-		mdc.stat = &pps_buf;
-		mdc.parent_ie = parent_ie;
+	mdc.pre_dump = false;
+	mdc.lazy = cow_is_phased_skeleton_dump() ? false : opts.lazy_pages;
+	mdc.cow_lazy_build_only = false;
+	mdc.cow_skeleton_non_lazy = cow_is_phased_skeleton_dump();
+	mdc.stat = &pps_buf;
+	mdc.parent_ie = parent_ie;
 
-		ret = parasite_dump_pages_seized(item, &vmas, &mdc, parasite_ctl);
-		gettimeofday(&t_now, NULL);
-		timersub(&t_now, &t_checkpoint, &t_delta);
-		pr_err("TIMING: parasite_dump_pages_seized took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
-		t_checkpoint = t_now;
-		if (ret)
-			goto err_cure;
-	}
+	ret = parasite_dump_pages_seized(item, &vmas, &mdc, parasite_ctl);
+	if (ret)
+		goto err_cure;
 
 	ret = parasite_dump_sigacts_seized(parasite_ctl, item);
-	gettimeofday(&t_now, NULL);
-	timersub(&t_now, &t_checkpoint, &t_delta);
-	pr_err("TIMING: parasite_dump_sigacts_seized took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
-	t_checkpoint = t_now;
 	if (ret) {
 		pr_err("Can't dump sigactions (pid: %d) with parasite\n", pid);
 		goto err_cure;
 	}
 
 	ret = parasite_dump_itimers_seized(parasite_ctl, item);
-	gettimeofday(&t_now, NULL);
-	timersub(&t_now, &t_checkpoint, &t_delta);
-	pr_err("TIMING: parasite_dump_itimers_seized took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
-	t_checkpoint = t_now;
 	if (ret) {
 		pr_err("Can't dump itimers (pid: %d)\n", pid);
 		goto err_cure;
 	}
 
 	ret = parasite_dump_posix_timers_seized(&proc_args, parasite_ctl, item);
-	gettimeofday(&t_now, NULL);
-	timersub(&t_now, &t_checkpoint, &t_delta);
-	pr_err("TIMING: parasite_dump_posix_timers_seized took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
-	t_checkpoint = t_now;
 	if (ret) {
 		pr_err("Can't dump posix timers (pid: %d)\n", pid);
 		goto err_cure;
 	}
 
 	ret = dump_task_core_all(parasite_ctl, item, &pps_buf, cr_imgset, &misc);
-	gettimeofday(&t_now, NULL);
-	timersub(&t_now, &t_checkpoint, &t_delta);
-	pr_err("TIMING: dump_task_core_all took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
-	t_checkpoint = t_now;
 	if (ret) {
 		pr_err("Dump core (pid: %d) failed with %d\n", pid, ret);
 		goto err_cure;
 	}
 
 	ret = dump_task_cgroup(parasite_ctl, item);
-	gettimeofday(&t_now, NULL);
-	timersub(&t_now, &t_checkpoint, &t_delta);
-	pr_err("TIMING: dump_task_cgroup took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
-	t_checkpoint = t_now;
 	if (ret) {
 		pr_err("Dump cgroup of threads in process (pid: %d) failed with %d\n", pid, ret);
 		goto err_cure;
@@ -1952,20 +1844,12 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	else
 #endif
 		ret = compel_stop_daemon(parasite_ctl);
-	gettimeofday(&t_now, NULL);
-	timersub(&t_now, &t_checkpoint, &t_delta);
-	pr_err("TIMING: compel_stop_daemon took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
-	t_checkpoint = t_now;
 	if (ret) {
 		pr_err("Can't stop daemon in parasite (pid: %d)\n", pid);
 		goto err_cure;
 	}
 
 	ret = dump_task_threads(parasite_ctl, item);
-	gettimeofday(&t_now, NULL);
-	timersub(&t_now, &t_checkpoint, &t_delta);
-	pr_err("TIMING: dump_task_threads took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
-	t_checkpoint = t_now;
 	if (ret) {
 		pr_err("Can't dump threads\n");
 		goto err_cure;
@@ -1999,40 +1883,22 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	else
 		ret = compel_cure(parasite_ctl);
 #endif
-	gettimeofday(&t_now, NULL);
-	timersub(&t_now, &t_checkpoint, &t_delta);
-	pr_err("TIMING: compel_cure took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
-	t_checkpoint = t_now;
 	if (ret) {
 		pr_err("Can't cure (pid: %d) from parasite\n", pid);
 		goto err;
 	}
 
 	ret = dump_task_mm(pid, &pps_buf, &misc, &vmas, cr_imgset);
-	gettimeofday(&t_now, NULL);
-	timersub(&t_now, &t_checkpoint, &t_delta);
-	pr_err("TIMING: dump_task_mm took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
-	t_checkpoint = t_now;
 	if (ret) {
 		pr_err("Dump mappings (pid: %d) failed with %d\n", pid, ret);
 		goto err;
 	}
 
 	ret = dump_task_fs(pid, &misc, cr_imgset);
-	gettimeofday(&t_now, NULL);
-	timersub(&t_now, &t_checkpoint, &t_delta);
-	pr_err("TIMING: dump_task_fs took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
-	t_checkpoint = t_now;
 	if (ret) {
 		pr_err("Dump fs (pid: %d) failed with %d\n", pid, ret);
 		goto err;
 	}
-
-	gettimeofday(&t_now, NULL);
-	timersub(&t_now, &t_start, &t_delta);
-	pr_err("========================================\n");
-	pr_err("TIMING: dump_one_task TOTAL took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
-	pr_err("========================================\n");
 
 	exit_code = 0;
 err:
