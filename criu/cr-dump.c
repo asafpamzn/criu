@@ -2639,8 +2639,6 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 	int ret;
 	int exit_code = -1;
 
-	pr_debug("DEBUG_SOCKET: cr_dump_tasks_cow_phased ENTRY\n");
-
 	kerndat_warn_about_madv_guards();
 
 	pr_info("========================================\n");
