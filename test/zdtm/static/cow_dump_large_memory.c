@@ -8,6 +8,7 @@
 #include <unistd.h>
 
 #include "zdtmtst.h"
+#include "cow_dump_util.h"
 
 const char *test_doc = "--cow-dump scale test: a large anon-private region "
 		       "(256MB) with a background writer randomly touching "
@@ -19,9 +20,12 @@ const char *test_author = "Asaf Pamuk <asafp@anthropic.com>";
 
 /*
  * 256MB — enough to exercise batching without blowing up CI RAM.
- * Bump for local scale testing.
+ * Override at build time with -DCOW_LARGE_MEMORY_MB=N for scale runs.
  */
-#define TOTAL_MB	256
+#ifndef COW_LARGE_MEMORY_MB
+#define COW_LARGE_MEMORY_MB	256
+#endif
+#define TOTAL_MB		COW_LARGE_MEMORY_MB
 #define NR_PAGES	((TOTAL_MB * 1024UL * 1024UL) / 4096UL)
 #define MARKER_INIT	0x11
 #define MARKER_WRITER	0xAA
@@ -70,6 +74,19 @@ int main(int argc, char **argv)
 
 	atomic_store(&stop_writer, 1);
 	pthread_join(th, NULL);
+
+	/*
+	 * Drain gate: scales with region size. 10s per GB is generous —
+	 * in practice we've seen ~8 GB/s UFFDIO_COPY throughput on this
+	 * kernel, so 10s/GB gives 125x headroom.
+	 */
+	{
+		unsigned long drain_ms = 10000UL * (TOTAL_MB / 1024UL + 1);
+		if (cow_wait_for_drain(mem, sz, (unsigned int)drain_ms) < 0) {
+			fail("drain did not complete within %lu ms", drain_ms);
+			return 1;
+		}
+	}
 
 	for (i = 0; i < NR_PAGES; i++) {
 		unsigned char *page = mem + i * PAGE_SIZE;

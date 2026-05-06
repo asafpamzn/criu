@@ -11,7 +11,7 @@ LDFLAGS := -pthread
 
 # Header-only tests (portable, work on macOS + Linux)
 TESTS_PORTABLE := test_batch_bitmap test_spsc_queue test_mpsc_queue \
-		  test_spmc_queue test_atomic_bitmap
+		  test_spmc_queue test_atomic_bitmap test_stress
 
 # Tests linking real COW .c files (Linux-only: need pthread_spinlock_t, mmap alignment)
 TESTS_LINUX := test_unmapped_tracker test_page_pool test_page_state_tracker \
@@ -40,6 +40,9 @@ test_spmc_queue: test_spmc_queue.c test_harness.h shims/page.h shims/criu-log.h 
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
 test_atomic_bitmap: test_atomic_bitmap.c test_harness.h
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
+test_stress: test_stress.c test_harness.h shims/page.h shims/criu-log.h shims/xmalloc.h
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
 # Tests linking against COW source files (Linux-only)

@@ -44,7 +44,7 @@ static inline int cow_wait_for_drain(const void *addr, size_t len,
 	while (1) {
 		size_t resident = 0, i;
 
-		if (mincore((void *)addr, len, vec) < 0) {
+		if (mincore((void *)addr, len, (void *)vec) < 0) {
 			pr_perror("mincore");
 			free(vec);
 			return -1;

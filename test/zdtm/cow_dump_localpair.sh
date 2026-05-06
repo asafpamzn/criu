@@ -110,23 +110,27 @@ ip netns exec "$REPLICA_NS" unshare --pid --mount --fork -- \
 REPLICA_WORKER=$!
 sleep 0.5
 
-# Helper: send a shell command to a worker, wait for WORKER_DONE,
-# return its rc in $WORKER_RC. Stream intermediate lines to caller.
+# Helper: send a shell command to a worker, wait for a NEW WORKER_DONE
+# line (one more than existed before the send), return rc in $WORKER_RC.
 send_and_wait() {
 	local role="$1"; shift
 	local cmd="$*"
 	local fifo="$IMAGES_DIR/cmd_${role}.fifo"
 	local outf="$IMAGES_DIR/${role}.out"
-	local before
-	before=$(wc -l <"$outf" 2>/dev/null || echo 0)
+	local marker="^WORKER_DONE $role rc="
+	local before_count now_count
+	before_count=$(grep -c "$marker" "$outf" 2>/dev/null)
+	[ -z "$before_count" ] && before_count=0
 	# Send command
 	echo "$cmd" > "$fifo"
-	# Poll for "WORKER_DONE $role rc=..." suffix
-	local deadline=$(( $(date +%s) + 120 ))
+	local deadline=$(( $(date +%s) + ${SEND_AND_WAIT_TIMEOUT:-120} ))
 	while :; do
-		local last
-		last=$(tail -n1 "$outf" 2>/dev/null || true)
-		if [[ "$last" == WORKER_DONE\ $role\ rc=* ]]; then
+		now_count=$(grep -c "$marker" "$outf" 2>/dev/null)
+		[ -z "$now_count" ] && now_count=0
+		if [ "$now_count" -gt "$before_count" ]; then
+			# Grab the last matching line for rc
+			local last
+			last=$(grep "$marker" "$outf" | tail -n1)
 			WORKER_RC="${last##*rc=}"
 			return 0
 		fi
@@ -158,8 +162,9 @@ rm -f "$PIDFILE" "$OUTFILE" "$OUTFILE.inprogress"
 # The test binary backgrounds itself in test_init(), so the foreground
 # command returns when the daemon is ready. The daemon keeps running
 # in the worker's pidns.
-send_and_wait primary \
-	"$TEST_BIN --pidfile='$PIDFILE' --outfile='$OUTFILE' 2>&1" \
+VICTIM_CMD="$TEST_BIN --pidfile='$PIDFILE' --outfile='$OUTFILE' 2>&1"
+echo "=== dispatching victim cmd: $VICTIM_CMD ==="
+send_and_wait primary "$VICTIM_CMD" \
 	|| die "victim launch timed out"
 [ "$WORKER_RC" -eq 0 ] || die "victim exited rc=$WORKER_RC"
 # Small retry: the daemon parent writes the pidfile via an atomic
@@ -188,7 +193,8 @@ echo "=== Dump command dispatched to primary ==="
 # while dump blocks waiting for the lazy-pages daemon to connect, so
 # WORKER_DONE won't appear here until after we start the daemon.
 PRIMARY_LOG="$IMAGES_DIR/dump.log"
-PRIMARY_DONE_COUNT_BEFORE=$(grep -c "^WORKER_DONE primary" "$IMAGES_DIR/primary.out" 2>/dev/null || echo 0)
+PRIMARY_DONE_COUNT_BEFORE=$(grep -c "^WORKER_DONE primary" "$IMAGES_DIR/primary.out" 2>/dev/null)
+[ -z "$PRIMARY_DONE_COUNT_BEFORE" ] && PRIMARY_DONE_COUNT_BEFORE=0
 READY=0
 for i in $(seq 1 600); do
 	if grep -q "PAGE SERVER READY TO SERVE" "$PRIMARY_LOG" 2>/dev/null; then
@@ -199,7 +205,8 @@ for i in $(seq 1 600); do
 	# Only panic if a *new* WORKER_DONE primary appeared (dump exited
 	# without printing READY). The prior count came from the sanity
 	# check + victim launch; ignore those.
-	now=$(grep -c "^WORKER_DONE primary" "$IMAGES_DIR/primary.out" 2>/dev/null || echo 0)
+	now=$(grep -c "^WORKER_DONE primary" "$IMAGES_DIR/primary.out" 2>/dev/null)
+	[ -z "$now" ] && now=0
 	if [ "$now" -gt "$PRIMARY_DONE_COUNT_BEFORE" ]; then
 		echo "=== dump exited before READY; log tail: ==="
 		tail -40 "$PRIMARY_LOG" 2>/dev/null
@@ -228,7 +235,8 @@ sleep 0.5
 # victim-launch command that bumped PRIMARY_DONE_COUNT_BEFORE.
 echo "=== Waiting for dump to complete ==="
 for i in $(seq 1 600); do
-	now=$(grep -c "^WORKER_DONE primary" "$IMAGES_DIR/primary.out" 2>/dev/null || echo 0)
+	now=$(grep -c "^WORKER_DONE primary" "$IMAGES_DIR/primary.out" 2>/dev/null)
+	[ -z "$now" ] && now=0
 	if [ "$now" -gt "$PRIMARY_DONE_COUNT_BEFORE" ]; then
 		rc_line=$(grep "^WORKER_DONE primary" "$IMAGES_DIR/primary.out" | tail -n1)
 		RC_DUMP="${rc_line##*rc=}"
@@ -256,8 +264,12 @@ send_and_wait replica "kill -TERM $VPID 2>/dev/null || true" \
 
 # --- Wait for outfile ---
 # ZDTM test outfile format: "HH:MM:SS.mmm: PID: {PASS|FAIL: ...}"
-# We match PASS/FAIL anywhere on a line.
-for i in $(seq 1 200); do
+# We match PASS/FAIL anywhere on a line. Tunable via OUTFILE_TIMEOUT
+# (default 60s — needs raising for 10+ GB workloads whose verify loop
+# reads every page).
+OUTFILE_TIMEOUT_MS="${OUTFILE_TIMEOUT_MS:-60000}"
+OUTFILE_ITERS=$(( OUTFILE_TIMEOUT_MS / 100 ))
+for i in $(seq 1 "$OUTFILE_ITERS"); do
 	for candidate in "$OUTFILE" "$OUTFILE.inprogress"; do
 		if [ -s "$candidate" ] && grep -qE "(PASS$|FAIL:)" "$candidate"; then
 			RESULT="$candidate"; break 2

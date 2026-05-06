@@ -7,4 +7,5 @@ test_unmapped_tracker
 test_page_pool
 test_page_state_tracker
 test_hung_page_tracker
+test_stress
 *.dSYM/
