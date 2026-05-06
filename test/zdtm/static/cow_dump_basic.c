@@ -4,13 +4,20 @@
 #include <unistd.h>
 
 #include "zdtmtst.h"
+#include "cow_dump_util.h"
 
-const char *test_doc = "Basic --cow-dump end-to-end: dump + lazy-pages restore "
-		       "with a static anon private mapping; verify every page "
-		       "is restored byte-exact.";
+const char *test_doc = "--cow-dump skeleton + pipe sanity: 4 MB static "
+		       "anon private mapping, no Phase-2 writes. Gates "
+		       "verification on the lazy-pages daemon having drained "
+		       "every page into the restored address space (via "
+		       "mincore) so data-content bugs are distinguishable "
+		       "from drain/race bugs. Does NOT exercise the WP-fault "
+		       "or dirty-page-resend paths — see cow_dump_write_storm "
+		       "for that.";
 const char *test_author = "Asaf Pamuk <asafp@anthropic.com>";
 
-#define NR_PAGES 1024
+#define NR_PAGES	1024
+#define DRAIN_TIMEOUT	10000	/* ms */
 
 int main(int argc, char **argv)
 {
@@ -32,6 +39,19 @@ int main(int argc, char **argv)
 
 	test_daemon();
 	test_waitsig();
+
+	/*
+	 * Gate verification on the lazy-pages drain actually completing.
+	 * mincore() reports residency without faulting, so pages the
+	 * daemon has not yet UFFDIO_COPY-ed show as non-resident until
+	 * the drain puts them in. Without this gate we'd silently read
+	 * pages through the on-demand fault path instead of verifying
+	 * the drain did its job.
+	 */
+	if (cow_wait_for_drain(mem, sz, DRAIN_TIMEOUT) < 0) {
+		fail("lazy-pages drain did not complete within %d ms", DRAIN_TIMEOUT);
+		return 1;
+	}
 
 	for (i = 0; i < NR_PAGES; i++) {
 		unsigned char expected = (unsigned char)(i & 0xff);
