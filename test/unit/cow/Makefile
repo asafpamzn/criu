@@ -64,17 +64,26 @@ test_hung_page_tracker: test_hung_page_tracker.c $(CRIU_SRC)/cow/hung-page-track
 check: all
 	@echo "=== COW Unit Tests ==="; \
 	failures=0; \
+	total_passed=0; \
+	total_failed=0; \
 	for t in $(TESTS); do \
 		echo ""; \
 		echo "--- $$t ---"; \
-		./$$t || failures=$$((failures + 1)); \
+		output=$$(./$$t 2>&1); \
+		rc=$$?; \
+		echo "$$output"; \
+		if [ $$rc -ne 0 ]; then failures=$$((failures + 1)); fi; \
+		p=$$(echo "$$output" | sed -n 's/^ *\([0-9]*\) passed.*/\1/p' | tail -1); \
+		f=$$(echo "$$output" | sed -n 's/^.*passed, *\([0-9]*\) failed.*/\1/p' | tail -1); \
+		total_passed=$$((total_passed + $${p:-0})); \
+		total_failed=$$((total_failed + $${f:-0})); \
 	done; \
 	echo ""; \
 	echo "=================="; \
+	echo "TOTAL: $$total_passed passed, $$total_failed failed ($$failures suite(s) failed)"; \
 	if [ $$failures -eq 0 ]; then \
 		echo "ALL TESTS PASSED"; \
 	else \
-		echo "$$failures TEST SUITE(S) FAILED"; \
 		exit 1; \
 	fi
 

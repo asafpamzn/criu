@@ -824,10 +824,34 @@ void cow_cleanup_async_uffd(void)
 	 * Unregister VMAs in chunks with yields between each.
 	 * This spreads the kernel page-table walk time and allows
 	 * the target process to make progress between chunks.
+	 *
+	 * Scale the pre-unregister sleep with tracked memory size
+	 * (50 ms per GB), floor at 500 ms, cap at the historical 15 s.
+	 * Page-table walk cost is ~linear in tracked bytes, so a fixed
+	 * 15 s was over-long for small dumps and potentially short for
+	 * very large ones.
 	 */
-	pr_err("Unregistering VMAs from uffd sleeping 15 seconds\n");
-	sleep(15);
-	pr_err("Unregistering VMAs from uffd sleeping 15 seconds done\n");
+	{
+		unsigned long tracked_bytes = 0;
+		unsigned long sleep_ms;
+
+		if (cdi->tracked_vmas) {
+			for (i = 0; i < cdi->nr_tracked_vmas; i++)
+				tracked_bytes += cdi->tracked_vmas[i].end -
+						 cdi->tracked_vmas[i].start;
+		}
+
+		sleep_ms = 50UL * ((tracked_bytes + (1UL << 30) - 1) >> 30);
+		if (sleep_ms < 500)
+			sleep_ms = 500;
+		if (sleep_ms > 15000)
+			sleep_ms = 15000;
+
+		pr_err("Unregister pre-sleep: %lu ms (tracked=%lu MB, 50 ms/GB)\n",
+		       sleep_ms, tracked_bytes >> 20);
+		usleep(sleep_ms * 1000UL);
+		pr_err("Unregister pre-sleep done\n");
+	}
 	if (cdi->uffd >= 0 && cdi->tracked_vmas && cdi->nr_tracked_vmas > 0) {
 		pr_info("Unregistering %u VMAs from uffd fd=%d (chunked)\n",
 			cdi->nr_tracked_vmas, cdi->uffd);

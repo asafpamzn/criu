@@ -191,6 +191,12 @@ TST_NOFILE	:=				\
 		socket-ext			\
 		unhashed_proc			\
 		cow00				\
+		cow_dump_basic			\
+		cow_dump_mmap_munmap		\
+		cow_dump_write_storm		\
+		cow_dump_large_memory		\
+		cow_dump_multi_thread		\
+		cow_dump_file_backed		\
 		child_opened_proc		\
 		posix_timers			\
 		sigpending			\
@@ -609,6 +615,11 @@ socket_aio:		LDLIBS += -lrt -pthread
 uptime_grow:		LDLIBS += -lrt -pthread
 unlink_largefile:	CFLAGS += -D_FILE_OFFSET_BITS=64 -D_LARGEFILE64_SOURCE
 inotify_system_nodel:	CFLAGS += -DNO_DEL
+cow_dump_mmap_munmap:	LDLIBS += -pthread
+cow_dump_write_storm:	LDLIBS += -pthread
+cow_dump_large_memory:	LDLIBS += -pthread
+cow_dump_multi_thread:	LDLIBS += -pthread
+cow_dump_file_backed:	LDLIBS += -pthread
 pthread00:		LDLIBS += -pthread
 pthread00-pac:		CFLAGS += ${PAC_CFLAGS}
 pthread00-pac:		LDLIBS += -pthread

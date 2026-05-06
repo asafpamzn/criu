@@ -1124,6 +1124,12 @@ class criu:
         self.__lazy_pages = (self.__remote_lazy_pages or
                              bool(opts['lazy_pages']))
         self.__lazy_migrate = bool(opts['lazy_migrate'])
+        self.__cow_dump = bool(opts.get('cow_dump'))
+        # COW dump needs the lazy-pages daemon to be running before criu
+        # dump so the dump can connect to it as a page-server client
+        # (criu/cr-dump.c:~2695 connect_to_page_server_to_send has no retry).
+        if self.__cow_dump:
+            self.__lazy_pages = True
         self.__restore_sibling = bool(opts['sibling'])
         self.__join_ns = bool(opts['join_ns'])
         self.__empty_ns = bool(opts['empty_ns'])
@@ -1173,6 +1179,44 @@ class criu:
             self.__criu = criu_config
         else:
             self.__criu = criu_cli
+
+    def __cow_wait_for_log(self, log_name, marker, timeout=120.0):
+        """Poll a CRIU log file for a marker string.
+
+        Also checks that the dump process is still alive; if it has
+        died with a non-zero exit while we're waiting, surface that.
+        """
+        path = os.path.join(self.__ddir(), log_name)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.__dump_process is not None:
+                rc = self.__dump_process.poll()
+                if rc is not None and rc != 0:
+                    grep_errors(path, err=rc)
+                    raise test_fail_exc(
+                        "criu dump --cow-dump exited %d while waiting for %r"
+                        % (rc, marker))
+            try:
+                with open(path) as f:
+                    if marker in f.read():
+                        return
+            except FileNotFoundError:
+                pass
+            time.sleep(0.1)
+        raise test_fail_exc(
+            "timeout waiting for %r in %s" % (marker, log_name))
+
+    def __cow_wait_dump_ready(self):
+        # criu/page-xfer.c:~1633 prints this once the primary's
+        # TCP page-server is listening (and empty pagemap stubs have
+        # been written so the replica daemon can discover tasks).
+        self.__cow_wait_for_log("dump.log", "PAGE SERVER READY TO SERVE")
+
+    def __cow_wait_skeleton_complete(self):
+        # criu/cr-dump.c:~3043 prints this when Phase 3 has written
+        # the full skeleton and all pages have been sent. After this,
+        # the dump process exits.
+        self.__cow_wait_for_log("dump.log", "PHASE 3 SKELETON DUMP COMPLETE")
 
     def fini(self):
         if self.__lazy_migrate:
@@ -1504,9 +1548,45 @@ class criu:
         if self.__lazy_migrate and action == "dump":
             a_opts += ["--lazy-pages", "--port", "12345"] + self.__tls
             nowait = True
+        if self.__cow_dump and action == "dump":
+            # COW flow (see scripts/migrate_new.sh + scripts/restore_new.sh):
+            #   1. Start dump --cow-dump --lazy-pages --page-server in
+            #      background. Phase 1 writes empty pagemap-*.img stubs
+            #      (criu/mem.c:~711) so the replica daemon can discover
+            #      tasks. Dump then listens on TCP and prints
+            #      "PAGE SERVER READY TO SERVE".
+            #   2. Wait for that marker, then start the lazy-pages
+            #      daemon (acts as the replica page-server receiver).
+            #   3. Wait for "PHASE 3 SKELETON DUMP COMPLETE" +
+            #      dump to exit cleanly.
+            # Matches scripts/migrate_new.sh: --cow-dump --lazy-pages
+            # --address/--port, but NOT --page-server (that flag makes
+            # dump connect to an external page-server; COW dump hosts
+            # its own server internally in cr_page_server at
+            # criu/cr-dump.c:2763 once Phase 1 is ready).
+            a_opts += [
+                "--cow-dump", "--lazy-pages",
+                "--address", "127.0.0.1", "--port", "12345",
+                "--leave-running",
+            ] + self.__tls
+            nowait = True
         self.__dump_process = self.__criu_act(action,
                                               opts=a_opts + opts,
                                               nowait=nowait)
+        if self.__cow_dump and action == "dump":
+            self.__cow_wait_dump_ready()
+            lp_opts = [
+                "--page-server", "--cow-dump",
+                "--address", "127.0.0.1", "--port", "12345",
+            ] + self.__tls
+            self.__lazy_pages_p = self.__criu_act("lazy-pages",
+                                                  opts=lp_opts,
+                                                  nowait=True)
+            self.__cow_wait_skeleton_complete()
+            ret = self.__dump_process.wait()
+            self.__dump_process = None
+            if ret:
+                raise test_fail_exc("criu dump --cow-dump exited with %d" % ret)
         if self.__stream:
             ret = self.wait_for_criu_image_streamer()
             if ret:
@@ -1556,24 +1636,30 @@ class criu:
             r_opts.append('mnt[zdtm]:%s' % os.path.join(criu_dir, "criu.tree"))
 
         if self.__lazy_pages or self.__lazy_migrate:
-            lp_opts = []
-            if self.__remote_lazy_pages or self.__lazy_migrate:
-                lp_opts += [
-                    "--page-server", "--port", "12345", "--address",
-                    "127.0.0.1"
-                ] + self.__tls
+            # For --cow-dump the lazy-pages daemon was already started in
+            # dump() and is still running. Don't start another one; just
+            # add --lazy-pages (and --cow-dump, matching scripts/restore_new.sh).
+            if self.__cow_dump:
+                r_opts += ["--lazy-pages", "--cow-dump"]
+            else:
+                lp_opts = []
+                if self.__remote_lazy_pages or self.__lazy_migrate:
+                    lp_opts += [
+                        "--page-server", "--port", "12345", "--address",
+                        "127.0.0.1"
+                    ] + self.__tls
 
-            if self.__remote_lazy_pages:
-                ps_opts = [
-                    "--pidfile", "ps.pid", "--port", "12345", "--lazy-pages"
-                ] + self.__tls
-                self.__page_server_p = self.__criu_act("page-server",
-                                                       opts=ps_opts,
-                                                       nowait=True)
-            self.__lazy_pages_p = self.__criu_act("lazy-pages",
-                                                  opts=lp_opts,
-                                                  nowait=True)
-            r_opts += ["--lazy-pages"]
+                if self.__remote_lazy_pages:
+                    ps_opts = [
+                        "--pidfile", "ps.pid", "--port", "12345", "--lazy-pages"
+                    ] + self.__tls
+                    self.__page_server_p = self.__criu_act("page-server",
+                                                           opts=ps_opts,
+                                                           nowait=True)
+                self.__lazy_pages_p = self.__criu_act("lazy-pages",
+                                                      opts=lp_opts,
+                                                      nowait=True)
+                r_opts += ["--lazy-pages"]
 
         if self.__mntns_compat_mode:
             r_opts = ['--mntns-compat-mode'] + r_opts
@@ -1705,7 +1791,11 @@ def cr(cr_api, test, opts):
         else:
             try_run_hook(test, ["--pre-dump"])
             cr_api.dump("dump")
-            if not opts['lazy_migrate']:
+            if opts.get('cow_dump'):
+                # COW dump ran with --leave-running; the process is
+                # still alive. Kill it so restore can recreate its PID.
+                test.kill()
+            elif not opts['lazy_migrate']:
                 test.gone()
             else:
                 test.unlink_pidfile()
@@ -2186,7 +2276,7 @@ class Launcher:
               'remote_lazy_pages', 'show_stats', 'lazy_migrate', 'stream',
               'tls', 'criu_bin', 'crit_bin', 'pre_dump_mode', 'mntns_compat_mode',
               'rootless', 'preload_libfault', 'mocked_cuda_checkpoint',
-              'pycriu_search_path')
+              'pycriu_search_path', 'cow_dump')
         arg = repr((name, desc, flavor, {d: self.__opts[d] for d in nd}))
 
         if self.__use_log:
@@ -2479,7 +2569,8 @@ def run_tests(opts):
         ]).wait():
             raise Exception("ip link set up dev lo")
 
-    if opts['lazy_pages'] or opts['remote_lazy_pages'] or opts['lazy_migrate']:
+    if opts['lazy_pages'] or opts['remote_lazy_pages'] or opts['lazy_migrate'] \
+            or opts.get('cow_dump'):
         uffd = criu.check("uffd")
         uffd_noncoop = criu.check("uffd-noncoop")
         if not uffd:
@@ -2563,6 +2654,16 @@ def run_tests(opts):
                 if test_flag(tdesc, 'noremotelazy'):
                     launcher.skip(t, "remote lazy pages are not supported")
                     continue
+
+            # --cow-dump is a strict opt-in / opt-out: tests tagged
+            # 'cow-dump' only run when --cow-dump is specified, and
+            # --cow-dump only runs cow-dump-tagged tests.
+            if test_flag(tdesc, 'cow-dump') and not opts.get('cow_dump'):
+                launcher.skip(t, "cow-dump test requires --cow-dump")
+                continue
+            if opts.get('cow_dump') and not test_flag(tdesc, 'cow-dump'):
+                launcher.skip(t, "not a cow-dump test")
+                continue
 
             test_flavs = tdesc.get('flavor', 'h ns uns').split()
             opts_flavs = (opts['flavor'] or 'h,ns,uns').split(',')
@@ -2855,6 +2956,9 @@ def get_cli_args():
                     action='store_true')
     rp.add_argument("--lazy-migrate",
                     help="restore pages on demand",
+                    action='store_true')
+    rp.add_argument("--cow-dump",
+                    help="dump with --cow-dump (COW live migration)",
                     action='store_true')
     rp.add_argument("--remote-lazy-pages",
                     help="simulate lazy migration",
