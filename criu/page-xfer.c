@@ -158,10 +158,46 @@ static inline int __recv(int sk, void *buf, size_t sz, int fl)
 	return opts.tls ? tls_recv(buf, sz, fl) : recv(sk, buf, sz, fl);
 }
 
+/*
+ * Blocking-loop send: keep calling __send() until all `sz` bytes are
+ * delivered, the peer closes, or a real error occurs. Short writes
+ * happen on blocking TCP sockets under socket-buffer pressure; the
+ * old single-shot code treated them as fatal and callers would
+ * BUG_ON on the short return (see cow-bulk-send.c:1680 /
+ * cow-page-xfer.c:56). Retry EINTR too — it's recoverable.
+ *
+ * MSG_DONTWAIT callers have their own retry policy; don't break them.
+ *
+ * Return: `sz` on success, 0 on peer close mid-write, -1 on error.
+ */
+static int __send_all(int sk, const void *buf, size_t sz, int fl)
+{
+	const char *cursor = buf;
+	size_t remaining = sz;
+
+	if (fl & MSG_DONTWAIT)
+		return __send(sk, buf, sz, fl);
+
+	while (remaining > 0) {
+		int ret = __send(sk, cursor, remaining, fl);
+
+		if (ret < 0) {
+			if (errno == EINTR)
+				continue;
+			return -1;
+		}
+		if (ret == 0)
+			return 0;
+		cursor += ret;
+		remaining -= ret;
+	}
+	return sz;
+}
+
 /* Exported wrappers for cow-page-xfer.c and cow-bulk-send.c */
 int page_server_send(int sk, const void *buf, size_t sz, int fl)
 {
-	return __send(sk, buf, sz, fl);
+	return __send_all(sk, buf, sz, fl);
 }
 
 int page_server_recv(int sk, void *buf, size_t sz, int fl)
@@ -181,7 +217,7 @@ u64 encode_pm_id(int type, unsigned long id)
 
 static inline int send_psi_flags(int sk, struct page_server_iov *pi, int flags)
 {
-	if (__send(sk, pi, sizeof(*pi), flags) != sizeof(*pi)) {
+	if (__send_all(sk, pi, sizeof(*pi), flags) != sizeof(*pi)) {
 		pr_perror("Can't send PSI %d to server", pi->cmd);
 		return -1;
 	}

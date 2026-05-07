@@ -160,6 +160,24 @@ static volatile int g_bulk_transfer_done_count = 0;
 static volatile int g_num_sender_threads = 0;
 
 /*
+ * Pages that were scanned/work-queued but could not be sent because the
+ * VMA disappeared between enumeration and process_vm_readv (ADD/REMOVE
+ * race: target calls munmap during Phase 2 before the UFFD REMOVE event
+ * is observed by any code path on the source side; UFFD events are
+ * consumed only on the replica, so from the source's point of view the
+ * kernel is the authority via EFAULT/ESRCH/ENOMEM from process_vm_readv).
+ *
+ * Counted so cow_wait_p3_threads' scanned==sent invariant is not
+ * violated by a legitimate skip.
+ */
+static volatile unsigned long g_vma_vanished_skipped_pages = 0;
+
+static inline bool cow_errno_is_vma_gone(int err)
+{
+	return err == EFAULT || err == ESRCH || err == ENOMEM;
+}
+
+/*
  * Work-stealing infrastructure for bulk transfer phase.
  * Instead of statically assigning VMA chunks to threads, we create a shared
  * work queue of chunks that threads pull from dynamically.
@@ -769,6 +787,7 @@ int cow_start_scanner_thread(pid_t source_pid)
 	/* Reset verification counters */
 	g_total_scanned_pages = 0;
 	g_total_sent_pages = 0;
+	g_vma_vanished_skipped_pages = 0;
 
 #ifdef CONFIG_HAS_LIBBPF
 	/*
@@ -1585,8 +1604,31 @@ static int send_lazy_vma_pages_batch(int sk, struct lazy_vma_entry *lve,
 
 	ret = process_vm_readv(source_pid, &local_iov, 1, &remote_iov, 1, 0);
 	if (ret != (ssize_t)(nr_pages * PAGE_SIZE)) {
+		/*
+		 * EFAULT / ESRCH / ENOMEM mean the VMA (or part of it) is
+		 * no longer mapped in the source — typically because the
+		 * target process is in Phase 2 and did a munmap between
+		 * VMA enumeration and the read. The REMOVE event is only
+		 * observed by the replica's lazy-pages daemon, so the
+		 * source has no other signal; process_vm_readv's errno
+		 * IS the detection mechanism. Log and skip.
+		 *
+		 * NOTE: we do NOT bump g_vma_vanished_skipped_pages here.
+		 * This path is the *initial bulk* walk — those pages were
+		 * never counted into g_total_scanned_pages (that counter
+		 * only tracks dirty-region re-sends via the scanner). A
+		 * skip here is a no-op for the scanned/sent balance.
+		 *
+		 * Other errors (EPERM, EINVAL, E2BIG, etc.) are genuine
+		 * failures and still return -1.
+		 */
+		if (ret < 0 && cow_errno_is_vma_gone(errno)) {
+			pr_debug("cow-bulk: VMA vanished at %lx (pid %d, %d pages, errno=%d): skip (bulk path)\n",
+				 base_vaddr, source_pid, nr_pages, errno);
+			return 0;
+		}
 		pr_perror("Failed to read %d pages at %lx from pid %d (got %d)",
-			  nr_pages, base_vaddr, source_pid, ret);
+			  nr_pages, base_vaddr, source_pid, (int)ret);
 		return -1;
 	}
 
@@ -1665,9 +1707,8 @@ static int send_dirty_slices(struct p3_thread_ctx *ctx,
 
 	ret = process_vm_readv(source_pid, &local_iov, 1,
 			       remote_iov, nr_slices, 0);
-	BUG_ON(ret != (ssize_t)total_bytes);
-
-	{
+	if (ret == (ssize_t)total_bytes) {
+		/* Fast path: whole batch readable in one syscall. */
 		unsigned long offset = 0;
 		for (i = 0; i < nr_slices; i++) {
 			int nr_pages = slices[i].nr_pages;
@@ -1677,12 +1718,66 @@ static int send_dirty_slices(struct p3_thread_ctx *ctx,
 							  (char *)buffer + offset,
 							  nr_pages, slices[i].dst_id,
 							  slices[i].start, 1);
-			BUG_ON(srv < 0);
+			if (srv < 0)
+				return -1;
 			total_sent += nr_pages;
 			ctx->pages_sent += nr_pages;
 			tls_total_sent_pages += nr_pages;
 			offset += (unsigned long)nr_pages * PAGE_SIZE;
 		}
+		return total_sent;
+	}
+
+	/*
+	 * Slow path: the multi-iov readv failed. One or more slices
+	 * have a VMA that vanished between scanner enumeration and our
+	 * read. Retry each slice individually so a single bad range
+	 * doesn't drop the whole batch.
+	 *
+	 * A non-vma-gone errno on the single-slice retry is a real
+	 * error and aborts the batch.
+	 */
+	if (!(ret < 0 && cow_errno_is_vma_gone(errno))) {
+		pr_perror("send_dirty_slices: unexpected process_vm_readv failure (ret=%zd, %d slices)",
+			  ret, nr_slices);
+		return -1;
+	}
+
+	for (i = 0; i < nr_slices; i++) {
+		int nr_pages = slices[i].nr_pages;
+		unsigned long len = (unsigned long)nr_pages * PAGE_SIZE;
+		struct iovec lone_local, lone_remote;
+		int srv;
+		ssize_t r;
+
+		lone_local.iov_base = buffer;
+		lone_local.iov_len = len;
+		lone_remote.iov_base = (void *)slices[i].start;
+		lone_remote.iov_len = len;
+
+		r = process_vm_readv(source_pid, &lone_local, 1, &lone_remote, 1, 0);
+		if (r != (ssize_t)len) {
+			if (r < 0 && cow_errno_is_vma_gone(errno)) {
+				__sync_fetch_and_add(&g_vma_vanished_skipped_pages,
+						     nr_pages);
+				pr_debug("send_dirty_slices: slice %d at %lx vanished (%d pages, errno=%d): skip\n",
+					 i, slices[i].start, nr_pages, errno);
+				continue;
+			}
+			pr_perror("send_dirty_slices: slice %d at %lx read failed (ret=%zd)",
+				  i, slices[i].start, r);
+			return -1;
+		}
+
+		srv = send_pages_batch_compressed(ctx->socket, buffer,
+						  nr_pages, slices[i].dst_id,
+						  slices[i].start, 1);
+		if (srv < 0)
+			return -1;
+
+		total_sent += nr_pages;
+		ctx->pages_sent += nr_pages;
+		tls_total_sent_pages += nr_pages;
 	}
 
 	return total_sent;
@@ -1847,11 +1942,25 @@ static void *p3_bulk_sender_thread(void *arg)
 						ctx->dst_id, ctx->source_pid);
 
 					if (sent < 0) {
-						pr_err("P3[%d]: Failed to send batch at %lx\n",
+						/*
+						 * Real I/O / socket error. The dump is
+						 * unrecoverable; flag the per-thread
+						 * error for cow_wait_p3_threads() and
+						 * stop this sender cleanly. No BUG() —
+						 * that would leave sibling P3 threads
+						 * running and produce a torn abort.
+						 */
+						pr_err("P3[%d]: Failed to send batch at %lx — marking dump as failed\n",
 						       thread_id, vaddr);
-						BUG();
+						ctx->error = true;
+						goto p3_sender_exit;
 					}
 
+					/*
+					 * sent == 0 means the VMA vanished between
+					 * enumeration and read (munmap race) — soft
+					 * error, skip this batch and continue.
+					 */
 					total_sent += sent;
 					vaddr += batch_pages * PAGE_SIZE;
 				}
@@ -1976,7 +2085,17 @@ static void *p3_bulk_sender_thread(void *arg)
 
 				sent = send_dirty_slices(ctx, g_scanner_source_pid,
 							 slices, nr_slices);
-				BUG_ON(sent <= 0);
+				if (sent < 0) {
+					/* Real I/O error; abort this sender so
+					 * cow_wait_p3_threads flags the dump. */
+					pr_err("P3[%d]: send_dirty_slices failed — aborting\n",
+					       thread_id);
+					ctx->error = true;
+					goto p3_sender_exit;
+				}
+				/* sent == 0 is legitimate: every slice in the
+				 * batch had its VMA vanish (counted via
+				 * g_vma_vanished_skipped_pages). */
 				loop_total_pages += sent;
 				slices_sent += nr_slices;
 				packed_batches++;
@@ -2071,6 +2190,7 @@ static void *p3_bulk_sender_thread(void *arg)
 		       thread_id, ctx->pages_sent, elapsed_ms);
 	}
 
+p3_sender_exit:
 	/* Flush thread-local counters to globals (one atomic per counter) */
 	__sync_fetch_and_add(&g_total_sent_pages, tls_total_sent_pages);
 	__sync_fetch_and_add(&g_compress_uncompressed_bytes, tls_compress_in_bytes);
@@ -2193,20 +2313,59 @@ void cow_wait_p3_threads(void)
 	pr_err("P3 TIMING from freeze: scanner=%ld ms, senders=%ld ms, total=%ld ms, %lu pages\n",
 	       scanner_ms, senders_ms, total_ms, total);
 
-	/* Verify all scanned pages were sent */
+	/*
+	 * Verify all scanned pages were sent. Subtract pages that were
+	 * legitimately skipped because their VMA vanished between
+	 * enumeration and process_vm_readv (ADD/REMOVE race on a Phase-2
+	 * munmap) — the scanner counted those pages in `scanned` but
+	 * there was nothing left to read for them.
+	 */
 	{
 		unsigned long scanned = __atomic_load_n(&g_total_scanned_pages, __ATOMIC_ACQUIRE);
 		unsigned long sent = __atomic_load_n(&g_total_sent_pages, __ATOMIC_ACQUIRE);
-		pr_err("P3 verification: scanned=%lu sent=%lu\n", scanned, sent);
-		if (sent != scanned) {
-			pr_err("BUG: scanned pages (%lu) != sent pages (%lu), missing %lu pages!\n",
-			       scanned, sent, scanned > sent ? scanned - sent : sent - scanned);
-			BUG();
+		unsigned long skipped = __atomic_load_n(&g_vma_vanished_skipped_pages,
+							__ATOMIC_ACQUIRE);
+		unsigned long expected_sent = (skipped > scanned) ? 0 : scanned - skipped;
+
+		pr_err("P3 verification: scanned=%lu sent=%lu vma_vanished_skipped=%lu expected_sent=%lu\n",
+		       scanned, sent, skipped, expected_sent);
+
+		if (sent != expected_sent) {
+			/*
+			 * If a sender thread hit an error mid-flight we
+			 * will legitimately end up with sent < expected.
+			 * Surface the mismatch via cow_p3_had_error()
+			 * instead of BUG()-ing and aborting, so the main
+			 * dump path can clean up rather than core-dump.
+			 */
+			pr_err("P3 page count mismatch: scanned=%lu sent=%lu skipped=%lu (expected_sent=%lu, diff=%ld)\n",
+			       scanned, sent, skipped, expected_sent,
+			       (long)expected_sent - (long)sent);
+			if (errors == 0) {
+				/* No sender reported an error but we're
+				 * short anyway — treat as a hard error. */
+				errors = 1;
+			}
 		}
 	}
 
-	if (errors > 0)
-		pr_warn("P3 threads completed with %d errors\n", errors);
+	if (errors > 0) {
+		pr_err("P3 threads completed with %d errors — dump is not usable\n",
+		       errors);
+		cow_p3_mark_had_error();
+	}
+}
+
+static volatile int g_p3_had_error = 0;
+
+void cow_p3_mark_had_error(void)
+{
+	__atomic_store_n(&g_p3_had_error, 1, __ATOMIC_RELEASE);
+}
+
+bool cow_p3_had_error(void)
+{
+	return __atomic_load_n(&g_p3_had_error, __ATOMIC_ACQUIRE) != 0;
 }
 
 bool cow_p3_thread_running(void)

@@ -98,6 +98,21 @@ int cow_start_p3_threads(int *sockets, int num_sockets, u64 dst_id, pid_t source
 void cow_wait_p3_threads(void);
 
 /*
+ * Return true if any P3 sender thread reported a fatal error during
+ * bulk transfer, or if the scanned/sent page counts didn't match.
+ * The main dump path should check this after cow_wait_p3_threads()
+ * and fail the dump cleanly rather than letting the (incomplete)
+ * dump be used for restore.
+ */
+bool cow_p3_had_error(void);
+
+/*
+ * Internal helper used by cow_wait_p3_threads() to record the
+ * error state. Not intended for callers outside the COW subsystem.
+ */
+void cow_p3_mark_had_error(void);
+
+/*
  * Check if any P3 thread is still running.
  */
 bool cow_p3_thread_running(void);

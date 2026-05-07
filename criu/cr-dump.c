@@ -3064,6 +3064,12 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 	}
 	pr_err("P3 threads completed: %lu total pages sent\n", cow_p3_pages_sent());
 
+	if (cow_p3_had_error()) {
+		pr_err("cow-dump: P3 bulk transfer reported errors — failing "
+		       "the dump rather than producing a torn image\n");
+		goto err_refreeze;
+	}
+
 	/* Free new VMA ranges after P3 threads are done using them */
 	cow_free_new_vma_ranges();
 

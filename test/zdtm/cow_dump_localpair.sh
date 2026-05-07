@@ -162,7 +162,15 @@ rm -f "$PIDFILE" "$OUTFILE" "$OUTFILE.inprogress"
 # The test binary backgrounds itself in test_init(), so the foreground
 # command returns when the daemon is ready. The daemon keeps running
 # in the worker's pidns.
-VICTIM_CMD="$TEST_BIN --pidfile='$PIDFILE' --outfile='$OUTFILE' 2>&1"
+# Some tests (e.g. cow_dump_file_backed) declare a mandatory --test_dir
+# via TEST_OPTION(). Detect it by grepping the binary's strings and
+# pass --test_dir only when the test recognises it; ZDTM's parseargs
+# rejects unknown options, so we can't pass it unconditionally.
+VICTIM_EXTRA=""
+if "$TEST_BIN" --help 2>&1 | grep -q -- "--test_dir"; then
+	VICTIM_EXTRA="--test_dir='$IMAGES_DIR'"
+fi
+VICTIM_CMD="$TEST_BIN --pidfile='$PIDFILE' --outfile='$OUTFILE' $VICTIM_EXTRA 2>&1"
 echo "=== dispatching victim cmd: $VICTIM_CMD ==="
 send_and_wait primary "$VICTIM_CMD" \
 	|| die "victim launch timed out"
@@ -282,10 +290,20 @@ if [ -z "$RESULT" ]; then
 	ls -la "$OUTFILE" "$OUTFILE.inprogress" 2>&1 | head -5
 	die "no PASS/FAIL in outfile"
 fi
+
+# If we matched on .inprogress but the test just finished and renamed
+# it to .out between grep and cat, fall back to .out. Either file has
+# the same content for the one line we care about.
+if [ ! -s "$RESULT" ] && [ -s "$OUTFILE" ]; then
+	RESULT="$OUTFILE"
+fi
+
 echo "=== Test output ==="
-cat "$RESULT"
+cat "$RESULT" 2>/dev/null
 echo "=== end ==="
-if grep -qE "PASS$" "$RESULT"; then
+# Re-check against the (possibly final) result file, tolerating the rename.
+if grep -qE "PASS$" "$RESULT" 2>/dev/null || \
+   grep -qE "PASS$" "$OUTFILE" 2>/dev/null; then
 	echo "PASS: $TEST_NAME"
 	exit 0
 fi

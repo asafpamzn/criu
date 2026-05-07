@@ -144,6 +144,65 @@ static void *alloc_chunk(void)
 	return chunk;
 }
 
+/* Forward decl — used by producer_release below. */
+void page_pool_put(void *page);
+
+/*
+ * Hold a "producer" reference on the chunk currently assigned to a
+ * thread pool. The buffering path itself is both a producer and a
+ * consumer of pool pages during Phase 2: the P3 receiver allocates
+ * pages via page_pool_get_pages, then cow_page_buffer_add_batch can
+ * release ("put back") those pages when the new batch overlaps an
+ * existing entry (overwrite / merge), and the UFFD REMOVE-event
+ * handler releases pages when the target munmap'd a range.
+ *
+ * With nothing holding a net reference on a producer's current chunk,
+ * the sequence "alloc → add_batch overwrite → put back everything"
+ * can take refcount to 0 and munmap the chunk while the producer's
+ * pool->current_chunk still points at it. The next
+ * page_pool_get_pages on that thread-pool then dereferences a freed
+ * mapping and SIGSEGVs.
+ *
+ * We add one reference when we install a chunk as current_chunk and
+ * drop it when we replace it (via page_pool_swap_current_chunk).
+ * Net effect on consumers is zero.
+ */
+static void page_pool_producer_hold(void *chunk)
+{
+	struct chunk_header *hdr = (struct chunk_header *)chunk;
+	atomic_fetch_add(&hdr->refcount, 1);
+}
+
+static void page_pool_producer_release(void *chunk)
+{
+	void *page;
+	if (!chunk)
+		return;
+	/*
+	 * Release via page_pool_put so if the producer held the last
+	 * reference the normal tracking+munmap path runs. The "page"
+	 * we pass is the chunk header page itself — same chunk base.
+	 */
+	page = chunk;
+	page_pool_put(page);
+}
+
+/*
+ * Replace pool->current_chunk with a freshly-allocated chunk. Takes
+ * care of producer reference bookkeeping so the old chunk can be
+ * safely munmap'd if the consumer has already drained all its pages.
+ */
+static void page_pool_swap_current_chunk(struct thread_pool *pool)
+{
+	void *old_chunk = pool->current_chunk;
+	void *new_chunk = alloc_chunk();
+
+	page_pool_producer_hold(new_chunk);
+	pool->current_chunk = new_chunk;
+	pool->next_page = 1;  /* Skip header page */
+	page_pool_producer_release(old_chunk);
+}
+
 int page_pool_thread_init(int thread_id)
 {
 	BUG_ON(thread_id < 0 || thread_id >= COW_MAX_THREADS);
@@ -158,6 +217,7 @@ int page_pool_thread_init(int thread_id)
 	}
 
 	pools[thread_id].current_chunk = alloc_chunk();
+	page_pool_producer_hold(pools[thread_id].current_chunk);
 	pools[thread_id].next_page = 1;  /* Skip header page */
 	pools[thread_id].initialized = true;
 
@@ -177,10 +237,8 @@ void *page_pool_get(int thread_id)
 	BUG_ON(!pool->initialized);
 
 	/* Need new chunk? */
-	if (pool->next_page >= COW_PAGES_PER_CHUNK) {
-		pool->current_chunk = alloc_chunk();
-		pool->next_page = 1;  /* Skip header */
-	}
+	if (pool->next_page >= COW_PAGES_PER_CHUNK)
+		page_pool_swap_current_chunk(pool);
 
 	/* Lock-free allocation: just bump the pointer */
 	page = (char *)pool->current_chunk + (pool->next_page * PAGE_SIZE);
@@ -210,10 +268,8 @@ void *page_pool_get_chunk(int thread_id, int *out_nr_pages)
 	BUG_ON(!pool->initialized);
 
 	/* Need new chunk if not enough pages left for a batch */
-	if (pool->next_page + COW_ALLOC_BATCH > COW_PAGES_PER_CHUNK) {
-		pool->current_chunk = alloc_chunk();
-		pool->next_page = 1;  /* Skip header page */
-	}
+	if (pool->next_page + COW_ALLOC_BATCH > COW_PAGES_PER_CHUNK)
+		page_pool_swap_current_chunk(pool);
 
 	/* Allocate COW_ALLOC_BATCH contiguous pages */
 	batch_start = (char *)pool->current_chunk + (pool->next_page * PAGE_SIZE);
@@ -260,10 +316,8 @@ void *page_pool_get_pages(int thread_id, int nr_pages)
 	BUG_ON(!pool->initialized);
 
 	/* Need new chunk if not enough pages left */
-	if (pool->next_page + nr_pages > COW_PAGES_PER_CHUNK) {
-		pool->current_chunk = alloc_chunk();
-		pool->next_page = 1;  /* Skip header page */
-	}
+	if (pool->next_page + nr_pages > COW_PAGES_PER_CHUNK)
+		page_pool_swap_current_chunk(pool);
 
 	/* Allocate exactly nr_pages contiguous pages */
 	pages_start = (char *)pool->current_chunk + (pool->next_page * PAGE_SIZE);
