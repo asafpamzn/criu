@@ -65,6 +65,8 @@
 #include "stats.h"
 #include "mem.h"
 #include "page-pipe.h"
+#include "cow-dump.h"
+#include "cow-bpf.h"
 #include "posix-timer.h"
 #include "vdso.h"
 #include "vma.h"
@@ -121,15 +123,27 @@ void free_mappings(struct vm_area_list *vma_area_list)
 int collect_mappings(pid_t pid, struct vm_area_list *vma_area_list, dump_filemap_t dump_file)
 {
 	int ret = -1;
+	struct timeval t_start, t_checkpoint, t_now, t_delta;
+	bool use_maps;
 
-	pr_info("\n");
-	pr_info("Collecting mappings (pid: %d)\n", pid);
-	pr_info("----------------------------------------\n");
+	gettimeofday(&t_start, NULL);
+	t_checkpoint = t_start;
 
-	ret = parse_smaps(pid, vma_area_list, dump_file);
+	pr_err("\n");
+	pr_err("Collecting mappings (pid: %d)\n", pid);
+	pr_err("----------------------------------------\n");
+
+	use_maps = opts.cow_dump && opts.lazy_pages;
+	ret = use_maps ? parse_maps(pid, vma_area_list, dump_file) : parse_smaps(pid, vma_area_list, dump_file);
+	gettimeofday(&t_now, NULL);
+	timersub(&t_now, &t_checkpoint, &t_delta);
+	pr_err("TIMING: parse_%s took %ld.%06ld seconds\n", use_maps ? "maps" : "smaps", t_delta.tv_sec,
+	       t_delta.tv_usec);
+	t_checkpoint = t_now;
 	if (ret < 0)
 		goto err;
 
+	pr_err("parse_%s ended (pid: %d)\n", use_maps ? "maps" : "smaps", pid);
 	/*
 	 * In addition to real process VMAs we should keep an info about
 	 * madvise(MADV_GUARD_INSTALL) pages. While these are not represented
@@ -139,18 +153,30 @@ int collect_mappings(pid_t pid, struct vm_area_list *vma_area_list, dump_filemap
 	 *
 	 * Also, we don't need to dump them during pre-dump.
 	 */
-	if (dump_file) {
+	if (dump_file && !opts.cow_dump) {
 		ret = collect_madv_guards(pid, vma_area_list);
+		gettimeofday(&t_now, NULL);
+		timersub(&t_now, &t_checkpoint, &t_delta);
+		pr_err("TIMING: collect_madv_guards took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
+		t_checkpoint = t_now;
 		if (ret < 0) {
 			pr_err("Collect MADV_GUARD_INSTALL pages (pid: %d) failed with %d\n", pid, ret);
 			goto err;
 		}
 	}
 
-	pr_info("Collected, longest area occupies %lu pages\n", vma_area_list->nr_priv_pages_longest);
+	pr_err("Collected, longest area occupies %lu pages\n", vma_area_list->nr_priv_pages_longest);
 	pr_info_vma_list(&vma_area_list->h);
+	gettimeofday(&t_now, NULL);
+	timersub(&t_now, &t_checkpoint, &t_delta);
+	pr_err("TIMING: pr_info_vma_list took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
+	t_checkpoint = t_now;
 
-	pr_info("----------------------------------------\n");
+	gettimeofday(&t_now, NULL);
+	timersub(&t_now, &t_start, &t_delta);
+	pr_err("TIMING: collect_mappings TOTAL took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
+
+	pr_err("----------------------------------------\n");
 err:
 	return ret;
 }
@@ -972,7 +998,8 @@ static int fixup_thread_rseq(const struct pstree_item *item, int i)
 	return 0;
 }
 
-static int dump_task_thread(struct parasite_ctl *parasite_ctl, const struct pstree_item *item, int id)
+static int dump_task_thread(struct parasite_ctl *parasite_ctl, const struct pstree_item *item,
+			    int id, bool defer_image_write)
 {
 	struct parasite_thread_ctl *tctl = dmpi(item)->thread_ctls[id];
 	struct pid *tid = &item->threads[id];
@@ -1001,17 +1028,44 @@ static int dump_task_thread(struct parasite_ctl *parasite_ctl, const struct pstr
 		goto err;
 	}
 
-	img = open_image(CR_FD_CORE, O_DUMP, tid->ns[0].virt);
-	if (!img)
-		goto err;
+	if (!defer_image_write) {
+		img = open_image(CR_FD_CORE, O_DUMP, tid->ns[0].virt);
+		if (!img)
+			goto err;
+		ret = pb_write_one(img, core, PB_CORE);
+		close_image(img);
+	} else {
+		ret = 0;
+	}
 
-	ret = pb_write_one(img, core, PB_CORE);
-
-	close_image(img);
 err:
 	compel_release_thread(tctl);
 	pr_info("----------------------------------------\n");
 	return ret;
+}
+
+/* Write deferred thread core images (after early resume, off critical path) */
+static int write_deferred_thread_cores(const struct pstree_item *item)
+{
+	int i, ret = 0;
+
+	for (i = 0; i < item->nr_threads; i++) {
+		struct pid *tid = &item->threads[i];
+		CoreEntry *core = item->core[i];
+		struct cr_img *img;
+
+		if (item->pid->real == tid->real)
+			continue;
+
+		img = open_image(CR_FD_CORE, O_DUMP, tid->ns[0].virt);
+		if (!img)
+			return -1;
+		ret = pb_write_one(img, core, PB_CORE);
+		close_image(img);
+		if (ret)
+			return ret;
+	}
+	return 0;
 }
 
 static int dump_one_zombie(const struct pstree_item *item, const struct proc_pid_stat *pps)
@@ -1289,7 +1343,9 @@ free_rseq:
 
 static struct proc_pid_stat pps_buf;
 
-static int dump_task_threads(struct parasite_ctl *parasite_ctl, const struct pstree_item *item)
+static int dump_task_threads(struct parasite_ctl *parasite_ctl,
+			     const struct pstree_item *item,
+			     bool defer_image_write)
 {
 	int i, ret = 0;
 
@@ -1299,7 +1355,8 @@ static int dump_task_threads(struct parasite_ctl *parasite_ctl, const struct pst
 			item->threads[i].ns[0].virt = vpid(item);
 			continue;
 		}
-		ret = dump_task_thread(parasite_ctl, item, i);
+		ret = dump_task_thread(parasite_ctl, item, i,
+				       defer_image_write);
 		if (ret)
 			break;
 	}
@@ -1555,6 +1612,120 @@ err_cure:
 	goto err_free;
 }
 
+/*
+ * COW seize helpers — extracted from dump_one_task and cr_dump_tasks
+ * to keep the COW migration path separate from CRIU's standard dump.
+ */
+
+/* Initialize COW tracking for one task's VMAs (called during seize freeze) */
+static int cow_seize_init_tracking(struct pstree_item *item,
+				   struct vm_area_list *vmas,
+				   struct parasite_ctl *ctl)
+{
+	int ret;
+
+	ret = cow_dump_init(item, vmas, ctl);
+	if (ret)
+		pr_err("Failed to initialize COW tracking for pid %d\n",
+		       item->pid->real);
+	return ret;
+}
+
+/* WP sync path: start+finish WP during the seize freeze */
+static int cow_seize_wp_sync(void)
+{
+	int ret;
+
+	ret = cow_dump_start_wp();
+	if (ret) {
+		pr_err("Failed to start write-protect\n");
+		return ret;
+	}
+	if (opts.lazy_pages && cow_start_monitor_thread()) {
+		pr_err("Failed to start COW monitor thread\n");
+		return -1;
+	}
+	return 0;
+}
+
+/* Stop parasite fast (skip rt_sigreturn single-stepping) */
+static int cow_seize_stop_parasite(struct parasite_ctl *ctl)
+{
+	return compel_stop_daemon_fast(ctl);
+}
+
+/* Cure parasite without remote munmap (restorer handles cleanup) */
+static int cow_seize_cure_parasite(struct parasite_ctl *ctl)
+{
+	return compel_cure_local(ctl);
+}
+
+/* Pre-seize: collect sockets, create uffd, optional pre-copy WP */
+static int cow_pre_seize(pid_t pid)
+{
+	if (cow_pre_collect_net_sockets())
+		return -1;
+	if (cow_dump_pre_init(pid))
+		return -1;
+
+	if (cow_is_wp_async() && !kdat.has_uffd_proc) {
+		if (cow_inject_userfaultfd(pid)) {
+			pr_err("Failed to inject userfaultfd\n");
+			return -1;
+		}
+		if (cow_pre_copy_apply_wp(pid)) {
+			pr_err("Failed to apply pre-copy WP\n");
+			return -1;
+		}
+	}
+	return 0;
+}
+
+/* Post-seize: resume process, apply WP_ASYNC + eBPF, write deferred cores */
+static int cow_post_seize(struct pstree_item *root)
+{
+	struct pstree_item *item;
+	int ret;
+
+	if (arch_set_thread_regs(root, true) < 0)
+		return -1;
+
+	cr_plugin_fini(CR_PLUGIN_STAGE__DUMP, 0);
+	pstree_switch_state(root, TASK_ALIVE);
+	timing_stop(TIME_FROZEN);
+	pr_err("seize complete: process resumed\n");
+
+	/* Track phase: WP_ASYNC + eBPF */
+	if (cow_is_wp_async()) {
+		struct timeval t_s, t_e, t_d;
+
+		gettimeofday(&t_s, NULL);
+		ret = cow_dump_start_wp();
+		if (!ret)
+			ret = cow_dump_finish_wp();
+		gettimeofday(&t_e, NULL);
+		timersub(&t_e, &t_s, &t_d);
+		pr_err("TIMING: track WP took %ld.%06ld seconds\n",
+		       t_d.tv_sec, t_d.tv_usec);
+		if (ret) {
+			pr_err("Track WP failed\n");
+			return ret;
+		}
+
+		if (cow_bpf_start(root->pid->real) == 0)
+			pr_err("BPF dirty tracker started (no gap after WP)\n");
+	}
+
+	/* Write deferred thread core images (off critical path) */
+	for_each_pstree_item(item) {
+		if (write_deferred_thread_cores(item)) {
+			pr_err("Failed to write deferred thread cores\n");
+			return -1;
+		}
+	}
+	return 0;
+}
+
 static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 {
 	pid_t pid = item->pid->real;
@@ -1566,12 +1737,16 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	struct parasite_drain_fd *dfds = NULL;
 	struct proc_posix_timers_stat proc_args;
 	struct mem_dump_ctl mdc;
+	struct timeval t_start, t_checkpoint, t_now, t_delta;
 
 	vm_area_list_init(&vmas);
 
-	pr_info("========================================\n");
-	pr_info("Dumping task (pid: %d comm: %s)\n", pid, __task_comm_info(pid));
-	pr_info("========================================\n");
+	gettimeofday(&t_start, NULL);
+	t_checkpoint = t_start;
+
+	pr_err("========================================\n");
+	pr_err("Dumping task (pid: %d comm: %s)\n", pid, __task_comm_info(pid));
+	pr_err("========================================\n");
 
 	if (item->pid->state == TASK_DEAD)
 		/*
@@ -1579,12 +1754,20 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 		 */
 		return 0;
 
-	pr_info("Obtaining task stat ... \n");
+	pr_err("Obtaining task stat ... \n");
 	ret = parse_pid_stat(pid, &pps_buf);
+	gettimeofday(&t_now, NULL);
+	timersub(&t_now, &t_checkpoint, &t_delta);
+	pr_err("TIMING: parse_pid_stat took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
+	t_checkpoint = t_now;
 	if (ret < 0)
 		goto err;
 
 	ret = collect_mappings(pid, &vmas, dump_filemap);
+	gettimeofday(&t_now, NULL);
+	timersub(&t_now, &t_checkpoint, &t_delta);
+	pr_err("TIMING: collect_mappings took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
+	t_checkpoint = t_now;
 	if (ret) {
 		pr_err("Collect mappings (pid: %d) failed with %d\n", pid, ret);
 		goto err;
@@ -1596,6 +1779,10 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 			goto err;
 
 		ret = collect_fds(pid, &dfds);
+		gettimeofday(&t_now, NULL);
+		timersub(&t_now, &t_checkpoint, &t_delta);
+		pr_err("TIMING: collect_fds took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
+		t_checkpoint = t_now;
 		if (ret) {
 			pr_err("Collect fds (pid: %d) failed with %d\n", pid, ret);
 			goto err;
@@ -1605,6 +1792,10 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	}
 
 	ret = parse_posix_timers(pid, &proc_args);
+	gettimeofday(&t_now, NULL);
+	timersub(&t_now, &t_checkpoint, &t_delta);
+	pr_err("TIMING: parse_posix_timers took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
+	t_checkpoint = t_now;
 	if (ret < 0) {
 		pr_err("Can't read posix timers file (pid: %d)\n", pid);
 		goto err;
@@ -1613,24 +1804,40 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	parasite_ensure_args_size(posix_timers_dump_size(proc_args.timer_n));
 
 	ret = dump_task_signals(pid, item);
+	gettimeofday(&t_now, NULL);
+	timersub(&t_now, &t_checkpoint, &t_delta);
+	pr_err("TIMING: dump_task_signals took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
+	t_checkpoint = t_now;
 	if (ret) {
 		pr_err("Dump %d signals failed %d\n", pid, ret);
 		goto err;
 	}
 
 	ret = dump_task_rseq(pid, item);
+	gettimeofday(&t_now, NULL);
+	timersub(&t_now, &t_checkpoint, &t_delta);
+	pr_err("TIMING: dump_task_rseq took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
+	t_checkpoint = t_now;
 	if (ret) {
 		pr_err("Dump %d rseq failed %d\n", pid, ret);
 		goto err;
 	}
 
 	parasite_ctl = parasite_infect_seized(pid, item, &vmas);
+	gettimeofday(&t_now, NULL);
+	timersub(&t_now, &t_checkpoint, &t_delta);
+	pr_err("TIMING: parasite_infect_seized took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
+	t_checkpoint = t_now;
 	if (!parasite_ctl) {
 		pr_err("Can't infect (pid: %d) with parasite\n", pid);
 		goto err;
 	}
 
 	ret = fixup_thread_rseq(item, 0);
+	gettimeofday(&t_now, NULL);
+	timersub(&t_now, &t_checkpoint, &t_delta);
+	pr_err("TIMING: fixup_thread_rseq took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
+	t_checkpoint = t_now;
 	if (ret) {
 		pr_err("Fixup rseq for %d failed %d\n", pid, ret);
 		goto err;
@@ -1678,7 +1885,7 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	item->sid = misc.sid;
 	item->pgid = misc.pgid;
 
-	pr_info("sid=%d pgid=%d pid=%d\n", item->sid, item->pgid, vpid(item));
+	pr_err("sid=%d pgid=%d pid=%d\n", item->sid, item->pgid, vpid(item));
 
 	if (item->sid == 0) {
 		pr_err("A session leader of %d(%d) is outside of its pid namespace\n", item->pid->real, vpid(item));
@@ -1713,76 +1920,192 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	mdc.stat = &pps_buf;
 	mdc.parent_ie = parent_ie;
 
+	if (opts.cow_dump) {
+		ret = cow_seize_init_tracking(item, &vmas, parasite_ctl);
+		gettimeofday(&t_now, NULL);
+		timersub(&t_now, &t_checkpoint, &t_delta);
+		pr_err("TIMING: cow_seize_init_tracking took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
+		t_checkpoint = t_now;
+		if (ret)
+			goto err_cure;
+	}
+
+	/*
+	 * Pagemap scan BEFORE WP threads to avoid mmap_lock
+	 * contention.  Sequential: pagemap ~8ms then WP ~68ms
+	 * = ~76ms total.  Parallel caused 174ms from lock
+	 * bouncing between 33 threads.
+	 */
 	ret = parasite_dump_pages_seized(item, &vmas, &mdc, parasite_ctl);
+	gettimeofday(&t_now, NULL);
+	timersub(&t_now, &t_checkpoint, &t_delta);
+	pr_err("TIMING: parasite_dump_pages_seized took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
+	t_checkpoint = t_now;
 	if (ret)
 		goto err_cure;
 
+	/*
+	 * WP_SYNC: start WP during freeze (overlaps with dump work).
+	 * WP_ASYNC: defer WP to after unfreeze — saves ~70ms from
+	 * the freeze window.  WP applied while process runs; the
+	 * process may briefly stall on mmap_lock but isn't frozen.
+	 */
+	if (opts.cow_dump && !cow_is_wp_async()) {
+		ret = cow_seize_wp_sync();
+		gettimeofday(&t_now, NULL);
+		timersub(&t_now, &t_checkpoint, &t_delta);
+		pr_err("TIMING: cow_seize_wp_sync took %ld.%06ld seconds\n",
+		       t_delta.tv_sec, t_delta.tv_usec);
+		t_checkpoint = t_now;
+		if (ret)
+			goto err_cure;
+	}
+
 	ret = parasite_dump_sigacts_seized(parasite_ctl, item);
+	gettimeofday(&t_now, NULL);
+	timersub(&t_now, &t_checkpoint, &t_delta);
+	pr_err("TIMING: parasite_dump_sigacts_seized took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
+	t_checkpoint = t_now;
 	if (ret) {
 		pr_err("Can't dump sigactions (pid: %d) with parasite\n", pid);
 		goto err_cure;
 	}
 
 	ret = parasite_dump_itimers_seized(parasite_ctl, item);
+	gettimeofday(&t_now, NULL);
+	timersub(&t_now, &t_checkpoint, &t_delta);
+	pr_err("TIMING: parasite_dump_itimers_seized took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
+	t_checkpoint = t_now;
 	if (ret) {
 		pr_err("Can't dump itimers (pid: %d)\n", pid);
 		goto err_cure;
 	}
 
 	ret = parasite_dump_posix_timers_seized(&proc_args, parasite_ctl, item);
+	gettimeofday(&t_now, NULL);
+	timersub(&t_now, &t_checkpoint, &t_delta);
+	pr_err("TIMING: parasite_dump_posix_timers_seized took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
+	t_checkpoint = t_now;
 	if (ret) {
 		pr_err("Can't dump posix timers (pid: %d)\n", pid);
 		goto err_cure;
 	}
 
 	ret = dump_task_core_all(parasite_ctl, item, &pps_buf, cr_imgset, &misc);
+	gettimeofday(&t_now, NULL);
+	timersub(&t_now, &t_checkpoint, &t_delta);
+	pr_err("TIMING: dump_task_core_all took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
+	t_checkpoint = t_now;
 	if (ret) {
 		pr_err("Dump core (pid: %d) failed with %d\n", pid, ret);
 		goto err_cure;
 	}
 
 	ret = dump_task_cgroup(parasite_ctl, item);
+	gettimeofday(&t_now, NULL);
+	timersub(&t_now, &t_checkpoint, &t_delta);
+	pr_err("TIMING: dump_task_cgroup took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
+	t_checkpoint = t_now;
 	if (ret) {
 		pr_err("Dump cgroup of threads in process (pid: %d) failed with %d\n", pid, ret);
 		goto err_cure;
 	}
 
-	ret = compel_stop_daemon(parasite_ctl);
+	/*
+	 * compel_stop_daemon and dump_task_threads use ptrace, which is
+	 * independent of the UFFDIO_WRITEPROTECT ioctls still running
+	 * in the WP worker threads.  Run them in parallel so the ~25ms
+	 * of ptrace work overlaps with any remaining WP time.
+	 */
+	/*
+	 * seize fast path: skip rt_sigreturn single-stepping (~14ms).
+	 * We detach and overwrite registers anyway.
+	 */
+	if (opts.cow_dump && opts.lazy_pages)
+		ret = cow_seize_stop_parasite(parasite_ctl);
+	else
+		ret = compel_stop_daemon(parasite_ctl);
+	gettimeofday(&t_now, NULL);
+	timersub(&t_now, &t_checkpoint, &t_delta);
+	pr_err("TIMING: compel_stop_daemon took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
+	t_checkpoint = t_now;
 	if (ret) {
 		pr_err("Can't stop daemon in parasite (pid: %d)\n", pid);
 		goto err_cure;
 	}
 
-	ret = dump_task_threads(parasite_ctl, item);
+	ret = dump_task_threads(parasite_ctl, item,
+			       opts.cow_dump && opts.lazy_pages);
+	gettimeofday(&t_now, NULL);
+	timersub(&t_now, &t_checkpoint, &t_delta);
+	pr_err("TIMING: dump_task_threads took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
+	t_checkpoint = t_now;
 	if (ret) {
 		pr_err("Can't dump threads\n");
 		goto err_cure;
 	}
 
 	/*
+	 * WP_SYNC: join WP threads during freeze.
+	 * WP_ASYNC: WP not started yet, nothing to join.
+	 */
+	if (opts.cow_dump && !cow_is_wp_async()) {
+		ret = cow_dump_finish_wp();
+		gettimeofday(&t_now, NULL);
+		timersub(&t_now, &t_checkpoint, &t_delta);
+		pr_err("TIMING: cow_dump_finish_wp took %ld.%06ld seconds\n",
+		       t_delta.tv_sec, t_delta.tv_usec);
+		t_checkpoint = t_now;
+		if (ret) {
+			pr_err("Async write-protect failed\n");
+			goto err_cure;
+		}
+	}
+
+	/*
 	 * On failure local map will be cured in cr_dump_finish()
 	 * for lazy pages.
 	 */
-	if (opts.lazy_pages)
+	if (opts.cow_dump && opts.lazy_pages)
+		ret = cow_seize_cure_parasite(parasite_ctl);
+	else if (opts.lazy_pages)
 		ret = compel_cure_remote(parasite_ctl);
 	else
 		ret = compel_cure(parasite_ctl);
+	gettimeofday(&t_now, NULL);
+	timersub(&t_now, &t_checkpoint, &t_delta);
+	pr_err("TIMING: compel_cure took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
+	t_checkpoint = t_now;
 	if (ret) {
 		pr_err("Can't cure (pid: %d) from parasite\n", pid);
 		goto err;
 	}
 
 	ret = dump_task_mm(pid, &pps_buf, &misc, &vmas, cr_imgset);
+	gettimeofday(&t_now, NULL);
+	timersub(&t_now, &t_checkpoint, &t_delta);
+	pr_err("TIMING: dump_task_mm took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
+	t_checkpoint = t_now;
 	if (ret) {
 		pr_err("Dump mappings (pid: %d) failed with %d\n", pid, ret);
 		goto err;
 	}
 
 	ret = dump_task_fs(pid, &misc, cr_imgset);
+	gettimeofday(&t_now, NULL);
+	timersub(&t_now, &t_checkpoint, &t_delta);
+	pr_err("TIMING: dump_task_fs took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
+	t_checkpoint = t_now;
 	if (ret) {
 		pr_err("Dump fs (pid: %d) failed with %d\n", pid, ret);
 		goto err;
 	}
+
+	gettimeofday(&t_now, NULL);
+	timersub(&t_now, &t_start, &t_delta);
+	pr_err("========================================\n");
+	pr_err("TIMING: dump_one_task TOTAL took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
+	pr_err("========================================\n");
 
 	exit_code = 0;
 err:
@@ -2102,16 +2425,43 @@ static int cr_dump_finish(int ret)
 		delete_link_remaps();
 	}
 
-	if (!ret && opts.lazy_pages)
+	/* Resume process early if using COW dump with lazy pages */
+	if (!ret && opts.lazy_pages && opts.cow_dump) {
+		pr_err("PAGE SERVER READY TO SERVE\n");
+
+		if (!cow_is_wp_async() && cow_start_monitor_thread()) {
+			pr_err("Failed to start COW monitor thread\n");
+			ret = -1;
+			goto out_release_cow;
+		}
+
+		/*
+		 * Process was already resumed in cr_dump_tasks() right
+		 * after dump_one_task.  Just start the page transfer.
+		 */
 		ret = cr_lazy_mem_dump();
+	} else {
+		/* Standard path: transfer pages then resume */
+		if (!ret && opts.lazy_pages)
+			ret = cr_lazy_mem_dump();
+		
+		if (arch_set_thread_regs(root_item, true) < 0)
+			ret = -1;
+		else {
+			cr_plugin_fini(CR_PLUGIN_STAGE__DUMP, ret);
 
-	if (arch_set_thread_regs(root_item, true) < 0)
-		return -1;
+			pstree_switch_state(root_item, (ret || post_dump_ret) ? TASK_ALIVE : opts.final_state);
+			timing_stop(TIME_FROZEN);
+		}
+	}
 
-	cr_plugin_fini(CR_PLUGIN_STAGE__DUMP, ret);
+out_release_cow:
+	/* Wait for background page server thread before destroying COW session */
+	wait_for_page_server_thread();
+	if (opts.cow_dump)
+		cow_dump_fini();
+	free_global_lazy_vmas();
 
-	pstree_switch_state(root_item, (ret || post_dump_ret) ? TASK_ALIVE : opts.final_state);
-	timing_stop(TIME_FROZEN);
 	free_pstree(root_item);
 	seccomp_free_entries();
 	free_file_locks();
@@ -2204,6 +2554,11 @@ int cr_dump_tasks(pid_t pid)
 	if (setup_alarm_handler())
 		goto err;
 
+	if (opts.cow_dump) {
+		if (cow_pre_seize(pid))
+			goto err;
+	}
+
 	/*
 	 * The collect_pstree will also stop (PTRACE_SEIZE) the tasks
 	 * thus ensuring that they don't modify anything we collect
@@ -2213,39 +2568,66 @@ int cr_dump_tasks(pid_t pid)
 	if (collect_pstree())
 		goto err;
 
-	if (checkpoint_devices())
-		goto err;
+	{
+		struct timeval t_pre_s, t_pre_e, t_pre_d, t_fn_s, t_fn_e, t_fn_d;
+		gettimeofday(&t_pre_s, NULL);
 
-	if (collect_pstree_ids())
-		goto err;
+#define TIME_FN(call, label) do { \
+	gettimeofday(&t_fn_s, NULL); \
+	call; \
+	gettimeofday(&t_fn_e, NULL); \
+	timersub(&t_fn_e, &t_fn_s, &t_fn_d); \
+	pr_err("TIMING: pre-dump " label " took %ld.%06ld seconds\n", \
+	       t_fn_d.tv_sec, t_fn_d.tv_usec); \
+} while (0)
 
-	if (network_lock())
-		goto err;
+		TIME_FN(ret = checkpoint_devices() ? -1 : 0, "checkpoint_devices");
+		if (ret) goto err;
 
-	if (rpc_query_external_files())
-		goto err;
+		TIME_FN(ret = collect_pstree_ids() ? -1 : 0, "collect_pstree_ids");
+		if (ret) goto err;
 
-	if (collect_file_locks())
-		goto err;
+		if (!opts.cow_dump) {
+			TIME_FN(ret = network_lock() ? -1 : 0, "network_lock");
+			if (ret) goto err;
+		}
 
-	if (collect_namespaces(true) < 0)
-		goto err;
+		TIME_FN(ret = rpc_query_external_files() ? -1 : 0, "rpc_query_ext");
+		if (ret) goto err;
 
-	glob_imgset = cr_glob_imgset_open(O_DUMP);
-	if (!glob_imgset)
-		goto err;
+		TIME_FN(ret = collect_file_locks() ? -1 : 0, "collect_file_locks");
+		if (ret) goto err;
 
-	if (seccomp_collect_dump_filters() < 0)
-		goto err;
+		TIME_FN(ret = (collect_namespaces(true) < 0) ? -1 : 0, "collect_namespaces");
+		if (ret) goto err;
 
-	/* Errors handled later in detect_pid_reuse */
-	parent_ie = get_parent_inventory();
+		TIME_FN(glob_imgset = cr_glob_imgset_open(O_DUMP), "cr_glob_imgset_open");
+		if (!glob_imgset) goto err;
 
-	if (collect_and_suspend_lsm() < 0)
-		goto err;
+		TIME_FN(ret = (seccomp_collect_dump_filters() < 0) ? -1 : 0, "seccomp_filters");
+		if (ret) goto err;
+
+		TIME_FN(parent_ie = get_parent_inventory(), "get_parent_inventory");
+
+		TIME_FN(ret = (collect_and_suspend_lsm() < 0) ? -1 : 0, "collect_lsm");
+		if (ret) goto err;
+
+#undef TIME_FN
+
+		gettimeofday(&t_pre_e, NULL);
+		timersub(&t_pre_e, &t_pre_s, &t_pre_d);
+		pr_err("TIMING: pre_dump_one_task overhead took %ld.%06ld seconds\n",
+		       t_pre_d.tv_sec, t_pre_d.tv_usec);
+	}
 
 	for_each_pstree_item(item) {
 		if (dump_one_task(item, parent_ie))
+			goto err;
+	}
+
+	/* COW: resume process, start tracking (WP + eBPF) */
+	if (opts.lazy_pages && opts.cow_dump) {
+		if (cow_post_seize(root_item))
 			goto err;
 	}
 

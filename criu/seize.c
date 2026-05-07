@@ -572,7 +572,7 @@ static int freeze_processes(void)
 	int fd, exit_code = -1;
 	enum freezer_state state = THAWED;
 
-	static const unsigned long step_ms = 100;
+	static const unsigned long step_ms = 1;
 	/* Since opts.timeout is in seconds, multiply it by 1000 to convert to milliseconds. */
 	unsigned long nr_attempts = (opts.timeout * 1000) / step_ms;
 	unsigned long i = 0;

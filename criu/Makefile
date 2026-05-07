@@ -64,6 +64,29 @@ criu/pie/Makefile.library: ;
 criu/pie/%: pie ;
 
 #
+# eBPF dirty page tracker (skeleton compiled into cow-bpf.o)
+BPF_SRC		:= criu/bpf/dirty_track.bpf.c
+BPF_OBJ		:= criu/bpf/dirty_track.bpf.o
+BPF_SKEL	:= criu/bpf/dirty_track.skel.h
+BPF_VMLINUX	:= criu/bpf/vmlinux.h
+
+$(BPF_VMLINUX):
+	$(call msg-gen, $@)
+	$(Q) bpftool btf dump file /sys/kernel/btf/vmlinux format c > $@
+
+BPF_ARCH	:= $(if $(filter aarch64,$(ARCH)),arm64,$(ARCH))
+
+$(BPF_OBJ): $(BPF_SRC) $(BPF_VMLINUX)
+	$(call msg-gen, $@)
+	$(Q) clang -g -O2 -target bpf -D__TARGET_ARCH_$(BPF_ARCH) \
+		-I criu/bpf -I /usr/include/bpf \
+		-c $< -o $@
+
+$(BPF_SKEL): $(BPF_OBJ)
+	$(call msg-gen, $@)
+	$(Q) bpftool gen skeleton $< > $@
+
+#
 # CRIU executable
 PROGRAM-BUILTINS	+= criu/pie/pie.lib.a
 PROGRAM-BUILTINS	+= images/built-in.o
@@ -72,7 +95,7 @@ PROGRAM-BUILTINS	+= $(ARCH-LIB)
 PROGRAM-BUILTINS	+= soccr/libsoccr.a
 PROGRAM-BUILTINS	+= $(COMPEL_LIBS)
 
-$(obj)/built-in.o: pie
+$(obj)/built-in.o: pie $(BPF_SKEL)
 	$(Q) $(MAKE) $(call build-as,Makefile.crtools,criu) all
 
 
