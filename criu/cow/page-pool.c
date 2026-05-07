@@ -393,7 +393,7 @@ void page_pool_put(void *page)
 		all_chunks[chunk_idx] = NULL;
 		pthread_spin_unlock(&chunk_list_lock);
 
-		munmap(hdr, COW_CHUNK_SIZE);
+		madvise(hdr, COW_CHUNK_SIZE, MADV_DONTNEED); //munmap(hdr, COW_CHUNK_SIZE);
 	}
 }
 
