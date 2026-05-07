@@ -156,7 +156,7 @@
 #define COW_NUM_P3_THREADS_BULK		15
 #define COW_NUM_SCANNERS		20
 #define COW_NUM_PRE_SCANNERS		1   /* Scanners active during pre-scan (before freeze) */
-#define COW_NUM_DRAIN_THREADS		30
+#define COW_NUM_DRAIN_THREADS		20
 #define COW_MAX_THREADS			33
 #endif
 
