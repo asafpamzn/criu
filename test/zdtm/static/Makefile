@@ -199,6 +199,7 @@ TST_NOFILE	:=				\
 		cow_dump_file_backed		\
 		cow_dump_new_vma		\
 		cow_dump_grow			\
+		cow_dump_munmap_half		\
 		child_opened_proc		\
 		posix_timers			\
 		sigpending			\
@@ -624,6 +625,7 @@ cow_dump_multi_thread:	LDLIBS += -pthread
 cow_dump_file_backed:	LDLIBS += -pthread
 cow_dump_new_vma:	LDLIBS += -pthread
 cow_dump_grow:		LDLIBS += -pthread
+cow_dump_munmap_half:	LDLIBS += -pthread
 pthread00:		LDLIBS += -pthread
 pthread00-pac:		CFLAGS += ${PAC_CFLAGS}
 pthread00-pac:		LDLIBS += -pthread
