@@ -46,7 +46,7 @@ if [ "$TREE_PID" = "$line" ]; then
 fi
 log_timing "START received (tree PID: $TREE_PID)"
 
-# Start lazy-pages (it will retry connecting to page server)
+# Start lazy-pages (connects to page server, buffers pages, starts restore)
 log_timing "Starting lazy-pages..."
 sudo "$CRIU_BIN" lazy-pages \
   --images-dir "$IMAGES_DIR" \
@@ -59,31 +59,15 @@ sudo "$CRIU_BIN" lazy-pages \
   -v1 -o "$IMAGES_DIR/lazy-server.log" &
 LAZY_PAGES_PID=$!
 
-sleep 1
-if ! kill -0 "$LAZY_PAGES_PID" 2>/dev/null; then
-  log_timing "ERROR: lazy-pages exited early"
+# Wait for lazy-pages to complete (it starts restore internally)
+wait $LAZY_PAGES_PID
+LP_EXIT=$?
+if [ $LP_EXIT -ne 0 ]; then
+  log_timing "ERROR: lazy-pages failed (exit code $LP_EXIT)"
   sudo tail -n 120 "$IMAGES_DIR/lazy-server.log" 2>/dev/null || true
   exit 1
 fi
-log_timing "Lazy-pages started (PID: $LAZY_PAGES_PID)"
-
-# Start CRIU restore (it will retry connecting to lazy-pages unix socket)
-log_timing "Starting CRIU restore..."
-if ! sudo "$CRIU_BIN" restore \
-  --images-dir "$IMAGES_DIR" \
-  --lazy-pages \
-  --tcp-close \
-  --cow-dump \
-  --restore-detached \
-  --skip-file-rwx-check \
-  --skip-file-size-check \
-  --file-validation filesize \
-  -v1 -o "$IMAGES_DIR/lazy-restore.log"; then
-  log_timing "ERROR: restore failed"
-  sudo tail -n 120 "$IMAGES_DIR/lazy-restore.log" 2>/dev/null || true
-  exit 1
-fi
-log_timing "CRIU restore completed"
+log_timing "Lazy-pages completed (restore done)"
 
 # Configure replication
 log_timing "Configuring replication..."

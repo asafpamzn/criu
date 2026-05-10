@@ -14,6 +14,7 @@
 #include <dirent.h>
 #include <string.h>
 #include <signal.h>
+#include <limits.h>
 
 #include "types.h"
 #include "cr_options.h"
@@ -118,6 +119,44 @@ static void free_cow_tasks(void)
 		xfree(ct);
 	}
 	nr_cow_tasks = 0;
+}
+
+static pid_t cow_start_restore(void)
+{
+	pid_t pid;
+	char log_path[PATH_MAX];
+
+	snprintf(log_path, sizeof(log_path), "%s/lazy-restore.log",
+		 opts.imgs_dir);
+
+	pid = fork();
+	if (pid < 0) {
+		pr_perror("Failed to fork for restore");
+		return -1;
+	}
+
+	if (pid == 0) {
+		char *argv[] = {
+			opts.argv_0, "restore",
+			"--images-dir", opts.imgs_dir,
+			"--lazy-pages",
+			"--tcp-close",
+			"--cow-dump",
+			"--restore-detached",
+			"--skip-file-rwx-check",
+			"--skip-file-size-check",
+			"--file-validation", "filesize",
+			"-v1", "-o", log_path,
+			NULL
+		};
+
+		execv(opts.argv_0, argv);
+		pr_perror("execv of criu restore failed");
+		_exit(1);
+	}
+
+	pr_info("Started criu restore (PID: %d)\n", pid);
+	return pid;
 }
 
 /*
@@ -261,11 +300,9 @@ int cr_lazy_pages_cow_phase2(bool daemon)
 	 */
 	BUG_ON(task_entries->nr_tasks + 2 > COW_MAX_EPOLL_FDS);
 
-	/*
-	 * Phase 3 continues in the normal lazy-pages flow.
-	 * The buffered pages in g_page_buffer will be:
-	 *   - Served to page faults (handle_page_fault checks buffer first)
-	 */
+	if (cow_start_restore() < 0)
+		goto err_disconnect;
+
 	ret = cow_phase3_restore_loop(epollfd, &events, nr_fds);
 	if (ret < 0)
 		pr_err("Phase 3 restore loop failed\n");
