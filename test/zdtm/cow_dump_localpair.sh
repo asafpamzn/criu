@@ -194,55 +194,47 @@ DUMP_CMD="$CRIU_BIN dump --tree $VPID --images-dir '$IMAGES_DIR' \
 	--address $PRIMARY_IP --port $PORT \
 	--leave-running --shell-job \
 	-v4 -o dump.log"
-echo "$DUMP_CMD" > "$IMAGES_DIR/cmd_primary.fifo"
-echo "=== Dump command dispatched to primary ==="
-
-# Wait for PAGE SERVER READY in dump.log. The worker keeps running
-# while dump blocks waiting for the lazy-pages daemon to connect, so
-# WORKER_DONE won't appear here until after we start the daemon.
 PRIMARY_LOG="$IMAGES_DIR/dump.log"
 PRIMARY_DONE_COUNT_BEFORE=$(grep -c "^WORKER_DONE primary" "$IMAGES_DIR/primary.out" 2>/dev/null)
 [ -z "$PRIMARY_DONE_COUNT_BEFORE" ] && PRIMARY_DONE_COUNT_BEFORE=0
+echo "$DUMP_CMD" > "$IMAGES_DIR/cmd_primary.fifo"
+echo "=== Dump command dispatched to primary ==="
+
+# Wait for page server TCP port to be listening.
+echo "=== Waiting for page server port $PORT ==="
 READY=0
 for i in $(seq 1 600); do
-	if grep -q "Page server ready" "$PRIMARY_LOG" 2>/dev/null; then
-		echo "=== PAGE SERVER READY after $((i*100))ms ==="
+	if ip netns exec "$PRIMARY_NS" ss -tln | grep -q ":$PORT "; then
+		echo "=== Page server port open after $((i*100))ms ==="
 		READY=1
 		break
 	fi
-	# Only panic if a *new* WORKER_DONE primary appeared (dump exited
-	# without printing READY). The prior count came from the sanity
-	# check + victim launch; ignore those.
 	now=$(grep -c "^WORKER_DONE primary" "$IMAGES_DIR/primary.out" 2>/dev/null)
 	[ -z "$now" ] && now=0
 	if [ "$now" -gt "$PRIMARY_DONE_COUNT_BEFORE" ]; then
-		echo "=== dump exited before READY; log tail: ==="
+		echo "=== dump exited before port ready; log tail: ==="
 		tail -40 "$PRIMARY_LOG" 2>/dev/null
-		die "dump exited before READY"
+		die "dump exited before port ready"
 	fi
 	sleep 0.1
 done
-[ "$READY" -eq 1 ] || die "timeout waiting for PAGE SERVER READY"
+[ "$READY" -eq 1 ] || die "timeout waiting for page server port"
 
-# --- Start lazy-pages on replica (in background within the worker!) ---
-# The daemon runs the whole time restore is doing its thing, so we
-# launch it in the background INSIDE the worker. The worker's WORKER_DONE
-# fires immediately (the backgrounded daemon keeps running as the
-# worker's child).
+# --- Start lazy-pages on replica ---
+# lazy-pages connects to primary, receives skeleton files + pages over TCP,
+# then auto-triggers restore via cow_start_restore(). Backgrounded inside
+# the worker so WORKER_DONE fires immediately.
 LAZY_CMD="$CRIU_BIN lazy-pages --images-dir '$IMAGES_DIR' \
 	--page-server --cow-dump \
 	--address $PRIMARY_IP --port $PORT \
 	-v4 -o lazy-pages.log &"
 send_and_wait replica "$LAZY_CMD" || die "lazy-pages dispatch timed out"
 [ "$WORKER_RC" -eq 0 ] || die "lazy-pages dispatch rc=$WORKER_RC"
-echo "=== Lazy-pages launched (backgrounded inside replica worker) ==="
-sleep 0.5
+echo "=== Lazy-pages launched (auto-restores after receiving skeletons) ==="
 
 # --- Wait for dump to finish ---
-# The dump command is the NEXT one the primary worker runs after the
-# victim-launch command that bumped PRIMARY_DONE_COUNT_BEFORE.
 echo "=== Waiting for dump to complete ==="
-for i in $(seq 1 600); do
+for i in $(seq 1 ${SEND_AND_WAIT_TIMEOUT:-600}); do
 	now=$(grep -c "^WORKER_DONE primary" "$IMAGES_DIR/primary.out" 2>/dev/null)
 	[ -z "$now" ] && now=0
 	if [ "$now" -gt "$PRIMARY_DONE_COUNT_BEFORE" ]; then
@@ -252,23 +244,23 @@ for i in $(seq 1 600); do
 		[ "$RC_DUMP" -eq 0 ] || { tail -40 "$PRIMARY_LOG"; die "dump rc=$RC_DUMP"; }
 		break
 	fi
-	sleep 0.5
+	sleep 1
 done
 
-# --- Restore on replica ---
-RESTORE_CMD="$CRIU_BIN restore --images-dir '$IMAGES_DIR' \
-	--lazy-pages --cow-dump --restore-detached --shell-job \
-	-v4 -o restore.log"
-send_and_wait replica "$RESTORE_CMD" || die "restore timed out"
-if [ "$WORKER_RC" -ne 0 ]; then
-	tail -40 "$IMAGES_DIR/restore.log" 2>/dev/null
-	die "restore rc=$WORKER_RC"
-fi
-echo "=== Restore completed ==="
-
-# --- Signal restored victim to run verify ---
-send_and_wait replica "kill -TERM $VPID 2>/dev/null || true" \
-	|| echo "=== (signal dispatch had trouble) ==="
+# --- Signal restored victim to run verification ---
+# After restore, the victim is blocked in test_waitsig() waiting for SIGTERM.
+# lazy-pages auto-triggered restore; by now it should be running.
+# Retry signaling until process appears (restore may still be in progress).
+echo "=== Signaling restored victim (pid $VPID) ==="
+for i in $(seq 1 60); do
+	send_and_wait replica "kill -0 $VPID 2>/dev/null"
+	if [ "$WORKER_RC" -eq 0 ]; then
+		send_and_wait replica "kill -TERM $VPID"
+		echo "=== Victim signaled ==="
+		break
+	fi
+	sleep 0.5
+done
 
 # --- Wait for outfile ---
 # ZDTM test outfile format: "HH:MM:SS.mmm: PID: {PASS|FAIL: ...}"
