@@ -129,19 +129,14 @@ static pid_t cow_start_restore(void)
 	pid_t pid;
 	char log_path[PATH_MAX];
 	int ret;
-	const char *img_dir;
 	char *argv[16];
 
-	img_dir = cow_get_skeleton_dir();
-	if (!img_dir)
-		img_dir = opts.imgs_dir;
-
-	snprintf(log_path, sizeof(log_path), "%s/lazy-restore.log", img_dir);
+	snprintf(log_path, sizeof(log_path), "%s/lazy-restore.log", opts.imgs_dir);
 
 	argv[0] = opts.argv_0;
 	argv[1] = "restore";
 	argv[2] = "--images-dir";
-	argv[3] = (char *)img_dir;
+	argv[3] = opts.imgs_dir;
 	argv[4] = "--lazy-pages";
 	argv[5] = "--tcp-close";
 	argv[6] = "--cow-dump";

@@ -29,13 +29,6 @@
 #undef LOG_PREFIX
 #define LOG_PREFIX "cow-bulk-recv: "
 
-static char cow_skeleton_dir[64];
-
-const char *cow_get_skeleton_dir(void)
-{
-	return cow_skeleton_dir[0] ? cow_skeleton_dir : NULL;
-}
-
 static int cow_recv_skeleton_file(struct page_server_iov *pi)
 {
 	char filename[128];
@@ -57,16 +50,7 @@ static int cow_recv_skeleton_file(struct page_server_iov *pi)
 		return -1;
 	filename[name_len] = '\0';
 
-	if (!cow_skeleton_dir[0]) {
-		snprintf(cow_skeleton_dir, sizeof(cow_skeleton_dir),
-			 "/dev/shm/criu-restore-%d", getpid());
-		if (mkdir(cow_skeleton_dir, 0700) < 0 && errno != EEXIST) {
-			pr_perror("Cannot create %s", cow_skeleton_dir);
-			return -1;
-		}
-	}
-
-	snprintf(path, sizeof(path), "%s/%s", cow_skeleton_dir, filename);
+	snprintf(path, sizeof(path), "%s/%s", opts.imgs_dir, filename);
 
 	buf = xmalloc(file_size);
 	if (!buf)

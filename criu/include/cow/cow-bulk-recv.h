@@ -26,7 +26,4 @@ extern void page_server_cleanup_async_bulk(void);
 /* TCP helper (implemented in page-xfer.c) */
 extern void page_server_tcp_nodelay(int sk, bool on);
 
-/* Path to /dev/shm dir where skeleton files were received (NULL if none) */
-extern const char *cow_get_skeleton_dir(void);
-
 #endif /* __CR_COW_BULK_RECV_H__ */
