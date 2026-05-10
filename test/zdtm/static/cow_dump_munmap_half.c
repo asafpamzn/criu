@@ -26,7 +26,7 @@ const char *test_author = "Asaf Pamuk <asafp@anthropic.com>";
  * (user's target: 32768 MB = 32 GB total, 16 GB kept + 16 GB munmap'd).
  */
 #ifndef COW_MUNMAP_HALF_MB
-#define COW_MUNMAP_HALF_MB	256
+#define COW_MUNMAP_HALF_MB	32768		/* 32 GB total (16 GB kept + 16 GB drop) */
 #endif
 #define TOTAL_MB		COW_MUNMAP_HALF_MB
 #define HALF_BYTES		(((size_t)TOTAL_MB << 20) / 2)

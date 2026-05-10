@@ -28,6 +28,7 @@ TESTS_ALL=(
 	cow_dump_new_vma
 	cow_dump_grow
 	cow_dump_munmap_half
+	cow_dump_munmap_reuse
 )
 
 usage() { sed -n '3,17p' "$0"; }
