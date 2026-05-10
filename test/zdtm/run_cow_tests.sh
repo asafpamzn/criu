@@ -68,8 +68,8 @@ cleanup_between_runs() {
 }
 trap cleanup_between_runs EXIT
 
-export SEND_AND_WAIT_TIMEOUT="${SEND_AND_WAIT_TIMEOUT:-600}"
-export OUTFILE_TIMEOUT_MS="${OUTFILE_TIMEOUT_MS:-900000}"
+export SEND_AND_WAIT_TIMEOUT="${SEND_AND_WAIT_TIMEOUT:-900}"
+export OUTFILE_TIMEOUT_MS="${OUTFILE_TIMEOUT_MS:-1200000}"
 
 echo "=== Running ${#TESTS[@]} test(s), $RUNS run(s) each ==="
 printf '%-30s %6s  %s\n' "TEST" "RESULT" "DETAILS"

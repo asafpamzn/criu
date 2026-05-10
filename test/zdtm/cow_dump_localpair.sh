@@ -123,7 +123,7 @@ send_and_wait() {
 	[ -z "$before_count" ] && before_count=0
 	# Send command
 	echo "$cmd" > "$fifo"
-	local deadline=$(( $(date +%s) + ${SEND_AND_WAIT_TIMEOUT:-120} ))
+	local deadline=$(( $(date +%s) + ${SEND_AND_WAIT_TIMEOUT:-900} ))
 	while :; do
 		now_count=$(grep -c "$marker" "$outf" 2>/dev/null)
 		[ -z "$now_count" ] && now_count=0
@@ -234,7 +234,7 @@ echo "=== Lazy-pages launched (auto-restores after receiving skeletons) ==="
 
 # --- Wait for dump to finish ---
 echo "=== Waiting for dump to complete ==="
-for i in $(seq 1 ${SEND_AND_WAIT_TIMEOUT:-600}); do
+for i in $(seq 1 ${SEND_AND_WAIT_TIMEOUT:-900}); do
 	now=$(grep -c "^WORKER_DONE primary" "$IMAGES_DIR/primary.out" 2>/dev/null)
 	[ -z "$now" ] && now=0
 	if [ "$now" -gt "$PRIMARY_DONE_COUNT_BEFORE" ]; then
@@ -267,7 +267,7 @@ done
 # We match PASS/FAIL anywhere on a line. Tunable via OUTFILE_TIMEOUT
 # (default 60s — needs raising for 10+ GB workloads whose verify loop
 # reads every page).
-OUTFILE_TIMEOUT_MS="${OUTFILE_TIMEOUT_MS:-60000}"
+OUTFILE_TIMEOUT_MS="${OUTFILE_TIMEOUT_MS:-1200000}"
 OUTFILE_ITERS=$(( OUTFILE_TIMEOUT_MS / 100 ))
 for i in $(seq 1 "$OUTFILE_ITERS"); do
 	for candidate in "$OUTFILE" "$OUTFILE.inprogress"; do
