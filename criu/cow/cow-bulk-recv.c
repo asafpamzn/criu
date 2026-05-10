@@ -7,8 +7,13 @@
  */
 
 #include <errno.h>
+#include <stdio.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <netinet/tcp.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <limits.h>
 
 #include "types.h"
 #include "criu-log.h"
@@ -23,6 +28,71 @@
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "cow-bulk-recv: "
+
+static char cow_skeleton_dir[PATH_MAX];
+
+const char *cow_get_skeleton_dir(void)
+{
+	return cow_skeleton_dir[0] ? cow_skeleton_dir : NULL;
+}
+
+static int cow_recv_skeleton_file(struct page_server_iov *pi)
+{
+	char filename[256];
+	char path[PATH_MAX];
+	void *buf;
+	int sk = get_page_server_sk();
+	int fd, name_len;
+	u64 file_size;
+
+	name_len = pi->nr_pages;
+	file_size = pi->vaddr;
+
+	if (name_len >= (int)sizeof(filename)) {
+		pr_err("Filename too long: %d\n", name_len);
+		return -1;
+	}
+
+	if (page_server_recv(sk, filename, name_len, MSG_WAITALL) != name_len)
+		return -1;
+	filename[name_len] = '\0';
+
+	if (!cow_skeleton_dir[0]) {
+		snprintf(cow_skeleton_dir, sizeof(cow_skeleton_dir),
+			 "/dev/shm/criu-restore-%d", getpid());
+		if (mkdir(cow_skeleton_dir, 0700) < 0 && errno != EEXIST) {
+			pr_perror("Cannot create %s", cow_skeleton_dir);
+			return -1;
+		}
+	}
+
+	snprintf(path, sizeof(path), "%s/%s", cow_skeleton_dir, filename);
+
+	buf = xmalloc(file_size);
+	if (!buf)
+		return -1;
+
+	if (page_server_recv(sk, buf, file_size, MSG_WAITALL) != (int)file_size) {
+		xfree(buf);
+		return -1;
+	}
+
+	fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (fd < 0) {
+		pr_perror("Cannot create %s", path);
+		xfree(buf);
+		return -1;
+	}
+	if (write(fd, buf, file_size) != (ssize_t)file_size) {
+		pr_perror("Short write to %s", path);
+		close(fd);
+		xfree(buf);
+		return -1;
+	}
+	close(fd);
+	xfree(buf);
+	return 0;
+}
 
 /* Bulk stream return codes (local defines) */
 #define BULK_STREAM_WOULD_BLOCK 0
@@ -89,6 +159,12 @@ static int read_bulk_header(struct ps_async_read_bulk *ar, int flags)
 	/* Header complete — reset for next header */
 	ar->rb = 0;
 	cmd = decode_ps_cmd(ar->pi.cmd);
+
+	if (cmd == PS_IOV_SKELETON_FILE) {
+		if (cow_recv_skeleton_file(&ar->pi) < 0)
+			return -1;
+		return BULK_STREAM_PROGRESS;
+	}
 
 	if (cmd == PS_IOV_ALL_PAGES_SENT) {
 		/* Primary signals all pages sent - replica can zero-fill rest */

@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/.env"
 
+IMAGES_DIR="/dev/shm/criu-migrate"
 MAX_WAIT=${MAX_WAIT:-600}
 TIMING_LOG="$IMAGES_DIR/restore-timing.log"
 

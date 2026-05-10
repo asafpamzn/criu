@@ -2266,7 +2266,11 @@ static int cr_dump_finish(int ret)
 		 */
 		gettimeofday(&t_start, NULL);
 		if (!ret && sk >= 0) {
-			if (send_all_pages_sent_signal(sk) < 0) {
+			if (cow_send_skeleton_files(sk) < 0) {
+				pr_err("COW: Failed to send skeleton files\n");
+				ret = -1;
+			}
+			if (!ret && send_all_pages_sent_signal(sk) < 0) {
 				pr_err("COW: Failed to send completion signal\n");
 				ret = -1;
 			}

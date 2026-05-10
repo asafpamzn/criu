@@ -14,6 +14,7 @@
 #define PS_IOV_START_RESTORE      12  /* Signal replica to start process */
 #define PS_IOV_ALL_PAGES_SENT     16  /* Primary -> Replica: all pages sent, zero-fill rest */
 #define PS_IOV_ALL_PAGES_SENT_ACK 17  /* Replica -> Primary: ACK, safe to close connection */
+#define PS_IOV_SKELETON_FILE      20  /* Primary -> Replica: skeleton image file transfer */
 
 /* Global compression statistics (used by cow-bulk-send.c) */
 extern unsigned long g_compress_uncompressed_bytes;
@@ -46,6 +47,9 @@ extern int cow_request_all_remote_pages(unsigned long img_id);
 
 /* COW server-side socket close */
 extern void cow_close_page_server_socket(void);
+
+/* COW skeleton file transfer: send all .img files over TCP */
+extern int cow_send_skeleton_files(int sk);
 
 /* COW lazy VMA pagemap writing */
 struct page_xfer;

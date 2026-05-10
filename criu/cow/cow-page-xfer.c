@@ -9,9 +9,14 @@
 #include <stdbool.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <string.h>
+#include <dirent.h>
+#include <fcntl.h>
+#include <limits.h>
 
 #include "cow/cow-page-xfer.h"
+#include "xmalloc.h"
 #include "page-xfer.h"
 #include "page.h"
 #include "pstree.h"
@@ -103,6 +108,81 @@ int send_all_pages_sent_ack(void)
 
 	pr_info("Sending all_pages_sent ACK to primary\n");
 	return send_psi(sk, &pi);
+}
+
+int cow_send_skeleton_files(int sk)
+{
+	DIR *dir;
+	struct dirent *de;
+	int count = 0;
+
+	dir = opendir(opts.imgs_dir);
+	if (!dir) {
+		pr_perror("Cannot open images dir %s", opts.imgs_dir);
+		return -1;
+	}
+
+	while ((de = readdir(dir)) != NULL) {
+		struct page_server_iov pi;
+		char path[PATH_MAX];
+		struct stat st;
+		int fd, name_len;
+		void *buf;
+
+		if (de->d_name[0] == '.')
+			continue;
+
+		name_len = strlen(de->d_name);
+		if (name_len < 4 || strcmp(de->d_name + name_len - 4, ".img") != 0)
+			continue;
+
+		snprintf(path, sizeof(path), "%s/%s", opts.imgs_dir, de->d_name);
+		if (stat(path, &st) < 0 || st.st_size == 0)
+			continue;
+
+		fd = open(path, O_RDONLY);
+		if (fd < 0) {
+			pr_perror("Cannot open %s", path);
+			continue;
+		}
+
+		buf = xmalloc(st.st_size);
+		if (!buf) {
+			close(fd);
+			closedir(dir);
+			return -1;
+		}
+
+		if (read(fd, buf, st.st_size) != st.st_size) {
+			pr_perror("Short read on %s", path);
+			xfree(buf);
+			close(fd);
+			closedir(dir);
+			return -1;
+		}
+		close(fd);
+
+		pi.cmd = PS_IOV_SKELETON_FILE;
+		pi.nr_pages = name_len;
+		pi.vaddr = st.st_size;
+		pi.dst_id = 0;
+
+		if (send_psi(sk, &pi) < 0 ||
+		    page_server_send(sk, de->d_name, name_len, 0) < 0 ||
+		    page_server_send(sk, buf, st.st_size, 0) < 0) {
+			pr_err("Failed to send skeleton file %s\n", de->d_name);
+			xfree(buf);
+			closedir(dir);
+			return -1;
+		}
+
+		xfree(buf);
+		count++;
+	}
+
+	closedir(dir);
+	pr_info("Sent %d skeleton files to replica\n", count);
+	return 0;
 }
 
 /*

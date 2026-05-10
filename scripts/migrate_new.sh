@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/.env"
 
+IMAGES_DIR="/dev/shm/criu-migrate"
 CRIU_BIN="${CRIU_BIN:-$SCRIPT_DIR/../criu/criu}"
 SSH="ssh -i $SSH_KEY -o StrictHostKeyChecking=no -o ConnectTimeout=10"
 REPLICA_SSH_HOST="${REPLICA_IP:-$REPLICA_HOST}"
@@ -30,8 +31,8 @@ sleep 0.1
 
 # Clean images dir
 log_timing "Cleaning $IMAGES_DIR..."
+sudo mkdir -p "$IMAGES_DIR"
 sudo rm -rf "$IMAGES_DIR"/*
-sudo rm -f "$TIMING_LOG"
 
 # Start replica over SSH (bidirectional protocol via coproc)
 log_timing "Starting restore on replica..."

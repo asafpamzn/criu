@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/.env"
 
+export IMAGES_DIR="/dev/shm/criu-migrate"
 CRIU_BIN="${CRIU_BIN:-$SCRIPT_DIR/../criu/criu}"
 TIMING_LOG="$IMAGES_DIR/restore-timing.log"
 
@@ -15,6 +16,7 @@ log_timing() {
   echo "[$timestamp +${elapsed}ms] $1" | sudo tee -a "$TIMING_LOG" >/dev/null
 }
 
+sudo mkdir -p "$IMAGES_DIR"
 sudo rm -f "$TIMING_LOG"
 log_timing "=== CRIU Restore - Replica ==="
 

@@ -129,22 +129,31 @@ static pid_t cow_start_restore(void)
 	pid_t pid;
 	char log_path[PATH_MAX];
 	int ret;
-	char *argv[] = {
-		opts.argv_0, "restore",
-		"--images-dir", opts.imgs_dir,
-		"--lazy-pages",
-		"--tcp-close",
-		"--cow-dump",
-		"--restore-detached",
-		"--skip-file-rwx-check",
-		"--skip-file-size-check",
-		"--file-validation", "filesize",
-		"-v1", "-o", log_path,
-		NULL
-	};
+	const char *img_dir;
+	char *argv[16];
 
-	snprintf(log_path, sizeof(log_path), "%s/lazy-restore.log",
-		 opts.imgs_dir);
+	img_dir = cow_get_skeleton_dir();
+	if (!img_dir)
+		img_dir = opts.imgs_dir;
+
+	snprintf(log_path, sizeof(log_path), "%s/lazy-restore.log", img_dir);
+
+	argv[0] = opts.argv_0;
+	argv[1] = "restore";
+	argv[2] = "--images-dir";
+	argv[3] = (char *)img_dir;
+	argv[4] = "--lazy-pages";
+	argv[5] = "--tcp-close";
+	argv[6] = "--cow-dump";
+	argv[7] = "--restore-detached";
+	argv[8] = "--skip-file-rwx-check";
+	argv[9] = "--skip-file-size-check";
+	argv[10] = "--file-validation";
+	argv[11] = "filesize";
+	argv[12] = "-v1";
+	argv[13] = "-o";
+	argv[14] = log_path;
+	argv[15] = NULL;
 
 	ret = posix_spawn(&pid, opts.argv_0, NULL, NULL, argv, environ);
 	if (ret != 0) {
