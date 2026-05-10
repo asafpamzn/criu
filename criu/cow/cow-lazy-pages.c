@@ -15,6 +15,7 @@
 #include <string.h>
 #include <signal.h>
 #include <limits.h>
+#include <spawn.h>
 
 #include "types.h"
 #include "cr_options.h"
@@ -121,38 +122,35 @@ static void free_cow_tasks(void)
 	nr_cow_tasks = 0;
 }
 
+extern char **environ;
+
 static pid_t cow_start_restore(void)
 {
 	pid_t pid;
 	char log_path[PATH_MAX];
+	int ret;
 
 	snprintf(log_path, sizeof(log_path), "%s/lazy-restore.log",
 		 opts.imgs_dir);
 
-	pid = fork();
-	if (pid < 0) {
-		pr_perror("Failed to fork for restore");
+	char *argv[] = {
+		opts.argv_0, "restore",
+		"--images-dir", opts.imgs_dir,
+		"--lazy-pages",
+		"--tcp-close",
+		"--cow-dump",
+		"--restore-detached",
+		"--skip-file-rwx-check",
+		"--skip-file-size-check",
+		"--file-validation", "filesize",
+		"-v1", "-o", log_path,
+		NULL
+	};
+
+	ret = posix_spawn(&pid, opts.argv_0, NULL, NULL, argv, environ);
+	if (ret != 0) {
+		pr_err("posix_spawn of criu restore failed: %s\n", strerror(ret));
 		return -1;
-	}
-
-	if (pid == 0) {
-		char *argv[] = {
-			opts.argv_0, "restore",
-			"--images-dir", opts.imgs_dir,
-			"--lazy-pages",
-			"--tcp-close",
-			"--cow-dump",
-			"--restore-detached",
-			"--skip-file-rwx-check",
-			"--skip-file-size-check",
-			"--file-validation", "filesize",
-			"-v1", "-o", log_path,
-			NULL
-		};
-
-		execv(opts.argv_0, argv);
-		pr_perror("execv of criu restore failed");
-		_exit(1);
 	}
 
 	pr_info("Started criu restore (PID: %d)\n", pid);
