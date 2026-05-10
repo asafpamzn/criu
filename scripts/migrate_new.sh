@@ -9,7 +9,6 @@ SSH="ssh -i $SSH_KEY -o StrictHostKeyChecking=no -o ConnectTimeout=10"
 REPLICA_SSH_HOST="${REPLICA_IP:-$REPLICA_HOST}"
 TIMING_LOG="$IMAGES_DIR/migrate-timing.log"
 
-# Timing helper
 SCRIPT_START_MS=$(date +%s%3N)
 log_timing() {
   local now=$(date +%s%3N)
@@ -19,54 +18,36 @@ log_timing() {
 }
 
 PID=$(pgrep -x valkey-server | head -n1)
-
 if [ -z "$PID" ]; then
   echo "ERROR: valkey-server not running"
   exit 1
 fi
 
-# Step 0: Kill leftover ssh/restore processes
-log_timing "Step 0: Killing leftover ssh restore processes..."
-echo "Step 0: Killing leftover ssh restore processes..."
+# Kill leftover ssh/restore processes
+log_timing "Killing leftover processes..."
 sudo pkill -9 -f "ssh.*restore_new.sh" 2>/dev/null || true
 sleep 0.1
-log_timing "Step 0: Done"
 
-# Step 1: Clean images dir
-log_timing "Step 1: Cleaning $IMAGES_DIR..."
-echo "Step 1: Cleaning $IMAGES_DIR..."
+# Clean images dir
+log_timing "Cleaning $IMAGES_DIR..."
 sudo rm -rf "$IMAGES_DIR"/*
 sudo rm -f "$TIMING_LOG"
-log_timing "Step 1: Done"
 
-# Step 2: Start restore on replica (it will wait for page server)
-log_timing "Step 2: Starting restore on replica..."
-echo "Step 2: Starting restore on replica..."
-stdbuf -oL $SSH ubuntu@$REPLICA_SSH_HOST "sudo $SCRIPT_DIR/restore_new.sh" 2>&1 | stdbuf -oL sed 's/^/[replica] /' &
-REPLICA_PID=$!
-log_timing "Step 2: SSH launched (PID: $REPLICA_PID)"
+# Start replica over SSH (bidirectional protocol via coproc)
+log_timing "Starting restore on replica..."
+coproc REPLICA { $SSH ubuntu@$REPLICA_SSH_HOST "sudo $SCRIPT_DIR/restore_new.sh"; }
+log_timing "SSH launched (PID: $REPLICA_PID)"
 
-# Step 3: Wait for replica ready signal
-log_timing "Step 3: Waiting for replica ready signal..."
-echo "Step 3: Waiting for replica ready signal..."
-READY_FILE="$IMAGES_DIR/ready.log"
-for i in $(seq 1 60); do
-  if [ -f "$READY_FILE" ]; then
-    log_timing "Step 3: Replica ready (iter $i)"
-    echo "Replica ready"
-    break
-  fi
-  sleep 0.5
-done
-if [ ! -f "$READY_FILE" ]; then
-  log_timing "Step 3: ERROR - replica ready signal not found"
-  echo "ERROR: replica ready signal not found at $READY_FILE"
+# Wait for replica READY (cleanup done, ready for dump)
+log_timing "Waiting for READY from replica..."
+if ! read -r -t 60 line <&"${REPLICA[0]}" || [ "$line" != "READY" ]; then
+  log_timing "ERROR: replica did not send READY (got: '$line')"
   exit 1
 fi
+log_timing "READY received"
 
-# Step 4: CRIU dump (run in background)
-log_timing "Step 4: Starting CRIU dump for PID $PID..."
-echo "Step 4: Starting CRIU dump for PID $PID..."
+# Start CRIU dump
+log_timing "Starting CRIU dump for PID $PID..."
 START_TIME=$(date +%s%3N)
 
 sudo "$CRIU_BIN" dump \
@@ -83,11 +64,14 @@ sudo "$CRIU_BIN" dump \
   --display-stats \
   -v2 -o "$IMAGES_DIR/lazy-primary.log" &
 DUMP_PID=$!
-log_timing "Step 4: CRIU dump started in background (PID: $DUMP_PID)"
+log_timing "CRIU dump started (PID: $DUMP_PID)"
 
-# Step 5: Wait for replica master_link_status:up (while dump runs)
-log_timing "Step 5: Polling for replica master_link_status:up..."
-echo "Step 5: Waiting for replica master_link_status:up..."
+# Tell replica to start (dump is running, page server will accept with retry)
+echo "START" >&"${REPLICA[1]}"
+log_timing "Sent START to replica"
+
+# Poll for replica master_link_status:up
+log_timing "Polling for master_link_status:up..."
 REPLICA_PORT="${REPLICA_PORT:-6379}"
 STATUS=""
 for i in $(seq 1 120); do
@@ -95,7 +79,7 @@ for i in $(seq 1 120); do
   if [[ "$STATUS" == *"master_link_status:up"* ]]; then
     END_TIME=$(date +%s%3N)
     ELAPSED=$((END_TIME - START_TIME))
-    log_timing "Step 5: master_link_status:up (iter $i, ${ELAPSED}ms since dump start)"
+    log_timing "master_link_status:up (iter $i, ${ELAPSED}ms since dump start)"
     echo "Replica master_link_status:up after ${ELAPSED}ms"
     break
   fi
@@ -103,48 +87,33 @@ for i in $(seq 1 120); do
 done
 
 if [[ "$STATUS" != *"master_link_status:up"* ]]; then
-  log_timing "Step 5: WARNING - master_link_status:up not reached within 60s"
+  ELAPSED=0
+  log_timing "WARNING: master_link_status:up not reached within 60s"
   echo "WARNING: master_link_status:up not reached within 60s"
 fi
 
 # Wait for CRIU dump to finish
-log_timing "Step 6: Waiting for CRIU dump to complete..."
+log_timing "Waiting for CRIU dump to complete..."
 wait $DUMP_PID
 DUMP_EXIT_CODE=$?
 DUMP_END_TIME=$(date +%s%3N)
 DUMP_ELAPSED=$((DUMP_END_TIME - START_TIME))
 if [ $DUMP_EXIT_CODE -eq 0 ]; then
-  log_timing "Step 6: CRIU dump completed successfully (took ${DUMP_ELAPSED}ms total)"
+  log_timing "CRIU dump completed (took ${DUMP_ELAPSED}ms)"
 else
-  log_timing "Step 6: ERROR - CRIU dump failed with exit code $DUMP_EXIT_CODE"
+  log_timing "ERROR: CRIU dump failed (exit code $DUMP_EXIT_CODE)"
   echo "ERROR: CRIU dump failed"
   exit 1
 fi
 
+wait $REPLICA_PID 2>/dev/null || true
 log_timing "Migration complete"
 
-# Calculate migration time (from dump start to replication up)
 MIGRATION_TIME_MS=$ELAPSED
 MIGRATION_TIME_SEC=$(echo "scale=2; $MIGRATION_TIME_MS / 1000" | bc)
 
 SUMMARY_LOG="$IMAGES_DIR/migrate_summary.log"
-
-# Print big summary (to both stdout and file)
 {
-echo ""
-echo "=================================================================="
-echo ""
-echo "  __  __ ___ ____ ____      _  _____ ___ ___  _   _ "
-echo " |  \/  |_ _/ ___|  _ \    / \|_   _|_ _/ _ \| \ | |"
-echo " | |\/| || | |  _| |_) |  / _ \ | |  | | | | |  \| |"
-echo " | |  | || | |_| |  _ <  / ___ \| |  | | |_| | |\  |"
-echo " |_|  |_|___\____|_| \_\/_/   \_\_| |___\___/|_| \_|"
-echo ""
-echo "   ____ ___  __  __ ____  _     _____ _____ _____ "
-echo "  / ___/ _ \|  \/  |  _ \| |   | ____|_   _| ____|"
-echo " | |  | | | | |\/| | |_) | |   |  _|   | | |  _|  "
-echo " | |__| |_| | |  | |  __/| |___| |___  | | | |___ "
-echo "  \____\___/|_|  |_|_|   |_____|_____| |_| |_____|"
 echo ""
 echo "=================================================================="
 echo ""

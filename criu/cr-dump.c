@@ -3036,11 +3036,7 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 		       t_delta.tv_sec, t_delta.tv_usec);
 	}
 
-	/*
-	 * Signal to the replica that skeleton dump is complete.
-	 * restore.sh polls for this marker before starting criu restore.
-	 */
-	pr_err("PHASE 3 SKELETON DUMP COMPLETE\n");
+	pr_info("Skeleton dump complete\n");
 
 	/*
 	 * Wait for P3 threads to complete their final scan (process is frozen,

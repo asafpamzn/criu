@@ -1659,14 +1659,8 @@ int cr_page_server(bool daemon_mode, bool lazy_dump, int cfd)
 	if (sk == -1)
 		return -1;
 
-	/*
-	 * The TCP socket is now bound and listening.  Signal readiness
-	 * so the replica can connect.  This marker MUST come after
-	 * listen() — writing it earlier caused a race where the
-	 * replica tried to connect before the socket was ready.
-	 */
 	if (opts.cow_dump && lazy_dump)
-		pr_err("PAGE SERVER READY TO SERVE\n");
+		pr_info("Page server ready, replica will connect with retry\n");
 
 no_server:
 
@@ -1707,12 +1701,22 @@ static int connect_to_page_server(void)
 
 	if (opts.ps_socket != -1) {
 		page_server_sk = opts.ps_socket;
-		pr_err("DEBUG_FD: connect_to_page_server reusing ps_socket=%d\n", page_server_sk);
 		goto out;
 	}
 
-	page_server_sk = setup_tcp_client(opts.addr);
-	pr_err("DEBUG_FD: connect_to_page_server setup_tcp_client returned page_server_sk=%d\n", page_server_sk);
+	if (opts.cow_dump) {
+		int retries = 300;
+
+		while (retries-- > 0) {
+			page_server_sk = setup_tcp_client(opts.addr);
+			if (page_server_sk >= 0)
+				break;
+			usleep(100000);
+		}
+	} else {
+		page_server_sk = setup_tcp_client(opts.addr);
+	}
+
 	if (page_server_sk == -1)
 		return -1;
 
@@ -1721,11 +1725,6 @@ static int connect_to_page_server(void)
 		return -1;
 	}
 out:
-	/*
-	 * CORK the socket at the very beginning. As per ANK
-	 * the corked by default socket with sporadic NODELAY-s
-	 * on urgent data is the smartest mode ever.
-	 */
 	tcp_cork(page_server_sk, true);
 	return 0;
 }

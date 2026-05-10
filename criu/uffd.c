@@ -324,13 +324,31 @@ int prepare_lazy_pages_socket(void)
 
 	mutex_init(lazy_sock_mutex);
 
-	if ((fd = socket(AF_UNIX, SOCK_STREAM, 0)) < 0)
-		return -1;
-
 	len = offsetof(struct sockaddr_un, sun_path) + strlen(sun.sun_path);
-	if (connect(fd, (struct sockaddr *)&sun, len) < 0) {
-		pr_perror("connect to %s failed", sun.sun_path);
-		goto out;
+	if (opts.cow_dump) {
+		int retries = 1200;
+
+		while (retries-- > 0) {
+			fd = socket(AF_UNIX, SOCK_STREAM, 0);
+			if (fd < 0)
+				return -1;
+			if (connect(fd, (struct sockaddr *)&sun, len) == 0)
+				break;
+			close(fd);
+			fd = -1;
+			usleep(100000);
+		}
+		if (fd < 0) {
+			pr_perror("connect to %s failed after retries", sun.sun_path);
+			return -1;
+		}
+	} else {
+		if ((fd = socket(AF_UNIX, SOCK_STREAM, 0)) < 0)
+			return -1;
+		if (connect(fd, (struct sockaddr *)&sun, len) < 0) {
+			pr_perror("connect to %s failed", sun.sun_path);
+			goto out;
+		}
 	}
 
 	lazy_pages_sk_id = fdstore_add(fd);
@@ -1691,7 +1709,7 @@ int cow_phase3_restore_loop(int ep_fd, struct epoll_event **events, int nr_fds)
 		return -1;
 	}
 
-	pr_err("COW Phase 3: Waiting for restore to connect\n");
+	pr_info("Phase 3: listening for restore connection\n");
 
 	/*
 	 * Simplified flow for COW bulk transfer:
