@@ -14,7 +14,7 @@ log_timing() {
   local now=$(date +%s%3N)
   local elapsed=$((now - SCRIPT_START_MS))
   local timestamp=$(date '+%H:%M:%S.%3N')
-  echo "[$timestamp +${elapsed}ms] $1" | sudo tee -a "$TIMING_LOG"
+  echo "[$timestamp +${elapsed}ms] $1" | sudo tee -a "$TIMING_LOG" >&2
 }
 
 PID=$(pgrep -x valkey-server | head -n1)
@@ -36,7 +36,8 @@ sudo rm -f "$TIMING_LOG"
 # Start replica over SSH (bidirectional protocol via coproc)
 log_timing "Starting restore on replica..."
 coproc REPLICA { $SSH ubuntu@$REPLICA_SSH_HOST "sudo $SCRIPT_DIR/restore_new.sh"; }
-log_timing "SSH launched (PID: $REPLICA_PID)"
+REPLICA_SAVED_PID=$REPLICA_PID
+log_timing "SSH launched (PID: $REPLICA_SAVED_PID)"
 
 # Wait for replica READY (cleanup done, ready for dump)
 log_timing "Waiting for READY from replica..."
@@ -106,7 +107,7 @@ else
   exit 1
 fi
 
-wait $REPLICA_PID 2>/dev/null || true
+wait $REPLICA_SAVED_PID 2>/dev/null || true
 log_timing "Migration complete"
 
 MIGRATION_TIME_MS=$ELAPSED
