@@ -57,6 +57,16 @@ static int discover_tasks_from_pagemaps(void)
 	struct dirent *de;
 	int img_dir_fd;
 
+	if (opts.tree_id) {
+		struct cow_task *ct = xmalloc(sizeof(*ct));
+		BUG_ON(!ct);
+		ct->pid = opts.tree_id;
+		list_add_tail(&ct->l, &cow_tasks);
+		nr_cow_tasks = 1;
+		pr_info("Using task pid=%d from --tree option\n", opts.tree_id);
+		return 0;
+	}
+
 	img_dir_fd = get_service_fd(IMG_FD_OFF);
 	if (img_dir_fd < 0) {
 		pr_err("No image directory fd\n");

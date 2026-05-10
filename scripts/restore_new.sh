@@ -33,13 +33,18 @@ sleep 1
 log_timing "Sending READY"
 echo "READY"
 
-# Wait for primary to tell us dump is started
+# Wait for primary to tell us dump is started (format: "START <PID>")
 log_timing "Waiting for START..."
-if ! read -r -t 60 line || [ "$line" != "START" ]; then
-  log_timing "ERROR: did not receive START (got: '$line')"
+if ! read -r -t 60 line; then
+  log_timing "ERROR: timeout waiting for START"
   exit 1
 fi
-log_timing "START received"
+TREE_PID="${line#START }"
+if [ "$TREE_PID" = "$line" ]; then
+  log_timing "ERROR: expected 'START <PID>', got: '$line'"
+  exit 1
+fi
+log_timing "START received (tree PID: $TREE_PID)"
 
 # Start lazy-pages (it will retry connecting to page server)
 log_timing "Starting lazy-pages..."
@@ -49,6 +54,7 @@ sudo "$CRIU_BIN" lazy-pages \
   --address "$PRIMARY_IP" \
   --port "$CRIU_PORT" \
   --cow-dump \
+  --tree "$TREE_PID" \
   --tcp-close \
   -v1 -o "$IMAGES_DIR/lazy-server.log" &
 LAZY_PAGES_PID=$!

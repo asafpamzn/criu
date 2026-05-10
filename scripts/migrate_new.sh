@@ -67,9 +67,9 @@ sudo "$CRIU_BIN" dump \
 DUMP_PID=$!
 log_timing "CRIU dump started (PID: $DUMP_PID)"
 
-# Tell replica to start (dump is running, page server will accept with retry)
-echo "START" >&"${REPLICA[1]}"
-log_timing "Sent START to replica"
+# Tell replica to start (include PID so lazy-pages knows the task)
+echo "START $PID" >&"${REPLICA[1]}"
+log_timing "Sent START $PID to replica"
 
 # Poll for replica master_link_status:up
 log_timing "Polling for master_link_status:up..."
