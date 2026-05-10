@@ -129,10 +129,6 @@ static pid_t cow_start_restore(void)
 	pid_t pid;
 	char log_path[PATH_MAX];
 	int ret;
-
-	snprintf(log_path, sizeof(log_path), "%s/lazy-restore.log",
-		 opts.imgs_dir);
-
 	char *argv[] = {
 		opts.argv_0, "restore",
 		"--images-dir", opts.imgs_dir,
@@ -146,6 +142,9 @@ static pid_t cow_start_restore(void)
 		"-v1", "-o", log_path,
 		NULL
 	};
+
+	snprintf(log_path, sizeof(log_path), "%s/lazy-restore.log",
+		 opts.imgs_dir);
 
 	ret = posix_spawn(&pid, opts.argv_0, NULL, NULL, argv, environ);
 	if (ret != 0) {
