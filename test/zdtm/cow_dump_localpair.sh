@@ -205,7 +205,7 @@ PRIMARY_DONE_COUNT_BEFORE=$(grep -c "^WORKER_DONE primary" "$IMAGES_DIR/primary.
 [ -z "$PRIMARY_DONE_COUNT_BEFORE" ] && PRIMARY_DONE_COUNT_BEFORE=0
 READY=0
 for i in $(seq 1 600); do
-	if grep -q "PAGE SERVER READY TO SERVE" "$PRIMARY_LOG" 2>/dev/null; then
+	if grep -q "Page server ready" "$PRIMARY_LOG" 2>/dev/null; then
 		echo "=== PAGE SERVER READY after $((i*100))ms ==="
 		READY=1
 		break
