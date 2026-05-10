@@ -38,7 +38,7 @@ const char *cow_get_skeleton_dir(void)
 
 static int cow_recv_skeleton_file(struct page_server_iov *pi)
 {
-	char filename[256];
+	char filename[128];
 	char path[PATH_MAX];
 	void *buf;
 	int sk = get_page_server_sk();
@@ -66,7 +66,7 @@ static int cow_recv_skeleton_file(struct page_server_iov *pi)
 		}
 	}
 
-	snprintf(path, sizeof(path), "%s/%s", cow_skeleton_dir, filename);
+	snprintf(path, sizeof(path), "%s/%.127s", cow_skeleton_dir, filename);
 
 	buf = xmalloc(file_size);
 	if (!buf)
