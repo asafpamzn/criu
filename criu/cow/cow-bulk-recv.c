@@ -29,7 +29,7 @@
 #undef LOG_PREFIX
 #define LOG_PREFIX "cow-bulk-recv: "
 
-static char cow_skeleton_dir[PATH_MAX];
+static char cow_skeleton_dir[64];
 
 const char *cow_get_skeleton_dir(void)
 {
@@ -66,7 +66,7 @@ static int cow_recv_skeleton_file(struct page_server_iov *pi)
 		}
 	}
 
-	snprintf(path, sizeof(path), "%s/%.127s", cow_skeleton_dir, filename);
+	snprintf(path, sizeof(path), "%s/%s", cow_skeleton_dir, filename);
 
 	buf = xmalloc(file_size);
 	if (!buf)
