@@ -88,7 +88,7 @@ aimed at minimizing source downtime during migration by tracking writes while
 the process continues to run.
 
 - User-facing docs: `COW_DUMP_README.md`
-- Design doc + code pointers: `COW_DUMP_DESIGN.md`
+- Design doc + code pointers: `docs/cow-dump-design.html`
 - Entry points and key files:
   - `criu/config.c` parses `--cow-dump`
   - `criu/cr-dump.c` initializes COW tracking on dump and resumes the process

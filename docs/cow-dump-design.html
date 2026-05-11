@@ -474,7 +474,7 @@
 <main>
 
 <h1>COW Dump Design Document</h1>
-<p class="meta">Generated from <code>COW_DUMP_DESIGN.md</code>. Covers the experimental COW dump path in this CRIU fork (<code>--cow-dump</code>).</p>
+<p class="meta">Covers the experimental COW dump path in this CRIU fork (<code>--cow-dump</code>).</p>
 
 <h2 id="overview">Overview</h2>
 <p>The COW (Copy-on-Write) dump implementation is an experimental feature in this CRIU fork designed to minimize source process downtime during live migration. Instead of freezing the process for the entire dump duration, COW dump uses Linux's userfaultfd write-protect (<code>UFFD_FEATURE_WP_ASYNC</code>) to track memory writes while the process continues running, enabling incremental page transfer.</p>

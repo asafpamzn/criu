@@ -136,10 +136,6 @@ int cow_send_skeleton_files(int sk)
 		if (name_len < 4 || strcmp(de->d_name + name_len - 4, ".img") != 0)
 			continue;
 
-		/* Skip pages-*.img — page data is sent over the bulk protocol */
-		if (strncmp(de->d_name, "pages-", 6) == 0)
-			continue;
-
 		snprintf(path, sizeof(path), "%s/%s", opts.imgs_dir, de->d_name);
 		if (stat(path, &st) < 0 || st.st_size == 0)
 			continue;
