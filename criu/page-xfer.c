@@ -1,4 +1,3 @@
-#include <dirent.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -52,24 +51,6 @@
 #include "cow/cow-bulk-recv.h"
 
 static int page_server_sk = -1;
-static bool bulk_stream_done = false;
-
-/* COW_TRANSFER_STREAMS defined in include/page-xfer.h */
-static int g_listen_sk = -1;	/* kept open for additional accepts */
-static int g_bulk_streams_closed;	/* count of streams that sent close */
-bool page_server_bulk_stream_done(void)
-{
-	return bulk_stream_done;
-}
-
-#define BULK_STREAM_WOULD_BLOCK 0
-#define BULK_STREAM_PROGRESS 1
-#define BULK_STREAM_COMPLETE 2
-/* No ACK on bulk close: end-of-stream marker is enough. */
-
-/* Global compression statistics for stats printing */
-static unsigned long g_compress_uncompressed_bytes = 0;
-static unsigned long g_compress_compressed_bytes = 0;
 
 
 int get_page_server_sk(void)
@@ -247,82 +228,6 @@ static inline int send_psi_flags(int sk, struct page_server_iov *pi, int flags)
 int send_psi(int sk, struct page_server_iov *pi)
 {
 	return send_psi_flags(sk, pi, 0);
-}
-
-/*
- * Send a page with LZ4 compression.
- * Protocol: header (PS_IOV_ADD_F_COMPRESS) + compressed_size (4 bytes) + compressed_data
- * Optimized: single buffer, single send() syscall
- */
-static __maybe_unused int send_page_compressed(int sk, const void *data, u64 dst_id,
-					      unsigned long vaddr)
-{
-	/* Buffer layout: [header][compressed_size][compressed_data] */
-	char send_buf[sizeof(struct page_server_iov) + sizeof(int) + LZ4_compressBound(PAGE_SIZE)];
-	struct page_server_iov *pi = (struct page_server_iov *)send_buf;
-	int *compressed_size = (int *)(send_buf + sizeof(*pi));
-	char *compressed_data = send_buf + sizeof(*pi) + sizeof(int);
-	int total_len;
-	int ret;
-
-	/* 1. Compress directly into send buffer (no memcpy!) */
-	*compressed_size = LZ4_compress_default(data, compressed_data, PAGE_SIZE, 
-						LZ4_compressBound(PAGE_SIZE));
-	if (*compressed_size <= 0) {
-		pr_err("LZ4 compression failed for page at %lx\n", vaddr);
-		return -1;
-	}
-
-	/* Track compression statistics */
-	g_compress_uncompressed_bytes += PAGE_SIZE;
-	g_compress_compressed_bytes += *compressed_size;
-
-	pr_debug("Compressed page at %lx: %lu -> %d bytes (%.1f%%)\n", 
-		 vaddr, PAGE_SIZE, *compressed_size, 
-		 (float)(*compressed_size) * 100 / PAGE_SIZE);
-
-	/* 2. Fill in header (after compression so we know it succeeded) */
-	pi->cmd = encode_ps_cmd(PS_IOV_ADD_F_COMPRESS, PE_PRESENT);
-	pi->nr_pages = 1;
-	pi->vaddr = vaddr;
-	pi->dst_id = dst_id;
-
-	/* 3. Single send: header + size + compressed data */
-	total_len = sizeof(*pi) + sizeof(int) + *compressed_size;
-	ret = __send(sk, send_buf, total_len, 0);
-	if (ret != total_len) {
-		pr_perror("Failed to send compressed page (sent %d/%d)", ret, total_len);
-		return -1;
-	}
-
-	return 0;
-}
-
-static __maybe_unused int send_page_uncompressed(int sk, const void *data,
-						 u64 dst_id,
-						 unsigned long vaddr)
-{
-	char send_buf[sizeof(struct page_server_iov) + PAGE_SIZE];
-	struct page_server_iov *pi = (struct page_server_iov *)send_buf;
-	void *payload = send_buf + sizeof(*pi);
-	int total_len;
-	int ret;
-
-	memcpy(payload, data, PAGE_SIZE);
-
-	pi->cmd = encode_ps_cmd(PS_IOV_ADD_F, PE_PRESENT);
-	pi->nr_pages = 1;
-	pi->vaddr = vaddr;
-	pi->dst_id = dst_id;
-
-	total_len = sizeof(*pi) + PAGE_SIZE;
-	ret = __send(sk, send_buf, total_len, 0);
-	if (ret != total_len) {
-		pr_perror("Failed to send page (sent %d/%d)", ret, total_len);
-		return -1;
-	}
-
-	return 0;
 }
 
 static void tcp_cork(int sk, bool on)
@@ -1094,13 +999,6 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 	int ret;
 
 	pr_debug("Transferring pages:\n");
-	
-
-	/* In COW dump mode, we need to interleave lazy VMA entries with pipe entries */
-	if (opts.cow_dump) {
-		pr_info("Writing pagemap entries (interleaved mode) for dst_id=%lu\n", 
-			(unsigned long)xfer->dst_id);
-	}
 
 	/* In COW dump mode, we need to interleave lazy VMA entries with pipe entries */
 	if (opts.cow_dump) {
@@ -1140,11 +1038,6 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 			pr_debug("\tp %p - %p\n", iov.iov_base, iov.iov_base + iov.iov_len);
 
 			flags = ppb_xfer_flags(xfer, ppb);
-			
-
-			pr_debug("Writing pagemap segment: 0x%lx-0x%lx (%lu pages)\n",
-				 (unsigned long)iov.iov_base, (unsigned long)(iov.iov_base + iov.iov_len),
-				 (unsigned long)(iov.iov_len / PAGE_SIZE));
 
 			pr_debug("Writing pagemap segment: 0x%lx-0x%lx (%lu pages)\n",
 				 (unsigned long)iov.iov_base, (unsigned long)(iov.iov_base + iov.iov_len),
@@ -1154,11 +1047,8 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 				return -1;
 			if ((flags & PE_PRESENT) && xfer->write_pages(xfer, ppb->p[0], iov.iov_len))
 				return -1;
-			
-
 		}
 	}
-	
 
 	ret = dump_holes(xfer, pp, &cur_hole, NULL);
 	if (ret)
@@ -1402,214 +1292,13 @@ static int page_server_add(int sk, struct page_server_iov *pi, u32 flags)
 
 static int page_server_get_pages(int sk, struct page_server_iov *pi)
 {
-	if (!page_request_lock_initialized) {
-		pthread_spin_init(&page_request_lock, PTHREAD_PROCESS_PRIVATE);
-		page_request_lock_initialized = true;
-	}
-}
-
-static void add_page_request(unsigned long vaddr, unsigned long nr_pages, int sk, u64 dst_id)
-{
-	struct page_request_entry *entry = xmalloc(sizeof(*entry));
-
-	if (!entry) {
-		pr_err("Failed to allocate page request entry\n");
-		return;
-	}
-
-	entry->vaddr = vaddr;
-	entry->nr_pages = nr_pages;
-	entry->sk = sk;
-	entry->dst_id = dst_id;
-	
-	pr_debug("Requesting page at %lx (nr_pages=%lu, dst_id=%lu)\n", vaddr, nr_pages, dst_id);
-	
-	/* Location will be looked up on first access */
-	entry->ppb = NULL;
-	entry->seg_idx = 0;
-	entry->page_idx_in_seg = 0;
-	entry->location_found = false;
-	
-	INIT_LIST_HEAD(&entry->list);
-
-	pthread_spin_lock(&page_request_lock);
-	list_add_tail(&entry->list, &page_request_queue);
-	pthread_spin_unlock(&page_request_lock);
-
-}
-
-static struct page_request_entry *get_next_page_request(void)
-{
-	struct page_request_entry *entry = NULL;
-
-	pthread_spin_lock(&page_request_lock);
-	if (!list_empty(&page_request_queue)) {
-		entry = list_first_entry(&page_request_queue, struct page_request_entry, list);
-		list_del(&entry->list);
-	}
-	pthread_spin_unlock(&page_request_lock);
-
-	return entry;
-}
-
-static bool has_page_requests(void)
-{
-	bool has_requests;
-
-	pthread_spin_lock(&page_request_lock);
-	has_requests = !list_empty(&page_request_queue);
-	pthread_spin_unlock(&page_request_lock);
-
-	return has_requests;
-}
-
-static unsigned long get_page_request_queue_size(void)
-{
-	unsigned long count = 0;
-	struct page_request_entry *entry;
-
-	pthread_spin_lock(&page_request_lock);
-	list_for_each_entry(entry, &page_request_queue, list) {
-		count++;
-	}
-	pthread_spin_unlock(&page_request_lock);
-
-	return count;
-}
-
-struct active_image {
-	u64 dst_id;
-	int main_sk;
-	unsigned long total_pages;
-	unsigned long remaining_pages;
-	unsigned long total_cow_pages;
-	unsigned long total_req_pages;
-	
-	struct list_head list;
-};
-
-static LIST_HEAD(active_images_queue);
-static pthread_spinlock_t active_images_lock;
-static bool active_images_lock_initialized = false;
-
-/* Single global background thread */
-static pthread_t g_unified_thread;
-static volatile bool g_unified_thread_running = false;
-static volatile bool g_unified_thread_stop = false;
-
-void wait_for_page_server_thread(void)
-{
-	if (!g_unified_thread_running)
-		return;
-	pr_info("Waiting for page server thread to finish...\n");
-	pthread_join(g_unified_thread, NULL);
-	g_unified_thread_running = false;
-	pr_info("Page server thread finished\n");
-}
-
-/* Active image tracking for unified background thread */
-
-
-static void init_active_images_queue(void)
-{
-	if (!active_images_lock_initialized) {
-		pthread_spin_init(&active_images_lock, PTHREAD_PROCESS_PRIVATE);
-		active_images_lock_initialized = true;
-	}
-}
-
-static struct active_image *find_active_image(u64 dst_id)
-{
-	struct active_image *img;
-	
-	/* Caller must hold lock */
-	list_for_each_entry(img, &active_images_queue, list) {
-		if (img->dst_id == dst_id)
-			return img;
-	}
-	return NULL;
-}
-
-static int add_active_image(u64 dst_id, int sk)
-{
-	struct active_image *img;
-	unsigned long total_pages;
-	
-	pthread_spin_lock(&active_images_lock);
-	
-	/* Check if already active */
-	if (find_active_image(dst_id)) {
-		pthread_spin_unlock(&active_images_lock);
-		pr_info("Image dst_id=%lu already active\n", dst_id);
-		return 0;
-	}
-	
-	pthread_spin_unlock(&active_images_lock);
-	
-	/* Count total pages in lazy VMAs for this dst_id (uses global list) */
-	pr_info("=== Scanning lazy VMAs for dst_id=%lu ===\n", dst_id);
-	total_pages = count_lazy_vma_pages(dst_id);
-	pr_info("=== Total lazy VMA pages: %lu ===\n", total_pages);
-	
-	if (total_pages == 0) {
-		pr_warn("Image dst_id=%lu has no lazy VMA pages\n", dst_id);
-		return 0;  /* Nothing to send */
-	}
-	
-	/* Create active image entry */
-	img = xzalloc(sizeof(*img));
-	if (!img) {
-		pr_err("Failed to allocate active image\n");
-		return -1;
-	}
-	
-	img->dst_id = dst_id;
-	img->main_sk = sk;
-	img->total_pages = total_pages;
-	img->remaining_pages = total_pages;
-	img->total_cow_pages = 0;
-	img->total_req_pages = 0;
-	
-	INIT_LIST_HEAD(&img->list);
-	
-	pthread_spin_lock(&active_images_lock);
-	list_add_tail(&img->list, &active_images_queue);
-	pthread_spin_unlock(&active_images_lock);
-	
-	pr_err("Added active image dst_id=%lu with %lu lazy VMA pages\n", 
-		dst_id, total_pages);
-	return 0;
-}
-/* Timing statistics for COW page flow (accumulated in nanoseconds, printed once/sec) */
-static struct {
-	unsigned long vma_lookup_total_ns;
-	unsigned long vma_lookup_count;
-	unsigned long send_page_total_ns;
-	unsigned long send_page_count;
-	unsigned long queue_dequeue_total_ns;
-	unsigned long queue_dequeue_count;
-	/* Sub-timing within send_lazy_vma_page (nanoseconds) */
-	unsigned long send_lock_ns;
-	unsigned long send_cow_lookup_ns;
-	unsigned long send_vm_readv_ns;
-	unsigned long send_compress_ns;
-	unsigned long send_socket_ns;
-	unsigned long send_unprotect_ns;
-	unsigned long send_unlock_ns;
-	unsigned long send_sub_count;
-} cow_timing;
-
-/* Helper to send a lazy VMA page using process_vm_readv */
-static int send_lazy_vma_page(int sk, unsigned long vaddr, u64 dst_id,
-			      pid_t source_pid)
-{
-	struct cow_page *cow_pg = NULL;
-	const void *data;
-	pthread_spinlock_t *lock = NULL;
-	char buffer[PAGE_SIZE];
+	struct pstree_item *item;
+	struct page_pipe *pp;
+	unsigned long len, nr_pages;
 	int ret;
 
-	clock_gettime(CLOCK_MONOTONIC, &t_start);
+	item = pstree_item_by_virt(pi->dst_id);
+	pp = dmpi(item)->mem_pp;
 
 	/* page_pipe_read() uses 'unsigned long *' but pi->nr_pages is u64.
 	 * Use a temporary variable to fix the incompatible pointer type
@@ -1619,8 +1308,10 @@ static int send_lazy_vma_page(int sk, unsigned long vaddr, u64 dst_id,
 	if (ret)
 		return ret;
 
-	if (cow_pg) {
-		pr_debug("[SEND_PAGE] Sending COW page at vaddr=0x%lx\n", vaddr);
+	/*
+	 * The pi is reused for send_psi here, so .nr_pages, .vaddr and
+	 * .dst_id all remain intact.
+	 */
 
 	pi->nr_pages = nr_pages;
 	if (pi->nr_pages == 0) {
@@ -1677,31 +1368,17 @@ static int page_server_serve(int sk)
 		tcp_cork(sk, true);
 	}
 
-
-	/* Initialize page request queue on first use */
-	init_page_request_queue();
-
 	while (1) {
 		struct page_server_iov pi;
 		u32 cmd;
 
 		ret = __recv(sk, &pi, sizeof(pi), MSG_WAITALL);
-
 		if (!ret)
 			break;
 
 		if (ret != sizeof(pi)) {
-			/*
-			 * After COW bulk transfer completes, the receiver
-			 * disconnects.  Treat this as success, not error.
-			 */
-			if (opts.cow_dump && !g_unified_thread_running) {
-				pr_info("Receiver disconnected after bulk transfer\n");
-				ret = 0;
-			} else {
-				pr_perror("Can't read pagemap from socket");
-				ret = -1;
-			}
+			pr_perror("Can't read pagemap from socket");
+			ret = -1;
 			break;
 		}
 
@@ -1736,7 +1413,7 @@ static int page_server_serve(int sk)
 				flags = PE_PARENT;
 			}
 
-			ret = page_server_add(sk, &pi, flags, cmd == PS_IOV_ADD_F_COMPRESS);
+			ret = page_server_add(sk, &pi, flags);
 			break;
 			}
 		case PS_IOV_CLOSE:
@@ -1782,7 +1459,7 @@ static int page_server_serve(int sk)
 			break;
 		}
 
-		if (ret){
+		if (ret)
 			break;
 		last_cmd = cmd;
 		if (pi.cmd == PS_IOV_CLOSE || pi.cmd == PS_IOV_FORCE_CLOSE)
@@ -1987,22 +1664,6 @@ int cr_page_server(bool daemon_mode, bool lazy_dump, int cfd)
 
 no_server:
 
-	/* Serve image files in background thread if requested */
-	if (opts.serve_images_port > 0) {
-		static struct { int port; const char *dir; } img_args;
-		pthread_t img_thread;
-
-		img_args.port = opts.serve_images_port;
-		img_args.dir = opts.imgs_dir;
-		if (pthread_create(&img_thread, NULL,
-				   serve_image_files_thread,
-				   &img_args) == 0) {
-			pthread_detach(img_thread);
-			pr_err("image-xfer: serving on :%d\n",
-			       opts.serve_images_port);
-		}
-	}
-
 	if (!daemon_mode && cfd >= 0) {
 		struct ps_info info = { .pid = getpid(), .port = opts.port };
 		int count;
@@ -2018,12 +1679,6 @@ no_server:
 	ret = run_tcp_server(daemon_mode, &ask, cfd, sk);
 	if (ret != 0)
 		return ret > 0 ? 0 : -1;
-
-	/* Enlarge socket buffers for throughput */
-	if (ask >= 0) {
-		int bufsize = 16 * 1024 * 1024;
-		setsockopt(ask, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
-	}
 
 	if (tls_x509_init(ask, true)) {
 		close_safe(&sk);
@@ -2064,12 +1719,6 @@ static int connect_to_page_server(void)
 
 	if (page_server_sk == -1)
 		return -1;
-
-	/* Enlarge receive buffer for throughput */
-	{
-		int bufsize = 16 * 1024 * 1024;
-		setsockopt(page_server_sk, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
-	}
 
 	if (tls_x509_init(page_server_sk, false)) {
 		close(page_server_sk);
@@ -2147,29 +1796,9 @@ struct ps_async_read {
 	void *priv;
 
 	struct list_head l;
-
-	/* Compression support */
-	int compressed_size;     /* Size of compressed data (0 = uncompressed) */
-	int compressed_rb;       /* Bytes read of compressed data */
-	char *compressed_buf;    /* Buffer for compressed data */
-	int compress_state;      /* 0=reading header, 1=reading size, 2=reading data */
 };
 
 static LIST_HEAD(async_reads);
-
-/*
- * Per-stream state for multi-TCP bulk transfers.  Each stream has its
- * own epoll_rfd, socket, and compression state machine so that the
- * receiver can process N parallel TCP streams independently.
- */
-struct bulk_stream {
-	struct epoll_rfd rfd;      /* embedded for container_of */
-	struct ps_async_read ar;   /* per-stream reader state */
-	int sk;                    /* socket fd */
-	int id;                    /* stream index for logging */
-};
-
-static struct bulk_stream bulk_streams[COW_TRANSFER_STREAMS];
 
 static inline void async_read_set_goal(struct ps_async_read *ar, unsigned long nr_pages)
 {
@@ -2197,338 +1826,6 @@ static int page_server_start_async_read(void *buf, unsigned long nr_pages, ps_as
 
 	init_ps_async_read(ar, buf, nr_pages, complete, priv);
 	list_add_tail(&ar->l, &async_reads);
-	return 0;
-}
-static struct {
-	unsigned long recv_calls;
-	unsigned long recv_would_block;
-	unsigned long recv_bytes;
-	unsigned long recv_wait_time_ns;
-	unsigned long pages_completed;
-	unsigned long decompress_calls;
-	unsigned long decompress_time_ns;
-	unsigned long callback_calls;
-	time_t last_print_time;
-} bulk_stats;
-
-/*
- * Bulk mode continuous stream reader.
- * Processes headers and pages as they arrive without correlation to requests.
- * The server's background thread sends pages continuously.
- * Supports compressed pages (PS_IOV_ADD_F_COMPRESS).
- */
-static int page_server_read_bulk_stream(struct ps_async_read *ar, int flags, int sk)
-{
-	int ret, need;
-	void *buf;
-	u32 cmd;
-
-	/* Reading header */
-	if (ar->compress_state == COMPRESS_STATE_READING_HEADER) {
-		if (ar->rb < sizeof(ar->pi)) {
-			struct timespec t_recv_start, t_recv_end;
-
-			buf = ((void *)&ar->pi) + ar->rb;
-			need = sizeof(ar->pi) - ar->rb;
-
-			clock_gettime(CLOCK_MONOTONIC, &t_recv_start);
-			bulk_stats.recv_calls++;
-			ret = __recv(sk, buf, need, flags);
-			clock_gettime(CLOCK_MONOTONIC, &t_recv_end);
-			bulk_stats.recv_wait_time_ns += (t_recv_end.tv_sec - t_recv_start.tv_sec) * 1000000000 +
-						       (t_recv_end.tv_nsec - t_recv_start.tv_nsec);
-			if (ret < 0) {
-				if (flags == MSG_DONTWAIT && (errno == EAGAIN || errno == EINTR)) {
-					bulk_stats.recv_would_block++;
-					return BULK_STREAM_WOULD_BLOCK;
-				}
-				pr_perror("Error reading header from page server");
-				return -1;
-			}
-			bulk_stats.recv_bytes += ret;
-			ar->rb += ret;
-		}
-
-		if (ar->rb == sizeof(ar->pi)) {
-			cmd = decode_ps_cmd(ar->pi.cmd);
-
-			if (ar->pi.nr_pages == 0) {
-					g_bulk_streams_closed++;
-					pr_err("End-of-stream marker (%d/%d closed)\n",
-					       g_bulk_streams_closed,
-					       COW_TRANSFER_STREAMS);
-					if (g_bulk_streams_closed >= COW_TRANSFER_STREAMS) {
-						bulk_stream_done = true;
-						/* Signal restore.sh that all
-						 * pages have been received */
-						if (opts.imgs_dir) {
-							char p[PATH_MAX];
-							int fd;
-
-							snprintf(p, sizeof(p),
-								 "%s/bulk_stream_done",
-								 opts.imgs_dir);
-							fd = open(p, O_CREAT |
-								  O_WRONLY |
-								  O_TRUNC, 0644);
-							if (fd >= 0)
-								close(fd);
-						}
-					}
-					return BULK_STREAM_COMPLETE;
-				}
-
-			if (cmd == PS_IOV_ADD_F_COMPRESS) {
-				ar->compress_state = COMPRESS_STATE_READING_SIZE;
-				ar->compressed_size = 0;
-				ar->compressed_rb = 0;
-			} else {
-				ar->compress_state = COMPRESS_STATE_READING_UNCOMPRESSED;
-				ar->goal = sizeof(ar->pi) + ar->pi.nr_pages * PAGE_SIZE;
-			}
-		}
-
-		return BULK_STREAM_PROGRESS;
-	}
-
-	/* Reading compressed size */
-	if (ar->compress_state == COMPRESS_STATE_READING_SIZE) {
-		struct timespec t_recv_start, t_recv_end;
-
-		need = sizeof(ar->compressed_size) - ar->compressed_rb;
-		buf = ((char *)&ar->compressed_size) + ar->compressed_rb;
-
-		clock_gettime(CLOCK_MONOTONIC, &t_recv_start);
-		bulk_stats.recv_calls++;
-		ret = __recv(sk, buf, need, flags);
-		clock_gettime(CLOCK_MONOTONIC, &t_recv_end);
-		bulk_stats.recv_wait_time_ns += (t_recv_end.tv_sec - t_recv_start.tv_sec) * 1000000000 +
-					       (t_recv_end.tv_nsec - t_recv_start.tv_nsec);
-		if (ret < 0) {
-			if (flags == MSG_DONTWAIT && (errno == EAGAIN || errno == EINTR)) {
-				bulk_stats.recv_would_block++;
-				return BULK_STREAM_WOULD_BLOCK;
-			}
-			pr_perror("Error reading compressed size");
-			return -1;
-		}
-		bulk_stats.recv_bytes += ret;
-		ar->compressed_rb += ret;
-
-		if (ar->compressed_rb == sizeof(ar->compressed_size)) {
-			if (ar->compressed_size <= 0 || ar->compressed_size > LZ4_compressBound(PAGE_SIZE)) {
-				pr_err("Invalid compressed size: %d\n", ar->compressed_size);
-				return -1;
-			}
-
-			ar->compressed_buf = xmalloc(ar->compressed_size);
-			if (!ar->compressed_buf) {
-				pr_err("Failed to allocate compressed buffer\n");
-				return -1;
-			}
-
-			ar->compressed_rb = 0;
-			ar->compress_state = COMPRESS_STATE_READING_COMPRESSED;
-		}
-
-		return BULK_STREAM_PROGRESS;
-	}
-
-	/* Reading compressed data */
-	if (ar->compress_state == COMPRESS_STATE_READING_COMPRESSED) {
-		struct timespec t_recv_start, t_recv_end;
-
-		need = ar->compressed_size - ar->compressed_rb;
-		buf = ar->compressed_buf + ar->compressed_rb;
-
-		clock_gettime(CLOCK_MONOTONIC, &t_recv_start);
-		bulk_stats.recv_calls++;
-		ret = __recv(sk, buf, need, flags);
-		clock_gettime(CLOCK_MONOTONIC, &t_recv_end);
-		bulk_stats.recv_wait_time_ns += (t_recv_end.tv_sec - t_recv_start.tv_sec) * 1000000000 +
-					       (t_recv_end.tv_nsec - t_recv_start.tv_nsec);
-		if (ret < 0) {
-			if (flags == MSG_DONTWAIT && (errno == EAGAIN || errno == EINTR)) {
-				bulk_stats.recv_would_block++;
-				return BULK_STREAM_WOULD_BLOCK;
-			}
-			pr_perror("Error reading compressed data");
-			xfree(ar->compressed_buf);
-			ar->compressed_buf = NULL;
-			return -1;
-		}
-		bulk_stats.recv_bytes += ret;
-		ar->compressed_rb += ret;
-
-		if (ar->compressed_rb == ar->compressed_size) {
-			int decomp_ret;
-			struct timespec t1, t2;
-
-			clock_gettime(CLOCK_MONOTONIC, &t1);
-			decomp_ret = LZ4_decompress_safe(ar->compressed_buf, ar->pages, ar->compressed_size,
-							 PAGE_SIZE);
-			clock_gettime(CLOCK_MONOTONIC, &t2);
-			bulk_stats.decompress_calls++;
-			bulk_stats.decompress_time_ns +=
-				(t2.tv_sec - t1.tv_sec) * 1000000000 + (t2.tv_nsec - t1.tv_nsec);
-			xfree(ar->compressed_buf);
-			ar->compressed_buf = NULL;
-
-			if (decomp_ret != PAGE_SIZE) {
-				pr_err("LZ4 decompression failed: expected %lu, got %d\n",
-				       PAGE_SIZE, decomp_ret);
-				return -1;
-			}
-
-			bulk_stats.callback_calls++;
-			bulk_stats.pages_completed++;
-			ret = ar->complete((int)ar->pi.dst_id, (unsigned long)ar->pi.vaddr, (int)ar->pi.nr_pages,
-					   ar->priv);
-			if (ret < 0)
-				return ret;
-
-			ar->rb = 0;
-			ar->goal = 0;
-			ar->compress_state = COMPRESS_STATE_READING_HEADER;
-			ar->compressed_size = 0;
-			ar->compressed_rb = 0;
-		}
-
-		return BULK_STREAM_PROGRESS;
-	}
-
-	/* Reading uncompressed page data */
-	if (ar->compress_state == COMPRESS_STATE_READING_UNCOMPRESSED) {
-		struct timespec t_recv_start, t_recv_end;
-
-		buf = ar->pages + (ar->rb - sizeof(ar->pi));
-		need = ar->goal - ar->rb;
-
-		clock_gettime(CLOCK_MONOTONIC, &t_recv_start);
-		bulk_stats.recv_calls++;
-		ret = __recv(sk, buf, need, flags);
-		clock_gettime(CLOCK_MONOTONIC, &t_recv_end);
-		bulk_stats.recv_wait_time_ns += (t_recv_end.tv_sec - t_recv_start.tv_sec) * 1000000000 +
-					       (t_recv_end.tv_nsec - t_recv_start.tv_nsec);
-		if (ret < 0) {
-			if (flags == MSG_DONTWAIT && (errno == EAGAIN || errno == EINTR)) {
-				bulk_stats.recv_would_block++;
-				return BULK_STREAM_WOULD_BLOCK;
-			}
-			pr_perror("Error reading uncompressed page data");
-			return -1;
-		}
-		bulk_stats.recv_bytes += ret;
-		ar->rb += ret;
-
-		if (ar->rb == ar->goal) {
-			bulk_stats.callback_calls++;
-			bulk_stats.pages_completed++;
-			ret = ar->complete((int)ar->pi.dst_id, (unsigned long)ar->pi.vaddr, (int)ar->pi.nr_pages,
-					   ar->priv);
-			if (ret < 0)
-				return ret;
-
-			ar->rb = 0;
-			ar->goal = 0;
-			ar->compress_state = COMPRESS_STATE_READING_HEADER;
-		}
-
-		return BULK_STREAM_PROGRESS;
-	}
-
-	return BULK_STREAM_PROGRESS;
-}
-
-/* Bulk stream statistics */
-
-
-static void check_and_print_bulk_stats(void)
-{
-	time_t now = time(NULL);
-	
-	if (now - bulk_stats.last_print_time >= 1) {
-		struct timespec ts;
-		struct tm *tm;
-		clock_gettime(CLOCK_REALTIME, &ts);
-		tm = localtime(&ts.tv_sec);
-		pr_debug("[BULK_RECV_STATS] [%02d:%02d:%02d.%03ld] recv=%lu block=%lu bytes=%lu recv_wait_ns=%lu pages=%lu decomp=%lu decomp_ns=%lu cb=%lu\n",
-			tm->tm_hour, tm->tm_min, tm->tm_sec, ts.tv_nsec / 1000000,
-			bulk_stats.recv_calls,
-			bulk_stats.recv_would_block,
-			bulk_stats.recv_bytes,
-			bulk_stats.recv_wait_time_ns,
-			bulk_stats.pages_completed,
-			bulk_stats.decompress_calls,
-			bulk_stats.decompress_time_ns,
-			bulk_stats.callback_calls);
-		
-		memset(&bulk_stats, 0, sizeof(bulk_stats));
-		bulk_stats.last_print_time = now;
-	}
-}
-
-static int page_server_async_read_bulk(struct epoll_rfd *f)
-{
-	struct bulk_stream *bs = container_of(f, struct bulk_stream, rfd);
-	int ret;
-
-	check_and_print_bulk_stats();
-	ret = page_server_read_bulk_stream(&bs->ar, MSG_DONTWAIT, bs->sk);
-
-	if (ret == BULK_STREAM_COMPLETE)
-		return 0;
-	return (ret < 0) ? -1 : 0;
-}
-
-static bool bulk_readers_initialized;
-
-int page_server_init_bulk_readers(void *buf, unsigned long nr_pages,
-				  ps_async_read_complete complete, void *priv)
-{
-	int i;
-
-	/*
-	 * Only initialize once.  This function is called for every
-	 * page fault, but the bulk readers must not be reset while
-	 * they are actively parsing stream data — doing so would
-	 * desynchronize the stream state machine.
-	 */
-	if (bulk_readers_initialized)
-		return 0;
-	bulk_readers_initialized = true;
-
-	for (i = 0; i < COW_TRANSFER_STREAMS; i++) {
-		struct ps_async_read *ar = &bulk_streams[i].ar;
-
-		if (bulk_streams[i].sk <= 0)
-			break;
-
-		/*
-		 * Each stream needs its own decompress buffer to avoid
-		 * overwriting another stream's data between decompress
-		 * and the UFFDIO_COPY callback.
-		 */
-		if (i == 0)
-			ar->pages = buf;
-		else {
-			ar->pages = xmalloc(PAGE_SIZE);
-			if (!ar->pages) {
-				pr_err("Failed to alloc stream %d buf\n", i);
-				return -1;
-			}
-		}
-		ar->rb = 0;
-		ar->goal = 0;
-		ar->nr_pages = nr_pages;
-		ar->complete = complete;
-		ar->priv = priv;
-		ar->compress_state = COMPRESS_STATE_READING_HEADER;
-		ar->compressed_size = 0;
-		ar->compressed_rb = 0;
-		ar->compressed_buf = NULL;
-	}
-
 	return 0;
 }
 
@@ -2613,15 +1910,12 @@ static int page_server_hangup_event(struct epoll_rfd *rfd)
 	return -1;
 }
 
+static struct epoll_rfd ps_rfd;
+
 int connect_to_page_server_to_recv(int epfd)
 {
-	int i;
-
 	if (connect_to_page_server())
 		return -1;
-	bulk_stream_done = false;
-	g_bulk_streams_closed = 0;
-	bulk_readers_initialized = false;
 
 	ps_rfd.fd = page_server_sk;
 	/* Use bulk stream reader in bulk mode, regular reader in on-demand mode */
@@ -2634,49 +1928,7 @@ int connect_to_page_server_to_recv(int epfd)
 	}
 	ps_rfd.hangup_event = page_server_hangup_event;
 
-	/* Stream 0: the main page_server_sk */
-	bulk_streams[0].sk = page_server_sk;
-	bulk_streams[0].id = 0;
-	bulk_streams[0].rfd.fd = page_server_sk;
-	if (opts.cow_dump)
-		bulk_streams[0].rfd.read_event = page_server_async_read_bulk;
-	else
-		bulk_streams[0].rfd.read_event = page_server_async_read;
-	bulk_streams[0].rfd.hangup_event = page_server_hangup_event;
-
-	if (epoll_add_rfd(epfd, &bulk_streams[0].rfd))
-		return -1;
-
-	/* Multi-TCP: additional connections for COW bulk mode */
-	if (opts.cow_dump && COW_TRANSFER_STREAMS > 1) {
-		for (i = 1; i < COW_TRANSFER_STREAMS; i++) {
-			int sk = -1, retry;
-
-			for (retry = 0; retry < 10 && sk < 0; retry++) {
-				sk = setup_tcp_client(opts.addr);
-				if (sk < 0)
-					usleep(100000);
-			}
-			if (sk < 0) {
-				pr_warn("Multi-TCP: stream %d connect failed after %d retries\n",
-					i, retry);
-				break;
-			}
-			bulk_streams[i].sk = sk;
-			bulk_streams[i].id = i;
-			bulk_streams[i].rfd.fd = sk;
-			bulk_streams[i].rfd.read_event = page_server_async_read_bulk;
-			bulk_streams[i].rfd.hangup_event = page_server_hangup_event;
-			if (epoll_add_rfd(epfd, &bulk_streams[i].rfd)) {
-				close(sk);
-				bulk_streams[i].sk = 0;
-				break;
-			}
-			pr_info("Multi-TCP: connected stream %d\n", i);
-		}
-	}
-
-	return 0;
+	return epoll_add_rfd(epfd, &ps_rfd);
 }
 
 /*

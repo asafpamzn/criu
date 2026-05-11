@@ -23,9 +23,6 @@ host-lib-y		+= src/lib/log.o
 
 lib-y			+= arch/$(ARCH)/src/lib/cpu.o
 lib-y			+= arch/$(ARCH)/src/lib/infect.o
-ifeq ($(ARCH),aarch64)
-lib-y			+= arch/$(ARCH)/src/lib/gcs.o
-endif
 lib-y			+= src/lib/infect-rpc.o
 lib-y			+= src/lib/infect-util.o
 lib-y			+= src/lib/infect.o

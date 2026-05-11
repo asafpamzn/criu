@@ -31,7 +31,6 @@
 #include "sk-inet.h"
 #include "net.h"
 #include "page-xfer.h"
-#include "image-xfer.h"
 #include "tty.h"
 #include "file-lock.h"
 #include "cr-service.h"
@@ -332,28 +331,6 @@ int main(int argc, char *argv[], char *envp[])
 	case CR_RESTORE:
 		if (opts.tree_id)
 			pr_warn("Using -t with criu restore is obsoleted\n");
-
-		/* Fetch images from source before restore if requested */
-		if (opts.fetch_images) {
-			char host[256];
-			int port;
-			char *colon = strrchr(opts.fetch_images, ':');
-			if (!colon) {
-				pr_err("--fetch-images requires HOST:PORT\n");
-				ret = -1;
-				break;
-			}
-			memcpy(host, opts.fetch_images,
-			       colon - opts.fetch_images);
-			host[colon - opts.fetch_images] = '\0';
-			port = atoi(colon + 1);
-			if (fetch_image_files(host, port,
-					      opts.imgs_dir, 120)) {
-				pr_err("Failed to fetch images\n");
-				ret = -1;
-				break;
-			}
-		}
 
 		ret = cr_restore_tasks();
 		if (ret == 0 && opts.exec_cmd) {

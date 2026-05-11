@@ -1347,7 +1347,6 @@ static int kerndat_uffd(void)
 	}
 
 	kdat.has_uffd = true;
-	kdat.has_wp_async = !!(kdat.uffd_features & UFFD_FEATURE_WP_ASYNC);
 
 	/*
 	 * we have to close the uffd and reopen in later in restorer

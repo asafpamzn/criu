@@ -1497,6 +1497,7 @@ int epoll_run_rfds(int epollfd, struct epoll_event *evs, int nr_fds, int timeout
 
 	while (1) {
 		struct timespec t_wait_start, t_wait_end;
+
 		/* Check and print stats periodically */
 		check_and_print_epoll_stats();
 

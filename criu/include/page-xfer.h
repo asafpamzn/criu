@@ -98,9 +98,6 @@ extern int open_page_xfer(struct page_xfer *xfer, int fd_type, unsigned long id)
 struct page_pipe;
 extern int page_xfer_dump_pages(struct page_xfer *, struct page_pipe *);
 extern int page_xfer_predump_pages(int pid, struct page_xfer *, struct page_pipe *);
-/* Multi-TCP: number of parallel transfer connections for COW bulk mode */
-#define COW_TRANSFER_STREAMS	8
-
 extern int connect_to_page_server_to_send(void);
 extern int connect_to_page_server_to_recv(int epfd);
 extern int remove_page_server_from_epoll(int epfd);

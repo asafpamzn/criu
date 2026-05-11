@@ -267,7 +267,6 @@ struct parasite_cow_dump_args {
 	unsigned int nr_failed_vmas;	/* Output: number of VMAs that couldn't be registered */
 	unsigned long uffd_features;	/* Input: UFFD features to request (e.g. WP or WP_ASYNC) */
 	int ret;			/* Output: return code */
-	unsigned long long uffd_features; /* Output: negotiated uffd features */
 };
 
 static inline struct parasite_vma_entry *cow_dump_vmas(struct parasite_cow_dump_args *a)

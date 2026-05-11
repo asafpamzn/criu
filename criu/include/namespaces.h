@@ -135,7 +135,6 @@ struct ns_id {
 			};
 			int nlsk;  /* for sockets collection */
 			int seqsk; /* to talk to parasite daemons */
-			bool sockets_collected; /* pre-collected before freeze */
 			struct list_head ids;
 			struct list_head links;
 			NetnsEntry *netns;
@@ -165,7 +164,6 @@ extern struct collect_image_info nsfile_cinfo;
 
 extern int walk_namespaces(struct ns_desc *nd, int (*cb)(struct ns_id *, void *), void *oarg);
 extern int collect_namespaces(bool for_dump);
-extern struct ns_id *pre_create_self_ns(struct ns_desc *nd);
 extern int collect_mnt_namespaces(bool for_dump);
 extern int dump_mnt_namespaces(void);
 extern int dump_namespaces(struct pstree_item *item, unsigned int ns_flags);

@@ -28,7 +28,6 @@ struct veth_pair {
 };
 
 extern int collect_net_namespaces(bool for_dump);
-extern int cow_pre_collect_net_sockets(void);
 
 extern int network_lock(void);
 extern void network_unlock(void);
