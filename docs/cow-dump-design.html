@@ -698,6 +698,7 @@
           <div class="phase-name">cr_dump_finish</div>
         </div>
         <ul>
+          <li>Send skeleton files (<code>PS_IOV_SKELETON_FILE</code> × N) &nbsp;→ (still frozen)</li>
           <li>Send <code>PS_IOV_ALL_PAGES_SENT</code> &nbsp;→ (still frozen)</li>
           <li>Unfreeze tasks immediately</li>
           <li>Wait for <code>PS_IOV_ALL_PAGES_SENT_ACK</code> &nbsp;← (off critical path)</li>
@@ -839,7 +840,7 @@
 
 <p><strong>Primary:</strong></p>
 <ul>
-  <li><code>cr_dump_finish</code> sends <code>PS_IOV_ALL_PAGES_SENT</code> (while still frozen), then unfreezes tasks immediately, then waits for <code>PS_IOV_ALL_PAGES_SENT_ACK</code> (off the critical freeze path), then calls <code>cow_cleanup_async_uffd()</code> (the cleanup path unregisters VMAs in chunks with 10ms yields every 10 VMAs, then closes the uffd).</li>
+  <li><code>cr_dump_finish</code> sends skeleton image files via <code>cow_send_skeleton_files()</code> (<code>PS_IOV_SKELETON_FILE</code> × N, one per <code>.img</code> file except <code>pages-*.img</code>), then sends <code>PS_IOV_ALL_PAGES_SENT</code> (all while still frozen), then unfreezes tasks immediately, then waits for <code>PS_IOV_ALL_PAGES_SENT_ACK</code> (off the critical freeze path), then calls <code>cow_cleanup_async_uffd()</code> (the cleanup path unregisters VMAs in chunks with 10ms yields every 10 VMAs, then closes the uffd).</li>
 </ul>
 
 <p><strong>Replica (serial — restore does NOT run concurrently with drain):</strong></p>
@@ -935,7 +936,7 @@
 
 <h3 id="protocol-ps-iov"><span class="channel-badge tcp">TCP</span> Page-server messages (<code>cow-page-xfer.h</code>)</h3>
 
-<p>Four message types are actively used on the page-server TCP channel. All share the same <code>struct page_server_iov</code> header; only <code>PS_IOV_ADD_F_COMPRESS</code> carries a trailing payload.</p>
+<p>Five message types are actively used on the page-server TCP channel. All share the same <code>struct page_server_iov</code> header; <code>PS_IOV_ADD_F_COMPRESS</code> and <code>PS_IOV_SKELETON_FILE</code> carry trailing payloads.</p>
 
 <table>
 <thead><tr><th>Cmd</th><th>Dir</th><th>Socket</th><th>Sent during</th><th>Purpose</th></tr></thead>
@@ -953,6 +954,13 @@
   <td>P3 (×N)</td>
   <td>Phase 2a (bulk), Phase 2b (pre-scan dirty re-sends), Phase 3 (frozen final-scan dirty + new-VMA pages)</td>
   <td>Compressed page batch. Header + 4-byte <code>compressed_size</code> + LZ4 payload.</td>
+</tr>
+<tr>
+  <td><code>PS_IOV_SKELETON_FILE</code> (20)</td>
+  <td class="proto-direction">P → R</td>
+  <td>main</td>
+  <td>Phase 3 end (frozen) — <code>cow_send_skeleton_files()</code> from <code>cr_dump_finish</code> (<code>cr-dump.c:2269</code>), sent just before <code>PS_IOV_ALL_PAGES_SENT</code></td>
+  <td>Transfers a skeleton image file (all <code>.img</code> files except <code>pages-*.img</code>) from primary to replica. Header encodes filename length in <code>nr_pages</code> and file size in <code>vaddr</code>; payload is filename bytes followed by file contents. One message per file.</td>
 </tr>
 <tr>
   <td><code>PS_IOV_ALL_PAGES_SENT</code> (16)</td>
