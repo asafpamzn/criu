@@ -7,7 +7,7 @@ with Valkey live migration.
 
 - **Two machines** (PRIMARY and REPLICA) with network connectivity
 - **Ubuntu 22.04+ or 24.04** (tested on 24.04 LTS)
-- **Linux kernel 5.7+** (for userfaultfd write-protect support)
+- **Linux kernel 6.7+** (for userfaultfd WP_ASYNC + PAGEMAP_SCAN)
 - **Shared storage** accessible from both machines (e.g., AWS FSx, NFS)
 - **SSH access** between machines
 
@@ -19,8 +19,8 @@ with Valkey live migration.
 
 ```bash
 uname -r
-# Must be >= 5.7 for userfaultfd write-protect (UFFD_FEATURE_PAGEFAULT_FLAG_WP)
-# Note: UFFD_FEATURE_WP_ASYNC is Linux 6.7+ and not enabled by default.
+# Must be >= 6.7 for both UFFD_FEATURE_WP_ASYNC (6.1+) and PAGEMAP_SCAN (6.7+)
+# Basic write-protect (UFFD_FEATURE_PAGEFAULT_FLAG_WP) is in 5.7+ but insufficient for COW mode.
 ```
 
 ### Enable Unprivileged Userfaultfd
@@ -367,7 +367,7 @@ If using AWS, ensure security groups allow:
 ./criu/criu check --feature uffd-noncoop
 
 # 2. Check kernel
-uname -r  # >= 5.7
+uname -r  # >= 6.7
 
 # 3. Check userfaultfd
 cat /proc/sys/vm/unprivileged_userfaultfd  # Should be 1

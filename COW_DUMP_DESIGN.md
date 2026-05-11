@@ -146,8 +146,10 @@ yet** — pages only accumulate in the batch buffer.
 
 ### Phase 2b — Pre-Scan + Send Dirty (Overwrite Older Pages)
 
-Gated by `COW_PRE_SCAN` (default on). Triggered when all bulk senders have
-completed.
+Gated by `COW_PRE_SCAN` (off by default; only active in
+`COW_PROFILE_SMALL`). When disabled, this phase is skipped entirely —
+scanners wait for the Phase 3 freeze signal and do a single final scan.
+When enabled, triggered after all bulk senders have completed.
 
 - `cow_start_scanner_thread()` started `COW_NUM_SCANNERS` scanner threads
   at the start of Phase 2; only the first `COW_NUM_PRE_SCANNERS` actively
@@ -211,31 +213,35 @@ still not started.
 
 Primary:
 
-- `cr_dump_finish` unfreezes tasks, sends `PS_IOV_ALL_PAGES_SENT`, waits
-  for `PS_IOV_ALL_PAGES_SENT_ACK`, then calls `cow_cleanup_async_uffd()`
-  (currently guarded by a hardcoded 15s sleep in the code; the cleanup
-  path unregisters VMAs in chunks with 10ms yields every 10 VMAs, then
-  closes the uffd).
+- `cr_dump_finish` sends `PS_IOV_ALL_PAGES_SENT` (while still frozen),
+  then unfreezes tasks immediately, then waits for
+  `PS_IOV_ALL_PAGES_SENT_ACK` (off the critical freeze path), then calls
+  `cow_cleanup_async_uffd()` (the cleanup path unregisters VMAs in chunks
+  with 10ms yields every 10 VMAs, then closes the uffd).
 
 Replica (serial — **restore does NOT run concurrently with drain**):
 
-1. `criu restore` connects to the lazy socket (`handle_lazy_accept` in
+1. Lazy-pages daemon receives `PS_IOV_ALL_PAGES_SENT` in
+   `cow_phase2_handle_pages()` and **immediately** sends
+   `PS_IOV_ALL_PAGES_SENT_ACK` back (`cow-lazy-pages.c:340-342`).
+   Primary receives the ACK after unfreezing.
+2. Lazy-pages daemon starts restore (`cow_start_restore()`). `criu restore`
+   connects to the lazy socket (`handle_lazy_accept` in
    `criu/uffd.c:1616`). Drain is **not** started here — tasks are still
    running (`criu/uffd.c:1667-1680`).
-2. Restore catches all tasks via `PTRACE_INTERRUPT`, then sends
+3. Restore catches all tasks via `PTRACE_INTERRUPT`, then sends
    `LAZY_PAGES_TASKS_FROZEN` over the lazy socket.
-3. `lazy_sk_read_event` receives `TASKS_FROZEN` and calls
+4. `lazy_sk_read_event` receives `TASKS_FROZEN` and calls
    `cow_handle_lazy_accept_post_connect()` → `cow_start_drain_thread()`
    (`criu/uffd.c:1545-1551`, `cow-uffd.c:1842-1853`). Drain threads walk
    `chunk_index` (work-stealing via `next_drain_chunk`) and issue
    `UFFDIO_COPY` for whole 1MB batches, freeing page-pool chunks as each
    empties. `EAGAIN` → retry queue; `EEXIST`/`ENOENT` → soft-handle.
-4. `cow_phase3_restore_loop` blocks on
+5. `cow_phase3_restore_loop` blocks on
    `while (cow_drain_thread_running() || cow_page_buffer_count() > 0)`
    (`criu/uffd.c:1796`). Restore only proceeds past this point after the
    batch buffer is empty.
-5. Restore unfreezes the tasks and sends `PS_IOV_ALL_PAGES_SENT_ACK` back
-   to the primary; primary closes the sockets.
+6. Restore unfreezes the tasks; sends `LAZY_PAGES_RESTORE_FINISHED`.
 
 ## Key Data Structures
 
@@ -342,18 +348,20 @@ All tunables live in `criu/include/cow/cow-conf.h`. Key constants:
 
 Thread counts are profile-gated:
 
-| Constant | `COW_PROFILE_SMALL` (default) | `COW_PROFILE_LARGE` |
+| Constant | `COW_PROFILE_SMALL` | `COW_PROFILE_LARGE` (default) |
 |---|---|---|
 | `COW_NUM_P3_THREADS` | 4 | 15 |
 | `COW_NUM_P3_THREADS_BULK` | 1 | 15 |
 | `COW_NUM_SCANNERS` | 4 | 20 |
 | `COW_NUM_PRE_SCANNERS` | 1 | 1 |
-| `COW_NUM_DRAIN_THREADS` | 4 | 10 |
+| `COW_NUM_DRAIN_THREADS` | 4 | 20 |
 | `COW_MAX_THREADS` | 16 | 33 |
 
 Notable compile-time feature flags (also in `cow-conf.h`):
 
-- `COW_PRE_SCAN` — iterative pre-freeze scan (on by default).
+- `COW_PRE_SCAN` — iterative pre-freeze scan (off by default; enabled
+  only in `COW_PROFILE_SMALL`). When disabled, scanners skip Phase 2b
+  and wait for the freeze signal, then do a single final scan.
 - `CONFIG_PAGE_STATE_TRACKER`, `CONFIG_HUNG_PAGE_TRACKER`,
   `CONFIG_COW_COMPARE`, `CONFIG_COW_COMPARE_PAGES` — diagnostics, off by
   default.
@@ -387,8 +395,8 @@ Three distinct message channels are in use:
 |---|---|---|---|---|
 | `PS_IOV_GET_ALL` (8) | R → P | main | Phase 2a start (once per task, from `cow_phase2` in `cow-lazy-pages.c:196-198`) | Replica requests bulk transfer for `dst_id`. Header-only (no payload). |
 | `PS_IOV_ADD_F_COMPRESS` (10) | P → R | P3 (×N) | Phase 2a (bulk), Phase 2b (pre-scan dirty re-sends), Phase 3 (frozen final-scan dirty + new-VMA pages) | Compressed page batch. Header + 4-byte `compressed_size` + LZ4 payload. |
-| `PS_IOV_ALL_PAGES_SENT` (16) | P → R | main | Phase 4 start — `send_all_pages_sent_signal()` from `cr_dump_finish` (`cr-dump.c:2401`) | Primary tells replica: no more pages will be sent. Replica may now transition from receiving into the drain/restore stage. Header-only. |
-| `PS_IOV_ALL_PAGES_SENT_ACK` (17) | R → P | main | When replica's Phase-2 event loop observes `cow_is_all_pages_sent_received()` (`cow-lazy-pages.c:294`) | ACK back to primary so it can close the page-server connection. Header-only. |
+| `PS_IOV_ALL_PAGES_SENT` (16) | P → R | main | Phase 4 start — `send_all_pages_sent_signal()` from `cr_dump_finish` (`cr-dump.c:2273`) | Primary tells replica: no more pages will be sent. Replica may now transition from receiving into the drain/restore stage. Header-only. |
+| `PS_IOV_ALL_PAGES_SENT_ACK` (17) | R → P | main | Immediately upon receiving `PS_IOV_ALL_PAGES_SENT` in `cow_phase2_handle_pages()` (`cow-lazy-pages.c:342`) | ACK back to primary so it can unfreeze and close. Sent by lazy-pages daemon before restore starts. Header-only. |
 
 Reserved/not used in the COW path:
 
@@ -486,6 +494,13 @@ numbers.
 ┌──────┴──────┐                           │                      │
 │  Phase 4    │  ── PS_IOV_ALL_PAGES_SENT ───►                    │
 │             │     (main sk)             │                      │
+│             │  ◄── PS_IOV_ALL_PAGES_    │                       │
+│             │        SENT_ACK ──────    │  (immediate ACK from  │
+│             │      (main sk)            │   lazy-pages daemon)  │
+│             │                           │                       │
+│             │   (primary unfreezes,     │                       │
+│             │    then receives ACK)     │                       │
+│             │                           │                       │
 │             │                           │  AF_UNIX accept       │
 │             │                           │ ◄──────────────────── │
 │             │                           │         connect       │
@@ -500,16 +515,12 @@ numbers.
 │             │                           │   drain threads       │
 │             │                           │   run: UFFDIO_COPY    │
 │             │                           │   1MB batches         │
-│             │  ◄── PS_IOV_ALL_PAGES_    │                       │
-│             │        SENT_ACK ──────    │                       │
-│             │      (main sk)            │                       │
 │             │                           │                       │
 │             │                           │   (drain done,        │
 │             │                           │    buffer empty)      │
 │             │                           │                       │
 │             │                           │ ── LAZY_PAGES_        │
 │             │                           │    DRAIN_COMPLETE ──► │
-│             │                           │                       │
 │             │                           │                       │
 │             │                           │                       │ restore
 │             │                           │                       │ unfreezes
@@ -642,8 +653,8 @@ sudo criu restore   --images-dir /images --lazy-pages
 
 1. **Single process tree**: tracking metadata is shared-global
    (`g_cow_info`, `global_lazy_vmas`).
-2. **Kernel requirements**: Linux 5.7+ for `UFFD_FEATURE_WP_ASYNC`.
-   `PAGEMAP_SCAN` (kernel 6.6+) or fallback path needed.
+2. **Kernel requirements**: Linux 6.7+ — requires both
+   `UFFD_FEATURE_WP_ASYNC` (kernel 6.1+) and `PAGEMAP_SCAN` (kernel 6.7+).
 3. **Memory overhead**: replica uses up to 512GB worth of 64MB chunks
    (`COW_MAX_POOL_CHUNKS`), refcount-freed as drain progresses.
 4. **UFFD cleanup**: page-table walks during `UFFDIO_UNREGISTER` can take

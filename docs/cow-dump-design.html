@@ -698,9 +698,9 @@
           <div class="phase-name">cr_dump_finish</div>
         </div>
         <ul>
-          <li>Unfreeze tasks</li>
-          <li>Send <code>PS_IOV_ALL_PAGES_SENT</code> &nbsp;→</li>
-          <li>Wait for <code>PS_IOV_ALL_PAGES_SENT_ACK</code> &nbsp;←</li>
+          <li>Send <code>PS_IOV_ALL_PAGES_SENT</code> &nbsp;→ (still frozen)</li>
+          <li>Unfreeze tasks immediately</li>
+          <li>Wait for <code>PS_IOV_ALL_PAGES_SENT_ACK</code> &nbsp;← (off critical path)</li>
           <li><code>cow_cleanup_async_uffd()</code></li>
           <li>Close sockets</li>
         </ul>
@@ -710,16 +710,27 @@
     <!-- Replica P4 -->
     <div class="diagram-col-cell">
       <div class="flow-box accent">
-        <h5>1. Restore connects</h5>
+        <h5>1. Immediate ACK</h5>
         <ul>
-          <li><code>handle_lazy_accept()</code> — tasks still running, <strong>no drain</strong></li>
+          <li>Lazy-pages daemon receives <code>PS_IOV_ALL_PAGES_SENT</code></li>
+          <li><strong>Immediately</strong> sends <code>PS_IOV_ALL_PAGES_SENT_ACK</code> back to primary</li>
         </ul>
       </div>
 
       <div class="flow-arrow">↓</div>
 
       <div class="flow-box accent">
-        <h5>2. Catch tasks → <code>TASKS_FROZEN</code></h5>
+        <h5>2. Restore connects</h5>
+        <ul>
+          <li><code>cow_start_restore()</code> → <code>handle_lazy_accept()</code></li>
+          <li>Tasks still running, <strong>no drain</strong></li>
+        </ul>
+      </div>
+
+      <div class="flow-arrow">↓</div>
+
+      <div class="flow-box accent">
+        <h5>3. Catch tasks → <code>TASKS_FROZEN</code></h5>
         <ul>
           <li>Restore <code>PTRACE_INTERRUPT</code>s all tasks</li>
           <li>Sends <code>LAZY_PAGES_TASKS_FROZEN</code> to lazy-pages daemon</li>
@@ -729,7 +740,7 @@
       <div class="flow-arrow">↓</div>
 
       <div class="flow-box accent">
-        <h5>3. Drain Threads start</h5>
+        <h5>4. Drain Threads start</h5>
         <ul>
           <li><code>cow_start_drain_thread()</code> on <code>TASKS_FROZEN</code> (<code>uffd.c:1545</code>)</li>
           <li>Walk <code>chunk_index</code> (work-steal via <code>next_drain_chunk</code>)</li>
@@ -741,7 +752,7 @@
       <div class="flow-arrow">↓</div>
 
       <div class="flow-box accent">
-        <h5>4. Restore waits for drain</h5>
+        <h5>5. Restore waits for drain</h5>
         <ul>
           <li><code>while (cow_drain_thread_running() || cow_page_buffer_count() &gt; 0)</code> (<code>uffd.c:1796</code>)</li>
           <li><strong>Restore does NOT run concurrently with drain</strong></li>
@@ -751,9 +762,9 @@
       <div class="flow-arrow">↓</div>
 
       <div class="flow-box accent">
-        <h5>5. Drain done → restore unfreezes</h5>
+        <h5>6. Drain done → restore unfreezes</h5>
         <ul>
-          <li>Restore unfreezes the task tree; sends <code>PS_IOV_ALL_PAGES_SENT_ACK</code> back to primary</li>
+          <li>Restore unfreezes the task tree</li>
         </ul>
       </div>
     </div>
@@ -793,7 +804,7 @@
 
 <div class="phase" id="phase2b">
 <h3>Phase 2b — Pre-Scan + Send Dirty (Overwrite Older Pages)</h3>
-<p>Gated by <code>COW_PRE_SCAN</code> (default on). Triggered when all bulk senders have completed.</p>
+<p>Gated by <code>COW_PRE_SCAN</code> (off by default; only active in <code>COW_PROFILE_SMALL</code>). When disabled, this phase is skipped entirely — scanners wait for the Phase 3 freeze signal and do a single final scan. When enabled, triggered after all bulk senders have completed.</p>
 <ul>
   <li><code>cow_start_scanner_thread()</code> started <code>COW_NUM_SCANNERS</code> scanner threads at the start of Phase 2; only the first <code>COW_NUM_PRE_SCANNERS</code> actively scan in Phase 2b, and all of them are woken once bulk is done. The rest wait directly for the freeze signal.</li>
   <li>Each scanner walks <code>global_lazy_vmas</code>, divides each VMA by pre-scanner count, and runs <code>PAGEMAP_SCAN</code> in <code>COW_PAGEMAP_SCAN_RANGE_SIZE</code> (4MB) sub-chunks with <code>PM_SCAN_WP_MATCHING</code>. The 4MB cap bounds <code>mmap_lock</code> hold time in the kernel.</li>
@@ -828,16 +839,17 @@
 
 <p><strong>Primary:</strong></p>
 <ul>
-  <li><code>cr_dump_finish</code> unfreezes tasks, sends <code>PS_IOV_ALL_PAGES_SENT</code>, waits for <code>PS_IOV_ALL_PAGES_SENT_ACK</code>, then calls <code>cow_cleanup_async_uffd()</code> (currently guarded by a hardcoded 15s sleep in the code; the cleanup path unregisters VMAs in chunks with 10ms yields every 10 VMAs, then closes the uffd).</li>
+  <li><code>cr_dump_finish</code> sends <code>PS_IOV_ALL_PAGES_SENT</code> (while still frozen), then unfreezes tasks immediately, then waits for <code>PS_IOV_ALL_PAGES_SENT_ACK</code> (off the critical freeze path), then calls <code>cow_cleanup_async_uffd()</code> (the cleanup path unregisters VMAs in chunks with 10ms yields every 10 VMAs, then closes the uffd).</li>
 </ul>
 
 <p><strong>Replica (serial — restore does NOT run concurrently with drain):</strong></p>
 <ol>
-  <li><code>criu restore</code> connects to the lazy socket (<code>handle_lazy_accept</code> in <code>criu/uffd.c:1616</code>). Drain is <strong>not</strong> started here — tasks are still running (<code>criu/uffd.c:1667-1680</code>).</li>
+  <li>Lazy-pages daemon receives <code>PS_IOV_ALL_PAGES_SENT</code> in <code>cow_phase2_handle_pages()</code> and <strong>immediately</strong> sends <code>PS_IOV_ALL_PAGES_SENT_ACK</code> back (<code>cow-lazy-pages.c:340-342</code>). Primary receives the ACK after unfreezing.</li>
+  <li>Lazy-pages daemon starts restore (<code>cow_start_restore()</code>). <code>criu restore</code> connects to the lazy socket (<code>handle_lazy_accept</code> in <code>criu/uffd.c:1616</code>). Drain is <strong>not</strong> started here — tasks are still running (<code>criu/uffd.c:1667-1680</code>).</li>
   <li>Restore catches all tasks via <code>PTRACE_INTERRUPT</code>, then sends <code>LAZY_PAGES_TASKS_FROZEN</code> over the lazy socket.</li>
   <li><code>lazy_sk_read_event</code> receives <code>TASKS_FROZEN</code> and calls <code>cow_handle_lazy_accept_post_connect()</code> → <code>cow_start_drain_thread()</code> (<code>criu/uffd.c:1545-1551</code>, <code>cow-uffd.c:1842-1853</code>). Drain threads walk <code>chunk_index</code> (work-stealing via <code>next_drain_chunk</code>) and issue <code>UFFDIO_COPY</code> for whole 1MB batches, freeing page-pool chunks as each empties. <code>EAGAIN</code> → retry queue; <code>EEXIST</code>/<code>ENOENT</code> → soft-handle.</li>
   <li><code>cow_phase3_restore_loop</code> blocks on <code>while (cow_drain_thread_running() || cow_page_buffer_count() &gt; 0)</code> (<code>criu/uffd.c:1796</code>). Restore only proceeds past this point after the batch buffer is empty.</li>
-  <li>Restore unfreezes the tasks and sends <code>PS_IOV_ALL_PAGES_SENT_ACK</code> back to the primary; primary closes the sockets.</li>
+  <li>Restore unfreezes the tasks; sends <code>LAZY_PAGES_RESTORE_FINISHED</code>.</li>
 </ol>
 </div>
 
@@ -894,20 +906,20 @@
 
 <p>Thread counts are profile-gated:</p>
 <table>
-<thead><tr><th>Constant</th><th><code>COW_PROFILE_SMALL</code> (default)</th><th><code>COW_PROFILE_LARGE</code></th></tr></thead>
+<thead><tr><th>Constant</th><th><code>COW_PROFILE_SMALL</code></th><th><code>COW_PROFILE_LARGE</code> (default)</th></tr></thead>
 <tbody>
 <tr><td><code>COW_NUM_P3_THREADS</code></td><td>4</td><td>15</td></tr>
 <tr><td><code>COW_NUM_P3_THREADS_BULK</code></td><td>1</td><td>15</td></tr>
 <tr><td><code>COW_NUM_SCANNERS</code></td><td>4</td><td>20</td></tr>
 <tr><td><code>COW_NUM_PRE_SCANNERS</code></td><td>1</td><td>1</td></tr>
-<tr><td><code>COW_NUM_DRAIN_THREADS</code></td><td>4</td><td>10</td></tr>
+<tr><td><code>COW_NUM_DRAIN_THREADS</code></td><td>4</td><td>20</td></tr>
 <tr><td><code>COW_MAX_THREADS</code></td><td>16</td><td>33</td></tr>
 </tbody>
 </table>
 
 <p>Notable compile-time feature flags (also in <code>cow-conf.h</code>):</p>
 <ul>
-  <li><code>COW_PRE_SCAN</code> — iterative pre-freeze scan (on by default).</li>
+  <li><code>COW_PRE_SCAN</code> — iterative pre-freeze scan (off by default; enabled only in <code>COW_PROFILE_SMALL</code>). When disabled, scanners skip Phase 2b and wait for the freeze signal.</li>
   <li><code>CONFIG_PAGE_STATE_TRACKER</code>, <code>CONFIG_HUNG_PAGE_TRACKER</code>, <code>CONFIG_COW_COMPARE</code>, <code>CONFIG_COW_COMPARE_PAGES</code> — diagnostics, off by default.</li>
 </ul>
 
@@ -946,15 +958,15 @@
   <td><code>PS_IOV_ALL_PAGES_SENT</code> (16)</td>
   <td class="proto-direction">P → R</td>
   <td>main</td>
-  <td>Phase 4 start — <code>send_all_pages_sent_signal()</code> from <code>cr_dump_finish</code> (<code>cr-dump.c:2401</code>)</td>
+  <td>Phase 4 start — <code>send_all_pages_sent_signal()</code> from <code>cr_dump_finish</code> (<code>cr-dump.c:2273</code>)</td>
   <td>Primary tells replica: no more pages will be sent. Replica may now transition from receiving into the drain/restore stage. Header-only.</td>
 </tr>
 <tr>
   <td><code>PS_IOV_ALL_PAGES_SENT_ACK</code> (17)</td>
   <td class="proto-direction">R → P</td>
   <td>main</td>
-  <td>When replica's Phase-2 event loop observes <code>cow_is_all_pages_sent_received()</code> (<code>cow-lazy-pages.c:294</code>)</td>
-  <td>ACK back to primary so it can close the page-server connection. Header-only.</td>
+  <td>Immediately upon receiving <code>PS_IOV_ALL_PAGES_SENT</code> in <code>cow_phase2_handle_pages()</code> (<code>cow-lazy-pages.c:342</code>)</td>
+  <td>ACK back to primary so it can unfreeze and close. Sent by lazy-pages daemon before restore starts. Header-only.</td>
 </tr>
 </tbody>
 </table>
@@ -1078,7 +1090,14 @@
   </div>
   <div class="msg col-3 local">(waiting to connect)</div>
 
-  <div class="msg col-1 local">&nbsp;</div>
+  <div class="msg span-12 accent">
+    <span class="msg-arrow">←</span>
+    <span class="channel-badge tcp">TCP</span>
+    <span class="msg-label"><code>PS_IOV_ALL_PAGES_SENT_ACK</code> &nbsp;(immediate, from lazy-pages daemon)</span>
+  </div>
+  <div class="msg col-3 local">&nbsp;</div>
+
+  <div class="msg col-1 local">primary unfreezes, receives ACK</div>
   <div class="msg span-23 local">AF_UNIX connect (restore → lazy-pages)</div>
 
   <div class="msg col-1 local">&nbsp;</div>
@@ -1095,13 +1114,6 @@
   <div class="msg col-1 local">&nbsp;</div>
   <div class="msg col-2 local">drain threads run: <code>UFFDIO_COPY</code> 1MB batches</div>
   <div class="msg col-3 local">blocked, waiting for drain</div>
-
-  <div class="msg span-12 accent">
-    <span class="msg-arrow">←</span>
-    <span class="channel-badge tcp">TCP</span>
-    <span class="msg-label"><code>PS_IOV_ALL_PAGES_SENT_ACK</code> &nbsp;(main socket)</span>
-  </div>
-  <div class="msg col-3 local">&nbsp;</div>
 
   <div class="msg col-1 local">&nbsp;</div>
   <div class="msg col-2 local">drain done, buffer empty</div>
@@ -1217,7 +1229,7 @@ sudo criu restore   --images-dir /images --lazy-pages</code></pre>
 <h2 id="limits">Known Limitations</h2>
 <ol>
   <li><strong>Single process tree</strong>: tracking metadata is shared-global (<code>g_cow_info</code>, <code>global_lazy_vmas</code>).</li>
-  <li><strong>Kernel requirements</strong>: Linux 5.7+ for <code>UFFD_FEATURE_WP_ASYNC</code>. <code>PAGEMAP_SCAN</code> (kernel 6.6+) or fallback path needed.</li>
+  <li><strong>Kernel requirements</strong>: Linux 6.7+ — requires both <code>UFFD_FEATURE_WP_ASYNC</code> (kernel 6.1+) and <code>PAGEMAP_SCAN</code> (kernel 6.7+).</li>
   <li><strong>Memory overhead</strong>: replica uses up to 512GB worth of 64MB chunks (<code>COW_MAX_POOL_CHUNKS</code>), refcount-freed as drain progresses.</li>
   <li><strong>UFFD cleanup</strong>: page-table walks during <code>UFFDIO_UNREGISTER</code> can take seconds on large memory; <code>cow_cleanup_async_uffd()</code> chunks the work and relies on close-on-exit for the rest. A hardcoded 15s sleep currently precedes cleanup (investigation outstanding).</li>
   <li><strong>Network lock skipped</strong>: COW path does not call <code>network_lock()</code>.</li>
