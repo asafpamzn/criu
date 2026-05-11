@@ -48,6 +48,13 @@ if ! valkey-cli ping &>/dev/null; then
   exit 1
 fi
 
+echo "Running CLEAN_STATE_FOR_DOLLY_SAVE..."
+CLEAN_START=$(date +%s%3N)
+valkey-cli CLEAN_STATE_FOR_DOLLY_SAVE
+CLEAN_END=$(date +%s%3N)
+CLEAN_ELAPSED=$((CLEAN_END - CLEAN_START))
+echo "[$(date '+%H:%M:%S.%3N') +${CLEAN_ELAPSED}ms] (wait_replicate) CLEAN_STATE_FOR_DOLLY_SAVE done" | sudo tee -a "$TIMING_LOG"
+
 echo "Configuring as replica of ${PRIMARY_IP}:${VALKEY_PORT}..."
 REPL_START=$(date +%s%3N)
 valkey-cli replicaof "$PRIMARY_IP" "$VALKEY_PORT"
