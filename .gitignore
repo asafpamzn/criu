@@ -36,6 +36,5 @@ include/common/config.h
 build/**
 scripts/.env
 artifacts/
-
-# Compiled page-recv binary
-tools/page-recv
+coverage-report/
+docs/

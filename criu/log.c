@@ -26,6 +26,7 @@
 
 #include "../soccr/soccr.h"
 #include "compel/log.h"
+#include <time.h>
 
 #define DEFAULT_LOGFD STDERR_FILENO
 /* Enable timestamps if verbosity is increased from default */
@@ -37,6 +38,7 @@ static unsigned int current_loglevel = DEFAULT_LOGLEVEL;
 static void vprint_on_level(unsigned int, const char *, va_list);
 
 static char buffer[LOG_BUF_LEN];
+static spinlock_t log_lock = SPINLOCK_INIT;
 static char buf_off = 0;
 /*
  * The early_log_buffer is used to store log messages before
@@ -53,8 +55,8 @@ static struct timeval start;
  * Manual buf len as sprintf will _always_ put '\0' at the end,
  * but we want a "constant" pid to be there on restore
  */
-#define TS_BUF_OFF 12
-
+#define TS_BUF_OFF 18
+#if 0
 static void timediff(struct timeval *from, struct timeval *to)
 {
 	to->tv_sec -= from->tv_sec;
@@ -65,16 +67,18 @@ static void timediff(struct timeval *from, struct timeval *to)
 		to->tv_usec += USEC_PER_SEC - from->tv_usec;
 	}
 }
-
+#endif
 static void print_ts(void)
 {
 	struct timeval t;
+	struct tm *tm;
 
 	gettimeofday(&t, NULL);
-	timediff(&start, &t);
-	snprintf(buffer, TS_BUF_OFF, "(%02u.%06u", (unsigned)t.tv_sec, (unsigned)t.tv_usec);
-	buffer[TS_BUF_OFF - 2] = ')'; /* this will overwrite the last digit if tv_sec>=100 */
-	buffer[TS_BUF_OFF - 1] = ' '; /* kill the '\0' produced by snprintf */
+	tm = localtime(&t.tv_sec);
+	snprintf(buffer, TS_BUF_OFF, "(%02d:%02d:%02d.%06u",
+		 tm->tm_hour, tm->tm_min, tm->tm_sec, (unsigned)t.tv_usec);
+	buffer[TS_BUF_OFF - 2] = ')';
+	buffer[TS_BUF_OFF - 1] = ' ';
 }
 
 int log_get_fd(void)
@@ -341,7 +345,7 @@ static void early_vprint(const char *format, unsigned int loglevel, va_list para
 		 * log levels with timestamps (>=LOG_TIMESTAMP).
 		 */
 		log_size = snprintf(early_log_buffer + early_log_buf_off, log_space,
-				    "(00.000000) ");
+				    "(00:00:00.000000) ");
 	}
 
 	if (log_size < log_space)
@@ -377,9 +381,17 @@ static void vprint_on_level(unsigned int loglevel, const char *format, va_list p
 		if (loglevel > current_loglevel)
 			return;
 		fd = log_get_fd();
-		if (current_loglevel >= LOG_TIMESTAMP)
-			print_ts();
 	}
+
+	/*
+	 * Protect the shared buffer from concurrent access by multiple
+	 * threads. Lock covers: print_ts(), vsnprintf(), write(), and
+	 * log_note_err() which all use the shared buffer.
+	 */
+	spin_lock(&log_lock);
+
+	if (loglevel != LOG_MSG && current_loglevel >= LOG_TIMESTAMP)
+		print_ts();
 
 	size = vsnprintf(buffer + buf_off, sizeof buffer - buf_off, format, params);
 	size += buf_off;
@@ -394,6 +406,8 @@ static void vprint_on_level(unsigned int loglevel, const char *format, va_list p
 	/* This is missing for messages in the early_log_buffer. */
 	if (loglevel == LOG_ERROR)
 		log_note_err(buffer + buf_off);
+
+	spin_unlock(&log_lock);
 
 	errno = _errno;
 }

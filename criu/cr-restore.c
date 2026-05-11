@@ -256,9 +256,6 @@ static int crtools_prepare_shared(void)
 	if (!files_collected() && collect_image(&inet_sk_cinfo))
 		return -1;
 
-	if (collect_binfmt_misc())
-		return -1;
-
 	if (tty_prep_fds())
 		return -1;
 
@@ -525,12 +522,12 @@ static int open_core(int pid, CoreEntry **pcore)
 
 static int open_cores(int pid, CoreEntry *leader_core)
 {
-	int i, tpid;
+	int i, j, tpid;
 	CoreEntry **cores = NULL;
 
-	cores = xmalloc(sizeof(*cores) * current->nr_threads);
+	cores = xzalloc(sizeof(*cores) * current->nr_threads);
 	if (!cores)
-		goto err;
+		return -1;
 
 	for (i = 0; i < current->nr_threads; i++) {
 		tpid = current->threads[i].ns[0].virt;
@@ -579,22 +576,31 @@ static int open_cores(int pid, CoreEntry *leader_core)
 
 	return 0;
 err:
+	for (j = 0; j < i; j++) {
+		if (cores[j] && cores[j] != leader_core)
+			core_entry__free_unpacked(cores[j], NULL);
+	}
 	xfree(cores);
 	return -1;
 }
 
 static int prepare_oom_score_adj(int value)
 {
-	int fd, ret = 0;
-	char buf[11];
+	int fd, len, ret = 0;
+	char buf[32];
 
 	fd = open_proc_rw(PROC_SELF, "oom_score_adj");
 	if (fd < 0)
 		return -1;
 
-	snprintf(buf, 11, "%d", value);
+	len = snprintf(buf, sizeof(buf), "%d", value);
+	if (len >= sizeof(buf)) {
+		pr_err("oom_score_adj value %d is too long\n", value);
+		close(fd);
+		return -1;
+	}
 
-	if (write(fd, buf, 11) < 0) {
+	if (write(fd, buf, len) < 0) {
 		pr_perror("Write %s to /proc/self/oom_score_adj failed", buf);
 		ret = -1;
 	}
@@ -641,7 +647,7 @@ static int restore_one_alive_task(int pid, CoreEntry *core)
 
 	args_len = round_up(sizeof(*ta) + sizeof(struct thread_restore_args) * current->nr_threads, page_size());
 	ta = mmap(NULL, args_len, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, 0, 0);
-	if (!ta)
+	if (ta == MAP_FAILED)
 		return -1;
 
 	memzero(ta, args_len);
@@ -825,7 +831,7 @@ static int restore_one_zombie(CoreEntry *core)
 		exit_code = 0;
 	}
 
-	exit((exit_code >> 8) & 0x7f);
+	exit((exit_code >> 8) & 0xff);
 
 	/* never reached */
 	BUG_ON(1);
@@ -1581,7 +1587,12 @@ static int __restore_task_with_children(void *_arg)
 		/* Wait prepare_userns */
 		if (restore_finish_ns_stage(CR_STATE_ROOT_TASK, CR_STATE_PREPARE_NAMESPACES) < 0)
 			goto err;
+	}
 
+	if (needs_prep_creds(current) && (prepare_userns_creds()))
+		goto err;
+
+	if (current->parent == NULL) {
 		/*
 		 * Since we don't support nesting of cgroup namespaces, let's
 		 * only set up the cgns (if it exists) in the init task.
@@ -1589,9 +1600,6 @@ static int __restore_task_with_children(void *_arg)
 		if (prepare_cgroup_namespace(current) < 0)
 			goto err;
 	}
-
-	if (needs_prep_creds(current) && (prepare_userns_creds()))
-		goto err;
 
 	/*
 	 * Call this _before_ forking to optimize cgroups
@@ -1676,6 +1684,11 @@ static int __restore_task_with_children(void *_arg)
 	restore_pgid();
 
 	if (current->parent == NULL) {
+		if (root_ns_mask & CLONE_NEWUSER)
+			/* Do this after user ns and mnt ns have been set up */
+			if (restore_userns_binfmt_misc(current))
+				goto err;
+
 		/*
 		 * Wait when all tasks passed the CR_STATE_FORKING stage.
 		 * The stage was started by criu, but now it waits for
@@ -1722,7 +1735,7 @@ static int attach_to_tasks(bool root_seized)
 	struct pstree_item *item;
 
 	for_each_pstree_item(item) {
-		int status, i;
+		int i;
 
 		if (!task_alive(item))
 			continue;
@@ -1747,6 +1760,16 @@ static int attach_to_tasks(bool root_seized)
 				pr_perror("Can't interrupt the %d task", pid);
 				return -1;
 			}
+		}
+	}
+	for_each_pstree_item(item) {
+		int status, i;
+
+		if (!task_alive(item))
+			continue;
+
+		for (i = 0; i < item->nr_threads; i++) {
+			pid_t pid = item->threads[i].real;
 
 			if (wait4(pid, &status, __WALL, NULL) != pid) {
 				pr_perror("waitpid(%d) failed", pid);
@@ -1823,41 +1846,56 @@ static int restore_rseq_cs(void)
 	return 0;
 }
 
-static int catch_tasks(bool root_seized)
+static int catch_tasks(pid_t *pids, int nr_tasks)
 {
 	struct pstree_item *item;
-	bool nobp = fault_injected(FI_NO_BREAKPOINTS) || !kdat.has_breakpoints;
+	int npids = 0;
 
 	for_each_pstree_item(item) {
-		int status, i, ret;
+		int i;
 
 		if (!task_alive(item))
 			continue;
 
-		if (item->nr_threads == 1) {
-			item->threads[0].real = item->pid->real;
-		} else {
-			if (parse_threads(item->pid->real, &item->threads, &item->nr_threads))
-				return -1;
-		}
-
 		for (i = 0; i < item->nr_threads; i++) {
 			pid_t pid = item->threads[i].real;
 
+			if (nr_tasks <= npids) {
+				pr_err("Too many threads discovered while catching tasks\n");
+				return -1;
+			}
+			pids[npids] = pid;
+			npids++;
 			if (ptrace(PTRACE_INTERRUPT, pid, 0, 0)) {
 				pr_perror("Can't interrupt the %d task", pid);
 				return -1;
 			}
+		}
+	}
+	for_each_pstree_item(item) {
+		int status, i;
+
+		if (!task_alive(item))
+			continue;
+
+		for (i = 0; i < item->nr_threads; i++) {
+			pid_t pid = item->threads[i].real;
 
 			if (wait4(pid, &status, __WALL, NULL) != pid) {
 				pr_perror("waitpid(%d) failed", pid);
 				return -1;
 			}
 
-			ret = compel_stop_pie(pid, rsti(item)->breakpoint, nobp);
-			if (ret < 0)
+			if (ptrace(PTRACE_SYSCALL, pid, NULL, NULL)) {
+				pr_perror("Unable to resume the %d process", pid);
 				return -1;
+			}
 		}
+	}
+
+	if (npids != nr_tasks) {
+		pr_err("Captured %d tasks, but %d expected\n", npids, nr_tasks);
+		return -1;
 	}
 
 	return 0;
@@ -2365,6 +2403,7 @@ static int restore_root_task(struct pstree_item *init)
 	int ret, fd, mnt_ns_fd = -1;
 	int root_seized = 0;
 	struct pstree_item *item;
+	pid_t *pids = NULL;
 
 	ret = run_scripts(ACT_PRE_RESTORE);
 	if (ret != 0) {
@@ -2583,7 +2622,10 @@ skip_ns_bouncing:
 
 	timing_stop(TIME_RESTORE);
 
-	if (catch_tasks(root_seized)) {
+	pids = xzalloc(sizeof(pid_t) * task_entries->nr_threads);
+	if (!pids)
+		goto out_kill_network_unlocked;
+	if (catch_tasks(pids, task_entries->nr_threads)) {
 		pr_err("Can't catch all tasks\n");
 		goto out_kill_network_unlocked;
 	}
@@ -2593,11 +2635,13 @@ skip_ns_bouncing:
 
 	__restore_switch_stage(CR_STATE_COMPLETE);
 
-	ret = compel_stop_on_syscall(task_entries->nr_threads, __NR(rt_sigreturn, 0), __NR(rt_sigreturn, 1));
+	ret = compel_stop_tasks_on_syscall(task_entries->nr_threads, pids, __NR(rt_sigreturn, 0), __NR(rt_sigreturn, 1));
 	if (ret) {
 		pr_err("Can't stop all tasks on rt_sigreturn\n");
 		goto out_kill_network_unlocked;
 	}
+	xfree(pids);
+	pids = NULL;
 
 	finalize_restore();
 
@@ -2833,6 +2877,7 @@ out_kill:
 	}
 
 out:
+	xfree(pids);
 	depopulate_roots_yard(mnt_ns_fd, true);
 	stop_usernsd();
 	__restore_switch_stage(CR_STATE_FAIL);
@@ -3815,7 +3860,6 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 		goto err;
 	}
 
-	task_args->breakpoint = &rsti(current)->breakpoint;
 	task_args->fault_strategy = fi_strategy;
 
 	sigemptyset(&blockmask);
@@ -3948,6 +3992,11 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 			goto err;
 		}
 
+		if (tcore->thread_core->has_timerslack_ns) {
+			thread_args[i].has_timerslack_ns = true;
+			thread_args[i].timerslack_ns = tcore->thread_core->timerslack_ns;
+		}
+
 		ret = prep_sched_info(&thread_args[i].sp, tcore->thread_core);
 		if (ret)
 			goto err;
@@ -3970,9 +4019,6 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 		else
 			strncpy(thread_args[i].comm, core->tc->comm, TASK_COMM_LEN - 1);
 		thread_args[i].comm[TASK_COMM_LEN - 1] = 0;
-
-		if (thread_args[i].pid != pid)
-			core_entry__free_unpacked(tcore, NULL);
 
 		pr_info("Thread %4d stack %8p rt_sigframe %8p\n", i, mz[i].stack, mz[i].rt_sigframe);
 	}
@@ -3998,7 +4044,13 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 
 	/* No longer need it */
 	core_entry__free_unpacked(core, NULL);
+	for (i = 0; i < current->nr_threads; i++) {
+		if (current->core[i] && current->core[i] != core)
+			core_entry__free_unpacked(current->core[i], NULL);
+	}
 	xfree(current->core);
+	xfree(siginfo_priv_nr);
+	siginfo_priv_nr = NULL;
 
 	/*
 	 * Now prepare run-time data for threads restore.

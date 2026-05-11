@@ -12,12 +12,13 @@
 #include "cr_options.h"
 #include "servicefd.h"
 #include "mem.h"
+#include "cow/cow-mem.h"
 #include "mman.h"
 #include "parasite-syscall.h"
 #include "parasite.h"
 #include "page-pipe.h"
 #include "page-xfer.h"
-#include "cow-dump.h"
+#include "cow/cow-dump.h"
 #include "log.h"
 #include "kerndat.h"
 #include "stats.h"
@@ -283,7 +284,7 @@ static bool is_stack(struct pstree_item *item, unsigned long vaddr)
  */
 
 static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct page_pipe *pp, pmc_t *pmc, u64 *pvaddr,
-			 bool has_parent, struct page_xfer *xfer)
+			 bool has_parent, struct page_xfer *xfer, bool cow_skeleton_non_lazy)
 {
 	unsigned long nr_scanned;
 	unsigned long pages[3] = {};
@@ -291,12 +292,6 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 	bool dump_all_pages;
 	int ret = 0;
 	unsigned long vma_start = *pvaddr;
-	unsigned long pages_skipped = 0;
-	struct timeval loop_start = {}, loop_checkpoint = {};
-	unsigned long should_dump_time_us = 0;
-	unsigned long pipe_add_time_us = 0;
-	unsigned long pages_processed_since_report = 0;
-	bool collect_timing = !pr_quelled(LOG_DEBUG);
 	bool cow_tracked = !opts.cow_dump ||
 			   cow_dump_is_vma_tracked(item->pid->real,
 						   vma->e->start,
@@ -314,11 +309,6 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 
 	dump_all_pages = should_dump_entire_vma(vma->e);
 
-	pr_debug("generate_iovs: VMA 0x%llx-0x%llx (start=0x%llx) dump_all=%d has_parent=%d lazy_capable=%d flags=0x%x prot=0x%x\n",
-		(unsigned long long)vma->e->start, (unsigned long long)vma->e->end,
-		(unsigned long long)vma_start, dump_all_pages, has_parent,
-		lazy_capable, vma->e->flags, vma->e->prot);
-
 	/*
 	 * COW-dump optimization: Skip expensive per-page pagemap scanning.
 	 * Create one iov for entire VMA and detect holes lazily on-demand
@@ -333,73 +323,40 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 	 */
 
 	if (opts.cow_dump && lazy_capable) {
-		struct lazy_vma_entry *lve = xmalloc(sizeof(*lve));
-		unsigned long nr_pages, bitmap_size;
-		
-		if (!lve)
-			return -1;
-		
-		/* Initialize global list on first use */
-		init_global_lazy_vmas();
-		lve->vma = vma;
-		nr_pages = vma_entry_len(vma->e) / PAGE_SIZE;
-		lve->total_pages = nr_pages;
-		
-		/* Store virtual PID to match request_all_remote_pages() which
-		 * sends lpi->pr.img_id (the vpid).
+		unsigned long nr_pages = vma_entry_len(vma->e) / PAGE_SIZE;
+
+		/*
+		 * Phase-3 skeleton dump (cow_skeleton_non_lazy): the lazy VMAs
+		 * have already been streamed by the P3 sender threads, so we
+		 * must not push their pages into the pipe again. Also do not
+		 * re-add to global_lazy_vmas — the list was built at pre-dump.
 		 */
-		lve->dst_id = vpid(item);
-		lve->source_pid = item->pid->real;
-		
-		/* Allocate sent bitmap for this VMA */
-		bitmap_size = (nr_pages + 7) / 8;
-		lve->sent_bitmap = xzalloc(bitmap_size);
-		if (!lve->sent_bitmap) {
-			xfree(lve);
-			return -1;
+		if (cow_skeleton_non_lazy) {
+			return 0;
 		}
 
-		lve->start = vma->e->start;
-		lve->end = vma->e->end;
-		
-		/* Add to global list (thread-safe) */
-		pthread_spin_lock(&lazy_vmas_lock);
-		list_add_tail(&lve->list, &global_lazy_vmas);
-		pthread_spin_unlock(&lazy_vmas_lock);
-		
-		pr_debug("Added lazy VMA 0x%llx-0x%llx to global list (%lu pages, %lu byte bitmap, dst_id=%lu, pid=%d)\n",
-			(unsigned long long)vma->e->start, (unsigned long long)vma->e->end, nr_pages, bitmap_size,
-			(unsigned long)lve->dst_id, lve->source_pid);
-		return 0;
+		/*
+		 * COW pre-dump: Add this VMA to the global lazy VMA list.
+		 * The dst_id is vpid(item) to match what the REPLICA sends
+		 * in request_all_remote_pages(img_id).
+		 *
+		 * NOTE: do NOT use xfer->dst_id here.  In local mode
+		 * (no --page-server) the page_xfer union overlaps
+		 * dst_id with the pmi/pi pointers, so xfer->dst_id
+		 * contains a raw pointer value — garbage.
+		 */
+		return cow_mem_add_lazy_vma(vma, nr_pages, vpid(item),
+					    item->pid->real);
 	}
 
-	if (collect_timing) {
-		gettimeofday(&loop_start, NULL);
-		loop_checkpoint = loop_start;
-	}
-	
 	nr_scanned = 0;
 	for (vaddr = *pvaddr; vaddr < vma->e->end; vaddr += PAGE_SIZE, nr_scanned++) {
 		unsigned int ppb_flags = 0;
 		struct page_info page_info = {};
 		int st;
 
-		if (collect_timing) {
-			struct timeval t1, t2, t_delta;
-
-			gettimeofday(&t1, NULL);
-
-			/* If dump_all_pages is true, should_dump_page is called to get pme. */
-			if (should_dump_page(pmc, vma->e, vaddr, &page_info))
-				return -1;
-
-			gettimeofday(&t2, NULL);
-			timersub(&t2, &t1, &t_delta);
-			should_dump_time_us += t_delta.tv_sec * 1000000 + t_delta.tv_usec;
-		} else {
-			if (should_dump_page(pmc, vma->e, vaddr, &page_info))
-				return -1;
-		}
+		if (should_dump_page(pmc, vma->e, vaddr, &page_info))
+			return -1;
 
 		if (!dump_all_pages && page_info.next != vaddr) {
 			vaddr = page_info.next - PAGE_SIZE;
@@ -622,7 +579,8 @@ static int detect_pid_reuse(struct pstree_item *item, struct proc_pid_stat *pps,
 
 static int generate_vma_iovs(struct pstree_item *item, struct vma_area *vma, struct page_pipe *pp,
 			     struct page_xfer *xfer, struct parasite_dump_pages_args *args, struct parasite_ctl *ctl,
-			     pmc_t *pmc, bool has_parent, bool pre_dump, int parent_predump_mode)
+			     pmc_t *pmc, bool has_parent, bool pre_dump, int parent_predump_mode,
+			     bool cow_skeleton_non_lazy)
 {
 	u64 vaddr;
 	int ret;
@@ -728,7 +686,7 @@ static int generate_vma_iovs(struct pstree_item *item, struct vma_area *vma, str
 	if (cow_lazy_opt) {
 		vaddr = vma->e->start;
 		return generate_iovs(item, vma, pp, pmc, &vaddr, has_parent,
-				     xfer);
+				     xfer, cow_skeleton_non_lazy);
 	}
 
 	if (pmc_get_map(pmc, vma))
@@ -738,7 +696,8 @@ static int generate_vma_iovs(struct pstree_item *item, struct vma_area *vma, str
 		return add_shmem_area(item->pid->real, vma->e, pmc);
 	vaddr = vma->e->start;
 again:
-	ret = generate_iovs(item, vma, pp, pmc, &vaddr, has_parent, xfer);
+	ret = generate_iovs(item, vma, pp, pmc, &vaddr, has_parent, xfer,
+			    cow_skeleton_non_lazy);
 	if (ret == -EAGAIN) {
 		BUG_ON(!(pp->flags & PP_CHUNK_MODE));
 
@@ -762,13 +721,12 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	struct page_pipe *pp;
 	struct vma_area *vma_area;
 	struct page_xfer xfer = { .parent = NULL };
-	int ret, exit_code = -1;
+	int ret = 0, exit_code = -1;
 	unsigned cpp_flags = 0;
 	unsigned long pmc_size;
 	int possible_pid_reuse = 0;
 	bool has_parent;
 	int parent_predump_mode = -1;
-	struct timeval t_start, t_checkpoint;
 	unsigned int nr_segs;
 
 	pr_info("\n");
@@ -804,15 +762,6 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 		 */
 		cpp_flags |= PP_CHUNK_MODE;
 	
-	{
-		struct timeval t_now, t_delta;
-		gettimeofday(&t_now, NULL);
-		timersub(&t_now, &t_start, &t_delta);
-		pr_err("TIMING: __parasite_dump_pages_seized startup took %ld.%06ld seconds\n",
-		       t_delta.tv_sec, t_delta.tv_usec);
-	}
-
-	gettimeofday(&t_checkpoint, NULL);
 	nr_segs = vma_area_list->nr_priv_pages;
 	if (opts.cow_dump && mdc->lazy) {
 		unsigned long pages = 0;
@@ -863,28 +812,40 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 			nr_segs = pages;
 	}
 
-	{
-		struct timeval t_now, t_delta;
-		gettimeofday(&t_now, NULL);
-		timersub(&t_now, &t_checkpoint, &t_delta);
-		pr_err("TIMING: nr_segs_calc took %ld.%06ld seconds (nr_segs=%u)\n",
-		       t_delta.tv_sec, t_delta.tv_usec, nr_segs);
-	}
-
 	pp = create_page_pipe(nr_segs, mdc->lazy ? NULL : pargs_iovs(args), cpp_flags);
 	if (!pp)
 		goto out;
 
-	{
-		struct timeval t_now, t_delta;
-		gettimeofday(&t_now, NULL);
-		timersub(&t_now, &t_checkpoint, &t_delta);
-		pr_err("TIMING: create_page_pipe took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
-	}
-
-	if (!mdc->pre_dump) {
-		struct timeval t_xfer_start, t_xfer_end, t_xfer_delta;
-		gettimeofday(&t_xfer_start, NULL);
+	/*
+	 * COW pre-dump (cow_lazy_build_only): do not open any xfer.
+	 * The VMA walk below still runs generate_vma_iovs so lazy VMAs get
+	 * registered in global_lazy_vmas (via generate_iovs -> cow_mem_add_lazy_vma).
+	 * Non-lazy VMAs that push iovs into the page pipe are discarded at
+	 * out_pp — we skip drain_pages and xfer_pages below so no pages are
+	 * read from the target process and nothing is written to disk.
+	 * All on-disk images for non-lazy VMAs are produced in Phase-3
+	 * skeleton (while frozen).
+	 */
+	if (mdc->cow_lazy_build_only) {
+		/*
+		 * Create an empty pagemap image so the replica's
+		 * discover_tasks_from_pagemaps() (cow-lazy-pages.c) can find
+		 * this task at Phase-2 startup. No page entries are written
+		 * here — Phase-3 skeleton reopens with O_DUMP|O_TRUNC and
+		 * fills in the real content.
+		 */
+		ret = open_page_xfer(&xfer, CR_FD_PAGEMAP, vpid(item));
+		if (ret < 0)
+			goto out_pp;
+		xfer.close(&xfer);
+		/* Reset xfer so later code knows it's not open */
+		memset(&xfer, 0, sizeof(xfer));
+	} else if (!mdc->pre_dump) {
+		/*
+		 * Regular dump -- create xfer object and send pages to it
+		 * right here. For pre-dumps the pp will be taken by the
+		 * caller and handled later.
+		 */
 		ret = open_page_xfer(&xfer, CR_FD_PAGEMAP, vpid(item));
 		gettimeofday(&t_xfer_end, NULL);
 		timersub(&t_xfer_end, &t_xfer_start, &t_xfer_delta);
@@ -923,19 +884,24 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 			continue;
 
 		ret = generate_vma_iovs(item, vma_area, pp, &xfer, args, ctl, &pmc, has_parent, mdc->pre_dump,
-					parent_predump_mode);
+					parent_predump_mode, mdc->cow_skeleton_non_lazy);
 		if (ret < 0)
 			goto out_xfer;
 	}
-
-	{
-		struct timeval t_now, t_delta;
-		gettimeofday(&t_now, NULL);
-		timersub(&t_now, &t_checkpoint, &t_delta);
-		pr_err("TIMING: generate_vma_iovs loop took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
-	}
 	if (mdc->lazy)
 		memcpy(pargs_iovs(args), pp->iovs, sizeof(struct iovec) * pp->free_iov);
+
+	/*
+	 * COW pre-dump (cow_lazy_build_only): bail out early. global_lazy_vmas
+	 * has been populated by generate_iovs for lazy VMAs. Non-lazy VMAs
+	 * pushed iovs into pp but we discard them — their pages will be
+	 * dumped in Phase-3 skeleton while frozen.
+	 */
+	if (mdc->cow_lazy_build_only) {
+		exit_code = 0;
+		ret = 0;
+		goto out_pp;
+	}
 
 	/*
 	 * Faking drain_pages for pre-dump here. Actual drain_pages for pre-dump
@@ -1071,9 +1037,8 @@ int parasite_dump_pages_seized(struct pstree_item *item, struct vm_area_list *vm
 	 * 9. syscall fails to copy
 	 *    data from M
 	 */
-
-	if ((!mdc->pre_dump || opts.pre_dump_mode == PRE_DUMP_SPLICE) &&
-	    pargs->nr_vmas > 0) {
+	// TODO AVI - we do not need to skip PARASITE_CMD_MPROTECT_VMAS as we skip this function entirely.
+	if (!mdc->pre_dump || opts.pre_dump_mode == PRE_DUMP_SPLICE) {
 		pargs->add_prot = PROT_READ;
 		ret = compel_rpc_call_sync(PARASITE_CMD_MPROTECT_VMAS, ctl);
 		if (ret) {
@@ -1094,8 +1059,7 @@ int parasite_dump_pages_seized(struct pstree_item *item, struct vm_area_list *vm
 		return ret;
 	}
 
-	if ((!mdc->pre_dump || opts.pre_dump_mode == PRE_DUMP_SPLICE) &&
-	    pargs->nr_vmas > 0) {
+	if (!mdc->pre_dump || opts.pre_dump_mode == PRE_DUMP_SPLICE) {
 		pargs->add_prot = 0;
 		if (compel_rpc_call_sync(PARASITE_CMD_MPROTECT_VMAS, ctl)) {
 			pr_err("Can't rollback unprotected vmas with parasite\n");

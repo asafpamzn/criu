@@ -1220,6 +1220,7 @@ int setup_tcp_server(char *type, char *addr, unsigned short *port)
 		return -1;
 	}
 
+	pr_debug("DEBUG_SOCKET: setup_tcp_server type=%s port=%u\n", type, *port);
 	pr_info("Starting %s server on port %u\n", type, *port);
 
 	sk = socket(saddr.ss_family, SOCK_STREAM, IPPROTO_TCP);
@@ -1239,7 +1240,9 @@ int setup_tcp_server(char *type, char *addr, unsigned short *port)
 		goto out;
 	}
 
-	if (listen(sk, 8)) {
+	pr_debug("DEBUG_SOCKET: Bound socket fd=%d to port %u\n", sk, *port);
+
+	if (listen(sk, 32)) {
 		pr_perror("Can't listen on %s server socket", type);
 		goto out;
 	}
@@ -1264,6 +1267,23 @@ int setup_tcp_server(char *type, char *addr, unsigned short *port)
 out:
 	close(sk);
 	return -1;
+}
+
+/* Global listening socket for accepting additional P3 connections */
+static int g_listen_sk = -1;
+
+int get_listen_socket(void)
+{
+	return g_listen_sk;
+}
+
+void close_listen_socket(void)
+{
+	pr_debug("DEBUG_SOCKET: close_listen_socket called fd=%d\n", g_listen_sk);
+	if (g_listen_sk >= 0) {
+		close(g_listen_sk);
+		g_listen_sk = -1;
+	}
 }
 
 int run_tcp_server(bool daemon_mode, int *ask, int cfd, int sk)
@@ -1311,8 +1331,8 @@ int run_tcp_server(bool daemon_mode, int *ask, int cfd, int sk)
 			goto err;
 		}
 		pr_info("Accepted connection from %s:%s\n", address, port);
-		if (!opts.cow_dump)
-			close(sk);
+		/* Keep listening socket for P3 parallel connections */
+		g_listen_sk = sk;
 	}
 
 	return 0;
@@ -1387,10 +1407,13 @@ int epoll_add_rfd(int epfd, struct epoll_rfd *rfd)
 {
 	struct epoll_event ev;
 
+	pr_err("DEBUG_FD: epoll_add_rfd fd=%d read_event=%p hangup_event=%p\n",
+	       rfd->fd, rfd->read_event, rfd->hangup_event);
+
 	ev.events = EPOLLIN | EPOLLRDHUP;
 	ev.data.ptr = rfd;
 	if (epoll_ctl(epfd, EPOLL_CTL_ADD, rfd->fd, &ev) == -1) {
-		pr_perror("epoll_ctl failed");
+		pr_perror("epoll_ctl failed for fd=%d", rfd->fd);
 		return -1;
 	}
 
@@ -1399,8 +1422,10 @@ int epoll_add_rfd(int epfd, struct epoll_rfd *rfd)
 
 int epoll_del_rfd(int epfd, struct epoll_rfd *rfd)
 {
+	pr_err("DEBUG_FD: epoll_del_rfd fd=%d\n", rfd->fd);
+
 	if (epoll_ctl(epfd, EPOLL_CTL_DEL, rfd->fd, NULL) == -1) {
-		pr_perror("epoll_ctl failed");
+		pr_perror("epoll_ctl DEL failed for fd=%d", rfd->fd);
 		return -1;
 	}
 
@@ -1411,8 +1436,11 @@ static int epoll_hangup_event(int epollfd, struct epoll_rfd *rfd)
 {
 	int ret = 0;
 
+	pr_err("DEBUG_CALLBACK: epoll_hangup_event called fd=%d\n", rfd->fd);
+
 	if (rfd->hangup_event) {
 		ret = rfd->hangup_event(rfd);
+		pr_err("DEBUG_CALLBACK: hangup_event returned %d, will remove fd=%d from epoll\n", ret, rfd->fd);
 		if (ret < 0)
 			return ret;
 	}
@@ -1420,6 +1448,7 @@ static int epoll_hangup_event(int epollfd, struct epoll_rfd *rfd)
 	if (epoll_del_rfd(epollfd, rfd))
 		return -1;
 
+	pr_err("DEBUG_CALLBACK: closing fd=%d after hangup\n", rfd->fd);
 	close_safe(&rfd->fd);
 
 	return ret;
@@ -1438,13 +1467,13 @@ static void check_and_print_epoll_stats(void)
 {
 	time_t now = time(NULL);
 	
-	if (now - epoll_stats.last_print_time >= 1) {
+	if (now - epoll_stats.last_print_time >= 60) {
 		if (epoll_stats.total_read_calls > 0 || epoll_stats.total_read_success > 0 || epoll_stats.epoll_wait_calls > 0) {
 			struct timespec ts;
 			struct tm *tm;
 			clock_gettime(CLOCK_REALTIME, &ts);
 			tm = localtime(&ts.tv_sec);
-			pr_warn("[EPOLL_STATS] [%02d:%02d:%02d.%03ld] read_calls=%lu read_success=%lu epoll_wait_calls=%lu epoll_wait_ns=%lu\n",
+			pr_info("[EPOLL_STATS] [%02d:%02d:%02d.%03ld] read_calls=%lu read_success=%lu epoll_wait_calls=%lu epoll_wait_ns=%lu\n",
 				tm->tm_hour, tm->tm_min, tm->tm_sec, ts.tv_nsec / 1000000,
 				epoll_stats.total_read_calls,
 				epoll_stats.total_read_success,
@@ -1459,7 +1488,7 @@ static void check_and_print_epoll_stats(void)
 }
 
 extern void check_and_print_uffd_stats(void);
-extern int process_eagain_requests(void);
+extern int cow_process_eagain_requests(void);
 
 int epoll_run_rfds(int epollfd, struct epoll_event *evs, int nr_fds, int timeout)
 {
@@ -1468,33 +1497,36 @@ int epoll_run_rfds(int epollfd, struct epoll_event *evs, int nr_fds, int timeout
 
 	while (1) {
 		struct timespec t_wait_start, t_wait_end;
-		
 		/* Check and print stats periodically */
 		check_and_print_epoll_stats();
 
 			/* Check and print statistics every second */
 		check_and_print_uffd_stats();
 
-		/* In COW dump mode, process pending EAGAIN requests
-		 * and check if critical pages are ready */
+		/* In COW dump mode, process pending EAGAIN requests */
 		if (opts.cow_dump) {
-			extern void check_critical_pages_ready(void);
-			ret = process_eagain_requests();
-			if (ret < 0)
+			ret = cow_process_eagain_requests();
+			if (ret < 0) {
+				pr_err("DEBUG_EPOLL: cow_process_eagain_requests returned %d\n", ret);
 				goto out;
-			check_critical_pages_ready();
+			}
 		}
-		
+
 		clock_gettime(CLOCK_MONOTONIC, &t_wait_start);
-		ret = epoll_wait(epollfd, evs, nr_fds, 10);
+
+		/* Use passed-in timeout, default to 1000ms if not specified */
+		ret = epoll_wait(epollfd, evs, nr_fds, timeout > 0 ? timeout : 1000);
 		clock_gettime(CLOCK_MONOTONIC, &t_wait_end);
 		epoll_stats.epoll_wait_calls++;
 		epoll_stats.epoll_wait_time_ns += (t_wait_end.tv_sec - t_wait_start.tv_sec) * 1000000000 + (t_wait_end.tv_nsec - t_wait_start.tv_nsec);
-		
+
 		if (ret <= 0) {
-			if (ret < 0)
+			if (ret < 0) {
 				pr_perror("polling failed");
-			break;
+				break;
+			}
+			/* Timeout - return 0 so caller can check exit conditions */
+			return 0;
 		}
 
 		nr_events = ret;
@@ -1506,10 +1538,14 @@ int epoll_run_rfds(int epollfd, struct epoll_event *evs, int nr_fds, int timeout
 			events = evs[i].events;
 
 			if (events & EPOLLIN) {
+				/* Print every event when timeout is small (restore_finished) */
 				epoll_stats.total_read_calls++;
 				ret = rfd->read_event(rfd);
-				if (ret < 0)
+
+				if (ret < 0) {
+					pr_err("DEBUG_EPOLL: read_event failed fd=%d ret=%d\n", rfd->fd, ret);
 					goto out;
+				}
 				if (ret > 0) {
 					epoll_stats.total_read_success++;
 					have_a_break = true;
@@ -1517,6 +1553,7 @@ int epoll_run_rfds(int epollfd, struct epoll_event *evs, int nr_fds, int timeout
 			}
 
 			if (events & (EPOLLHUP | EPOLLRDHUP)) {
+				pr_err("DEBUG_CALLBACK: EPOLLHUP/EPOLLRDHUP detected fd=%d events=0x%x\n", rfd->fd, events);
 				ret = epoll_hangup_event(epollfd, rfd);
 				if (ret < 0)
 					goto out;

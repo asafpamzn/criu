@@ -6,6 +6,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <sched.h>
+#include <signal.h>
 
 #include <fcntl.h>
 
@@ -53,6 +54,13 @@ void flush_early_log_to_stderr(void) __attribute__((destructor));
 void flush_early_log_to_stderr(void)
 {
 	flush_early_log_buffer(STDERR_FILENO);
+}
+
+static void crash_handler(int sig)
+{
+	pr_err("CRIU crashed with signal %d (%s)\n", sig, strsignal(sig));
+	print_stack_trace(getpid());
+	_exit(128 + sig);
 }
 
 static int image_dir_mode(void)
@@ -183,6 +191,11 @@ int main(int argc, char *argv[], char *envp[])
 		pr_perror("Failed to set a SIGPIPE signal ignore.");
 		return 1;
 	}
+
+	/* Install crash handler to print backtrace on fatal signals */
+	signal(SIGSEGV, crash_handler);
+	signal(SIGBUS, crash_handler);
+	signal(SIGABRT, crash_handler);
 
 	cmd = argv[optind];
 	ret = parse_criu_mode(argc, argv, &optind);
@@ -544,6 +557,8 @@ usage:
 	       "  --skip-file-rwx-check\n"
 	       "			Skip checking file permissions\n"
 	       "			(r/w/x for u/g/o) on restore.\n"
+	       "  --skip-file-size-check\n"
+	       "			Skip checking file size on restore.\n"
 	       "\n"
 	       "Check options:\n"
 	       "  Without options, \"criu check\" checks availability of absolutely required\n"

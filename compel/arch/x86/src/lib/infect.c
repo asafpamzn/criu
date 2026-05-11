@@ -17,6 +17,7 @@
 #include <compel/plugins/std/syscall-codes.h>
 #include <compel/plugins/std/syscall.h>
 #include "common/err.h"
+#include "common/page.h"
 #include "asm/infect-types.h"
 #include "ptrace.h"
 #include "infect.h"
@@ -632,70 +633,6 @@ int arch_fetch_sas(struct parasite_ctl *ctl, struct rt_sigframe *s)
 	return err ? err : ret;
 }
 
-/* Copied from the gdb header gdb/nat/x86-dregs.h */
-
-/* Debug registers' indices.  */
-#define DR_FIRSTADDR 0
-#define DR_LASTADDR  3
-#define DR_NADDR     4 /* The number of debug address registers.  */
-#define DR_STATUS    6 /* Index of debug status register (DR6).  */
-#define DR_CONTROL   7 /* Index of debug control register (DR7).  */
-
-#define DR_LOCAL_ENABLE_SHIFT  0 /* Extra shift to the local enable bit.  */
-#define DR_GLOBAL_ENABLE_SHIFT 1 /* Extra shift to the global enable bit.  */
-#define DR_ENABLE_SIZE	       2 /* Two enable bits per debug register.  */
-
-/* Locally enable the break/watchpoint in the I'th debug register.  */
-#define X86_DR_LOCAL_ENABLE(i) (1 << (DR_LOCAL_ENABLE_SHIFT + DR_ENABLE_SIZE * (i)))
-
-int ptrace_set_breakpoint(pid_t pid, void *addr)
-{
-	k_rtsigset_t block;
-	int ret;
-
-	/* Set a breakpoint */
-	if (ptrace(PTRACE_POKEUSER, pid, offsetof(struct user, u_debugreg[DR_FIRSTADDR]), addr)) {
-		pr_perror("Unable to setup a breakpoint into %d", pid);
-		return -1;
-	}
-
-	/* Enable the breakpoint */
-	if (ptrace(PTRACE_POKEUSER, pid, offsetof(struct user, u_debugreg[DR_CONTROL]),
-		   X86_DR_LOCAL_ENABLE(DR_FIRSTADDR))) {
-		pr_perror("Unable to enable the breakpoint for %d", pid);
-		return -1;
-	}
-
-	/*
-	 * FIXME(issues/1429): SIGTRAP can't be blocked, otherwise its handler
-	 * will be reset to the default one.
-	 */
-	ksigfillset(&block);
-	ksigdelset(&block, SIGTRAP);
-	if (ptrace(PTRACE_SETSIGMASK, pid, sizeof(k_rtsigset_t), &block)) {
-		pr_perror("Can't block signals for %d", pid);
-		return -1;
-	}
-	ret = ptrace(PTRACE_CONT, pid, NULL, NULL);
-	if (ret) {
-		pr_perror("Unable to restart the  stopped tracee process %d", pid);
-		return -1;
-	}
-
-	return 1;
-}
-
-int ptrace_flush_breakpoints(pid_t pid)
-{
-	/* Disable the breakpoint */
-	if (ptrace(PTRACE_POKEUSER, pid, offsetof(struct user, u_debugreg[DR_CONTROL]), 0)) {
-		pr_perror("Unable to disable the breakpoint for %d", pid);
-		return -1;
-	}
-
-	return 0;
-}
-
 int ptrace_get_regs(pid_t pid, user_regs_struct_t *regs)
 {
 	struct iovec iov;
@@ -738,7 +675,9 @@ int ptrace_set_regs(pid_t pid, user_regs_struct_t *regs)
 	return ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
 }
 
-#define TASK_SIZE ((1UL << 47) - PAGE_SIZE)
+#define TASK_SIZE_47 ((1UL << 47) - PAGE_SIZE)
+#define TASK_SIZE_56 ((1UL << 56) - PAGE_SIZE)
+
 /*
  * Task size may be limited to 3G but we need a
  * higher limit, because it's backward compatible.
@@ -747,7 +686,23 @@ int ptrace_set_regs(pid_t pid, user_regs_struct_t *regs)
 
 unsigned long compel_task_size(void)
 {
-	return TASK_SIZE;
+	void *addr;
+
+	/*
+	 * On x86-64, task_size is either (1UL << 47) for 4-level paging
+	 * or (1UL << 56) for 5-level paging.
+	 */
+	addr = mmap((void *)(TASK_SIZE_47), page_size(), PROT_NONE,
+		    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+		    -1, 0);
+	if (addr != MAP_FAILED) {
+		munmap(addr, page_size());
+		return TASK_SIZE_56;
+	}
+	if (errno == EEXIST)
+		return TASK_SIZE_56;
+
+	return TASK_SIZE_47;
 }
 
 bool __compel_shstk_enabled(user_fpregs_struct_t *ext_regs)
@@ -761,7 +716,7 @@ bool __compel_shstk_enabled(user_fpregs_struct_t *ext_regs)
 	return false;
 }
 
-int parasite_setup_shstk(struct parasite_ctl *ctl, user_fpregs_struct_t *ext_regs)
+int parasite_setup_shstk(struct parasite_ctl *ctl, __maybe_unused user_fpregs_struct_t *ext_regs)
 {
 	pid_t pid = ctl->rpid;
 	unsigned long sa_restorer = ctl->parasite_ip;

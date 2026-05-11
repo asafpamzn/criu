@@ -360,11 +360,6 @@ static dev_t get_host_dev(unsigned int which)
 			.path	= "/dev",
 			.magic	= TMPFS_MAGIC,
 		},
-		[KERNDAT_FS_STAT_BINFMT_MISC] = {
-			.name	= "binfmt_misc",
-			.path	= "/proc/sys/fs/binfmt_misc",
-			.magic	= BINFMTFS_MAGIC,
-		},
 	};
 
 	if (which >= KERNDAT_FS_STAT_MAX) {
@@ -1756,83 +1751,6 @@ static int kerndat_has_timer_cr_ids(void)
 	return 0;
 }
 
-static void breakpoint_func(void)
-{
-	if (raise(SIGSTOP))
-		pr_perror("Unable to kill itself with SIGSTOP");
-	exit(1);
-}
-
-/*
- * kerndat_breakpoints checks that hardware breakpoints work as they should.
- * In some cases, they might not work in virtual machines if the hypervisor
- * doesn't virtualize them. For example, they don't work in AMD SEV virtual
- * machines if the Debug Virtualization extension isn't supported or isn't
- * enabled in SEV_FEATURES.
- */
-static int kerndat_breakpoints(void)
-{
-	int status, ret, exit_code = -1;
-	pid_t pid;
-
-	pid = fork();
-	if (pid == -1) {
-		pr_perror("fork");
-		return -1;
-	}
-	if (pid == 0) {
-		if (ptrace(PTRACE_TRACEME, 0, 0, 0)) {
-			pr_perror("ptrace(PTRACE_TRACEME)");
-			exit(1);
-		}
-		raise(SIGSTOP);
-		breakpoint_func();
-		exit(1);
-	}
-	if (waitpid(pid, &status, 0) == -1) {
-		pr_perror("waitpid for initial stop");
-		goto err;
-	}
-	if (!WIFSTOPPED(status) || WSTOPSIG(status) != SIGSTOP) {
-		pr_err("Child didn't stop as expected: status=%x\n", status);
-		goto err;
-	}
-	ret = ptrace_set_breakpoint(pid, &breakpoint_func);
-	if (ret < 0) {
-		pr_err("Failed to set breakpoint\n");
-		goto err;
-	}
-	if (ret == 0) {
-		pr_debug("Hardware breakpoints appear to be disabled\n");
-		goto out;
-	}
-	if (waitpid(pid, &status, 0) == -1) {
-		pr_perror("waitpid for breakpoint trigger");
-		goto err;
-	}
-	if (!WIFSTOPPED(status) || WSTOPSIG(status) != SIGTRAP) {
-		pr_warn("Hardware breakpoints don't seem to work (status=%x)\n", status);
-		goto out;
-	}
-	kdat.has_breakpoints = true;
-out:
-	exit_code = 0;
-err:
-	if (kill(pid, SIGKILL)) {
-		pr_perror("Failed to kill the child process");
-		exit_code = -1;
-	}
-	if (waitpid(pid, &status, 0) == -1) {
-		pr_perror("Failed to wait for the child process");
-		exit_code = -1;
-	}
-	if (!WIFSIGNALED(status) || WTERMSIG(status) != SIGKILL) {
-		pr_err("The child exited with unexpected code: %x\n", status);
-		exit_code = -1;
-	}
-	return exit_code;
-}
-
 static int kerndat_has_madv_guard(void)
 {
 	void *map;
@@ -1866,6 +1784,92 @@ void kerndat_warn_about_madv_guards(void)
 		pr_warn("ioctl(PAGEMAP_SCAN) doesn't support PAGE_IS_GUARD flag. "
 			"CRIU dump will fail if dumped processes use madvise(MADV_GUARD_INSTALL). "
 			"Please, consider updating your kernel.\n");
+}
+
+/* Keep the fd open so that it can be closed by the caller (required by the parent process) */
+static int __mount_and_stat_detached_binfmt_misc(struct stat *st, int *mnt_fd)
+{
+	int fd;
+
+	fd = mount_detached_fs("binfmt_misc");
+	if (fd < 0) {
+		/* Most likely a permission error, so we can't use binfmt_misc */
+		return 1;
+	}
+
+	if (fstat(fd, st) < 0) {
+		pr_perror("Failed to stat a binfmt_misc mountpoint");
+		close(fd);
+		return -1;
+	}
+
+	*mnt_fd = fd;
+
+	return 0;
+}
+
+struct has_binfmt_misc_arg {
+	dev_t st_dev;
+	bool has;
+};
+
+static int __has_binfmt_misc_sandboxing(void *arg)
+{
+	struct has_binfmt_misc_arg *has_arg = (struct has_binfmt_misc_arg *)arg;
+	struct stat st;
+	int ret, mnt_fd;
+
+	if (unshare(CLONE_NEWNS | CLONE_NEWUSER)) {
+		pr_perror("Failed to unshare namespaces");
+		return 1;
+	}
+
+	ret = __mount_and_stat_detached_binfmt_misc(&st, &mnt_fd);
+	if (ret < 0) {
+		return 1;
+	} else if (ret == 1) {
+		has_arg->has = false;
+		return 0;
+	}
+
+	if (has_arg->st_dev != st.st_dev)
+		has_arg->has = true;
+	else
+		has_arg->has = false;
+
+	close(mnt_fd);
+
+	return 0;
+}
+
+static int kerndat_has_binfmt_misc_sandboxing(void)
+{
+	int ret, mnt_fd;
+	struct stat st;
+	struct has_binfmt_misc_arg arg;
+
+	ret = __mount_and_stat_detached_binfmt_misc(&st, &mnt_fd);
+	if (ret < 0) {
+		return -1;
+	} else if (ret == 1) {
+		arg.has = false;
+		goto out;
+	}
+
+	arg.st_dev = st.st_dev;
+
+	ret = call_in_child_process(__has_binfmt_misc_sandboxing, (void *)&arg);
+	close(mnt_fd);
+	if (ret < 0) {
+		pr_err("Failed to check binfmt_misc sandboxing support in child process\n");
+		return -1;
+	}
+
+out:
+	pr_info("binfmt_misc sandboxing is %s supported\n", arg.has ? "" : "not");
+	kdat.has_binfmt_misc_sandboxing = arg.has;
+
+	return 0;
 }
 
 /*
@@ -2133,12 +2137,12 @@ int kerndat_init(void)
 		pr_err("kerndat_has_timer_cr_ids has failed when initializing kerndat.\n");
 		ret = -1;
 	}
-	if (!ret && kerndat_breakpoints()) {
-		pr_err("kerndat_breakpoints has failed when initializing kerndat.\n");
-		ret = -1;
-	}
 	if (!ret && kerndat_has_madv_guard()) {
 		pr_err("kerndat_has_madv_guard has failed when initializing kerndat.\n");
+		ret = -1;
+	}
+	if (!ret && kerndat_has_binfmt_misc_sandboxing()) {
+		pr_err("kerndat_has_binfmt_misc_sandboxing has failed when initializing kerndat.\n");
 		ret = -1;
 	}
 

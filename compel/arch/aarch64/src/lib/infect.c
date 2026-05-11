@@ -2,8 +2,8 @@
 #include <sys/ptrace.h>
 #include <sys/types.h>
 #include <sys/uio.h>
+#include <sys/auxv.h>
 #include <asm/ptrace.h>
-#include <linux/elf.h>
 
 #include <compel/plugins/std/syscall-codes.h>
 #include "common/page.h"
@@ -12,7 +12,8 @@
 #include "errno.h"
 #include "infect.h"
 #include "infect-priv.h"
-#include "asm/breakpoints.h"
+#include "asm/gcs-types.h"
+#include <linux/prctl.h>
 
 unsigned __page_size = 0;
 unsigned __page_shift = 0;
@@ -33,11 +34,28 @@ static inline void __always_unused __check_code_syscall(void)
 	BUILD_BUG_ON(!is_log2(sizeof(code_syscall)));
 }
 
+bool __compel_host_supports_gcs(void)
+{
+	unsigned long hwcap = getauxval(AT_HWCAP);
+	return (hwcap & HWCAP_GCS) != 0;
+}
+
+static bool __compel_gcs_enabled(struct cr_user_gcs *gcs)
+{
+	if (!compel_host_supports_gcs())
+		return false;
+
+	return gcs && (gcs->features_enabled & PR_SHADOW_STACK_ENABLE) != 0;
+}
+
 int sigreturn_prep_regs_plain(struct rt_sigframe *sigframe, user_regs_struct_t *regs, user_fpregs_struct_t *fpregs)
 {
 	struct fpsimd_context *fpsimd = RT_SIGFRAME_FPU(sigframe);
+	struct gcs_context *gcs = RT_SIGFRAME_GCS(sigframe);
 
 	memcpy(sigframe->uc.uc_mcontext.regs, regs->regs, sizeof(regs->regs));
+
+	pr_debug("sigreturn_prep_regs_plain: sp %lx pc %lx\n", (long)regs->sp, (long)regs->pc);
 
 	sigframe->uc.uc_mcontext.sp = regs->sp;
 	sigframe->uc.uc_mcontext.pc = regs->pc;
@@ -51,6 +69,19 @@ int sigreturn_prep_regs_plain(struct rt_sigframe *sigframe, user_regs_struct_t *
 	fpsimd->head.magic = FPSIMD_MAGIC;
 	fpsimd->head.size = sizeof(*fpsimd);
 
+	if (__compel_gcs_enabled(&fpregs->gcs)) {
+		gcs->head.magic = GCS_MAGIC;
+		gcs->head.size = sizeof(*gcs);
+		gcs->reserved = 0;
+		gcs->gcspr = fpregs->gcs.gcspr_el0 - 8;
+		gcs->features_enabled = fpregs->gcs.features_enabled;
+
+		pr_debug("sigframe gcspr=%llx features_enabled=%llx\n", fpregs->gcs.gcspr_el0 - 8, fpregs->gcs.features_enabled);
+	} else {
+		pr_debug("sigframe gcspr=[disabled]\n");
+		memset(gcs, 0, sizeof(*gcs));
+	}
+
 	return 0;
 }
 
@@ -59,7 +90,7 @@ int sigreturn_prep_fpu_frame_plain(struct rt_sigframe *sigframe, struct rt_sigfr
 	return 0;
 }
 
-int compel_get_task_regs(pid_t pid, user_regs_struct_t *regs, user_fpregs_struct_t *fpsimd, save_regs_t save,
+int compel_get_task_regs(pid_t pid, user_regs_struct_t *regs, user_fpregs_struct_t *ext_regs, save_regs_t save,
 			 void *arg, __maybe_unused unsigned long flags)
 {
 	struct iovec iov;
@@ -74,14 +105,28 @@ int compel_get_task_regs(pid_t pid, user_regs_struct_t *regs, user_fpregs_struct
 		goto err;
 	}
 
-	iov.iov_base = fpsimd;
-	iov.iov_len = sizeof(*fpsimd);
+	iov.iov_base = &ext_regs->fpstate;
+	iov.iov_len = sizeof(ext_regs->fpstate);
 	if ((ret = ptrace(PTRACE_GETREGSET, pid, NT_PRFPREG, &iov))) {
 		pr_perror("Failed to obtain FPU registers for %d", pid);
 		goto err;
 	}
 
-	ret = save(pid, arg, regs, fpsimd);
+	memset(&ext_regs->gcs, 0, sizeof(ext_regs->gcs));
+
+	iov.iov_base = &ext_regs->gcs;
+	iov.iov_len = sizeof(ext_regs->gcs);
+	if (ptrace(PTRACE_GETREGSET, pid, NT_ARM_GCS, &iov) == 0) {
+		pr_info("gcs: GCSPR_EL0 for %d: 0x%llx, features: 0x%llx\n",
+			pid, ext_regs->gcs.gcspr_el0, ext_regs->gcs.features_enabled);
+
+		if (!__compel_gcs_enabled(&ext_regs->gcs))
+			pr_info("gcs: GCS is NOT enabled\n");
+	} else {
+		pr_info("gcs: GCS state not available for %d\n", pid);
+	}
+
+	ret = save(pid, arg, regs, ext_regs);
 err:
 	return ret;
 }
@@ -90,14 +135,44 @@ int compel_set_task_ext_regs(pid_t pid, user_fpregs_struct_t *ext_regs)
 {
 	struct iovec iov;
 
+	struct cr_user_gcs gcs;
+	struct iovec gcs_iov = { .iov_base = &gcs, .iov_len = sizeof(gcs) };
+
 	pr_info("Restoring GP/FPU registers for %d\n", pid);
 
-	iov.iov_base = ext_regs;
-	iov.iov_len = sizeof(*ext_regs);
+	iov.iov_base = &ext_regs->fpstate;
+	iov.iov_len = sizeof(ext_regs->fpstate);
 	if (ptrace(PTRACE_SETREGSET, pid, NT_PRFPREG, &iov)) {
 		pr_perror("Failed to set FPU registers for %d", pid);
 		return -1;
 	}
+
+	if (ptrace(PTRACE_GETREGSET, pid, NT_ARM_GCS, &gcs_iov) < 0) {
+		pr_info("gcs: Failed to get GCS for %d\n", pid);
+	} else {
+		ext_regs->gcs = gcs;
+		compel_set_task_gcs_regs(pid, ext_regs);
+	}
+
+	return 0;
+}
+
+int compel_set_task_gcs_regs(pid_t pid, user_fpregs_struct_t *ext_regs)
+{
+	struct iovec iov;
+
+	pr_info("gcs: restoring GCS registers for %d\n", pid);
+	pr_info("gcs: restoring GCS: gcspr=%llx features=%llx\n",
+		ext_regs->gcs.gcspr_el0, ext_regs->gcs.features_enabled);
+
+	iov.iov_base = &ext_regs->gcs;
+	iov.iov_len = sizeof(ext_regs->gcs);
+
+	if (ptrace(PTRACE_SETREGSET, pid, NT_ARM_GCS, &iov)) {
+		pr_perror("gcs: Failed to set GCS registers for %d", pid);
+		return -1;
+	}
+
 	return 0;
 }
 
@@ -179,110 +254,67 @@ unsigned long compel_task_size(void)
 	return task_size;
 }
 
-static struct hwbp_cap *ptrace_get_hwbp_cap(pid_t pid)
+int inject_gcs_cap_token(struct parasite_ctl *ctl, pid_t pid, struct cr_user_gcs *gcs)
 {
-	static struct hwbp_cap info;
-	static int available = -1;
+	struct iovec gcs_iov = { .iov_base = gcs, .iov_len = sizeof(*gcs) };
 
-	if (available == -1) {
-		unsigned int val;
-		struct iovec iovec = {
-			.iov_base = &val,
-			.iov_len = sizeof(val),
-		};
+	uint64_t token_addr = gcs->gcspr_el0 - 8;
+	uint64_t sigtramp_addr = gcs->gcspr_el0 - 16;
 
-		if (ptrace(PTRACE_GETREGSET, pid, NT_ARM_HW_BREAK, &iovec) < 0)
-			available = 0;
-		else {
-			info.arch = (char)((val >> 8) & 0xff);
-			info.bp_count = (char)(val & 0xff);
+	uint64_t cap_token = ALIGN_DOWN(GCS_SIGNAL_CAP(token_addr), 8);
+	unsigned long restorer_addr;
 
-			available = (info.arch != 0);
-		}
+	pr_info("gcs: (setup) CAP token: 0x%lx at addr: 0x%lx\n", cap_token, token_addr);
+
+	/* Inject capability token at gcspr_el0 - 8 */
+	if (ptrace(PTRACE_POKEDATA, pid, (void *)token_addr, cap_token)) {
+		pr_perror("gcs: (setup) Inject GCS cap token failed");
+		return -1;
 	}
 
-	return available == 1 ? &info : NULL;
+	/* Inject restorer trampoline address (gcspr_el0 - 16) */
+	restorer_addr = ctl->parasite_ip;
+	if (ptrace(PTRACE_POKEDATA, pid, (void *)sigtramp_addr, restorer_addr)) {
+		pr_perror("gcs: (setup) Inject GCS restorer failed");
+		return -1;
+	}
+
+	/* Update GCSPR_EL0 */
+	gcs->gcspr_el0 = token_addr;
+	if (ptrace(PTRACE_SETREGSET, pid, NT_ARM_GCS, &gcs_iov)) {
+		pr_perror("gcs: PTRACE_SETREGS FAILED");
+		return -1;
+	}
+
+	pr_debug("gcs: parasite_ip=%#lx sp=%#llx gcspr_el0=%#llx\n",
+		 ctl->parasite_ip, ctl->orig.regs.sp, gcs->gcspr_el0);
+
+	return 0;
 }
 
-int ptrace_set_breakpoint(pid_t pid, void *addr)
+int parasite_setup_shstk(struct parasite_ctl *ctl, user_fpregs_struct_t *ext_regs)
 {
-	k_rtsigset_t block;
-	struct hwbp_cap *info = ptrace_get_hwbp_cap(pid);
-	struct user_hwdebug_state regs = {};
-	unsigned int ctrl = 0;
-	struct iovec iovec;
+	struct cr_user_gcs gcs;
+	struct iovec gcs_iov = { .iov_base = &gcs, .iov_len = sizeof(gcs) };
+	pid_t pid = ctl->rpid;
 
-	if (info == NULL || info->bp_count == 0)
+	if(!__compel_host_supports_gcs())
 		return 0;
 
-	/*
-	 * The struct is copied from `arch/arm64/include/asm/hw_breakpoint.h` in
-	 * linux kernel:
-	 *  struct arch_hw_breakpoint_ctrl {
-	 *  	__u32 __reserved        : 19,
-	 *  	len             : 8,
-	 *  	type            : 2,
-	 *  	privilege       : 2,
-	 *  	enabled         : 1;
-	 *  };
-	 *
-	 * The part of `struct arch_hw_breakpoint_ctrl` bits meaning is defined
-	 * in <<ARM Architecture Reference Manual for A-profile architecture>>,
-	 * D13.3.2 DBGBCR<n>_EL1, Debug Breakpoint Control Registers.
-	 */
-	ctrl = ARM_BREAKPOINT_LEN_4;
-	ctrl = (ctrl << 2) | ARM_BREAKPOINT_EXECUTE;
-	ctrl = (ctrl << 2) | AARCH64_BREAKPOINT_EL0;
-	ctrl = (ctrl << 1) | ENABLE_HBP;
-	regs.dbg_regs[0].addr = (__u64)addr;
-	regs.dbg_regs[0].ctrl = ctrl;
-	iovec.iov_base = &regs;
-	iovec.iov_len = (offsetof(struct user_hwdebug_state, dbg_regs) + sizeof(regs.dbg_regs[0]));
-
-	if (ptrace(PTRACE_SETREGSET, pid, NT_ARM_HW_BREAK, &iovec))
-		return -1;
-
-	/*
-	 * FIXME(issues/1429): SIGTRAP can't be blocked, otherwise its handler
-	 * will be reset to the default one.
-	 */
-	ksigfillset(&block);
-	ksigdelset(&block, SIGTRAP);
-	if (ptrace(PTRACE_SETSIGMASK, pid, sizeof(k_rtsigset_t), &block)) {
-		pr_perror("Can't block signals for %d", pid);
+	if (ptrace(PTRACE_GETREGSET, pid, NT_ARM_GCS, &gcs_iov) != 0) {
+		pr_perror("GCS state not available for %d", pid);
 		return -1;
 	}
 
-	if (ptrace(PTRACE_CONT, pid, NULL, NULL) != 0) {
-		pr_perror("Unable to restart the  stopped tracee process %d", pid);
+	if (!__compel_gcs_enabled(&gcs))
+		return 0;
+
+	if (inject_gcs_cap_token(ctl, pid, &gcs)) {
+		pr_perror("Failed to inject GCS cap token for %d", pid);
 		return -1;
 	}
 
-	return 1;
-}
-
-int ptrace_flush_breakpoints(pid_t pid)
-{
-	struct hwbp_cap *info = ptrace_get_hwbp_cap(pid);
-	struct user_hwdebug_state regs = {};
-	unsigned int ctrl = 0;
-	struct iovec iovec;
-
-	if (info == NULL || info->bp_count == 0)
-		return 0;
-
-	ctrl = ARM_BREAKPOINT_LEN_4;
-	ctrl = (ctrl << 2) | ARM_BREAKPOINT_EXECUTE;
-	ctrl = (ctrl << 2) | AARCH64_BREAKPOINT_EL0;
-	ctrl = (ctrl << 1) | DISABLE_HBP;
-	regs.dbg_regs[0].addr = 0ul;
-	regs.dbg_regs[0].ctrl = ctrl;
-
-	iovec.iov_base = &regs;
-	iovec.iov_len = (offsetof(struct user_hwdebug_state, dbg_regs) + sizeof(regs.dbg_regs[0]));
-
-	if (ptrace(PTRACE_SETREGSET, pid, NT_ARM_HW_BREAK, &iovec))
-		return -1;
+	pr_info("gcs: GCS enabled for %d\n", pid);
 
 	return 0;
 }

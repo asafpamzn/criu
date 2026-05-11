@@ -540,6 +540,10 @@ static int read_pstree_ids(struct pstree_item *pi)
 		if (rst_add_ns_id(pi->ids->pid_ns_id, pi, &pid_ns_desc))
 			return -1;
 	}
+	if (pi->ids->has_user_ns_id) {
+		if (rst_add_ns_id(pi->ids->user_ns_id, pi, &user_ns_desc))
+			return -1;
+	}
 
 	return 0;
 }
@@ -1027,8 +1031,13 @@ int prepare_pstree(void)
 		if (fd == -1)
 			ret = -1;
 		else {
-			snprintf(buf, sizeof(buf), "%u", pid_max + 1);
-			if (write(fd, buf, strlen(buf)) < 0) {
+			int len;
+
+			len = snprintf(buf, sizeof(buf), "%u", pid_max + 1);
+			if (len >= sizeof(buf)) {
+				pr_err("pid_max value %u is too long\n", pid_max + 1);
+				ret = -1;
+			} else if (write(fd, buf, len) < 0) {
 				pr_perror("Can't set kernel pid_max=%s", buf);
 				ret = -1;
 			} else

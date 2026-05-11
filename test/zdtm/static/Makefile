@@ -26,6 +26,7 @@ TST_NOFILE	:=				\
 		timers				\
 		timers01			\
 		timerfd				\
+		timerslack_ns			\
 		unbound_sock			\
 		sched_prio00			\
 		sched_policy00			\
@@ -67,12 +68,14 @@ TST_NOFILE	:=				\
 		pipe00				\
 		pipe01				\
 		pipe02				\
+		pipe_owner			\
 		pthread00			\
 		pthread00-pac			\
 		pthread01			\
 		pthread02			\
 		pthread_timers			\
 		pthread_timers_h		\
+		leader_posix_timer		\
 		rseq00				\
 		membarrier			\
 		vdso00				\
@@ -188,6 +191,16 @@ TST_NOFILE	:=				\
 		socket-ext			\
 		unhashed_proc			\
 		cow00				\
+		cow_dump_basic			\
+		cow_dump_mmap_munmap		\
+		cow_dump_write_storm		\
+		cow_dump_large_memory		\
+		cow_dump_multi_thread		\
+		cow_dump_file_backed		\
+		cow_dump_new_vma		\
+		cow_dump_grow			\
+		cow_dump_munmap_half		\
+		cow_dump_munmap_reuse		\
 		child_opened_proc		\
 		posix_timers			\
 		sigpending			\
@@ -365,6 +378,7 @@ TST_FILE	=				\
 		file_lease02			\
 		file_lease03			\
 		file_lease04			\
+		file_lease05			\
 		file_locks00			\
 		file_locks00_fail		\
 		file_locks01			\
@@ -520,30 +534,30 @@ install: all
 .PHONY: all install
 
 $(TST_NOFILE:%=%.pid):	%.pid:	%
-	$(<D)/$(<F) --pidfile=$@ --outfile=$<.out
+	$(TEST_ENV) $(<D)/$(<F) --pidfile=$@ --outfile=$<.out
 
 $(TST_FILE:%=%.pid):	%.pid:	%
-	$(<D)/$(<F) --pidfile=$@ --outfile=$<.out --filename=$<.test
+	$(TEST_ENV) $(<D)/$(<F) --pidfile=$@ --outfile=$<.out --filename=$<.test
 
 $(TST_DIR:%=%.pid):	%.pid:	%
-	$(<D)/$(<F) --pidfile=$@ --outfile=$<.out --dirname=$<.test
+	$(TEST_ENV) $(<D)/$(<F) --pidfile=$@ --outfile=$<.out --dirname=$<.test
 
 $(TST_DIR_FILE:%=%.pid):	%.pid:	%
-	$(<D)/$(<F) --pidfile=$@ --outfile=$<.out --dirname=$<.dir.test --filename=$<.test
+	$(TEST_ENV) $(<D)/$(<F) --pidfile=$@ --outfile=$<.out --dirname=$<.dir.test --filename=$<.test
 
 cmdlinenv00.pid: cmdlinenv00
-	$(<D)/$(<F) --pidfile=$@ --outfile=$<.out --arg1=arg1 --arg2=arg2 --arg3=arg3
+	$(TEST_ENV) $(<D)/$(<F) --pidfile=$@ --outfile=$<.out --arg1=arg1 --arg2=arg2 --arg3=arg3
 
 shm-unaligned.pid: shm-unaligned
-	$(<D)/$(<F) --pidfile=$@ --outfile=$<.out --shmem_size=5000
+	$(TEST_ENV) $(<D)/$(<F) --pidfile=$@ --outfile=$<.out --shmem_size=5000
 
 shm-hugetlb.pid: shm-hugetlb
-	$(<D)/$(<F) --pidfile=$@ --outfile=$<.out --shmem_size=4194304
+	$(TEST_ENV) $(<D)/$(<F) --pidfile=$@ --outfile=$<.out --shmem_size=4194304
 
 env00.pid:	env00
-	$(<D)/$(<F) --pidfile=$@ --outfile=$<.out --envname=ENV_00_TEST
+	$(TEST_ENV) $(<D)/$(<F) --pidfile=$@ --outfile=$<.out --envname=ENV_00_TEST
 umask00.pid:	umask00
-	$(<D)/$(<F) --pidfile=$@ --outfile=$<.out --mask=0345
+	$(TEST_ENV) $(<D)/$(<F) --pidfile=$@ --outfile=$<.out --mask=0345
 
 fifo-rowo-pair.pid: fifo-rowo-pair
 	$(<D)/$(<F) --pidfile=$@ --outfile=$<.out --name_master=$<.master.test --name_slave=$<.slave.test
@@ -605,6 +619,15 @@ socket_aio:		LDLIBS += -lrt -pthread
 uptime_grow:		LDLIBS += -lrt -pthread
 unlink_largefile:	CFLAGS += -D_FILE_OFFSET_BITS=64 -D_LARGEFILE64_SOURCE
 inotify_system_nodel:	CFLAGS += -DNO_DEL
+cow_dump_mmap_munmap:	LDLIBS += -pthread
+cow_dump_write_storm:	LDLIBS += -pthread
+cow_dump_large_memory:	LDLIBS += -pthread
+cow_dump_multi_thread:	LDLIBS += -pthread
+cow_dump_file_backed:	LDLIBS += -pthread
+cow_dump_new_vma:	LDLIBS += -pthread
+cow_dump_grow:		LDLIBS += -pthread
+cow_dump_munmap_half:	LDLIBS += -pthread
+cow_dump_munmap_reuse:	LDLIBS += -pthread
 pthread00:		LDLIBS += -pthread
 pthread00-pac:		CFLAGS += ${PAC_CFLAGS}
 pthread00-pac:		LDLIBS += -pthread
@@ -612,11 +635,13 @@ pthread01:		LDLIBS += -pthread
 pthread02:		LDLIBS += -pthread
 pthread_timers:		LDLIBS += -lrt -pthread
 pthread_timers_h:	LDLIBS += -lrt -pthread
+leader_posix_timer:	LDLIBS += -lrt -pthread
 different_creds:	LDLIBS += -pthread
 sigpending:		LDLIBS += -pthread
 sigaltstack:		LDLIBS += -pthread
 seccomp_filter_tsync:	LDLIBS += -pthread
 seccomp_filter_threads:	LDLIBS += -pthread
+timerslack_ns:		LDLIBS += -pthread
 shm:			CFLAGS += -DNEW_IPC_NS
 msgque:			CFLAGS += -DNEW_IPC_NS
 sem:			CFLAGS += -DNEW_IPC_NS

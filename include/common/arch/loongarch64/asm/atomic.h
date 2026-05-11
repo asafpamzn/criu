@@ -41,6 +41,8 @@ static inline int atomic_add_return(int i, atomic_t *v)
 #define atomic_inc_return(v)	atomic_add_return(1, v)
 #define atomic_dec(v)		atomic_sub(1, v)
 #define atomic_dec_return(v)	atomic_sub_return(1, v)
+/* true if the result is 0, or false for all other cases. */
+#define atomic_dec_and_test(v) (atomic_sub_return(1, v) == 0)
 
 static inline int atomic_cmpxchg(atomic_t *ptr, int old, int new)
 {

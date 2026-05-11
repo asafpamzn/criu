@@ -2,9 +2,11 @@
 #define UAPI_COMPEL_ASM_TYPES_H__
 
 #include <stdint.h>
+#include <signal.h>
 
 #define SIGMAX	   64
 #define SIGMAX_OLD 31
+#define ARCH_SI_TRAP	TRAP_BRKPT
 
 /*
  * From the Linux kernel header arch/loongarch/include/uapi/asm/ptrace.h

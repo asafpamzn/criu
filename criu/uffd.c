@@ -33,6 +33,7 @@
 #include "crtools.h"
 #include "cr_options.h"
 #include "xmalloc.h"
+#include "common/list.h"
 #include <compel/plugins/std/syscall-codes.h>
 #include "restorer.h"
 #include "page-xfer.h"
@@ -43,14 +44,17 @@
 #include "util.h"
 #include "namespaces.h"
 #include "pagemap.h"
+#include "cow/cow-conf.h"
+#include "cow/pf-tracker.h"
+#include "cow/cow-lazy-pages.h"
+#include "cow/cow-uffd.h"
+#include "uffd-internal.h"
+#include "cow/unmapped-tracker.h"
+#include "cow/page-pool.h"
+#include "cow/cow-compare.h"
+
 #undef LOG_PREFIX
 #define LOG_PREFIX "uffd: "
-
-#define lp_debug(lpi, fmt, arg...)  pr_debug("%d-%d: " fmt, lpi->pid, lpi->lpfd.fd, ##arg)
-#define lp_info(lpi, fmt, arg...)   pr_info("%d-%d: " fmt, lpi->pid, lpi->lpfd.fd, ##arg)
-#define lp_warn(lpi, fmt, arg...)   pr_warn("%d-%d: " fmt, lpi->pid, lpi->lpfd.fd, ##arg)
-#define lp_err(lpi, fmt, arg...)    pr_err("%d-%d: " fmt, lpi->pid, lpi->lpfd.fd, ##arg)
-#define lp_perror(lpi, fmt, arg...) pr_perror("%d-%d: " fmt, lpi->pid, lpi->lpfd.fd, ##arg)
 
 #define NEED_UFFD_API_FEATURES \
 	(UFFD_FEATURE_EVENT_FORK | UFFD_FEATURE_EVENT_REMAP | UFFD_FEATURE_EVENT_UNMAP | UFFD_FEATURE_EVENT_REMOVE)
@@ -58,6 +62,8 @@
 #define LAZY_PAGES_SOCK_NAME "lazy-pages.socket"
 
 #define LAZY_PAGES_RESTORE_FINISHED 0x52535446 /* ReSTore Finished */
+#define LAZY_PAGES_DRAIN_COMPLETE   0x44524E43 /* DRaiN Complete (COW mode) */
+#define LAZY_PAGES_TASKS_FROZEN     0x54534B46 /* TaSKs Frozen (COW mode) */
 
 /*
  * Background transfer parameters.
@@ -70,236 +76,22 @@
 
 static mutex_t *lazy_sock_mutex;
 
-struct lazy_iov {
-	struct list_head l;
-	unsigned long start;	 /* run-time start address, tracks remaps */
-	unsigned long end;	 /* run-time end address, tracks remaps */
-	unsigned long img_start; /* start address at the dump time */
-};
-
-struct lazy_pages_info {
-	int pid;
-	bool exited;
-
-	struct list_head iovs;
-	struct list_head reqs;
-
-	struct lazy_pages_info *parent;
-	unsigned ref_cnt;
-
-	struct page_read pr;
-
-	unsigned long xfer_len; /* in pages */
-	unsigned long total_pages;
-	unsigned long copied_pages;
-
-	struct epoll_rfd lpfd;
-
-	struct list_head l;
-
-	unsigned long buf_size;
-	void *buf;
-
-	int mem_fd;  /* /proc/pid/mem for convergence page overwrites */
-};
-
 /* global lazy-pages daemon state */
 static LIST_HEAD(lpis);
 static LIST_HEAD(exiting_lpis);
 static LIST_HEAD(pending_lpis);
 static int epollfd;
 static bool restore_finished;
+/* phase3_active is now in cow-uffd.c: cow_is_phase3_active() / cow_set_phase3_active() */
 static struct epoll_rfd lazy_sk_rfd;
 /* socket for communication with lazy-pages daemon */
 static int lazy_pages_sk_id = -1;
 
-/* Pending EAGAIN requests (for bulk mode) */
-struct uffd_eagain_request {
-	struct list_head l;
-	struct lazy_pages_info *lpi;
-	__u64 address;
-	unsigned long nr_pages;
-	void *buf;  /* Copy of data that couldn't be written */
-};
-static LIST_HEAD(eagain_requests);
-static pthread_mutex_t eagain_mutex = PTHREAD_MUTEX_INITIALIZER;
-
 /*
- * Parallel UFFDIO_COPY: work queue for decoupling network receive
- * from kernel page installation.  The epoll thread decompresses
- * pages and posts work items; worker threads do the ioctl.
+ * COW stats and EAGAIN handling functions are in cow-uffd.c:
+ * - check_and_print_uffd_stats()
+ * - cow_queue_eagain_request(), cow_process_eagain_requests()
  */
-#define COPY_WORKERS		4
-#define COPY_QUEUE_SIZE		4096
-
-struct copy_work {
-	struct lazy_pages_info *lpi;
-	unsigned long vaddr;
-	unsigned long nr_pages;
-	char data[4096];	/* page data copy (4KB) */
-};
-
-static struct {
-	struct copy_work items[COPY_QUEUE_SIZE];
-	unsigned long head;	/* producer (epoll thread) */
-	unsigned long tail;	/* consumer (worker threads) */
-	pthread_mutex_t mutex;
-	pthread_cond_t not_empty;
-	pthread_cond_t not_full;
-	bool shutdown;
-	pthread_t threads[COPY_WORKERS];
-	bool running;
-} copy_queue;
-
-static pthread_mutex_t lpi_mutex = PTHREAD_MUTEX_INITIALIZER;
-static volatile unsigned long pages_enqueued;
-static volatile unsigned long pages_installed;
-
-/* Histogram statistics structure */
-static struct {
-	/* Histogram buckets by page count: 1, 16, 32, 64, 128, 256, 512, 1024, >1024 */
-	unsigned long pf_hist[9]; /* Page fault histogram */
-	unsigned long bg_hist[9]; /* Background transfer histogram */
-
-	unsigned long total_pf_reqs;
-	unsigned long total_bg_reqs;
-	unsigned long total_pages;
-
-	/* Timing statistics (nanoseconds) */
-	unsigned long io_complete_bulk_total_ns;
-	unsigned long io_complete_bulk_count;
-	unsigned long io_complete_bulk_count_start;
-	unsigned long uffd_copy_total_ns;
-	unsigned long uffd_copy_count;
-	unsigned long drop_iovs_total_ns;
-	unsigned long drop_iovs_count;
-
-	/* EAGAIN retry statistics */
-	unsigned long eagain_processed;
-	unsigned long eagain_succeeded;
-	unsigned long eagain_blocked;
-	unsigned long eagain_errors;
-	unsigned long eagain_skipped;
-	unsigned long eagain_total_ns;
-	unsigned long eagain_calls;
-
-	time_t last_print_time;
-} uffd_stats;
-
-static int get_histogram_bucket(unsigned long nr_pages)
-{
-	if (nr_pages == 1)
-		return 0; /* 4KB */
-	if (nr_pages <= 16)
-		return 1; /* 64KB */
-	if (nr_pages <= 32)
-		return 2; /* 128KB */
-	if (nr_pages <= 64)
-		return 3; /* 256KB */
-	if (nr_pages <= 128)
-		return 4; /* 512KB */
-	if (nr_pages <= 256)
-		return 5; /* 1MB */
-	if (nr_pages <= 512)
-		return 6; /* 2MB */
-	if (nr_pages <= 1024)
-		return 7; /* 4MB */
-	return 8;	  /* >4MB */
-}
-
-static const char *get_bucket_label(int bucket)
-{
-	switch (bucket) {
-	case 0:
-		return "4K";
-	case 1:
-		return "64K";
-	case 2:
-		return "128K";
-	case 3:
-		return "256K";
-	case 4:
-		return "512K";
-	case 5:
-		return "1M";
-	case 6:
-		return "2M";
-	case 7:
-		return "4M";
-	case 8:
-		return ">4M";
-	default:
-		return "?";
-	}
-}
-
-void check_and_print_uffd_stats(void)
-{
-	time_t now = time(NULL);
-	int i;	
-
-	if (now - uffd_stats.last_print_time >= 1) {
-		
-		{
-			struct timespec ts;
-			struct tm *tm;
-			clock_gettime(CLOCK_REALTIME, &ts);
-			tm = localtime(&ts.tv_sec);
-			pr_debug("[UFFD_STATS] [%02d:%02d:%02d.%03ld] reqs=%lu(pf:%lu,bg:%lu) pages=%lu\n",
-				tm->tm_hour, tm->tm_min, tm->tm_sec, ts.tv_nsec / 1000000,
-				uffd_stats.total_pf_reqs + uffd_stats.total_bg_reqs,
-				uffd_stats.total_pf_reqs,
-				uffd_stats.total_bg_reqs,
-				uffd_stats.total_pages);
-		}
-
-		/* Print page fault histogram */
-
-		pr_debug("  PF: ");
-		for (i = 0; i < 9; i++) {
-			if (uffd_stats.pf_hist[i] > 0)
-				pr_debug(" %s=%lu", get_bucket_label(i), uffd_stats.pf_hist[i]);
-		}
-		pr_debug("\n");
-
-		/* Print background transfer histogram */
-
-		pr_debug("  BG: ");
-		for (i = 0; i < 9; i++) {
-			if (uffd_stats.bg_hist[i] > 0)
-				pr_debug(" %s=%lu", get_bucket_label(i), uffd_stats.bg_hist[i]);
-		}
-		pr_debug("\n");
-
-		/* Print timing stats */
-		if (uffd_stats.io_complete_bulk_count_start > 0) {
-			pr_debug("  TIMING: io_bulk=%lu ns (%lu, %lu ops) copy=%lu ns (%lu ops) drop=%lu ns (%lu ops)\n",
-				uffd_stats.io_complete_bulk_total_ns / uffd_stats.io_complete_bulk_count,
-				uffd_stats.io_complete_bulk_count,
-				uffd_stats.io_complete_bulk_count_start,
-				uffd_stats.uffd_copy_count > 0 ? uffd_stats.uffd_copy_total_ns / uffd_stats.uffd_copy_count : 0,
-				uffd_stats.uffd_copy_count,
-				uffd_stats.drop_iovs_count > 0 ? uffd_stats.drop_iovs_total_ns / uffd_stats.drop_iovs_count : 0,
-				uffd_stats.drop_iovs_count);
-		}
-
-		/* Print EAGAIN stats */
-		if (uffd_stats.eagain_processed > 0 || uffd_stats.eagain_skipped > 0 || uffd_stats.eagain_calls > 0) {
-			pr_debug("  EAGAIN: processed=%lu succeeded=%lu blocked=%lu errors=%lu skipped=%lu | time=%lu ns (%lu calls)\n",
-				uffd_stats.eagain_processed,
-				uffd_stats.eagain_succeeded,
-				uffd_stats.eagain_blocked,
-				uffd_stats.eagain_errors,
-				uffd_stats.eagain_skipped,
-				uffd_stats.eagain_calls > 0 ? uffd_stats.eagain_total_ns / uffd_stats.eagain_calls : 0,
-				uffd_stats.eagain_calls);
-		}
-
-		/* Reset all counters */
-		memset(&uffd_stats, 0, sizeof(uffd_stats));
-		uffd_stats.last_print_time = now;
-	}
-}
 
 static int handle_uffd_event(struct epoll_rfd *lpfd);
 
@@ -318,7 +110,6 @@ static struct lazy_pages_info *lpi_init(void)
 	lpi->lpfd.read_event = handle_uffd_event;
 	lpi->xfer_len = DEFAULT_XFER_LEN;
 	lpi->ref_cnt = 1;
-	lpi->mem_fd = -1;
 
 	return lpi;
 }
@@ -341,7 +132,8 @@ static void free_iovs(struct lazy_pages_info *lpi)
 
 static void lpi_fini(struct lazy_pages_info *lpi);
 
-static inline void lpi_put(struct lazy_pages_info *lpi)
+/* Non-static for use by uffd_cow.c */
+void lpi_put(struct lazy_pages_info *lpi)
 {
 	lpi->ref_cnt--;
 	if (!lpi->ref_cnt)
@@ -560,13 +352,31 @@ int prepare_lazy_pages_socket(void)
 
 	mutex_init(lazy_sock_mutex);
 
-	if ((fd = socket(AF_UNIX, SOCK_STREAM, 0)) < 0)
-		return -1;
-
 	len = offsetof(struct sockaddr_un, sun_path) + strlen(sun.sun_path);
-	if (connect(fd, (struct sockaddr *)&sun, len) < 0) {
-		pr_perror("connect to %s failed", sun.sun_path);
-		goto out;
+	if (opts.cow_dump) {
+		int retries = 1200;
+
+		while (retries-- > 0) {
+			fd = socket(AF_UNIX, SOCK_STREAM, 0);
+			if (fd < 0)
+				return -1;
+			if (connect(fd, (struct sockaddr *)&sun, len) == 0)
+				break;
+			close(fd);
+			fd = -1;
+			usleep(100000);
+		}
+		if (fd < 0) {
+			pr_perror("connect to %s failed after retries", sun.sun_path);
+			return -1;
+		}
+	} else {
+		if ((fd = socket(AF_UNIX, SOCK_STREAM, 0)) < 0)
+			return -1;
+		if (connect(fd, (struct sockaddr *)&sun, len) < 0) {
+			pr_perror("connect to %s failed", sun.sun_path);
+			goto out;
+		}
 	}
 
 	lazy_pages_sk_id = fdstore_add(fd);
@@ -636,6 +446,12 @@ static struct lazy_iov *find_iov(struct lazy_pages_info *lpi, unsigned long addr
 			return iov;
 
 	return NULL;
+}
+
+/* Non-static wrapper for use by cow-uffd.c */
+struct lazy_iov *cow_find_iov(struct lazy_pages_info *lpi, unsigned long addr)
+{
+	return find_iov(lpi, addr);
 }
 
 static int split_iov(struct lazy_iov *iov, unsigned long addr)
@@ -747,6 +563,11 @@ static int __drop_iovs(struct list_head *iovs, unsigned long addr, unsigned long
 	if (drop_end < addr)
 		drop_end = ULONG_MAX;
 
+	if (opts.cow_dump) {
+		pr_err("COW should not reach __drop_iovs (addr=0x%lx len=%d)\n", addr, len);
+		BUG();
+	}
+
 	list_for_each_entry_safe(iov, n, iovs, l) {
 		unsigned long start = iov->start;
 		unsigned long end = iov->end;
@@ -792,6 +613,11 @@ static int __drop_iovs(struct list_head *iovs, unsigned long addr, unsigned long
 
 static int drop_iovs(struct lazy_pages_info *lpi, unsigned long addr, unsigned long len)
 {
+	if (opts.cow_dump) {
+		pr_err("COW should not reach drop_iovs (addr=0x%lx len=%d)\n", addr, len);
+		BUG();
+	}
+
 	if (__drop_iovs(&lpi->iovs, addr, len))
 		return -1;
 
@@ -929,7 +755,8 @@ static int remap_iovs(struct lazy_pages_info *lpi, unsigned long from, unsigned 
 static int collect_iovs(struct lazy_pages_info *lpi)
 {
 	unsigned long start, end, len, nr_pages = 0;
-	int n_vma = 0, max_iov_len = 0, ret = -1;
+	unsigned long max_iov_len = 0;
+	int n_vma = 0, ret = -1;
 	struct page_read *pr = &lpi->pr;
 	struct lazy_iov *iov;
 	MmEntry *mm;
@@ -1125,7 +952,6 @@ out:
 
 static int handle_exit(struct lazy_pages_info *lpi)
 {
-	lp_debug(lpi, "EXIT\n");
 	if (epoll_del_rfd(epollfd, &lpi->lpfd))
 		return -1;
 	free_iovs(lpi);
@@ -1175,295 +1001,44 @@ static int uffd_check_op_error(struct lazy_pages_info *lpi, const char *op, unsi
 
 static int xfer_pages(struct lazy_pages_info *lpi);
 
-
 /*
- * Queue an EAGAIN request for later retry in COW dump mode.
- * For copy operations, buf should point to the data to copy.
- * For zero operations, buf should be NULL.
+ * EAGAIN request handling is in cow-uffd.c:
+ * - cow_queue_eagain_request()
+ * - cow_queue_drain_eagain_request()
  */
-static int queue_eagain_request(struct lazy_pages_info *lpi, __u64 address, 
-                                unsigned long nr_pages, void *buf, const char *op_name)
-{
-	struct uffd_eagain_request *req;
-	void *buf_copy = NULL;
-	unsigned long len = nr_pages * page_size();
-	
-	lp_debug(lpi, "uffd_%s EAGAIN in COW mode: queueing 0x%llx/%ld for later\n",
-		 op_name, address, len);
-	
-	/* Copy buffer if provided (copy operation) */
-	if (buf) {
-		buf_copy = xmalloc(len);
-		if (!buf_copy) {
-			lp_err(lpi, "Failed to allocate buffer for EAGAIN request\n");
-			return -1;
-		}
-		memcpy(buf_copy, buf, len);
-	}
-	
-	/* Create request entry */
-	req = xmalloc(sizeof(*req));
-	if (!req) {
-		if (buf_copy)
-			xfree(buf_copy);
-		return -1;
-	}
-	
-	req->lpi = lpi;
-	req->address = address;
-	req->nr_pages = nr_pages;
-	req->buf = buf_copy;  /* NULL for zero operations */
-	INIT_LIST_HEAD(&req->l);
-	
-	list_add_tail(&req->l, &eagain_requests);
-	
-	return 0;
-}
-
-/*
- * Parallel page installation worker.  Uses pwrite(/proc/pid/mem) when
- * userfaultfd is disabled (COW pwrite mode), UFFDIO_COPY otherwise.
- */
-static void copy_worker_process(struct copy_work *w)
-{
-	unsigned long pages = w->nr_pages;
-	unsigned long len = pages * page_size();
-
-	if (w->lpi->exited)
-		return;
-
-	/* Pwrite mode: direct memory write, no userfaultfd */
-	if (w->lpi->lpfd.fd < 0 && w->lpi->mem_fd >= 0) {
-		ssize_t wr = pwrite(w->lpi->mem_fd, w->data, len, w->vaddr);
-		if (wr == (ssize_t)len) {
-			pthread_mutex_lock(&lpi_mutex);
-			w->lpi->copied_pages += pages;
-			drop_iovs(w->lpi, w->vaddr, len);
-			pthread_mutex_unlock(&lpi_mutex);
-			__sync_fetch_and_add(&pages_installed, pages);
-		}
-		return;
-	}
-
-	/* UFFDIO_COPY mode */
-	{
-		struct uffdio_copy uc;
-		int ret;
-
-		uc.dst = w->vaddr;
-		uc.src = (unsigned long)w->data;
-		uc.len = len;
-		uc.mode = 0;
-		uc.copy = 0;
-
-		ret = ioctl(w->lpi->lpfd.fd, UFFDIO_COPY, &uc);
-		if (ret == -1) {
-			if (errno == EAGAIN && opts.cow_dump) {
-				pthread_mutex_lock(&eagain_mutex);
-				queue_eagain_request(w->lpi, w->vaddr,
-						     pages, w->data, "copy");
-				pthread_mutex_unlock(&eagain_mutex);
-				return;
-			}
-			if ((errno == EEXIST || uc.copy == -EEXIST) &&
-			    opts.cow_dump && w->lpi->mem_fd >= 0) {
-				if (pwrite(w->lpi->mem_fd, w->data,
-					   uc.len, w->vaddr) < 0)
-					;
-			}
-			return;
-		}
-
-		if (uc.copy < 0 && -uc.copy == EAGAIN && opts.cow_dump) {
-			pthread_mutex_lock(&eagain_mutex);
-			queue_eagain_request(w->lpi, w->vaddr,
-					     pages, w->data, "copy");
-			pthread_mutex_unlock(&eagain_mutex);
-			return;
-		}
-
-		pthread_mutex_lock(&lpi_mutex);
-		w->lpi->copied_pages += pages;
-		drop_iovs(w->lpi, w->vaddr, len);
-		pthread_mutex_unlock(&lpi_mutex);
-		__sync_fetch_and_add(&pages_installed, pages);
-	}
-}
-
-static void *copy_worker_thread(void *arg)
-{
-	(void)arg;
-	pthread_setname_np(pthread_self(), "uffd-copy");
-
-	for (;;) {
-		struct copy_work work;
-		unsigned long tail;
-
-		pthread_mutex_lock(&copy_queue.mutex);
-		while (copy_queue.head == copy_queue.tail &&
-		       !copy_queue.shutdown)
-			pthread_cond_wait(&copy_queue.not_empty,
-					  &copy_queue.mutex);
-		if (copy_queue.shutdown &&
-		    copy_queue.head == copy_queue.tail) {
-			pthread_mutex_unlock(&copy_queue.mutex);
-			break;
-		}
-		tail = copy_queue.tail % COPY_QUEUE_SIZE;
-		work = copy_queue.items[tail];
-		copy_queue.tail++;
-		pthread_cond_signal(&copy_queue.not_full);
-		pthread_mutex_unlock(&copy_queue.mutex);
-
-		copy_worker_process(&work);
-	}
-	return NULL;
-}
-
-static void start_copy_workers(void)
-{
-	int i;
-
-	if (copy_queue.running)
-		return;
-
-	pthread_mutex_init(&copy_queue.mutex, NULL);
-	pthread_cond_init(&copy_queue.not_empty, NULL);
-	pthread_cond_init(&copy_queue.not_full, NULL);
-	copy_queue.head = 0;
-	copy_queue.tail = 0;
-	copy_queue.shutdown = false;
-
-	for (i = 0; i < COPY_WORKERS; i++)
-		pthread_create(&copy_queue.threads[i], NULL,
-			       copy_worker_thread, NULL);
-	copy_queue.running = true;
-	pr_info("Started %d UFFDIO_COPY worker threads\n", COPY_WORKERS);
-}
-
-static void stop_copy_workers(void)
-{
-	int i;
-
-	if (!copy_queue.running)
-		return;
-
-	pthread_mutex_lock(&copy_queue.mutex);
-	copy_queue.shutdown = true;
-	pthread_cond_broadcast(&copy_queue.not_empty);
-	pthread_mutex_unlock(&copy_queue.mutex);
-
-	for (i = 0; i < COPY_WORKERS; i++)
-		pthread_join(copy_queue.threads[i], NULL);
-	copy_queue.running = false;
-}
-
-static int enqueue_copy_work(struct lazy_pages_info *lpi,
-			     unsigned long vaddr, unsigned long nr_pages,
-			     const void *data)
-{
-	unsigned long head;
-
-	if (!copy_queue.running)
-		start_copy_workers();
-
-	pthread_mutex_lock(&copy_queue.mutex);
-	while (copy_queue.head - copy_queue.tail >= COPY_QUEUE_SIZE &&
-	       !copy_queue.shutdown)
-		pthread_cond_wait(&copy_queue.not_full,
-				  &copy_queue.mutex);
-
-	head = copy_queue.head % COPY_QUEUE_SIZE;
-	copy_queue.items[head].lpi = lpi;
-	copy_queue.items[head].vaddr = vaddr;
-	copy_queue.items[head].nr_pages = nr_pages;
-	memcpy(copy_queue.items[head].data, data, nr_pages * page_size());
-	copy_queue.head++;
-	__sync_fetch_and_add(&pages_enqueued, nr_pages);
-	pthread_cond_signal(&copy_queue.not_empty);
-	pthread_mutex_unlock(&copy_queue.mutex);
-	return 0;
-}
 
 static int uffd_copy(struct lazy_pages_info *lpi, __u64 address, unsigned long *nr_pages)
 {
 	unsigned long len = *nr_pages * page_size();
 
-	lp_debug(lpi, "uffd_copy: 0x%llx/%ld\n", (unsigned long long)address, len);
-
-	/* Pwrite mode: direct memory write, no userfaultfd */
-	if (lpi->lpfd.fd < 0 && lpi->mem_fd >= 0) {
-		ssize_t wr = pwrite(lpi->mem_fd, lpi->buf, len, address);
-		if (wr == (ssize_t)len) {
-			lpi->copied_pages += *nr_pages;
-			return 0;
-		}
-		lp_err(lpi, "pwrite failed at 0x%llx: %s\n",
-		       (unsigned long long)address, strerror(errno));
-		return -1;
+	/* COW mode: use unified copy with full tracking */
+	if (opts.cow_dump) {
+		int ret = cow_uffd_copy(lpi->lpfd.fd, address, lpi->buf, *nr_pages,
+					lpi, NULL, 0, "uffd_copy");
+		/* cow_uffd_copy returns 1=success, 0=soft-handled, -1=error */
+		return ret < 0 ? -1 : 0;
 	}
 
-	/* UFFDIO_COPY mode */
-	{
-	struct uffdio_copy uffdio_copy;
-
+	/* Non-COW mode: original implementation */
 	uffdio_copy.dst = address;
 	uffdio_copy.src = (unsigned long)lpi->buf;
 	uffdio_copy.len = len;
 	uffdio_copy.mode = 0;
 	uffdio_copy.copy = 0;
 
+	lp_debug(lpi, "uffd_copy: 0x%llx/%ld\n", uffdio_copy.dst, len);
+
 	if (ioctl(lpi->lpfd.fd, UFFDIO_COPY, &uffdio_copy) == -1) {
-		/* In COW dump mode, queue EAGAIN requests instead of blocking */
-		if (errno == EAGAIN && opts.cow_dump)
-			return queue_eagain_request(lpi, address, *nr_pages, lpi->buf, "copy");
-
-		/*
-		 * EEXIST: page already present (convergence re-send).
-		 * Write updated data directly via /proc/pid/mem.
-		 */
-		if ((errno == EEXIST || uffdio_copy.copy == -EEXIST) &&
-		    opts.cow_dump && lpi->mem_fd >= 0) {
-			ssize_t wr = pwrite(lpi->mem_fd, lpi->buf, len, address);
-			if (wr == (ssize_t)len) {
-				lp_debug(lpi, "Convergence overwrite at 0x%llx (%lu pages)\n",
-					 (unsigned long long)address, *nr_pages);
-				lpi->copied_pages += *nr_pages;
-				return 0;
-			}
-			lp_err(lpi, "Failed to overwrite page at 0x%llx via mem_fd: %s\n",
-			       (unsigned long long)address, strerror(errno));
-		}
-
-		/* Non-COW mode or non-EAGAIN: check for other errors */
-		if (uffd_check_op_error(lpi, "copy", nr_pages, uffdio_copy.copy)) {
-			lp_err(lpi, "UFFDIO_COPY got error\n");
+		if (uffd_check_op_error(lpi, "copy", nr_pages, uffdio_copy.copy))
 			return -1;
-		}
-
-		/* If uffd_check_op_error handled it (e.g., ENOSPC/ESRCH), return success */
 		return 0;
 	}
 
 	if (uffdio_copy.copy < 0) {
-		/* Soft userfaultfd error: encoded as -errno in copy */
 		errno = -uffdio_copy.copy;
-
-		/* In COW dump mode, queue EAGAIN requests */
-		if (errno == EAGAIN && opts.cow_dump)
-			return queue_eagain_request(lpi, address, *nr_pages, lpi->buf, "copy");
-
-		if (uffd_check_op_error(lpi, "copy", nr_pages, uffdio_copy.copy)) {
-			lp_err(lpi, "UFFDIO_COPY err \n");
+		if (uffd_check_op_error(lpi, "copy", nr_pages, uffdio_copy.copy))
 			return -1;
-		}
 		return 0;
-	}
-
-	/* Success */
-	if (uffdio_copy.copy == 0) {
-		lp_err(lpi, "UFFDIO_COPY copied 0 bytes at 0x%llx\n", uffdio_copy.dst);
-		*nr_pages = 0;
 	}
 
 	lpi->copied_pages += *nr_pages;
@@ -1477,6 +1052,11 @@ static int uffd_io_complete(struct page_read *pr, unsigned long img_addr, unsign
 	unsigned long addr = 0, req_pages;
 	struct lazy_iov *req;
 	int ret;
+
+	if (opts.cow_dump) {
+		pr_err("COW should not reach uffd_io_complete (img_addr=0x%lx nr=%lu)\n", img_addr, nr);
+		BUG();
+	}
 
 	lpi = container_of(pr, struct lazy_pages_info, pr);
 	pr_debug("uffd_io_complete\n");
@@ -1523,10 +1103,7 @@ static int uffd_io_complete(struct page_read *pr, unsigned long img_addr, unsign
 	 * list and let drop_iovs do the range math, free memory etc.
 	 */
 	iov_list_insert(req, &lpi->iovs);
-	ret = drop_iovs(lpi, addr, nr * PAGE_SIZE);
-
-	
-	return ret;
+	return drop_iovs(lpi, addr, nr * PAGE_SIZE);
 }
 
 static int uffd_io_complete_bulk(struct page_read *pr, unsigned long vaddr, unsigned long nr)
@@ -1724,7 +1301,11 @@ static int xfer_pages(struct lazy_pages_info *lpi)
 	unsigned long nr_pages;
 	unsigned long len;
 	int err;
-	int bucket;
+
+	if (opts.cow_dump) {
+		pr_err("COW should not reach xfer_pages\n");
+		BUG();
+	}
 
 	iov = pick_next_range(lpi);
 	if (!iov)
@@ -1738,12 +1319,6 @@ static int xfer_pages(struct lazy_pages_info *lpi)
 	iov_list_insert(iov, &lpi->reqs);
 
 	nr_pages = (iov->end - iov->start) / PAGE_SIZE;
-
-	/* Update statistics */
-	uffd_stats.total_bg_reqs++;
-	uffd_stats.total_pages += nr_pages;
-	bucket = get_histogram_bucket(nr_pages);
-	uffd_stats.bg_hist[bucket]++;
 
 	update_xfer_len(lpi, false);
 
@@ -1766,6 +1341,10 @@ static int handle_remove(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 	lp_debug(lpi, "%s: %llx(%llx)\n", msg->event == UFFD_EVENT_REMOVE ? "REMOVE" : "UNMAP",
 		 unreg.start, unreg.len);
 
+	/* COW mode: track unmapped pages and remove from buffer */
+	if (opts.cow_dump)
+		cow_handle_remove_event(unreg.start, unreg.len);
+
 	/*
 	 * The REMOVE event does not change the VMA, so we need to
 	 * make sure that we won't handle #PFs in the removed
@@ -1785,7 +1364,7 @@ static int handle_remove(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 		pr_perror("Failed to unregister (%llx - %llx)", unreg.start, unreg.start + unreg.len);
 		return -1;
 	}
-
+	if (opts.cow_dump) return 0;//WE do not drop_iov since it is not thread safe
 	return drop_iovs(lpi, unreg.start, unreg.len);
 
 }
@@ -1884,17 +1463,56 @@ static bool is_page_queued(struct lazy_pages_info *lpi, unsigned long addr)
 static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 {
 	struct lazy_iov *iov;
-	__u64 address;
+	unsigned long long address;
 	int ret;
 	unsigned long nr_pages;
-	int bucket;
 
 	/* Align requested address to the next page boundary */
 	address = msg->arg.pagefault.address & ~(page_size() - 1);
-	lp_warn(lpi, "#PF at 0x%llx\n", address);
 
-	if (is_page_queued(lpi, address)) {
-		lp_warn(lpi, "#PF at 0x%llx queued\n", address);
+	lp_debug(lpi, "#PF at 0x%llx\n", address);
+
+	/*
+	 * COW mode: Serve page faults from the buffer.
+	 * This can happen during restorer execution (e.g., rseq setup) or after sigreturn.
+	 * We must resolve the fault or the process will block.
+	 */
+	if (opts.cow_dump) {
+		void *page_data;
+		int ret;
+
+		lp_debug(lpi, "COW #PF at 0x%llx drain_running=%d\n",
+			 address, cow_drain_thread_running());
+
+		/* Try to get page from buffer */
+		page_data = cow_page_buffer_lookup_and_remove(address);
+		if (page_data) {
+			/*
+			 * Route through cow_uffd_copy so page-state, pf_tracker,
+			 * and EEXIST/EAGAIN/ENOENT handling all go through the
+			 * unified path. Transition IN_BUFFER -> PF_PENDING first;
+			 * cow_uffd_copy will move it to COPIED / DISCARDED /
+			 * EAGAIN_QUEUED depending on UFFDIO_COPY result. On EAGAIN
+			 * cow_queue_eagain_request() copies the buffer, so we can
+			 * always return the page to the pool after the call.
+			 */
+			page_state_set(address, PAGE_STATE_PF_PENDING);
+			ret = cow_uffd_copy(lpi->lpfd.fd, address, page_data, 1,
+					    lpi, NULL, 0, "PAGE_FAULT");
+			page_pool_put(page_data);
+			if (ret < 0) {
+				lp_err(lpi, "PAGE_FAULT: cow_uffd_copy failed for 0x%llx\n", address);
+				return -1;
+			}
+			return 0;
+		}
+
+		/* Not in buffer - zero the page */
+		lp_debug(lpi, "PAGE_FAULT: 0x%llx not in buffer, zeroing\n", address);
+		return uffd_zero(lpi, address, 1);
+	}
+
+	if (is_page_queued(lpi, address))
 		return 0;
 	}
 
@@ -1913,12 +1531,6 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 	iov_list_insert(iov, &lpi->reqs);
 
 	nr_pages = (iov->end - iov->start) / PAGE_SIZE;
-
-	/* Update statistics */
-	uffd_stats.total_pf_reqs++;
-	uffd_stats.total_pages += nr_pages;
-	bucket = get_histogram_bucket(nr_pages);
-	uffd_stats.pf_hist[bucket]++;
 
 	update_xfer_len(lpi, true);
 
@@ -1975,7 +1587,8 @@ static int handle_uffd_event(struct epoll_rfd *lpfd)
 	return 0;
 }
 
-static void lazy_pages_summary(struct lazy_pages_info *lpi)
+/* Non-static for use by uffd_cow.c */
+void lazy_pages_summary(struct lazy_pages_info *lpi)
 {
 	lp_debug(lpi, "UFFD transferred pages: (%ld/%ld)\n",
 		 lpi->copied_pages, lpi->total_pages);
@@ -2194,6 +1807,11 @@ static int handle_requests(int epollfd, struct epoll_event **events, int nr_fds)
 	int poll_timeout = -1;
 	int ret;
 
+	if (opts.cow_dump) {
+		pr_err("COW should not reach handle_requests (use cr_lazy_pages_cow_phase2)\n");
+		BUG();
+	}
+
 	for (;;) {
 		ret = epoll_run_rfds(epollfd, *events, nr_fds, poll_timeout);
 		if (ret < 0)
@@ -2209,10 +1827,12 @@ static int handle_requests(int epollfd, struct epoll_event **events, int nr_fds)
 		/* make sure we return success if there is nothing to xfer */
 		ret = 0;
 
-		if (opts.cow_dump && !list_empty(&eagain_requests)) {
-			if (process_eagain_requests()) {
-				ret = -1;
-				goto out;
+		list_for_each_entry_safe(lpi, n, &lpis, l) {
+			if (!list_empty(&lpi->iovs) && list_empty(&lpi->reqs)) {
+				ret = xfer_pages(lpi);
+				if (ret < 0)
+					goto out;
+				break;
 			}
 		}
 
@@ -2343,6 +1963,37 @@ int lazy_pages_finish_restore(void)
 		return -1;
 	}
 
+	/*
+	 * COW mode: Signal lazy-pages that tasks are frozen (catch_tasks done),
+	 * then wait for drain to complete before unfreezing.
+	 */
+	if (opts.cow_dump) {
+		uint32_t tasks_frozen = LAZY_PAGES_TASKS_FROZEN;
+		uint32_t drain_signal;
+
+		pr_info("COW mode: Sending TASKS_FROZEN signal to lazy-pages\n");
+		ret = send(fd, &tasks_frozen, sizeof(tasks_frozen), 0);
+		if (ret != sizeof(tasks_frozen)) {
+			pr_perror("Failed sending TASKS_FROZEN signal");
+			close(fd);
+			return -1;
+		}
+
+		pr_info("COW mode: Waiting for drain complete signal...\n");
+		ret = recv(fd, &drain_signal, sizeof(drain_signal), MSG_WAITALL);
+		if (ret != sizeof(drain_signal)) {
+			pr_perror("Failed receiving drain complete signal");
+			close(fd);
+			return -1;
+		}
+		if (drain_signal != LAZY_PAGES_DRAIN_COMPLETE) {
+			pr_err("Unexpected signal: %x (expected drain complete)\n", drain_signal);
+			close(fd);
+			return -1;
+		}
+		pr_info("COW mode: Drain complete, proceeding to unfreeze\n");
+	}
+
 	ret = send(fd, &fin, sizeof(fin), 0);
 	if (ret != sizeof(fin)) {
 		if (ret < 0 && errno == EPIPE) {
@@ -2395,14 +2046,26 @@ static int lazy_sk_read_event(struct epoll_rfd *rfd)
 		return -1;
 	}
 
-	if (fin != LAZY_PAGES_RESTORE_FINISHED) {
-		pr_err("Unexpected response: %x\n", fin);
-		return -1;
+	if (fin == LAZY_PAGES_RESTORE_FINISHED) {
+		restore_finished = true;
+		return 1;
 	}
 
-	restore_finished = true;
+	/*
+	 * COW mode: TASKS_FROZEN signal means restore has caught all tasks
+	 * via PTRACE_INTERRUPT. Now it's safe to start drain - tasks are frozen.
+	 */
+	if (fin == LAZY_PAGES_TASKS_FROZEN && opts.cow_dump) {
+		pr_info("COW: Received TASKS_FROZEN signal, starting drain\n");
+		if (cow_handle_lazy_accept_post_connect(&lpis) < 0) {
+			pr_err("Failed to start drain after TASKS_FROZEN\n");
+			return -1;
+		}
+		return 0;
+	}
 
-	return 1;
+	pr_err("Unexpected response: %x\n", fin);
+	return -1;
 }
 
 static int lazy_sk_hangup_event(struct epoll_rfd *rfd)
@@ -2456,8 +2119,271 @@ close_uffd:
 	close(listen);
 	return -1;
 }
-extern int page_server_init_bulk_readers(void *buf, unsigned long nr_pages,
-					 ps_async_read_complete complete, void *priv);
+
+/* Pre-buffer and convergence infrastructure is in cow-uffd.c */
+static struct epoll_rfd lazy_listen_rfd;
+
+
+/*
+ * Non-blocking accept handler for when criu restore connects.
+ * Called from epoll loop when restore connects on the Unix socket.
+ */
+static int handle_lazy_accept(struct epoll_rfd *rfd)
+{
+	int client;
+	int i;
+	struct sockaddr_un saddr;
+	socklen_t len = sizeof(saddr);
+
+	client = accept(rfd->fd, (struct sockaddr *)&saddr, &len);
+	if (client < 0) {
+		if (errno == EAGAIN || errno == EWOULDBLOCK)
+			return 0;
+		pr_perror("accept failed");
+		return -1;
+	}
+
+	/* Set up lpi for each task (reads uffd from restore) */
+	{
+		int uffd_count = 0;
+		for (i = 0; i < task_entries->nr_tasks; i++) {
+			struct lazy_pages_info *lpi = NULL;
+
+			if (ud_open(client, &lpi))
+				goto err;
+			if (lpi == NULL)
+				continue;
+			/*
+			 * Always add UFFD to epoll, even in COW mode.
+			 * Page faults can still occur (e.g., during comparison)
+			 * and need to be handled by serving from buffer.
+			 */
+			if (epoll_add_rfd(epollfd, &lpi->lpfd))
+				goto err;
+
+			lp_debug(lpi, "registered UFFD handler (fd=%d)\n", lpi->lpfd.fd);
+			uffd_count++;
+		}
+		pr_info("Registered %d UFFD handlers for page faults\n", uffd_count);
+	}
+
+	/* Set up restore-finished notification socket */
+	lazy_sk_rfd.fd = client;
+	lazy_sk_rfd.read_event = lazy_sk_read_event;
+	lazy_sk_rfd.hangup_event = lazy_sk_hangup_event;
+	if (epoll_add_rfd(epollfd, &lazy_sk_rfd))
+		goto err;
+
+	/* Remove listen socket from epoll — only one connection needed */
+	epoll_del_rfd(epollfd, rfd);
+	close(rfd->fd);
+
+	/*
+	 * Keep buffering ON — handle_page_fault() will serve from buffer.
+	 * In COW mode, drain will start when we receive TASKS_FROZEN signal
+	 * from restore (after catch_tasks() completes).
+	 */
+	cow_set_restore_connected(true);
+
+	pr_info("criu restore setup complete, %lu pages buffered\n",
+		cow_page_buffer_count());
+
+	/*
+	 * COW mode: Don't start drain here - tasks are still running!
+	 * Drain will start when lazy_sk_read_event receives TASKS_FROZEN.
+	 */
+
+	return 0;
+
+err:
+	close(client);
+	return -1;
+}
+
+/*
+ * Simple COW state accessors are in cow-uffd.c:
+ * - cow_is_restore_connected(), cow_set_restore_connected()
+ * - cow_is_all_pages_sent_received(), cow_set_all_pages_sent_received()
+ */
+
+/*
+ * Unregister all VMAs from UFFD before process unfreezes.
+ * This ensures no page faults can occur after drain completes.
+ */
+static void cow_unregister_all_uffds(void)
+{
+	struct lazy_pages_info *lpi;
+	struct lazy_iov *iov;
+
+	list_for_each_entry(lpi, &lpis, l) {
+		if (lpi->exited || lpi->lpfd.fd < 0)
+			continue;
+
+		list_for_each_entry(iov, &lpi->iovs, l) {
+			struct uffdio_range unreg = {
+				.start = iov->start,
+				.len = iov->end - iov->start,
+			};
+
+			if (ioctl(lpi->lpfd.fd, UFFDIO_UNREGISTER, &unreg)) {
+				if (errno != ENOMEM) /* ENOMEM = process already gone */
+					lp_perror(lpi, "UFFDIO_UNREGISTER 0x%lx-0x%lx",
+						  iov->start, iov->end);
+			} else {
+				lp_debug(lpi, "Unregistered UFFD 0x%lx-0x%lx\n",
+					 iov->start, iov->end);
+			}
+		}
+	}
+
+	pr_info("All UFFD regions unregistered\n");
+}
+
+/*
+ * COW Phase 3: Enter restore loop after pages are buffered and pstree loaded.
+ * Called from cow-lazy-pages.c after Phase 2 completes.
+ *
+ * This sets up the lazy socket for restore to connect and enters the
+ * main event loop to handle page faults (WP_SYNC convergence).
+ */
+int cow_phase3_restore_loop(int ep_fd, struct epoll_event **events, int nr_fds)
+{
+	int lazy_sk;
+	int flags;
+	int ret;
+
+	/* Set global epollfd for use by handle_lazy_accept() */
+	epollfd = ep_fd;
+	cow_set_phase3_active(true);
+
+	/* Create lazy socket for restore to connect */
+	lazy_sk = prepare_lazy_socket();
+	if (lazy_sk < 0) {
+		pr_err("Failed to create lazy socket for Phase 3\n");
+		return -1;
+	}
+
+	/* Make listen socket non-blocking and add to epoll */
+	flags = fcntl(lazy_sk, F_GETFL, 0);
+	fcntl(lazy_sk, F_SETFL, flags | O_NONBLOCK);
+
+	lazy_listen_rfd.fd = lazy_sk;
+	lazy_listen_rfd.read_event = handle_lazy_accept;
+	if (epoll_add_rfd(epollfd, &lazy_listen_rfd)) {
+		close(lazy_sk);
+		return -1;
+	}
+
+	pr_info("Phase 3: listening for restore connection\n");
+
+	/*
+	 * Simplified flow for COW bulk transfer:
+	 * 1. Wait for restore to connect (accept via epoll)
+	 * 2. handle_lazy_accept() sets up LPIs and starts drain thread
+	 * 3. Wait for drain to complete (all pages UFFDIO_COPY'd)
+	 * 4. Return - process unfreezes with all pages in place
+	 *
+	 * No page fault handling needed since all pages are already buffered
+	 * and will be drained to process memory while frozen.
+	 */
+
+	/* Wait for restore to connect - single epoll iteration */
+	while (!cow_is_restore_connected()) {
+		ret = epoll_run_rfds(epollfd, *events, nr_fds, 1000);
+		if (ret < 0) {
+			pr_err("epoll failed waiting for restore\n");
+			close(lazy_sk);
+			return -1;
+		}
+	}
+
+	pr_info("Restore connected, waiting for drain to complete (%lu pages)\n",
+		cow_page_buffer_count());
+
+	/*
+	 * Wait for drain thread to finish copying all pages.
+	 * Poll epoll to handle any page faults that might occur.
+	 * Even though process is frozen, page faults can happen during
+	 * comparison or other operations.
+	 */
+	while (cow_drain_thread_running() || cow_page_buffer_count() > 0) {
+		/* Poll epoll with 10ms timeout to handle page faults */
+		ret = epoll_run_rfds(epollfd, *events, nr_fds, 10);
+		if (ret < 0) {
+			pr_err("epoll failed during drain wait\n");
+			return -1;
+		}
+
+		/* Handle any EAGAIN retries */
+		if (!cow_is_eagain_queue_empty()) {
+			if (cow_process_eagain_requests()) {
+				pr_err("EAGAIN processing failed during drain\n");
+				return -1;
+			}
+		}
+	}
+
+	pr_info("Drain complete, buffer empty\n");
+
+	/* Debug: show page pool utilization */
+	page_pool_dump_utilization();
+
+	/* DEBUG: Process comparison with primary */
+#ifdef CONFIG_COW_COMPARE
+	if (opts.cow_dump && opts.addr) {
+		int compare_sk;
+		struct lazy_pages_info *first_lpi;
+		pid_t target_pid = 0;
+
+		/* Get the first LPI's PID as the target */
+		if (!list_empty(&lpis)) {
+			first_lpi = list_first_entry(&lpis, struct lazy_pages_info, l);
+			target_pid = first_lpi->pid;
+		}
+
+		if (target_pid > 0) {
+			pr_err("COMPARE: REPLICA connecting to primary for comparison (PID %d)\n",
+			       target_pid);
+
+			if (cow_compare_connect(opts.addr, &compare_sk) == 0) {
+				int result = cow_compare_receive_and_verify(compare_sk, target_pid);
+				close(compare_sk);
+
+				if (result != 0) {
+					pr_err("COMPARE: DIFFERENCES FOUND - see logs above\n");
+#ifdef CONFIG_COW_WAIT_REPLICA_TOUCH
+					/* Pause for investigation */
+					pr_err("COMPARE: Touch /tmp/continue_replica to proceed\n");
+					while (access("/tmp/continue_replica", F_OK) != 0)
+						sleep(1);
+					unlink("/tmp/continue_replica");
+#endif
+				} else {
+					pr_err("COMPARE: Processes are IDENTICAL - proceeding\n");
+				}
+			}
+		} else {
+			pr_warn("COMPARE: No LPI found, skipping comparison\n");
+		}
+	}
+#endif //CONFIG_COW_COMPARE
+	/* Unregister all UFFD regions before unfreezing process */
+	cow_unregister_all_uffds();
+
+	/*
+	 * Signal restore that drain is complete and it's safe to unfreeze.
+	 * Restore is waiting in lazy_pages_finish_restore() for this signal.
+	 */
+	if (opts.cow_dump) {
+		uint32_t drain_complete = LAZY_PAGES_DRAIN_COMPLETE;
+		if (send(lazy_sk_rfd.fd, &drain_complete, sizeof(drain_complete), 0) != sizeof(drain_complete))
+			pr_perror("Failed to send drain complete signal");
+		else
+			pr_info("COW Phase 3: Sent drain complete signal to restore\n");
+	}
+	return 0;
+}
+
 int cr_lazy_pages(bool daemon)
 {
 	struct epoll_event *events = NULL;
@@ -2467,6 +2393,13 @@ int cr_lazy_pages(bool daemon)
 
 	if (!kdat.has_uffd)
 		return -1;
+
+	/*
+	 * COW Phase 2: No inventory/pstree yet, just buffer pages.
+	 * Use separate code path with minimal dependencies.
+	 */
+	if (opts.cow_dump && opts.use_page_server)
+		return cr_lazy_pages_cow_phase2(daemon);
 
 	if (prepare_dummy_pstree())
 		return -1;
@@ -2518,10 +2451,9 @@ int cr_lazy_pages(bool daemon)
 	/*
 	 * we poll nr_tasks userfault fds, UNIX socket between lazy-pages
 	 * daemon and the cr-restore, and, optionally TCP socket for
-	 * remote pages
+	 * remote pages. Add +1 for the listen socket in pre-buffer mode.
 	 */
-	nr_fds = task_entries->nr_tasks + (opts.use_page_server ? 2 : 1)
-		 + (opts.cow_dump ? COW_TRANSFER_STREAMS - 1 : 0);
+	nr_fds = task_entries->nr_tasks + (opts.use_page_server ? 2 : 1) + 1;
 	epollfd = epoll_prepare(nr_fds, &events);
 	if (epollfd < 0)
 		return -1;

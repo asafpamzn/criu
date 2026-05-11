@@ -65,7 +65,14 @@
 #include "stats.h"
 #include "mem.h"
 #include "page-pipe.h"
-#include "cow-dump.h"
+#include "cow/cow-conf.h"
+#include "cow/cow-dump.h"
+#include "cow/cow-page-xfer.h"
+#include "cow/cow-bulk-send.h"
+#include "cow/cow-compare.h"
+#ifdef CONFIG_HAS_LIBBPF
+#include "cow/cow-bpf.h"
+#endif
 #include "posix-timer.h"
 #include "vdso.h"
 #include "vma.h"
@@ -106,6 +113,25 @@ int __attribute__((weak)) arch_set_thread_regs(struct pstree_item *item, bool wi
 #define PERSONALITY_LENGTH 9
 static char loc_buf[PERSONALITY_LENGTH];
 
+/* Phase 3 freeze start time - set in cr_dump_tasks_cow_phased, used in cr_dump_finish */
+static struct timeval g_phase3_freeze_start;
+
+static int cr_dump_tasks_cow_phased(pid_t pid);
+#ifdef COW_CONF_TODO_ASK_AVI_cow_seize_cure_parasite
+/* Stop parasite - optionally fast (skip rt_sigreturn single-stepping) */
+static int cow_seize_stop_parasite(struct parasite_ctl *ctl)
+{
+	return compel_stop_daemon_fast(ctl);
+}
+
+
+/* Cure parasite without remote munmap (restorer handles cleanup) */
+static int cow_seize_cure_parasite(struct parasite_ctl *ctl)
+{
+	return compel_cure_local(ctl);	
+}
+#endif
+
 void free_mappings(struct vm_area_list *vma_area_list)
 {
 	struct vma_area *vma_area, *p;
@@ -122,23 +148,13 @@ void free_mappings(struct vm_area_list *vma_area_list)
 int collect_mappings(pid_t pid, struct vm_area_list *vma_area_list, dump_filemap_t dump_file)
 {
 	int ret = -1;
-	struct timeval t_start, t_checkpoint, t_now, t_delta;
 	bool use_maps;
 
 	gettimeofday(&t_start, NULL);
 	t_checkpoint = t_start;
 
-	pr_err("\n");
-	pr_err("Collecting mappings (pid: %d)\n", pid);
-	pr_err("----------------------------------------\n");
-
 	use_maps = opts.cow_dump && opts.lazy_pages;
 	ret = use_maps ? parse_maps(pid, vma_area_list, dump_file) : parse_smaps(pid, vma_area_list, dump_file);
-	gettimeofday(&t_now, NULL);
-	timersub(&t_now, &t_checkpoint, &t_delta);
-	pr_err("TIMING: parse_%s took %ld.%06ld seconds\n", use_maps ? "maps" : "smaps", t_delta.tv_sec,
-	       t_delta.tv_usec);
-	t_checkpoint = t_now;
 	if (ret < 0)
 		goto err;
 
@@ -779,6 +795,8 @@ int dump_thread_core(int pid, CoreEntry *core, const struct parasite_dump_thread
 			tc->has_pdeath_sig = true;
 			tc->pdeath_sig = ti->pdeath_sig;
 		}
+		tc->has_timerslack_ns = true;
+		tc->timerslack_ns = ti->timerslack_ns;
 		tc->comm = xstrdup(ti->comm);
 		if (tc->comm == NULL)
 			return -1;
@@ -1529,7 +1547,7 @@ static int pre_dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie
 	struct parasite_ctl *parasite_ctl;
 	int ret = -1;
 	struct parasite_dump_misc misc;
-	struct mem_dump_ctl mdc;
+	struct mem_dump_ctl mdc = {};
 
 	vm_area_list_init(&vmas);
 
@@ -1560,11 +1578,30 @@ static int pre_dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie
 		goto err;
 	}
 
+	if (opts.cow_dump)
+		pr_err("COW PHASE 1: Collected %lu VMAs for pid %d\n",
+		       (unsigned long)vmas.nr, pid);
+
 	ret = -1;
 	parasite_ctl = parasite_infect_seized(pid, item, &vmas);
 	if (!parasite_ctl) {
 		pr_err("Can't infect (pid: %d) with parasite\n", pid);
 		goto err_free;
+	}
+
+	/*
+	 * For COW phased migration: set up WP_ASYNC tracking after infecting.
+	 * The parasite creates the userfaultfd inside the target process context
+	 * (since /proc/<pid>/userfaultfd is deprecated/unavailable on some kernels).
+	 * This allows the process to run with async write tracking during bulk
+	 * page transfer. Dirty pages are later discovered via PAGEMAP_SCAN.
+	 */
+	if (opts.cow_dump) {
+		ret = cow_dump_init_async(item, &vmas, parasite_ctl);
+		if (ret) {
+			pr_err("Failed to init COW ASYNC (pid: %d)\n", pid);
+			goto err_cure;
+		}
 	}
 
 	ret = parasite_fixup_vdso(parasite_ctl, pid, &vmas);
@@ -1587,8 +1624,20 @@ static int pre_dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie
 
 	item->pid->ns[0].virt = misc.pid;
 
-	mdc.pre_dump = true;
-	mdc.lazy = false;
+	/*
+	 * COW phased migration:
+	 *   pre_dump = false: treat as real dump for page collection
+	 *   lazy = true: use lazy VMA path in generate_iovs() to mark pages
+	 *                for deferred transfer instead of immediate dump
+	 *   cow_lazy_build_only = true: populate global_lazy_vmas only,
+	 *                do NOT write any pagemap/pages image. All disk
+	 *                writes for COW mode happen in Phase-3 skeleton
+	 *                (while frozen). Pre-dump is planning-only.
+	 */
+	mdc.pre_dump = !opts.cow_dump;
+	mdc.lazy = opts.cow_dump;
+	mdc.cow_lazy_build_only = opts.cow_dump;
+	mdc.cow_skeleton_non_lazy = false;
 	mdc.stat = NULL;
 	mdc.parent_ie = parent_ie;
 
@@ -1619,8 +1668,7 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	struct cr_imgset *cr_imgset = NULL;
 	struct parasite_drain_fd *dfds = NULL;
 	struct proc_posix_timers_stat proc_args;
-	struct mem_dump_ctl mdc;
-	struct timeval t_start, t_checkpoint, t_now, t_delta;
+	struct mem_dump_ctl mdc = {};
 
 	vm_area_list_init(&vmas);
 
@@ -1798,8 +1846,22 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 		}
 	}
 
+	/*
+	 * Phase-3 skeleton dump:
+	 *   - Non-COW: standard dump — run parasite_dump_pages_seized to dump
+	 *     all page data.
+	 *   - COW: pre-dump was planning-only; lazy VMAs have already streamed
+	 *     via P3 sender threads; we still need to dump *non-lazy* VMAs
+	 *     (file-backed private writable, etc.) now, while frozen.
+	 *     cow_skeleton_non_lazy=true makes generate_iovs short-circuit
+	 *     lazy VMAs so we only write non-lazy ones to pagemap/pages images.
+	 */
+	pr_debug("VMA_TRACE: phase=PHASE3_SKELETON pid=%d cow_is_phased_skeleton_dump=%d will_dump_pages=1\n",
+	       pid, cow_is_phased_skeleton_dump() ? 1 : 0);
 	mdc.pre_dump = false;
-	mdc.lazy = opts.lazy_pages;
+	mdc.lazy = cow_is_phased_skeleton_dump() ? false : opts.lazy_pages;
+	mdc.cow_lazy_build_only = false;
+	mdc.cow_skeleton_non_lazy = cow_is_phased_skeleton_dump();
 	mdc.stat = &pps_buf;
 	mdc.parent_ie = parent_ie;
 
@@ -1902,24 +1964,29 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 		goto err_cure;
 	}
 
+
 	/*
-	 * compel_stop_daemon and dump_task_threads use ptrace, which is
-	 * independent of the UFFDIO_WRITEPROTECT ioctls still running
-	 * in the WP worker threads.  Run them in parallel so the ~25ms
-	 * of ptrace work overlaps with any remaining WP time.
+	 * TODO(Avi): COW_CONF_TODO_ASK_AVI_cow_seize_stop_parasite
+	 *
+	 * Originally we had a "fast path" here using cow_seize_stop_parasite()
+	 * which calls compel_stop_daemon_fast() - skipping rt_sigreturn
+	 * single-stepping. The theory was this would save ~14ms.
+	 *
+	 * However, actual timing shows compel_stop_daemon() only takes ~126us.
+	 * The optimization is not worth the complexity/risk. We now always use
+	 * the regular compel_stop_daemon() path.
+	 *
+	 * If you want to re-enable the fast path, define
+	 * COW_CONF_TODO_ASK_AVI_cow_seize_stop_parasite in cow-conf.h.
+	 * The fast path is safe because COW mode overwrites registers via
+	 * arch_set_thread_regs() and detaches via pstree_switch_state(TASK_ALIVE).
 	 */
-	/*
-	 * COW fast path: skip rt_sigreturn single-stepping (~14ms).
-	 * We detach and overwrite registers anyway.
-	 */
+#ifdef COW_CONF_TODO_ASK_AVI_cow_seize_stop_parasite
 	if (opts.cow_dump && opts.lazy_pages)
-		ret = compel_stop_daemon_fast(parasite_ctl);
+		ret = cow_seize_stop_parasite(parasite_ctl);
 	else
+#endif
 		ret = compel_stop_daemon(parasite_ctl);
-	gettimeofday(&t_now, NULL);
-	timersub(&t_now, &t_checkpoint, &t_delta);
-	pr_err("TIMING: compel_stop_daemon took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
-	t_checkpoint = t_now;
 	if (ret) {
 		pr_err("Can't stop daemon in parasite (pid: %d)\n", pid);
 		goto err_cure;
@@ -1951,24 +2018,33 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	}
 
 	/*
+	 * TODO(Avi): COW_CONF_TODO_ASK_AVI_cow_seize_cure_parasite
+	 *
 	 * On failure local map will be cured in cr_dump_finish()
-	 * for lazy pages.
+	 * for lazy pages. In COW phased skeleton dump, always use
+	 * compel_cure_remote() to keep mappings for convergence.
+	 *
+	 * Originally COW mode used local cure to skip remote munmap,
+	 * with the theory that restorer handles parasite cleanup.
+	 * However, compel_cure() only takes ~9.6ms - optimization may
+	 * not be worth the complexity/risk.
+	 *
+	 * If you want to re-enable the local cure optimization, define
+	 * COW_CONF_TODO_ASK_AVI_cow_seize_cure_parasite in cow-conf.h.
 	 */
-	/*
-	 * COW mode: skip munmap of parasite blob — it's a private anon
-	 * mapping covered by COW WP tracking, harmless after detach.
-	 * Saves the ptrace syscall injection overhead.
-	 */
+#ifdef COW_CONF_TODO_ASK_AVI_cow_seize_cure_parasite
 	if (opts.cow_dump && opts.lazy_pages)
-		ret = compel_cure_local(parasite_ctl);
-	else if (opts.lazy_pages)
+		ret = cow_seize_cure_parasite(parasite_ctl);
+	else if (opts.lazy_pages || cow_is_phased_skeleton_dump())
 		ret = compel_cure_remote(parasite_ctl);
 	else
 		ret = compel_cure(parasite_ctl);
-	gettimeofday(&t_now, NULL);
-	timersub(&t_now, &t_checkpoint, &t_delta);
-	pr_err("TIMING: compel_cure took %ld.%06ld seconds\n", t_delta.tv_sec, t_delta.tv_usec);
-	t_checkpoint = t_now;
+#else
+	if (opts.lazy_pages || cow_is_phased_skeleton_dump())
+		ret = compel_cure_remote(parasite_ctl);
+	else
+		ret = compel_cure(parasite_ctl);
+#endif
 	if (ret) {
 		pr_err("Can't cure (pid: %d) from parasite\n", pid);
 		goto err;
@@ -2141,7 +2217,7 @@ err:
 		pr_err("Pre-dumping FAILED.\n");
 	else {
 		write_stats(DUMP_STATS);
-		pr_info("Pre-dumping finished successfully\n");
+		pr_warn("Pre-dumping finished successfully\n");
 	}
 	return ret;
 }
@@ -2263,9 +2339,16 @@ static int cr_dump_finish(int ret)
 {
 	int post_dump_ret = 0;
 
-	if (disconnect_from_page_server())
-		ret = -1;
+	/*
+	 * For COW mode, don't disconnect yet - we need the socket open
+	 * to send all_pages_sent signal. It will be closed later.
+	 */
+	if (!(opts.cow_dump && cow_get_phase() == COW_PHASE_DONE)) {
+		if (disconnect_from_page_server())
+			ret = -1;
+	}
 
+	pr_err("DEBUG: Closing glob_imgset\n");
 	close_cr_imgset(&glob_imgset);
 
 	if (bfd_flush_images())
@@ -2314,39 +2397,149 @@ static int cr_dump_finish(int ret)
 	 */
 	if (ret || post_dump_ret || opts.final_state == TASK_ALIVE) {
 		unsuspend_lsm();
-		network_unlock();
+		/*
+		 * TODO(Avi): COW_CONF_TODO_ASK_AVI_network_lock
+		 * COW mode skips network_unlock(). See cow-conf.h for details.
+		 */
+#ifdef COW_CONF_TODO_ASK_AVI_network_lock
+		if (!opts.cow_dump)
+		{
+			struct timeval t_start, t_end, t_delta;
+			gettimeofday(&t_start, NULL);
+			network_unlock();
+			gettimeofday(&t_end, NULL);
+			timersub(&t_end, &t_start, &t_delta);
+			pr_err("TIMING: network_unlock took %ld.%06ld seconds\n",
+			       t_delta.tv_sec, t_delta.tv_usec);
+		}
+#else
+		{
+			struct timeval t_start, t_end, t_delta;
+			gettimeofday(&t_start, NULL);
+			network_unlock();
+			gettimeofday(&t_end, NULL);
+			timersub(&t_end, &t_start, &t_delta);
+			pr_err("TIMING: network_unlock took %ld.%06ld seconds\n",
+			       t_delta.tv_sec, t_delta.tv_usec);
+		}
+#endif
 		delete_link_remaps();
-		clean_cr_time_mounts();
 	}
 
-	/* Resume process early if using COW dump with lazy pages */
-	if (!ret && opts.lazy_pages && opts.cow_dump) {
-		pr_err("PAGE SERVER READY TO SERVE\n");
+	/*
+	 * COW phased dump path: signal replica and unfreeze.
+	 * Inventory was already written in cr_dump_tasks_cow_phased().
+	 */
+	if (opts.cow_dump && cow_get_phase() == COW_PHASE_DONE) {
+		struct timeval t_start, t_end, t_delta;
+		int sk = get_page_server_sk();
 
-		if (!cow_is_wp_async() && cow_start_monitor_thread()) {
-			pr_err("Failed to start COW monitor thread\n");
-			ret = -1;
-			goto out_release_cow;
-		}
+		pr_err("COW: Signaling replica (ret=%d, sk=%d)\n", ret, sk);
 
 		/*
-		 * Process was already resumed in cr_dump_tasks() right
-		 * after dump_one_task.  Just start the page transfer.
+		 * Send single completion signal while frozen (fast).
+		 * Replica waits for this before starting restore.
 		 */
-		ret = cr_lazy_mem_dump();
-	} else {
-		/* Standard path: transfer pages then resume */
-		if (!ret && opts.lazy_pages)
-			ret = cr_lazy_mem_dump();
-		
-		if (arch_set_thread_regs(root_item, true) < 0)
-			ret = -1;
-		else {
-			cr_plugin_fini(CR_PLUGIN_STAGE__DUMP, ret);
-
-			pstree_switch_state(root_item, (ret || post_dump_ret) ? TASK_ALIVE : opts.final_state);
-			timing_stop(TIME_FROZEN);
+		gettimeofday(&t_start, NULL);
+		if (!ret && sk >= 0) {
+			if (cow_send_skeleton_files(sk) < 0) {
+				pr_err("COW: Failed to send skeleton files\n");
+				ret = -1;
+			}
+			if (!ret && send_all_pages_sent_signal(sk) < 0) {
+				pr_err("COW: Failed to send completion signal\n");
+				ret = -1;
+			}
 		}
+		gettimeofday(&t_end, NULL);
+		timersub(&t_end, &t_start, &t_delta);
+		pr_err("TIMING: send_completion_signal took %ld.%06ld seconds\n",
+		       t_delta.tv_sec, t_delta.tv_usec);
+
+		/* Unfreeze IMMEDIATELY - don't wait for ACK while frozen */
+		{
+			struct timeval freeze_end, freeze_delta;
+			gettimeofday(&freeze_end, NULL);
+			timersub(&freeze_end, &g_phase3_freeze_start, &freeze_delta);
+			pr_err("TIMING: Phase 3 total freeze time: %ld.%06ld seconds\n",
+			       freeze_delta.tv_sec, freeze_delta.tv_usec);
+		}
+
+
+#ifdef CONFIG_COW_COMPARE
+		/*
+		 * When comparing, wait for ACK before compare starts.
+		 * Replica sends ACK after it's ready for comparison.
+		 */
+		gettimeofday(&t_start, NULL);
+		if (!ret && sk >= 0) {
+			if (wait_for_all_pages_sent_ack(sk) < 0) {
+				pr_err("COW: Failed to receive completion ACK\n");
+				ret = -1;
+			}
+		}
+		gettimeofday(&t_end, NULL);
+		timersub(&t_end, &t_start, &t_delta);
+		pr_err("TIMING: wait_for_completion_ack took %ld.%06ld seconds (before compare)\n",
+		       t_delta.tv_sec, t_delta.tv_usec);
+
+		/* Process comparison with replica (source already unfrozen) */
+		{
+			int compare_sk;
+			pid_t target_pid = root_item->pid->real;
+
+			pr_err("COMPARE: PRIMARY waiting for replica connection (PID %d running)\n",
+			       target_pid);
+
+			if (cow_compare_listen(&compare_sk) == 0) {
+				cow_compare_send_state(compare_sk, target_pid);
+				close(compare_sk);
+			}
+			pr_err("COMPARE: PRIMARY comparison done\n");
+		}
+
+		pr_err("COW: Unfreezing process\n");
+		pstree_switch_state(root_item, TASK_ALIVE);
+#else
+
+		pr_err("COW: Unfreezing process\n");
+		pstree_switch_state(root_item, TASK_ALIVE);
+		/* Wait for ACK AFTER unfreeze - not on critical path */
+		gettimeofday(&t_start, NULL);
+		if (!ret && sk >= 0) {
+			if (wait_for_all_pages_sent_ack(sk) < 0) {
+				pr_err("COW: Failed to receive completion ACK\n");
+				ret = -1;
+			}
+		}
+		gettimeofday(&t_end, NULL);
+		timersub(&t_end, &t_start, &t_delta);
+		pr_err("TIMING: wait_for_completion_ack took %ld.%06ld seconds (after unfreeze)\n",
+		       t_delta.tv_sec, t_delta.tv_usec);
+#endif
+
+		/* Cleanup after unfreeze - not on critical path */
+		cow_cleanup_async_uffd();
+
+		/* Close page server socket AFTER unfreeze */
+		close_page_server_socket();
+
+		goto out_release_cow;
+	}
+
+	/* Standard path: transfer pages then resume */
+	if (!ret && opts.lazy_pages) {
+		pr_debug("DEBUG_SOCKET: About to call cr_lazy_mem_dump (standard path)\n");
+		ret = cr_lazy_mem_dump();
+	}
+
+	if (arch_set_thread_regs(root_item, true) < 0)
+		ret = -1;
+	else {
+		cr_plugin_fini(CR_PLUGIN_STAGE__DUMP, ret);
+
+		pstree_switch_state(root_item, (ret || post_dump_ret) ? TASK_ALIVE : opts.final_state);
+		timing_stop(TIME_FROZEN);
 	}
 
 out_release_cow:
@@ -2361,7 +2554,7 @@ out_release_cow:
 	free_file_locks();
 	free_link_remaps();
 	free_aufs_branches();
-	free_userns_maps();
+	free_userns_data();
 
 	close_service_fd(CR_PROC_FD_OFF);
 	close_image_dir();
@@ -2374,10 +2567,71 @@ out_release_cow:
 		pr_err("Dumping FAILED.\n");
 	} else {
 		write_stats(DUMP_STATS);
-		pr_info("Dumping finished successfully\n");
+		pr_warn("Dumping finished successfully\n");
 	}
 	return post_dump_ret ?: (ret != 0);
 }
+
+/*
+ * cr_dump_post_task_operations - Common post-task dump operations
+ *
+ * Called after all tasks have been dumped. Handles mount namespaces,
+ * file locks, process tree, cgroups, and other post-dump cleanup.
+ *
+ * Returns: 0 on success, -1 on error
+ */
+static int cr_dump_post_task_operations(InventoryEntry *he)
+{
+	if (dead_pid_conflict())
+		return -1;
+
+	if (dump_mnt_namespaces() < 0)
+		return -1;
+
+	if (dump_file_locks())
+		return -1;
+
+	if (dump_verify_tty_sids())
+		return -1;
+
+	if (dump_zombies())
+		return -1;
+
+	if (dump_pstree(root_item))
+		return -1;
+
+	if (cr_dump_shmem())
+		return -1;
+
+	if (root_ns_mask) {
+		if (dump_namespaces(root_item, root_ns_mask))
+			return -1;
+	}
+
+	if ((root_ns_mask & CLONE_NEWTIME) == 0) {
+		if (dump_time_ns(0))
+			return -1;
+	}
+
+	if (dump_aa_namespaces() < 0)
+		return -1;
+
+	if (dump_cgroups())
+		return -1;
+
+	if (fix_external_unix_sockets())
+		return -1;
+
+	if (tty_post_actions())
+		return -1;
+
+	if (inventory_save_uptime(he))
+		return -1;
+
+	return 0;
+}
+
+
 
 int cr_dump_tasks(pid_t pid)
 {
@@ -2386,6 +2640,19 @@ int cr_dump_tasks(pid_t pid)
 	struct pstree_item *item;
 	int ret;
 	int exit_code = -1;
+
+	pr_debug("DEBUG_SOCKET: cr_dump_tasks ENTRY cow_dump=%d lazy_pages=%d\n",
+	       opts.cow_dump, opts.lazy_pages);
+
+	/*
+	 * COW phased migration: when both --cow-dump and --lazy-pages are
+	 * enabled, use the phased WP_ASYNC → WP_SYNC flow for minimal
+	 * source downtime.
+	 */
+	if (opts.cow_dump && opts.lazy_pages) {
+		pr_debug("DEBUG_SOCKET: Redirecting to cr_dump_tasks_cow_phased\n");
+		return cr_dump_tasks_cow_phased(pid);
+	}
 
 	kerndat_warn_about_madv_guards();
 
@@ -2482,8 +2749,21 @@ int cr_dump_tasks(pid_t pid)
 	       t_fn_d.tv_sec, t_fn_d.tv_usec); \
 } while (0)
 
-		TIME_FN(ret = checkpoint_devices() ? -1 : 0, "checkpoint_devices");
-		if (ret) goto err;
+	/*
+	 * TODO(Avi): COW_CONF_TODO_ASK_AVI_network_lock
+	 * COW mode skips network_lock(). See cow-conf.h for details.
+	 * Questions: Is this intentional? How does COW handle TCP state?
+	 */
+#ifdef COW_CONF_TODO_ASK_AVI_network_lock
+	if (!opts.cow_dump) {
+		if (network_lock())
+			goto err;
+	}
+#else	
+	if (network_lock())
+		goto err;
+	
+#endif
 
 		TIME_FN(ret = collect_pstree_ids() ? -1 : 0, "collect_pstree_ids");
 		if (ret) goto err;
@@ -2496,8 +2776,10 @@ int cr_dump_tasks(pid_t pid)
 		TIME_FN(ret = rpc_query_external_files() ? -1 : 0, "rpc_query_ext");
 		if (ret) goto err;
 
-		TIME_FN(ret = collect_file_locks() ? -1 : 0, "collect_file_locks");
-		if (ret) goto err;
+	glob_imgset = cr_glob_imgset_open(O_DUMP);
+	if (!glob_imgset)
+		goto err;
+	pr_err("DEBUG: glob_imgset opened for dump (standard path)\n");
 
 		TIME_FN(ret = (collect_namespaces(true) < 0) ? -1 : 0, "collect_namespaces");
 		if (ret) goto err;
@@ -2559,63 +2841,8 @@ int cr_dump_tasks(pid_t pid)
 		parent_ie = NULL;
 	}
 
-	/*
-	 * It may happen that a process has completed but its files in
-	 * /proc/PID/ are still open by another process. If the PID has been
-	 * given to some newer thread since then, we may be unable to dump
-	 * all this.
-	 */
-	if (dead_pid_conflict())
-		goto err;
-
-	/* MNT namespaces are dumped after files to save remapped links */
-	if (dump_mnt_namespaces() < 0)
-		goto err;
-
-	if (dump_file_locks())
-		goto err;
-
-	if (dump_verify_tty_sids())
-		goto err;
-
-	if (dump_zombies())
-		goto err;
-
-	if (dump_pstree(root_item))
-		goto err;
-
-	/*
-	 * TODO: cr_dump_shmem has to be called before dump_namespaces(),
-	 * because page_ids is a global variable and it is used to dump
-	 * ipc shared memory, but an ipc namespace is dumped in a child
-	 * process.
-	 */
-	if (cr_dump_shmem())
-		goto err;
-
-	if (root_ns_mask) {
-		if (dump_namespaces(root_item, root_ns_mask))
-			goto err;
-	}
-
-	if ((root_ns_mask & CLONE_NEWTIME) == 0) {
-		if (dump_time_ns(0))
-			goto err;
-	}
-
-	if (dump_aa_namespaces() < 0)
-		goto err;
-
-	if (dump_cgroups())
-		goto err;
-
-	if (fix_external_unix_sockets())
-		goto err;
-
-	if (tty_post_actions())
-		goto err;
-
-	if (inventory_save_uptime(&he))
+	/* Standard post-task dump operations */
+	if (cr_dump_post_task_operations(&he))
 		goto err;
 
 	he.has_pre_dump_mode = false;
@@ -2625,6 +2852,487 @@ int cr_dump_tasks(pid_t pid)
 	}
 
 	exit_code = write_img_inventory(&he);
+err:
+	if (parent_ie)
+		inventory_entry__free_unpacked(parent_ie, NULL);
+
+	return cr_dump_finish(exit_code);
+}
+
+/*
+ * cr_dump_tasks_cow_phased - COW phased migration orchestration
+ *
+ * Implements the WP_ASYNC → WP_SYNC phased migration flow:
+ *   Phase 1: pre_dump → WP_ASYNC all VMAs → resume immediately
+ *   Phase 2: bulk page transfer (process running, writes tracked async)
+ *   Phase 3: freeze → dump skeleton (no pages) → PAGEMAP_SCAN dirty pages
+ *   Phase 4: WP_SYNC on dirty pages → resume → convergence
+ */
+static int cr_dump_tasks_cow_phased(pid_t pid)
+{
+	InventoryEntry he = INVENTORY_ENTRY__INIT;
+	InventoryEntry *parent_ie = NULL;
+	struct pstree_item *item;
+	struct timeval freeze_start, freeze_end, freeze_delta;
+	int ret;
+	int exit_code = -1;
+
+	kerndat_warn_about_madv_guards();
+
+	pr_info("========================================\n");
+	pr_info("COW Phased dump (pid: %d comm: %s)\n", pid, __task_comm_info(pid));
+	pr_info("========================================\n");
+
+	rlimit_unlimit_nofile();
+
+	root_item = alloc_pstree_item();
+	if (!root_item)
+		goto err;
+	root_item->pid->real = pid;
+
+	ret = run_scripts(ACT_PRE_DUMP);
+	if (ret != 0) {
+		pr_err("Pre dump script failed with %d!\n", ret);
+		goto err;
+	}
+
+	if (init_stats(DUMP_STATS))
+		goto err;
+
+	if (cr_plugin_init(CR_PLUGIN_STAGE__DUMP))
+		goto err;
+
+	if (lsm_check_opts())
+		goto err;
+
+	if (irmap_load_cache())
+		goto err;
+
+	if (cpu_init())
+		goto err;
+
+	if (vdso_init_dump())
+		goto err;
+
+	if (cgp_init(opts.cgroup_props,
+		     opts.cgroup_props ? strlen(opts.cgroup_props) : 0,
+		     opts.cgroup_props_file))
+		goto err;
+
+	if (parse_cg_info())
+		goto err;
+
+	if (prepare_inventory(&he))
+		goto err;
+
+	if (opts.cpu_cap & CPU_CAP_IMAGE) {
+		if (cpu_dump_cpuinfo())
+			goto err;
+	}
+
+	if (connect_to_page_server_to_send() < 0)
+		goto err;
+
+	if (setup_alarm_handler())
+		goto err;
+
+	/* === PHASE 1: Seize + Pre-dump + WP_ASYNC === */
+	pr_err("=== PHASE 1: Seize + Pre-dump + WP_ASYNC ===\n");
+
+	gettimeofday(&freeze_start, NULL);
+	pr_err("TIMING: Phase 1 freeze started\n");
+
+	if (collect_pstree())
+		goto err;
+
+	if (checkpoint_devices())
+		goto err;
+
+	if (collect_pstree_ids_predump())
+		goto err;
+
+	if (collect_namespaces(false) < 0)
+		goto err;
+
+	/* Errors handled later in detect_pid_reuse */
+	parent_ie = get_parent_inventory();
+
+	if (collect_and_suspend_lsm() < 0)
+		goto err;
+
+	for_each_pstree_item(item) {
+		if (pre_dump_one_task(item, parent_ie))
+			goto err;
+	}
+
+	/*
+	 * Start BPF dirty page tracker BEFORE unfreezing the process.
+	 * This ensures we capture all page faults from the moment the
+	 * process resumes. Starting after unfreeze creates a race window
+	 * where faults could be missed.
+	 */
+#ifdef CONFIG_HAS_LIBBPF
+	if (cow_bpf_start(root_item->pid->real) == 0)
+		pr_err("BPF dirty tracker started (before unfreeze)\n");
+	else
+		pr_info("BPF dirty tracker not available, using PAGEMAP_SCAN\n");
+#endif
+
+	/* Unfreeze — process runs with WP_ASYNC, BPF captures all faults */
+	ret = arch_set_thread_regs(root_item, false);
+	if (ret)
+		goto err;
+
+	pstree_switch_state(root_item, TASK_ALIVE);
+
+	gettimeofday(&freeze_end, NULL);
+	timersub(&freeze_end, &freeze_start, &freeze_delta);
+	pr_err("TIMING: Phase 1 freeze ended - process frozen for %ld.%06ld seconds\n",
+	       freeze_delta.tv_sec, freeze_delta.tv_usec);
+
+	/* === PHASE 2: Bulk page transfer + iterative dirty scan === */
+	pr_err("=== PHASE 2: Bulk page transfer + dirty scan convergence ===\n");
+
+	/*
+	 * Start the page server which starts P3 threads.
+	 * P3 threads do bulk transfer then iterative dirty scanning.
+	 * WP_ASYNC tracks writes without generating faults.
+	 */
+	ret = cr_page_server(false, true, -1);
+	if (ret) {
+		pr_err("Bulk page transfer failed\n");
+		goto err_refreeze;
+	}
+
+	wait_for_page_server_thread();
+
+	/*
+	 * Clean up page_pipes and local parasite mappings from Phase 1.
+	 * The bulk transfer is complete, so we no longer need these.
+	 */
+	for_each_pstree_item(item) {
+		if (item->pid->state != TASK_DEAD && dmpi(item)->mem_pp) {
+			destroy_page_pipe(dmpi(item)->mem_pp);
+			dmpi(item)->mem_pp = NULL;
+			if (dmpi(item)->parasite_ctl) {
+				if (compel_cure_local(dmpi(item)->parasite_ctl))
+					pr_err("Can't cure local (pid: %d)\n",
+					       item->pid->real);
+				dmpi(item)->parasite_ctl = NULL;
+			}
+		}
+	}
+
+	/*
+	 * Wait for P3 threads to converge (all below dirty page threshold).
+	 * Threads are running iterative dirty scan loop.
+	 */
+	pr_err("=== Waiting for dirty page convergence ===\n");
+	while (!cow_all_threads_below_threshold()) {
+		usleep(10000);  /* 10ms poll */
+	}
+	pr_err("=== CONVERGENCE: All threads below threshold ===\n");
+
+	/* === PHASE 3: Freeze + skeleton dump === */
+	pr_err("=== PHASE 3: Freeze + skeleton dump ===\n");
+
+	gettimeofday(&freeze_start, NULL);
+	g_phase3_freeze_start = freeze_start;  /* Save for cr_dump_finish */
+	pr_err("TIMING: Phase 3 freeze started\n");
+
+	/*
+	 * Re-seize all tasks. After Phase 1, tasks were released via
+	 * pstree_switch_state(TASK_ALIVE) which detached from ptrace.
+	 * We need to re-attach to perform the skeleton dump.
+	 */
+	{
+		struct timeval t_start, t_end, t_delta, t_elapsed;
+		gettimeofday(&t_start, NULL);
+		timersub(&t_start, &freeze_start, &t_elapsed);
+		pr_warn("TIMING @%ld.%06ld: reseize_pstree starting\n",
+		       t_elapsed.tv_sec, t_elapsed.tv_usec);
+		ret = reseize_pstree();
+		gettimeofday(&t_end, NULL);
+		timersub(&t_end, &t_start, &t_delta);
+		pr_err("TIMING: reseize_pstree took %ld.%06ld seconds\n",
+		       t_delta.tv_sec, t_delta.tv_usec);
+	}
+	if (ret) {
+		pr_err("Failed to re-seize tasks\n");
+		goto err;
+	}
+
+#ifdef SCAN_COMPARE
+	/* DEBUG: Compare BPF vs PAGEMAP_SCAN and exit */
+	cow_debug_scan_compare();	
+#endif
+
+	/*
+	 * Collect pstree IDs now so vpid(item) is valid for the VMA detection.
+	 * This must happen before cow_detect_new_vmas() which uses dst_id.
+	 */
+	{
+		struct timeval t_start, t_end, t_delta;
+		gettimeofday(&t_start, NULL);
+		if (collect_pstree_ids())
+			goto err;
+		gettimeofday(&t_end, NULL);
+		timersub(&t_end, &t_start, &t_delta);
+		pr_err("TIMING: collect_pstree_ids took %ld.%06ld seconds\n",
+		       t_delta.tv_sec, t_delta.tv_usec);
+	}
+
+	/* Update COW dst_id now that collect_pstree_ids() has populated vpid */
+	cow_set_dst_id(vpid(root_item));
+
+	/*
+	 * Detect VMAs that were created between Phase 1 and Phase 3.
+	 * New VMAs weren't tracked during Phase 2, so their pages weren't
+	 * sent. We mark them as dirty to ensure they get transferred
+	 * and protected with WP_SYNC for convergence.
+	 */
+	{
+		struct vm_area_list phase3_vmas;
+		unsigned long *new_vma_ranges = NULL;
+		unsigned int nr_new_vma_ranges = 0;
+		struct timeval t_start, t_end, t_delta;
+
+		vm_area_list_init(&phase3_vmas);
+
+		gettimeofday(&t_start, NULL);
+		ret = collect_mappings(root_item->pid->real, &phase3_vmas, NULL);
+		gettimeofday(&t_end, NULL);
+		timersub(&t_end, &t_start, &t_delta);
+		pr_err("TIMING: Phase3 collect_mappings took %ld.%06ld seconds\n",
+		       t_delta.tv_sec, t_delta.tv_usec);
+		if (ret) {
+			pr_err("Failed to collect Phase 3 VMAs\n");
+			goto err;
+		}
+
+		pr_err("COW PHASE 3: Collected %lu VMAs for pid %d (compare with Phase 1 count)\n",
+		       (unsigned long)phase3_vmas.nr, root_item->pid->real);
+
+		gettimeofday(&t_start, NULL);
+		ret = cow_detect_new_vmas(&phase3_vmas, &new_vma_ranges, &nr_new_vma_ranges);
+		gettimeofday(&t_end, NULL);
+		timersub(&t_end, &t_start, &t_delta);
+		pr_err("TIMING: cow_detect_new_vmas took %ld.%06ld seconds\n",
+		       t_delta.tv_sec, t_delta.tv_usec);
+		free_mappings(&phase3_vmas);
+
+		if (ret) {
+			pr_err("Failed to detect new VMAs\n");
+			goto err;
+		}
+
+		if (nr_new_vma_ranges > 0) {
+			pr_err("COW PHASE 3: Found %u new VMA regions since Phase 1!\n",
+				nr_new_vma_ranges);
+			pr_err("COW PHASE 3: These VMAs were created while process ran during Phase 2.\n");
+			pr_err("COW PHASE 3: Their PAGE DATA will be sent, but VMA METADATA is missing from dump.\n");
+			pr_err("COW PHASE 3: REPLICA will NOT have these VMAs - expect comparison differences!\n");
+
+			/* Pass new VMA ranges to P3 threads for sending during final scan */
+			cow_set_new_vma_ranges(new_vma_ranges, nr_new_vma_ranges);
+			/* Don't free - P3 threads will use it */
+		} else {
+			pr_err("COW PHASE 3: No new VMAs detected - VMA count unchanged since Phase 1.\n");
+			xfree(new_vma_ranges);
+		}
+	}
+
+	/*
+	 * Signal P3 threads to do final scan (process is frozen, new VMA ranges set).
+	 * Must be after cow_set_new_vma_ranges() so threads can send new VMA pages.
+	 */
+	cow_signal_last_scan();
+
+	/*
+	 * TODO(Avi): COW_CONF_TODO_ASK_AVI_network_lock
+	 * COW mode skips network_lock(). See cow-conf.h for details.
+	 */
+#ifdef COW_CONF_TODO_ASK_AVI_network_lock
+	if (!opts.cow_dump) {
+	{
+		struct timeval t_start, t_end, t_delta;
+		gettimeofday(&t_start, NULL);
+		if (network_lock())
+			goto err;
+		gettimeofday(&t_end, NULL);
+		timersub(&t_end, &t_start, &t_delta);
+		pr_err("TIMING: network_lock took %ld.%06ld seconds\n",
+		       t_delta.tv_sec, t_delta.tv_usec);
+	}
+#else
+	{	
+		struct timeval t_start, t_end, t_delta;
+		gettimeofday(&t_start, NULL);
+		if (network_lock())
+			goto err;
+		gettimeofday(&t_end, NULL);
+		timersub(&t_end, &t_start, &t_delta);
+		pr_err("TIMING: network_lock took %ld.%06ld seconds\n",
+		       t_delta.tv_sec, t_delta.tv_usec);
+	}
+#endif
+
+	{
+		struct timeval t_start, t_end, t_delta;
+		gettimeofday(&t_start, NULL);
+		if (rpc_query_external_files())
+			goto err;
+		gettimeofday(&t_end, NULL);
+		timersub(&t_end, &t_start, &t_delta);
+		pr_err("TIMING: rpc_query_external_files took %ld.%06ld seconds\n",
+		       t_delta.tv_sec, t_delta.tv_usec);
+	}
+
+	{
+		struct timeval t_start, t_end, t_delta;
+		gettimeofday(&t_start, NULL);
+		if (collect_file_locks())
+			goto err;
+		gettimeofday(&t_end, NULL);
+		timersub(&t_end, &t_start, &t_delta);
+		pr_err("TIMING: collect_file_locks took %ld.%06ld seconds\n",
+		       t_delta.tv_sec, t_delta.tv_usec);
+	}
+
+	{
+		struct timeval t_start, t_end, t_delta;
+		gettimeofday(&t_start, NULL);
+		if (collect_namespaces(true) < 0)
+			goto err;
+		gettimeofday(&t_end, NULL);
+		timersub(&t_end, &t_start, &t_delta);
+		pr_err("TIMING: collect_namespaces took %ld.%06ld seconds\n",
+		       t_delta.tv_sec, t_delta.tv_usec);
+	}
+
+	{
+		struct timeval t_start, t_end, t_delta;
+		gettimeofday(&t_start, NULL);
+		glob_imgset = cr_glob_imgset_open(O_DUMP);
+		if (!glob_imgset)
+			goto err;
+		gettimeofday(&t_end, NULL);
+		timersub(&t_end, &t_start, &t_delta);
+		pr_err("TIMING: cr_glob_imgset_open took %ld.%06ld seconds\n",
+		       t_delta.tv_sec, t_delta.tv_usec);
+	}
+	pr_err("DEBUG: glob_imgset opened for skeleton dump (COW path)\n");
+
+	{
+		struct timeval t_start, t_end, t_delta;
+		gettimeofday(&t_start, NULL);
+		if (seccomp_collect_dump_filters() < 0)
+			goto err;
+		gettimeofday(&t_end, NULL);
+		timersub(&t_end, &t_start, &t_delta);
+		pr_err("TIMING: seccomp_collect_dump_filters took %ld.%06ld seconds\n",
+		       t_delta.tv_sec, t_delta.tv_usec);
+	}
+
+	/* Set phase to SCAN so cow_is_phased_skeleton_dump() returns true */
+	cow_set_phase(COW_PHASE_SCAN);
+
+	/* Dump skeleton (everything except pages) */
+	{
+		struct timeval t_start, t_end, t_delta, t_elapsed;
+		gettimeofday(&t_start, NULL);
+		timersub(&t_start, &freeze_start, &t_elapsed);
+		pr_warn("TIMING @%ld.%06ld: skeleton dump loop starting\n",
+		       t_elapsed.tv_sec, t_elapsed.tv_usec);
+		for_each_pstree_item(item) {
+			if (dump_one_task(item, parent_ie))
+				goto err;
+		}
+		gettimeofday(&t_end, NULL);
+		timersub(&t_end, &t_start, &t_delta);
+		pr_err("TIMING: skeleton dump loop took %ld.%06ld seconds\n",
+		       t_delta.tv_sec, t_delta.tv_usec);
+	}
+
+	if (parent_ie) {
+		inventory_entry__free_unpacked(parent_ie, NULL);
+		parent_ie = NULL;
+	}
+
+	/* Standard post-task dump operations */
+	{
+		struct timeval t_start, t_end, t_delta, t_elapsed;
+		gettimeofday(&t_start, NULL);
+		timersub(&t_start, &freeze_start, &t_elapsed);
+		pr_warn("TIMING @%ld.%06ld: cr_dump_post_task_operations starting\n",
+		       t_elapsed.tv_sec, t_elapsed.tv_usec);
+		if (cr_dump_post_task_operations(&he))
+			goto err;
+		gettimeofday(&t_end, NULL);
+		timersub(&t_end, &t_start, &t_delta);
+		pr_err("TIMING: cr_dump_post_task_operations took %ld.%06ld seconds\n",
+		       t_delta.tv_sec, t_delta.tv_usec);
+	}
+
+	pr_info("Skeleton dump complete\n");
+
+	/*
+	 * Wait for P3 threads to complete their final scan (process is frozen,
+	 * last_scan flag was set above). Threads will send any remaining dirty pages.
+	 *
+	 * NOTE: Inventory write and signal moved to cr_dump_finish() - they happen
+	 * AFTER all data is collected and flushed, right before unfreeze.
+	 */
+	pr_err("=== Waiting for P3 threads final scan ===\n");
+	{
+		struct timeval t_start, t_end, t_delta, t_elapsed;
+		gettimeofday(&t_start, NULL);
+		timersub(&t_start, &freeze_start, &t_elapsed);
+		pr_warn("TIMING @%ld.%06ld: cow_wait_p3_threads starting\n",
+		       t_elapsed.tv_sec, t_elapsed.tv_usec);
+		cow_wait_p3_threads();
+		gettimeofday(&t_end, NULL);
+		timersub(&t_end, &t_start, &t_delta);
+		pr_err("TIMING: cow_wait_p3_threads took %ld.%06ld seconds\n",
+		       t_delta.tv_sec, t_delta.tv_usec);
+	}
+	pr_err("P3 threads completed: %lu total pages sent\n", cow_p3_pages_sent());
+
+	if (cow_p3_had_error()) {
+		pr_err("cow-dump: P3 bulk transfer reported errors — failing "
+		       "the dump rather than producing a torn image\n");
+		goto err_refreeze;
+	}
+
+	/* Free new VMA ranges after P3 threads are done using them */
+	cow_free_new_vma_ranges();
+
+	/*
+	 * all_pages_sent signal is sent in cr_dump_finish() after unfreeze.
+	 */
+
+	cow_set_phase(COW_PHASE_DONE);
+
+	/* NOTE: cow_cleanup_async_uffd() moved to cr_dump_finish() after unfreeze */
+
+	/* Set up inventory fields and write - like standard path */
+	he.has_pre_dump_mode = false;
+	if (found_uprobes_vma()) {
+		he.has_allow_uprobes = true;
+		he.allow_uprobes = true;
+	}
+
+	exit_code = write_img_inventory(&he);
+	goto err;
+
+err_refreeze:
+	/*
+	 * If we failed during bulk transfer, try to re-seize tasks before
+	 * cleanup. Tasks were detached in Phase 1, so pstree_switch_state
+	 * alone won't work.
+	 */
+	if (reseize_pstree())
+		pr_warn("Failed to re-seize tasks during error cleanup\n");
 err:
 	if (parent_ie)
 		inventory_entry__free_unpacked(parent_ie, NULL);

@@ -81,36 +81,6 @@ address space. It is a separate project because the logic for generating and
 injecting Position-Independent Executable (PIE) code is complex and
 self-contained.
 
-### Project Goal
-
-**Near-zero-interruption live migration for Valkey.**
-
-This is not a research project. The goal is a production-grade solution that
-Valkey users can adopt. The constraints are non-negotiable:
-
-- **Source unresponsive time: 2-digit milliseconds maximum.** Any approach that
-  causes the source Valkey to be unresponsive for more than ~99ms is rejected.
-  This includes dump freeze time, cutover freeze, and any other window where
-  clients see errors or timeouts.
-- **No special infrastructure requirements.** The solution must work with
-  standard Linux (kernel 6.x+), standard networking (TCP), and standard
-  hardware. Requiring shared filesystems (FSx, NFS), specific cloud providers,
-  or exotic kernel modules disqualifies an approach. It must work for any
-  Valkey deployment on any two Linux machines connected by a network.
-- **Architecture: both aarch64 and x86_64.** The solution must work on both
-  architectures. No architecture-specific hacks or workarounds that only
-  apply to one.
-- **Target scale: 100GB+ datasets with live traffic.** The solution is required to handle
-  large Valkey instances under active read/write workloads during migration.
-- **Source stays up, replica can be down.** The source Valkey is required to remain
-  responsive to clients throughout the entire migration. The replica is not
-  serving traffic — it can be down/stopped/rebuilding for as long as needed.
-  Only the source's availability matters.
-
-Any direction that violates these constraints is a dead end. Do not propose
-solutions that require shared storage, that accept multi-second source freezes,
-or that only work at small scale.
-
 ### COW Dump (this fork)
 
 This repository contains an experimental COW (copy-on-write) dump implementation
@@ -130,54 +100,6 @@ the process continues to run.
   - `criu/mem.c` changes lazy-capable VMA handling for COW mode
   - `criu/page-xfer.c` integrates COW pages into page-server transfer
   - `criu/uffd.c` has restore-side changes for bulk transfer in COW mode
-
-### Current State (Feb 2026)
-
-**200GB quiesced migration: SOLVED.** Production-ready. 76ms freeze, 1ms
-cutover, 114.9s total migration at 1,707 MB/s. ALL 7 verification tests pass.
-
-**100GB live traffic migration: SOLVED.** Production-ready. 51ms freeze, 1ms
-cutover, 58.2s total migration at 1,704 MB/s. ALL 7 verification tests pass
-(12/14 historical runs passed; 2 failures were test-harness fill issues, not
-migration bugs).
-
-The live traffic SIGSEGV (jemalloc creating new mmap extents during transfer)
-was fixed with three defenses:
-  1. **VMA mirroring**: source detects new VMAs during convergence, sends
-     `PS_IOV_VMA_DIFF` to replica, CRIU injects `mmap(MAP_FIXED)` via ptrace
-  2. **Fork-snapshot convergence**: reads dirty pages from a COW fork instead
-     of the live process, guaranteeing temporal consistency
-  3. **Arena reset**: zeros glibc fastbins and empties bins at restore time
-See `FUTEX_DEADLOCK_RESEARCH.md` Acts XVII-XIX for the full analysis.
-
-Architecture (proven at 200GB quiesced, 100GB live):
-```
-Source: COW dump (51ms freeze) → page-server (8 TCP streams) → bulk + converge
-Replica: criu restore → ptrace-trap → page-recv (process_vm_writev) → SIGCONT
-```
-
-Key files:
-  - `criu/cr-restore.c`: `run_page_recv()` forks page-recv in the ptrace-trap
-    window; `inject_new_vmas()` handles VMA mirroring via ptrace
-  - `tools/page-recv.c`: standalone page receiver, handles bulk + convergence
-    + VMA diff protocol, multi-stream, LZ4 decompression
-  - `criu/page-xfer.c`: source-side page server, 8-stream bulk transfer,
-    fork-snapshot convergence, VMA diff detection and transmission
-  - `FUTEX_DEADLOCK_RESEARCH.md`: full debugging journal
-  - `LIVE_MIGRATION_GUIDE.md`: team-facing end-to-end guide
-
-### Deployment
-
-**CRITICAL**: The replica's `scripts/restore.sh` prefers `/usr/local/sbin/criu`
-over the local build (line 23-24). When deploying a new CRIU binary, ALWAYS
-copy it to BOTH paths on the replica:
-```bash
-scp criu/criu ubuntu@REPLICA:/tmp/criu-new
-ssh ubuntu@REPLICA 'sudo cp /tmp/criu-new /usr/local/sbin/criu && chmod +x /usr/local/sbin/criu'
-ssh ubuntu@REPLICA 'cp /tmp/criu-new ~/work/criu/criu/criu'
-```
-Similarly, deploy `tools/page-recv` to the replica's `~/work/criu/tools/page-recv`.
-Always verify with `md5sum` on both sides after deployment.
 
 ### Coding Style
 
@@ -240,4 +162,3 @@ Each ZDTM test has three stages: preparation, C/R, and results checks. During
 the test, a process calls `test_daemon()` to signal it is ready for C/R, then
 calls `test_waitsig()` to wait for the C/R stage to complete. After being
 restored, the test checks that all its resources are still in a valid state.
-

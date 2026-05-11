@@ -1,174 +1,206 @@
-# CRIU COW Dump (Copy-on-Write live migration)
+# COW Dump - Minimized Downtime Live Migration
 
-## Summary
+```echo 1 | sudo tee /proc/sys/vm/unprivileged_userfaultfd
+```
+## What is COW Dump?
 
-`--cow-dump` is an experimental CRIU mode that keeps the source process running
-while memory is transferred, by tracking writes with `userfaultfd` write-protect
-(WP) and shipping the **pre-write** contents of dirtied pages.
+COW (Copy-on-Write) dump is an experimental CRIU feature that minimizes source process downtime during live migration. Traditional CRIU dump freezes the process for the entire duration while saving memory to disk. COW dump uses Linux's userfaultfd write-protect mechanism to track memory writes while the process continues running.
 
-This fork is tested with **Valkey**: the restored instance is configured as a
-Valkey replica of the source, so it catches up after the point-in-time
-snapshot.
+## How It Works
 
-## Quick start (Valkey)
+### Traditional CRIU Dump
+```
+Time: ─────────────────────────────────────────────────────────►
 
-1. Follow `COW_DEVELOPER.md` to set up PRIMARY+REPLICA, shared `IMAGES_DIR`
-   (e.g. `/fsx/lazy`), and `scripts/.env`.
-2. On PRIMARY:
-
-```bash
-# Basic migration (fills dataset, then migrates)
-sudo ./scripts/migrate.sh 40
-
-# Real scenario with traffic + integrity checks (recommended)
-./scripts/run_migration_scenario.sh 40
+Process: [RUNNING] ──► [FROZEN ████████████████████████] ──► [KILLED/ALIVE]
+                           │
+                           └─ Dump all memory + state
+                              (can take minutes for large processes)
 ```
 
-Artifacts are written under `artifacts/<run_id>/` on PRIMARY.
-
-## Architecture (human view)
-
-### Actors
-
-- **Valkey (PRIMARY)**: the live source process.
-- **CRIU dump (PRIMARY)**: creates the base checkpoint and runs the page server.
-- **COW monitor (PRIMARY)**: background thread that snapshots pages on first
-  write fault.
-- **CRIU lazy-pages (REPLICA)**: receives pages from PRIMARY and services faults.
-- **CRIU restore (REPLICA)**: restores the process and installs UFFD handlers.
-- **Valkey replication**: `REPLICAOF` makes the replica catch up.
-
-### Timeline (what happens)
-
-1. **Stop-the-world (short):** CRIU seizes the process tree to build a consistent
-   base snapshot.
-2. **Arm COW tracking:**
-   - parasite creates a `userfaultfd` inside the target process and sends it
-     back to CRIU (or CRIU opens `/proc/<pid>/userfaultfd` on kernel 6.11+),
-   - CRIU registers eligible VMAs with `UFFDIO_REGISTER_MODE_WP` and applies
-     `UFFDIO_WRITEPROTECT` to those ranges (parallelized),
-   - the COW monitor thread starts (or is kept running) to handle write faults.
-3. **Base dump completes:** CRIU writes images and prints `PAGE SERVER READY TO SERVE`.
-4. **Source resumes:** the source keeps running under WP tracking.
-5. **Page transfer:** the page server streams lazy pages to the replica; if a
-   page was modified after the dump, the streamed content is the pre-write
-   snapshot captured by the monitor.
-6. **Replica becomes usable:**
-   - restore starts Valkey from images,
-   - scripts configure it as a replica and verify it rejects writes (`READONLY`),
-   - only then external clients are allowed in (iptables gate removed).
-
-### Bulk stream termination (no hangs)
-
-The page stream ends with an end marker: a `PS_IOV_CLOSE` header with
-`nr_pages == 0`. The receiver does **not** send an ACK back on the same socket
-(mixing control bytes with the bulk stream desynchronizes the protocol).
-
-## Measuring downtime (what numbers mean)
-
-There are two different measurements:
-
-- **CRIU frozen time**: from `stats-dump` (`freezing_time` + `frozen_time`).
-- **Client-observed latency/outage**: from ping/traffic monitors.
-
-Useful commands:
-
-```bash
-# Per-phase latency using artifacts/<run_id>/source_markers.log + source-ping.log
-python3 scripts/analyze_phase_latency.py artifacts/<run_id>
-
-# CRIU internal timings (archived by migrate.sh)
-cat artifacts/<run_id>/stats-dump.json
-cat artifacts/<run_id>/stats-restore.json
+### COW Dump
 ```
+Time: ─────────────────────────────────────────────────────────►
 
-For app-like KPIs (p99 read/write latency, max outage windows, data-integrity
-checks), use:
-
-```bash
-./scripts/run_migration_scenario.sh 40
+Process: [RUNNING] ─► [FROZEN] ─► [RUNNING █████████████] ─► [FROZEN] ─► [KILLED]
+                         │               │                      │
+                         │               │                      └─ Final dirty pages
+                         │               │                         + skeleton dump
+                         │               │                         (~seconds)
+                         │               │
+                         │               └─ Bulk transfer + iterative dirty scan
+                         │                  (process runs with write tracking)
+                         │
+                         └─ Init WP_ASYNC tracking
+                            (~seconds)
 ```
-
-## Performance results (aarch64, VPC 10-25Gbps)
-
-Tested on AWS EC2 (aarch64), two instances in the same VPC, FSx shared
-storage for images.  Source runs Valkey filled with 64KB random values.
-
-### Source unavailability (the number that matters)
-
-| Dataset | Benchmark traffic | Source frozen |
-|---------|-------------------|---------------|
-| 10 GB   | no                | **34 ms**     |
-| 40 GB   | yes (43K ops/s)   | **35 ms**     |
-| 100 GB  | yes (43K ops/s)   | **39 ms**     |
-
-Source freeze is the SIGSTOP→cutover→SIGCONT window.  It does not
-scale with dataset size because the bulk transfer runs while the
-source is live.
-
-### Stage-by-stage timing (100 GB + benchmark)
-
-| Stage | Duration | Notes |
-|-------|----------|-------|
-| Parasite infect + dump | 54 ms | Seize, snapshot metadata |
-| WP setup (userfaultfd) | 19 ms | 1560 ranges, 32 threads |
-| Source resumed | immediate | `--leave-running` |
-| Bulk transfer (network) | ~174 s | 25.3M pages, 578 MB/s |
-| Convergence (dirty resend) | < 1 s | 20-30 dirty pages |
-| Final freeze + cutover | **39 ms** | SIGSTOP → nc "GO" |
-| UFFDIO_COPY (receiver) | > 10 min | Post-cutover, on-demand |
-
-### Transfer configuration
-
-- **Streams**: 4 parallel TCP connections (`COW_TRANSFER_STREAMS`)
-- **Batch send**: 256 pages compressed (LZ4) into one `send()` call
-- **Socket buffers**: 4 MB SO_SNDBUF / SO_RCVBUF
-- **Cutover**: nc TCP listener (replaces SSH for sub-100ms latency)
-- **CLIENT PAUSE**: removed (breaks restored replica)
-
-### Known limitations
-
-- **VMA partitioning**: the large heap VMA lands on one stream, leaving
-  other streams idle.  Splitting the VMA across workers would give
-  4× throughput (~2.3 GB/s).
-- **UFFDIO_COPY bottleneck**: single-threaded kernel page installation
-  takes minutes for large datasets.  This is post-cutover (source is
-  already available) but delays replica readiness.
-- **100 GB replica crash**: the restored process page-faults faster
-  than UFFDIO_COPY can deliver, causing timeouts.  Needs pre-faulting
-  of critical pages or prioritized delivery.
 
 ## Requirements
 
-- **Kernel**: Linux 5.7+ (for `UFFD_FEATURE_PAGEFAULT_FLAG_WP`)
-- **Privileges**: root, or `vm.unprivileged_userfaultfd=1`
+- **Linux kernel 5.7+** with `UFFD_FEATURE_WP_ASYNC` support
+- CRIU built with COW support (this fork)
+- Network connectivity between primary and replica
+
+## Quick Start
+
+### 1. Start Page Server on Replica
+
+```bash
+# On REPLICA machine
+sudo criu page-server \
+    --images-dir /path/to/images \
+    --port 27 \
+    --lazy-pages
+```
+
+### 2. Run COW Dump on Primary
+
+```bash
+# On PRIMARY machine
+sudo criu dump \
+    -t <PID> \
+    -D /path/to/images \
+    --cow-dump \
+    --lazy-pages \
+    --page-server \
+    --address <REPLICA_IP> \
+    --port 27 \
+    -v4
+```
+
+### 3. Restore on Replica
+
+```bash
+# On REPLICA machine (after page-server signals ready)
+sudo criu restore \
+    -D /path/to/images \
+    --lazy-pages \
+    -v4
+```
+
+## Command-Line Options
+
+| Option | Description |
+|--------|-------------|
+| `--cow-dump` | Enable COW dump mode |
+| `--lazy-pages` | Required for COW dump (pages transferred on-demand) |
+| `--page-server` | Enable page server for remote transfer |
+| `--address <IP>` | Replica IP address |
+| `--port <PORT>` | Page server port (default: 27) |
+
+## Architecture Overview
+
+```
+PRIMARY                                    REPLICA
+┌─────────────────┐                       ┌─────────────────┐
+│                 │                       │                 │
+│   CRIU Dump     │   20 parallel         │   Page Server   │
+│   + P3 Threads  │ ◄─────────────────────► + Receivers     │
+│                 │   LZ4 compressed      │                 │
+│   ┌───────────┐ │   page batches        │   ┌───────────┐ │
+│   │ WP_ASYNC  │ │                       │   │   Page    │ │
+│   │ Tracking  │ │                       │   │   Buffer  │ │
+│   └───────────┘ │                       │   └───────────┘ │
+│                 │                       │                 │
+│   ┌───────────┐ │                       │   ┌───────────┐ │
+│   │  Source   │ │                       │   │  Target   │ │
+│   │  Process  │ │                       │   │  Process  │ │
+│   └───────────┘ │                       │   └───────────┘ │
+│                 │                       │                 │
+└─────────────────┘                       └─────────────────┘
+```
+
+## Phases
+
+### Phase 1: Initialize (~1-5 seconds freeze)
+- Seize process and collect VMA information
+- Create userfaultfd with WP_ASYNC
+- Apply write-protect to all tracked VMAs
+- **Unfreeze process** - it continues running
+
+### Phase 2: Bulk Transfer (process running)
+- 20 parallel sender threads transfer pages
+- 4 scanner threads find dirty pages via PAGEMAP_SCAN
+- Iterative dirty scanning until convergence threshold
+- LZ4 compression reduces bandwidth by 60-70%
+
+### Phase 3: Final Freeze (~1-10 seconds)
+- Freeze process for final dirty page scan
+- Dump process metadata ("skeleton dump")
+- Send remaining dirty pages
+- **Unfreeze process** (or kill, depending on options)
+
+## Performance Characteristics
+
+| Metric | Typical Value |
+|--------|---------------|
+| Phase 1 freeze | 1-5 seconds |
+| Phase 2 duration | Depends on write rate |
+| Phase 3 freeze | 1-10 seconds |
+| Convergence threshold | ~1.2GB dirty pages |
+| Parallel senders | 20 threads |
+| Batch size | 256KB (64 pages) |
+| Compression ratio | 40-50% |
+
+## Monitoring Progress
+
+COW dump outputs timing information to stderr:
+
+```
+=== PHASE 1: Seize + Pre-dump + WP_ASYNC ===
+TIMING: Phase 1 freeze started
+TIMING: cow_dump_init_async took 2.345678 seconds
+TIMING: Phase 1 freeze ended - process frozen for 3.456789 seconds
+
+=== PHASE 2: Bulk page transfer + dirty scan convergence ===
+TIMING: P3 bulk transfer started
+=== CONVERGENCE: All threads below threshold ===
+
+=== PHASE 3: Freeze + skeleton dump ===
+TIMING: Phase 3 freeze started
+TIMING: skeleton dump loop took 0.234567 seconds
+P3 threads completed: 1234567 total pages sent
+TIMING: Phase 3 freeze ended - process frozen for 5.678901 seconds
+```
 
 ## Troubleshooting
 
-### Permission denied for userfaultfd
-
-```
-userfaultfd requires CAP_SYS_PTRACE or sysctl vm.unprivileged_userfaultfd=1
-```
-
-Run as root, or:
+### Kernel Support Check
 
 ```bash
-sudo sysctl -w vm.unprivileged_userfaultfd=1
+# Check if kernel supports WP_ASYNC
+grep -i uffd /proc/kallsyms | grep -i async
 ```
 
-### Replica accepts writes
+### Common Issues
 
-The replica must be configured via `REPLICAOF` before opening it to clients.
-Check:
+**"Kernel does not support COW dump (requires UFFD_FEATURE_WP_ASYNC)"**
+- Upgrade to Linux 5.7+
+- Ensure userfaultfd is enabled in kernel config
 
-- `scripts/wait_and_replicate.sh`
-- `/fsx/lazy/lazy-restore.log`
-- `/fsx/lazy/lazy-server.log`
+**Slow convergence**
+- Process has high write rate
+- Consider increasing `DIRTY_SCAN_FREEZE_THRESHOLD`
 
-If Valkey can't persist replication state, ensure permissions:
+**Long UFFD cleanup**
+- Normal for large memory systems (300GB+)
+- Cleanup is chunked to avoid kernel lockups
 
-```bash
-sudo chown -R ubuntu:ubuntu /var/lib/valkey
-sudo chmod 750 /var/lib/valkey
-```
+## Limitations
+
+1. **Single process tree**: Currently tracks one process tree
+2. **Kernel version**: Requires Linux 5.7+ 
+3. **Write-intensive workloads**: May not converge quickly
+4. **Network dependency**: Requires stable network to replica
+
+## Technical Details
+
+For implementation details, see [COW_DUMP_DESIGN.md](COW_DUMP_DESIGN.md).
+
+## Source Files
+
+Core implementation in `criu/cow/`:
+- `cow-dump.c` - Main COW dump logic
+- `cow-bulk-send.c` - Parallel sender threads
+- `cow-unified-thread.c` - Page server thread
+- `cow-uffd.c` - Restore-side UFFD handling

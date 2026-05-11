@@ -9,6 +9,7 @@
 
 #define SIGMAX	   64
 #define SIGMAX_OLD 31
+#define ARCH_SI_TRAP	TRAP_BRKPT
 
 /*
  * Definitions from /usr/include/asm/ptrace.h:

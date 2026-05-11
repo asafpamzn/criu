@@ -226,16 +226,6 @@ int arch_fetch_sas(struct parasite_ctl *ctl, struct rt_sigframe *s)
 	return err ? err : ret;
 }
 
-int ptrace_set_breakpoint(pid_t pid, void *addr)
-{
-	return 0;
-}
-
-int ptrace_flush_breakpoints(pid_t pid)
-{
-	return 0;
-}
-
 /*refer to kernel linux-3.10/arch/mips/include/asm/processor.h*/
 #define TASK_SIZE32 0x7fff8000UL
 #define TASK_SIZE64 0x10000000000UL

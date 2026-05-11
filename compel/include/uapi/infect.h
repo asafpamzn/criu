@@ -93,9 +93,8 @@ enum trace_flags {
 	TRACE_EXIT,
 };
 
-extern int __must_check compel_stop_on_syscall(int tasks, int sys_nr, int sys_nr_compat);
-
-extern int __must_check compel_stop_pie(pid_t pid, void *addr, bool no_bp);
+extern int __must_check compel_stop_on_syscall(pid_t pid, int sys_nr, int sys_nr_compat);
+extern int compel_stop_tasks_on_syscall(int tasks, pid_t *pids, const int sys_nr, const int sys_nr_compat);
 
 extern int __must_check compel_unmap(struct parasite_ctl *ctl, unsigned long addr);
 
@@ -139,8 +138,6 @@ extern struct infect_ctx *compel_infect_ctx(struct parasite_ctl *);
 #define INFECT_NO_MEMFD (1UL << 0)
 /* Make parasite connect() fail */
 #define INFECT_FAIL_CONNECT (1UL << 1)
-/* No breakpoints in pie tracking */
-#define INFECT_NO_BREAKPOINTS (1UL << 2)
 /* Can run parasite inside compat tasks */
 #define INFECT_COMPATIBLE (1UL << 3)
 /* Workaround for ptrace bug on Skylake CPUs with kernels older than v4.14 */
@@ -192,6 +189,14 @@ void compel_set_leader_ip(struct parasite_ctl *ctl, uint64_t v);
 void compel_set_thread_ip(struct parasite_thread_ctl *tctl, uint64_t v);
 
 extern void compel_get_stack(struct parasite_ctl *ctl, void **rstack, void **r_thread_stack);
+
+#ifndef compel_host_supports_gcs
+static inline bool compel_host_supports_gcs(void)
+{
+	return false;
+}
+#define compel_host_supports_gcs
+#endif
 
 #ifndef compel_shstk_enabled
 static inline bool compel_shstk_enabled(user_fpregs_struct_t *ext_regs)

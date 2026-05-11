@@ -479,43 +479,6 @@ static int read_page_complete(unsigned long img_id, unsigned long vaddr, unsigne
 	return ret;
 }
 
-/* Bulk mode callback: simpler, no img_id validation needed */
-int bulk_page_complete(unsigned long img_id, unsigned long vaddr, unsigned long int nr_pages, void *priv)
-{
-	struct page_read *pr = priv;
-	
-	/* 
-	 * In bulk mode, pages arrive automatically in order from background thread.
-	 * No need for img_id validation - just call uffd_copy() directly via io_complete.
-	 */
-
-	if (pr->io_complete)
-		return pr->io_complete(pr, vaddr, nr_pages);
-	
-	pr_err("Bulk mode without io_complete callback!\n");
-	return -1;
-}
-
-/* Bulk transfer mode: pages arrive automatically from background thread */
-static int maybe_read_page_remote_bulk(struct page_read *pr, unsigned long vaddr, unsigned long nr, void *buf, unsigned flags)
-{
-	/* 
-	 * In bulk mode, the background thread sends all pages automatically.
-	 * We don't send individual requests - just wait for pages to arrive.
-	 * Use simpler callback that skips img_id validation.
-	 */
-	int ret = 0;
-	if (flags & PR_ASAP) {
-		pr_warn("pr%lu-%u Read %lx %lu maybe_read_page_remote_bulk\n", pr->img_id, pr->id, vaddr, nr);
-		ret = request_remote_pages(pr->img_id, vaddr, nr);
-	}
-
-	if (!ret) {
-		ret = page_server_start_read(buf, nr, bulk_page_complete, pr, flags);
-	}
-	return ret;
-}
-
 /* On-demand transfer mode: request individual pages as needed */
 static int maybe_read_page_remote(struct page_read *pr, unsigned long vaddr, unsigned long nr, void *buf, unsigned flags)
 {
@@ -530,7 +493,7 @@ static int maybe_read_page_remote(struct page_read *pr, unsigned long vaddr, uns
 
 static int read_pagemap_page(struct page_read *pr, unsigned long vaddr, unsigned long nr, void *buf, unsigned flags)
 {
-	pr_info("pr%lu-%u Read %lx %lu pages\n", pr->img_id, pr->id, vaddr, nr);
+	pr_debug("pr%lu-%u Read %lx %lu pages\n", pr->img_id, pr->id, vaddr, nr);
 	pagemap_bound_check(pr->pe, vaddr, nr);
 
 	if (pagemap_in_parent(pr->pe)) {
@@ -639,6 +602,12 @@ static int process_async_reads(struct page_read *pr)
 				       !!(pr->pe->flags & PE_LAZY));
 			}
 			
+			return -1;
+		}
+
+		if (ret == 0 && piov->end != piov->from) {
+			pr_err("Unexpected EOF reading pages: expected %ju more bytes at offset %ju\n",
+			       piov->end - piov->from, piov->from);
 			return -1;
 		}
 
@@ -916,16 +885,8 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 	pr->id = ids++;
 	pr->img_id = img_id;
 
-	if (remote) {
-		
-		/* Choose appropriate page read function based on mode */
-		if (opts.cow_dump) {
-			/* Bulk mode: pages arrive automatically from background thread */
-			pr->maybe_read_page = maybe_read_page_remote_bulk;
-		} else {
-			/* On-demand mode: request pages individually as needed */
-			pr->maybe_read_page = maybe_read_page_remote;
-		}
+	if (remote) {		
+		pr->maybe_read_page = maybe_read_page_remote;
 	} else if (opts.stream) {
 		pr->maybe_read_page = maybe_read_page_img_streamer;
 	} else {

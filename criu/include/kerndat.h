@@ -57,7 +57,6 @@ struct kerndat_s {
 	bool has_uffd;
 	unsigned long uffd_features;
 	bool has_uffd_proc; /* /proc/<pid>/userfaultfd available (kernel 6.11+) */
-	bool has_wp_async;  /* UFFD_FEATURE_WP_ASYNC available (kernel 6.7+) */
 	bool has_thp_disable;
 	bool can_map_vdso;
 	bool vdso_hint_reliable;
@@ -92,9 +91,9 @@ struct kerndat_s {
 	bool has_shstk;
 	bool has_close_range;
 	bool has_timer_cr_ids;
-	bool has_breakpoints;
 	bool has_madv_guard;
 	bool has_pagemap_scan_guard_pages;
+	bool has_binfmt_misc_sandboxing;
 };
 
 extern struct kerndat_s kdat;

@@ -66,6 +66,10 @@
 #define PR_SET_PDEATHSIG 1
 #endif
 
+#ifndef PR_SET_TIMERSLACK
+#define PR_SET_TIMERSLACK 29
+#endif
+
 #ifndef PR_SET_CHILD_SUBREAPER
 #define PR_SET_CHILD_SUBREAPER 36
 #endif
@@ -91,11 +95,16 @@
 	})
 
 static struct task_entries *task_entries_local;
-static futex_t thread_inprogress;
+
+static atomic_t thread_inprogress;
+static void *rst_mem;
+static long rst_mem_size;
+
 static pid_t *helpers;
 static int n_helpers;
 static pid_t *zombies;
 static int n_zombies;
+
 static enum faults fi_strategy;
 bool fault_injected(enum faults f)
 {
@@ -406,6 +415,22 @@ static inline int restore_pdeath_sig(struct thread_restore_args *ta)
 	ret = sys_prctl(PR_SET_PDEATHSIG, ta->pdeath_sig, 0, 0, 0);
 	if (ret) {
 		pr_err("Unable to set PR_SET_PDEATHSIG(%d): %d\n", ta->pdeath_sig, ret);
+		return -1;
+	}
+
+	return 0;
+}
+
+static inline int restore_timerslack(struct thread_restore_args *ta)
+{
+	int ret;
+
+	if (!ta->has_timerslack_ns)
+		return 0;
+
+	ret = sys_prctl(PR_SET_TIMERSLACK, ta->timerslack_ns, 0, 0, 0);
+	if (ret) {
+		pr_err("Unable to set PR_SET_TIMERSLACK(%lu): %d\n", ta->timerslack_ns, ret);
 		return -1;
 	}
 
@@ -739,6 +764,15 @@ static int recv_cg_set_restore_ack(int sk)
 	return 0;
 }
 
+static void thread_fini(void)
+{
+	if (!atomic_dec_and_test(&thread_inprogress))
+		return;
+
+	std_log_set_fd(-1);
+	sys_munmap(rst_mem, rst_mem_size);
+}
+
 /*
  * Threads restoration via sigreturn. Note it's locked
  * routine and calls for unlock at the end.
@@ -816,12 +850,13 @@ __visible long __export_restore_thread(struct thread_restore_args *args)
 	ret = restore_creds(args->creds_args, args->ta->proc_fd, args->ta->lsm_type, args->ta->uid);
 	ret = ret || restore_dumpable_flag(&args->ta->mm);
 	ret = ret || restore_pdeath_sig(args);
+	ret = ret || restore_timerslack(args);
 	if (ret)
 		BUG();
 
 	restore_finish_stage(task_entries_local, CR_STATE_RESTORE_CREDS);
 
-	futex_dec_and_wake(&thread_inprogress);
+	thread_fini();
 
 	new_sp = (long)rt_sigframe + RT_SIGFRAME_OFFSET(rt_sigframe);
 	rst_sigreturn(new_sp, rt_sigframe);
@@ -1223,9 +1258,9 @@ static int timerfd_arm(struct task_restore_args *args)
 
 			/*
 			 * We might need to adjust value because the checkpoint
-			 * and restore procedure takes some time itself. Note
-			 * we don't adjust nanoseconds, since the result may
-			 * overflow the limit NSEC_PER_SEC FIXME
+			 * and restore procedure takes some time itself. We also
+			 * accumulate tv_nsec and propagate any carry into tv_sec
+			 * to keep the itimerspec value normalized.
 			 */
 			if (sys_clock_gettime(t->clockid, &ts)) {
 				pr_err("Can't get current time\n");
@@ -1233,6 +1268,11 @@ static int timerfd_arm(struct task_restore_args *args)
 			}
 
 			t->val.it_value.tv_sec += (time_t)ts.tv_sec;
+			t->val.it_value.tv_nsec += ts.tv_nsec;
+			if (t->val.it_value.tv_nsec >= NSEC_PER_SEC) {
+				t->val.it_value.tv_nsec -= NSEC_PER_SEC;
+				t->val.it_value.tv_sec++;
+			}
 
 			pr_debug("Adjust id %x it_value(%llu, %llu) -> it_value(%llu, %llu)\n", t->id,
 				 (unsigned long long)ts.tv_sec, (unsigned long long)ts.tv_nsec,
@@ -1747,7 +1787,6 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	n_helpers = args->helpers_n;
 	zombies = args->zombies;
 	n_zombies = args->zombies_n;
-	*args->breakpoint = rst_sigreturn;
 #ifdef ARCH_HAS_LONG_PAGES
 	__page_size = args->page_size;
 #endif
@@ -1912,6 +1951,12 @@ __visible long __export_restore_task(struct task_restore_args *args)
 					   args->auto_dedup ? AUTO_DEDUP_OVERHEAD_BYTES : 0);
 			if (r < 0) {
 				pr_err("Can't read pages data (%d)\n", (int)r);
+				goto core_restore_end;
+			}
+
+			if (r == 0) {
+				pr_err("Unexpected EOF reading pages data at offset %ld (%d iovs remaining)\n",
+				       (long)rio->off, nr);
 				goto core_restore_end;
 			}
 
@@ -2284,9 +2329,12 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	ret = restore_creds(args->t->creds_args, args->proc_fd, args->lsm_type, args->uid);
 	ret = ret || restore_dumpable_flag(&args->mm);
 	ret = ret || restore_pdeath_sig(args->t);
+	ret = ret || restore_timerslack(args->t);
 	ret = ret || restore_child_subreaper(args->child_subreaper);
 
-	futex_set_and_wake(&thread_inprogress, args->nr_threads);
+	atomic_set(&thread_inprogress, args->nr_threads);
+	rst_mem = args->rst_mem;
+	rst_mem_size = args->rst_mem_size;
 
 	/*
 	 * Shadow stack of the leader can be locked only after all other
@@ -2297,15 +2345,17 @@ __visible long __export_restore_task(struct task_restore_args *args)
 		goto core_restore_end;
 
 	restore_finish_stage(task_entries_local, CR_STATE_RESTORE_CREDS);
-
+	/*
+	 * From this point forward, cross-process synchronization is strictly
+	 * prohibited. compel_stop_tasks_on_syscall enumerates all restored
+	 * tasks/threads sequentially, allowing each to execute one syscall
+	 * per iteration. Any attempt to communicate with other tasks or
+	 * threads may trigger a deadlock.
+	 */
 	if (ret)
 		BUG();
 
-	/* Wait until children stop to use args->task_entries */
-	futex_wait_while_gt(&thread_inprogress, 1);
-
 	sys_close(args->proc_fd);
-	std_log_set_fd(-1);
 
 	/*
 	 * The code that prepared the itimers makes sure that the
@@ -2323,7 +2373,7 @@ __visible long __export_restore_task(struct task_restore_args *args)
 
 	restore_posix_timers(args);
 
-	sys_munmap(args->rst_mem, args->rst_mem_size);
+	thread_fini();
 
 	/*
 	 * Sigframe stack.

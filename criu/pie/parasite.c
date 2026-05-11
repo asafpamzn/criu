@@ -42,6 +42,10 @@ static struct parasite_dump_pages_args *mprotect_args = NULL;
 #define PR_GET_PDEATHSIG 2
 #endif
 
+#ifndef PR_GET_TIMERSLACK
+#define PR_GET_TIMERSLACK 30
+#endif
+
 #ifndef PR_GET_CHILD_SUBREAPER
 #define PR_GET_CHILD_SUBREAPER 37
 #endif
@@ -193,6 +197,16 @@ static int dump_thread_common(struct parasite_dump_thread *ti)
 	if (ret) {
 		pr_err("Unable to get the parent death signal: %d\n", ret);
 		goto out;
+	}
+
+	{
+		long slack = sys_prctl(PR_GET_TIMERSLACK, 0, 0, 0, 0);
+		if (slack < 0) {
+			pr_err("Unable to get timer slack: %ld\n", slack);
+			ret = (int)slack;
+			goto out;
+		}
+		ti->timerslack_ns = (unsigned long)slack;
 	}
 
 	ret = sys_prctl(PR_GET_NAME, (unsigned long)&ti->comm, 0, 0, 0);
@@ -883,10 +897,11 @@ static int parasite_cow_dump_init(struct parasite_cow_dump_args *args)
    		 return -1;
 	}
 
-	/* Initialize userfaultfd API with WP features */
+	/* Initialize userfaultfd API with requested features */
 	memset(&api, 0, sizeof(api));
 	api.api = UFFD_API;
-	api.features = UFFD_FEATURE_PAGEFAULT_FLAG_WP | UFFD_FEATURE_WP_ASYNC;
+	api.features = args->uffd_features ? args->uffd_features
+					   : UFFD_FEATURE_PAGEFAULT_FLAG_WP;
 	api.ioctls = 0;
 
 	ret = sys_ioctl(uffd, UFFDIO_API, (unsigned long)&api);
@@ -898,9 +913,15 @@ static int parasite_cow_dump_init(struct parasite_cow_dump_args *args)
 		return -1;
 	}
 
-	args->uffd_features = api.features;
-	pr_info("UFFD created with features: 0x%llx\n", (unsigned long long)api.features);
-	if (!(api.features & UFFD_FEATURE_PAGEFAULT_FLAG_WP)) {
+	pr_info("UFFD created with features: 0x%llx (requested 0x%lx)\n",
+		(unsigned long long)api.features, args->uffd_features);
+	if (args->uffd_features && !(api.features & args->uffd_features)) {
+		pr_err("Kernel userfaultfd does not support requested features 0x%lx\n",
+		       args->uffd_features);
+		sys_close(uffd);
+		return -1;
+	}
+	if (!args->uffd_features && !(api.features & UFFD_FEATURE_PAGEFAULT_FLAG_WP)) {
 		pr_err("Kernel userfaultfd does not support WP pagefault flag\n");
 		sys_close(uffd);
 		return -1;

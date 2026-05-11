@@ -2171,7 +2171,7 @@ static bool validate_file(const int fd, const struct stat *fd_status, const stru
 {
 	int result = 1;
 
-	if (rfi->rfe->has_size && (fd_status->st_size != rfi->rfe->size)) {
+	if (rfi->rfe->has_size && !opts.skip_file_size_check && (fd_status->st_size != rfi->rfe->size)) {
 		pr_err("File %s has bad size %" PRIu64 " (expect %" PRIu64 ")\n", rfi->path, fd_status->st_size,
 		       rfi->rfe->size);
 		return false;
@@ -2216,6 +2216,7 @@ int open_path(struct file_desc *d, int (*open_cb)(int mntns_root, struct reg_fil
 			rfi->path = path;
 			goto ext;
 		}
+		pr_warn("External file %s has no --inherit-fd mapping on restore\n", rfi->rfe->name);
 	}
 
 	if (rfi->remap) {

@@ -8,6 +8,7 @@
 
 #define SIGMAX	   64
 #define SIGMAX_OLD 31
+#define ARCH_SI_TRAP	SI_KERNEL
 
 #define ARCH_HAS_PTRACE_GET_THREAD_AREA
 

@@ -11,8 +11,6 @@
 #include <sys/ptrace.h>
 #include <stdint.h>
 
-#include <compel/asm/breakpoints.h>
-
 /*
  * Some constants for ptrace that might be missing from the
  * standard library includes due to being (relatively) new.
