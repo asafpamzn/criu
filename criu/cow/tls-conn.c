@@ -18,7 +18,7 @@
 #include "cr_options.h"
 #include "xmalloc.h"
 #include "criu-log.h"
-#include "tls-conn.h"
+#include "cow/tls-conn.h"
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "tls-conn: "
