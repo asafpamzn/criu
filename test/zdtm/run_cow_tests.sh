@@ -29,6 +29,8 @@ TESTS_ALL=(
 	cow_dump_grow
 	cow_dump_munmap_half
 	cow_dump_munmap_reuse
+	cow_dump_mremap
+	cow_dump_wp_unpopulated
 )
 
 usage() { sed -n '3,17p' "$0"; }
