@@ -202,6 +202,31 @@ int page_server_send(int sk, const void *buf, size_t sz, int fl)
 
 int page_server_recv(int sk, void *buf, size_t sz, int fl)
 {
+	/*
+	 * GnuTLS returns one record at a time (~16KB max), so MSG_WAITALL
+	 * semantics must be implemented by looping. Without TLS the kernel
+	 * handles MSG_WAITALL internally.
+	 */
+	if (opts.tls && (fl & MSG_WAITALL)) {
+		char *cursor = buf;
+		size_t remaining = sz;
+
+		while (remaining > 0) {
+			int ret = __recv(sk, cursor, remaining, fl & ~MSG_WAITALL);
+
+			if (ret < 0) {
+				if (errno == EINTR)
+					continue;
+				return -1;
+			}
+			if (ret == 0)
+				return sz - remaining;
+			cursor += ret;
+			remaining -= ret;
+		}
+		return sz;
+	}
+
 	return __recv(sk, buf, sz, fl);
 }
 
