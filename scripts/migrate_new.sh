@@ -34,6 +34,17 @@ if [ -z "$PID" ]; then
   exit 1
 fi
 
+# Quick binary check: compare md5 of valkey binaries on both machines
+LOCAL_MD5=$(md5sum /usr/bin/valkey-* /usr/local/bin/valkey-* 2>/dev/null | sort | md5sum | awk '{print $1}')
+REMOTE_MD5=$($SSH ubuntu@$REPLICA_SSH_HOST "md5sum /usr/bin/valkey-* /usr/local/bin/valkey-* 2>/dev/null | sort | md5sum | awk '{print \$1}'"
+)
+if [ "$LOCAL_MD5" != "$REMOTE_MD5" ]; then
+  echo "ERROR: valkey binaries differ between primary and replica"
+  echo "  Primary: $LOCAL_MD5"
+  echo "  Replica: $REMOTE_MD5"
+  exit 1
+fi
+
 # Kill leftover ssh/restore processes
 log_timing "Killing leftover processes..."
 sudo pkill -9 -f "ssh.*restore_new.sh" 2>/dev/null || true
