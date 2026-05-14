@@ -6,9 +6,11 @@
 #include <sys/ioctl.h>
 #include <errno.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <inttypes.h>
 #include <linux/userfaultfd.h>
 #include <pthread.h>
+#include <poll.h>
 #include <time.h>
 #include <string.h>
 
@@ -39,6 +41,16 @@ struct cow_tracked_vma {
 	unsigned long end;
 };
 
+/*
+ * Track ranges that were unmapped during Phase 2 (detected via UFFD events
+ * or EFAULT from process_vm_readv). Phase 3 checks if new VMAs appeared
+ * at these addresses to detect munmap+mmap remaps.
+ */
+struct cow_unmapped_range {
+	unsigned long start;
+	unsigned long end;
+};
+
 /* COW dump state for one dump session — single tracked process */
 struct cow_dump_info {
 	pid_t source_pid;
@@ -47,6 +59,17 @@ struct cow_dump_info {
 	unsigned int nr_tracked_vmas;
 	struct cow_tracked_vma *tracked_vmas;
 	enum cow_dump_phase phase;  /* Current phase */
+
+	/* Unmapped ranges detected via UFFD events or EFAULT during Phase 2 */
+	struct cow_unmapped_range *unmapped_ranges;
+	unsigned int nr_unmapped_ranges;
+	unsigned int unmapped_capacity;
+	pthread_mutex_t unmapped_lock;
+
+	/* Event reader thread state */
+	pthread_t event_reader_thread;
+	atomic_int phase3_started;
+	bool event_reader_running;
 };
 
 /*
@@ -376,14 +399,160 @@ void cow_dump_fini(void)
 	if (!g_cow_info)
 		return;
 
+	/* Stop event reader thread if running */
+	if (g_cow_info->event_reader_running) {
+		atomic_store(&g_cow_info->phase3_started, 1);
+		pthread_join(g_cow_info->event_reader_thread, NULL);
+		g_cow_info->event_reader_running = false;
+	}
+
 	wait_for_page_server_thread();
 	pr_info("Cleaning up COW dump\n");
 
 	if (g_cow_info->uffd >= 0)
 		close(g_cow_info->uffd);
 	xfree(g_cow_info->tracked_vmas);
+	xfree(g_cow_info->unmapped_ranges);
+	pthread_mutex_destroy(&g_cow_info->unmapped_lock);
 	xfree(g_cow_info);
 	g_cow_info = NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Unmapped range tracking (UFFD events + EFAULT fallback)            */
+/* ------------------------------------------------------------------ */
+
+/*
+ * cow_record_unmapped_range - Record a range that was unmapped during Phase 2
+ *
+ * Called from:
+ * - UFFD event reader thread when UFFD_EVENT_UNMAP/REMOVE is received
+ * - Bulk sender when process_vm_readv returns EFAULT
+ *
+ * Thread-safe: multiple callers may run in parallel.
+ */
+void cow_record_unmapped_range(unsigned long start, unsigned long len)
+{
+	struct cow_dump_info *cdi = g_cow_info;
+
+	if (!cdi)
+		return;
+
+	pthread_mutex_lock(&cdi->unmapped_lock);
+
+	/* Grow array if needed */
+	if (cdi->nr_unmapped_ranges >= cdi->unmapped_capacity) {
+		unsigned int new_cap = cdi->unmapped_capacity ?
+				       cdi->unmapped_capacity * 2 : 16;
+		cdi->unmapped_ranges = xrealloc(cdi->unmapped_ranges,
+						new_cap * sizeof(*cdi->unmapped_ranges));
+		cdi->unmapped_capacity = new_cap;
+	}
+
+	cdi->unmapped_ranges[cdi->nr_unmapped_ranges].start = start;
+	cdi->unmapped_ranges[cdi->nr_unmapped_ranges].end = start + len;
+	cdi->nr_unmapped_ranges++;
+
+	pr_info("Recorded unmapped range: 0x%lx-0x%lx\n", start, start + len);
+
+	pthread_mutex_unlock(&cdi->unmapped_lock);
+}
+
+/*
+ * cow_uffd_event_reader - Background thread to read UFFD events during Phase 2
+ *
+ * Reads UFFD_EVENT_UNMAP and UFFD_EVENT_REMOVE events, recording unmapped
+ * ranges. Thread exits when Phase 3 starts (phase3_started flag set).
+ */
+static void *cow_uffd_event_reader(void *arg)
+{
+	struct cow_dump_info *cdi = arg;
+	struct uffd_msg msg;
+	ssize_t n;
+
+	pr_info("UFFD event reader thread started\n");
+
+	while (!atomic_load(&cdi->phase3_started)) {
+		struct pollfd pfd = { .fd = cdi->uffd, .events = POLLIN };
+		int ret = poll(&pfd, 1, 100 /* ms */);
+
+		if (ret < 0) {
+			if (errno == EINTR)
+				continue;
+			pr_perror("UFFD event reader poll failed");
+			break;
+		}
+
+		if (ret == 0)
+			continue;
+
+		n = read(cdi->uffd, &msg, sizeof(msg));
+		if (n < 0) {
+			if (errno == EINTR || errno == EAGAIN)
+				continue;
+			pr_perror("UFFD event reader read failed");
+			break;
+		}
+
+		if (n != sizeof(msg)) {
+			pr_warn("UFFD event reader: short read %zd\n", n);
+			continue;
+		}
+
+		if (msg.event == UFFD_EVENT_UNMAP ||
+		    msg.event == UFFD_EVENT_REMOVE) {
+			unsigned long start = msg.arg.remove.start;
+			unsigned long end = msg.arg.remove.end;
+
+			pr_info("UFFD EVENT: %s 0x%lx-0x%lx\n",
+				msg.event == UFFD_EVENT_UNMAP ? "UNMAP" : "REMOVE",
+				start, end);
+
+			cow_record_unmapped_range(start, end - start);
+		} else if (msg.event == UFFD_EVENT_REMAP) {
+			unsigned long from = msg.arg.remap.from;
+			unsigned long to = msg.arg.remap.to;
+			unsigned long len = msg.arg.remap.len;
+
+			pr_info("UFFD EVENT: REMAP 0x%lx -> 0x%lx (len=0x%lx)\n",
+				from, to, len);
+
+			cow_record_unmapped_range(from, len);
+		}
+	}
+
+	pr_info("UFFD event reader thread exiting\n");
+	return NULL;
+}
+
+static int cow_start_event_reader(struct cow_dump_info *cdi)
+{
+	int ret;
+
+	atomic_store(&cdi->phase3_started, 0);
+
+	ret = pthread_create(&cdi->event_reader_thread, NULL,
+			     cow_uffd_event_reader, cdi);
+	if (ret) {
+		pr_err("Failed to create UFFD event reader thread: %d\n", ret);
+		return -1;
+	}
+
+	cdi->event_reader_running = true;
+	return 0;
+}
+
+static void cow_stop_event_reader(struct cow_dump_info *cdi)
+{
+	if (!cdi->event_reader_running)
+		return;
+
+	atomic_store(&cdi->phase3_started, 1);
+	pthread_join(cdi->event_reader_thread, NULL);
+	cdi->event_reader_running = false;
+
+	pr_info("Stopped UFFD event reader, recorded %u unmapped ranges\n",
+		cdi->nr_unmapped_ranges);
 }
 
 /* ------------------------------------------------------------------ */
@@ -469,6 +638,8 @@ int cow_dump_init_async(struct pstree_item *item,
 	cdi->dst_id = vpid(item);
 	cdi->uffd = -1;
 	cdi->phase = COW_PHASE_ASYNC_BULK;
+	pthread_mutex_init(&cdi->unmapped_lock, NULL);
+	atomic_store(&cdi->phase3_started, 0);
 
 	g_cow_info = cdi;
 
@@ -492,7 +663,11 @@ int cow_dump_init_async(struct pstree_item *item,
 	args->nr_vmas = 0;
 	args->total_pages = 0;
 	args->nr_failed_vmas = 0;
-	args->uffd_features = UFFD_FEATURE_WP_ASYNC;
+	args->uffd_features = UFFD_FEATURE_WP_ASYNC |
+			      UFFD_FEATURE_EVENT_UNMAP |
+			      UFFD_FEATURE_EVENT_REMOVE |
+			      UFFD_FEATURE_EVENT_REMAP |
+			      UFFD_FEATURE_WP_UNPOPULATED;
 	args->ret = -1;
 
 	ret = compel_rpc_call(PARASITE_CMD_COW_DUMP_INIT, ctl);
@@ -522,6 +697,10 @@ int cow_dump_init_async(struct pstree_item *item,
 
 	/* Apply write-protect */
 	if (cow_apply_writeprotect(cdi))
+		goto err;
+
+	/* Start UFFD event reader thread to track unmaps during Phase 2 */
+	if (cow_start_event_reader(cdi))
 		goto err;
 
 	pr_info("COW ASYNC initialized for pid %d: tracked=%u pages=%lu uffd=%d\n",
@@ -709,6 +888,80 @@ static int cow_extend_tracked_vmas(unsigned long *ranges, unsigned int nr_ranges
 }
 
 /*
+ * cow_check_tracked_vma_remapped - Check if a tracked VMA was remapped
+ *
+ * DEPRECATED: This WPALLOWED probe approach was rejected because:
+ * 1. Adds extra PAGEMAP_SCAN during Phase 3 freeze — increases downtime
+ * 2. Unreliable on kernel 6.17 — testing showed unexpected behavior
+ * 3. Depends on WP_UNPOPULATED feature for anonymous VMAs
+ *
+ * Kept for reference. The replacement is UFFD_EVENT_UNMAP/REMOVE + EFAULT
+ * detection during Phase 2, with Phase 3 checking if new VMAs appeared
+ * at previously-unmapped addresses.
+ *
+ * Returns: 1 if remapped (no WPALLOWED on first page), 0 if original, -1 on error
+ */
+static int __maybe_unused cow_check_tracked_vma_remapped(pid_t pid,
+							 unsigned long start,
+							 unsigned long end)
+{
+	char path[64];
+	int fd;
+	struct pm_scan_arg args;
+	struct page_region region;
+	long ret;
+
+	snprintf(path, sizeof(path), "/proc/%d/pagemap", pid);
+	fd = open(path, O_RDONLY);
+	if (fd < 0) {
+		pr_perror("Failed to open %s for WPALLOWED probe", path);
+		return -1;
+	}
+
+	memset(&args, 0, sizeof(args));
+	args.size = sizeof(args);
+	args.flags = 0;
+	args.start = start;
+	args.end = start + PAGE_SIZE;  /* Probe ONLY the first page */
+	args.vec = (u64)(uintptr_t)&region;
+	args.vec_len = 1;
+	args.max_pages = 1;
+	args.category_anyof_mask = PAGE_IS_WPALLOWED;
+	args.return_mask = PAGE_IS_WPALLOWED;
+
+	ret = ioctl(fd, PAGEMAP_SCAN, &args);
+	close(fd);
+
+	if (ret < 0) {
+		if (errno == EFAULT || errno == ENOMEM) {
+			/* VMA gone entirely */
+			pr_err("COW REMAP: 0x%lx-0x%lx probe failed (EFAULT/ENOMEM) - VMA gone\n",
+			       start, end);
+			return 1;
+		}
+		pr_perror("PAGEMAP_SCAN WPALLOWED probe failed for 0x%lx", start);
+		return -1;
+	}
+
+	/*
+	 * ret == 0: first page has no WPALLOWED -> VMA was remapped.
+	 * ret > 0: first page has WPALLOWED -> VMA still registered.
+	 */
+	if (ret == 0) {
+		pr_err("COW REMAP DETECTED: 0x%lx-0x%lx first page lacks "
+		       "WPALLOWED (walk_end=0x%llx) -> remapped\n",
+		       start, end, (unsigned long long)args.walk_end);
+		return 1;
+	}
+
+	pr_info("COW REMAP CHECK: 0x%lx-0x%lx first page has WPALLOWED -> original\n",
+		start, end);
+	return 0;
+}
+
+
+
+/*
  * cow_detect_new_vmas - Detect VMAs that appeared after Phase 1
  *
  * Compares the current VMA list with the tracked VMAs from Phase 1.
@@ -734,12 +987,16 @@ int cow_detect_new_vmas(struct vm_area_list *vmas,
 	unsigned long *ranges = NULL;
 	unsigned int nr_ranges = 0;
 	unsigned int capacity = 0;
+	unsigned int i;
 	struct cow_dump_info *cdi = g_cow_info;
 
 	if (!cdi) {
 		pr_err("COW dump not initialized\n");
 		return -1;
 	}
+
+	/* Stop UFFD event reader - Phase 3 begins, process is frozen */
+	cow_stop_event_reader(cdi);
 
 	*new_ranges = NULL;
 	*nr_new_ranges = 0;
@@ -775,6 +1032,79 @@ int cow_detect_new_vmas(struct vm_area_list *vmas,
 		       vma->e->flags, vma->e->prot, vma->e->status,
 		       (uint64_t)vma->e->shmid,
 		       nr_ranges - before);
+	}
+
+	/*
+	 * Second pass: check unmapped ranges recorded during Phase 2.
+	 *
+	 * UFFD_EVENT_UNMAP/REMOVE events and EFAULT from process_vm_readv
+	 * recorded ranges that were unmapped while the process was running.
+	 * If a VMA now exists at that address, it was remapped (munmap+mmap).
+	 * We must treat it as "new" to trigger full content resend.
+	 *
+	 * This catches the case where:
+	 * 1. Phase 1: VMA at [A, A+size) tracked
+	 * 2. Phase 2: Process does munmap([A, A+size)) - event/EFAULT recorded
+	 * 3. Phase 2: Process does mmap(MAP_FIXED, [A, A+size)) - new VMA
+	 * 4. Phase 3: cow_region_subtract() sees VMA - no gap detected!
+	 * 5. Without this check: zero-fill pages never sent → SIGBUS
+	 */
+	pr_info("COW REMAP CHECK: checking %u unmapped ranges for remap\n",
+		cdi->nr_unmapped_ranges);
+	for (i = 0; i < cdi->nr_unmapped_ranges; i++) {
+		unsigned long u_start = cdi->unmapped_ranges[i].start;
+		unsigned long u_end = cdi->unmapped_ranges[i].end;
+		bool has_new_vma = false;
+
+		/* Check if any current VMA overlaps this unmapped range */
+		list_for_each_entry(vma, &vmas->h, list) {
+			if (!cow_is_vma_trackable(vma))
+				continue;
+			if (vma->e->start < u_end && vma->e->end > u_start) {
+				has_new_vma = true;
+				break;
+			}
+		}
+
+		if (has_new_vma) {
+			unsigned long len = u_end - u_start;
+
+			if (nr_ranges >= capacity) {
+				unsigned int new_cap = capacity ? capacity * 2 : 64;
+				unsigned long *new_r;
+
+				new_r = xrealloc(ranges,
+						 new_cap * 2 * sizeof(unsigned long));
+				BUG_ON(!new_r);
+				ranges = new_r;
+				capacity = new_cap;
+			}
+
+			ranges[nr_ranges * 2] = u_start;
+			ranges[nr_ranges * 2 + 1] = len;
+			nr_ranges++;
+
+			pr_err("COW REMAP: 0x%lx-0x%lx was unmapped then new VMA "
+			       "appeared - treating as new for full resend\n",
+			       u_start, u_end);
+		} else {
+			pr_info("COW UNMAP: 0x%lx-0x%lx was unmapped, no new VMA - "
+				"truly unmapped\n", u_start, u_end);
+			/*
+			 * TODO: Send PS_IOV_UNMAP_NOTIFY to replica for cleanup.
+			 * The replica should:
+			 * - Remove pages from buffer
+			 * - MADV_DONTNEED if pages were already applied
+			 * - Update lazy IOV list
+			 *
+			 * Note: When primary unmaps without remapping, the replica's
+			 * restored process still has the VMA (from Phase 1 dump).
+			 * We release pages via MADV_DONTNEED but don't remove the
+			 * VMA itself.
+			 *
+			 * TODO: Ask CRIU maintainers if VMA mismatch is acceptable.
+			 */
+		}
 	}
 
 	*new_ranges = ranges;
@@ -824,34 +1154,10 @@ void cow_cleanup_async_uffd(void)
 	 * Unregister VMAs in chunks with yields between each.
 	 * This spreads the kernel page-table walk time and allows
 	 * the target process to make progress between chunks.
-	 *
-	 * Scale the pre-unregister sleep with tracked memory size
-	 * (50 ms per GB), floor at 500 ms, cap at the historical 15 s.
-	 * Page-table walk cost is ~linear in tracked bytes, so a fixed
-	 * 15 s was over-long for small dumps and potentially short for
-	 * very large ones.
 	 */
-	{
-		unsigned long tracked_bytes = 0;
-		unsigned long sleep_ms;
-
-		if (cdi->tracked_vmas) {
-			for (i = 0; i < cdi->nr_tracked_vmas; i++)
-				tracked_bytes += cdi->tracked_vmas[i].end -
-						 cdi->tracked_vmas[i].start;
-		}
-
-		sleep_ms = 50UL * ((tracked_bytes + (1UL << 30) - 1) >> 30);
-		if (sleep_ms < 500)
-			sleep_ms = 500;
-		if (sleep_ms > 15000)
-			sleep_ms = 15000;
-
-		pr_err("Unregister pre-sleep: %lu ms (tracked=%lu MB, 50 ms/GB)\n",
-		       sleep_ms, tracked_bytes >> 20);
-		usleep(sleep_ms * 1000UL);
-		pr_err("Unregister pre-sleep done\n");
-	}
+	pr_err("Unregistering VMAs from uffd sleeping 15 seconds\n");
+	sleep(15);
+	pr_err("Unregistering VMAs from uffd sleeping 15 seconds done\n");
 	if (cdi->uffd >= 0 && cdi->tracked_vmas && cdi->nr_tracked_vmas > 0) {
 		pr_info("Unregistering %u VMAs from uffd fd=%d (chunked)\n",
 			cdi->nr_tracked_vmas, cdi->uffd);

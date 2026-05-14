@@ -247,9 +247,20 @@ for i in $(seq 1 ${SEND_AND_WAIT_TIMEOUT:-900}); do
 	sleep 1
 done
 
+# --- Start criu restore on replica ---
+# lazy-pages is waiting for restore to connect via the lazy-pages socket.
+# We launch criu restore in the replica worker (backgrounded) so it connects
+# to the lazy-pages daemon and restores the process tree.
+RESTORE_CMD="$CRIU_BIN restore --images-dir '$IMAGES_DIR' \
+	--lazy-pages --cow-dump \
+	--shell-job \
+	-v4 -o restore.log &"
+send_and_wait replica "$RESTORE_CMD" || die "restore dispatch timed out"
+[ "$WORKER_RC" -eq 0 ] || die "restore dispatch rc=$WORKER_RC"
+echo "=== Restore launched ==="
+
 # --- Signal restored victim to run verification ---
 # After restore, the victim is blocked in test_waitsig() waiting for SIGTERM.
-# lazy-pages auto-triggered restore; by now it should be running.
 # Retry signaling until process appears (restore may still be in progress).
 echo "=== Signaling restored victim (pid $VPID) ==="
 for i in $(seq 1 60); do

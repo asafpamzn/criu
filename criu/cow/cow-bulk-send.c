@@ -41,6 +41,7 @@
 #include "pagemap.h"
 #include "pagemap_scan.h"
 #include "common/bug.h"
+#include "cow/cow-dump.h"
 #ifdef CONFIG_HAS_LIBBPF
 #include "cow/cow-bpf.h"
 #endif
@@ -1625,6 +1626,8 @@ static int send_lazy_vma_pages_batch(int sk, struct lazy_vma_entry *lve,
 		if (ret < 0 && cow_errno_is_vma_gone(errno)) {
 			pr_debug("cow-bulk: VMA vanished at %lx (pid %d, %d pages, errno=%d): skip (bulk path)\n",
 				 base_vaddr, source_pid, nr_pages, errno);
+			/* Record for Phase 3 remap detection (fallback to UFFD events) */
+			cow_record_unmapped_range(base_vaddr, (unsigned long)nr_pages * PAGE_SIZE);
 			return 0;
 		}
 		pr_perror("Failed to read %d pages at %lx from pid %d (got %d)",
@@ -1762,6 +1765,8 @@ static int send_dirty_slices(struct p3_thread_ctx *ctx,
 						     nr_pages);
 				pr_debug("send_dirty_slices: slice %d at %lx vanished (%d pages, errno=%d): skip\n",
 					 i, slices[i].start, nr_pages, errno);
+				/* Record for Phase 3 remap detection (fallback to UFFD events) */
+				cow_record_unmapped_range(slices[i].start, len);
 				continue;
 			}
 			pr_perror("send_dirty_slices: slice %d at %lx read failed (ret=%zd)",

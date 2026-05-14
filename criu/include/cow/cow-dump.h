@@ -130,6 +130,17 @@ extern int cow_detect_new_vmas(struct vm_area_list *vmas,
  */
 extern void cow_cleanup_async_uffd(void);
 
-
+/**
+ * cow_record_unmapped_range - Record a range that was unmapped during Phase 2
+ * @start: Start address of unmapped range
+ * @len: Length of unmapped range
+ *
+ * Called from UFFD event reader thread when UFFD_EVENT_UNMAP/REMOVE is
+ * received, or from bulk sender when process_vm_readv returns EFAULT.
+ * Phase 3 checks if new VMAs appeared at these addresses to detect remaps.
+ *
+ * Thread-safe: multiple callers may run in parallel.
+ */
+extern void cow_record_unmapped_range(unsigned long start, unsigned long len);
 
 #endif /* __CR_COW_DUMP_H_ */
