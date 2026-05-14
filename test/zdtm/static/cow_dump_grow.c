@@ -70,8 +70,11 @@ static void *grower_thread(void *arg)
 	unsigned char *buf;
 	size_t i;
 
-	/* Let Phase 1 seize/unfreeze settle before we do large allocations. */
-	usleep(50 * 1000);
+	/*
+	 * No sleep needed - the thread is frozen during Phase 1 and unfrozen
+	 * when Phase 2 begins. The mmap for the grown region happens during
+	 * Phase 2 and is detected as a new VMA.
+	 */
 
 	buf = mmap(NULL, GROW_BYTES, PROT_READ | PROT_WRITE,
 		   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);

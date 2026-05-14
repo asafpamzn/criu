@@ -49,21 +49,11 @@ const char *test_author = "Asaf Pamuk <asafp@anthropic.com>";
 #define WRITE_STRIDE	4
 
 /*
- * Sleep before remap (wall-clock milliseconds from thread creation).
- *
- * Timeline (typical, 576MB total, r7g.large):
- *   T=0ms:   thread created, usleep starts
- *   T=218ms: Phase 1 freeze starts
- *   T=232ms: Phase 1 unfreeze
- *   T=342ms: Bulk transfer starts reading from low address
- *   T=367ms: Bulk finishes reading target (first 64MB)
- *   T=479ms: Bulk finishes reading padding (remaining 512MB)
- *   T=485ms: Phase 3 freeze (scanner converges, requests freeze)
- *
- * Need: T_delay > T_target_read (367ms) AND T_delay < T_phase3_freeze (485ms)
- * Using 420ms: 53ms after target read, 65ms before freeze.
+ * No sleep needed: the thread is frozen during Phase 1 and unfrozen when
+ * Phase 2 begins. UFFD_EVENT_UNMAP is delivered synchronously when munmap()
+ * is called, regardless of bulk transfer progress. The padding region ensures
+ * Phase 2 lasts long enough for the remap to complete before Phase 3 freeze.
  */
-#define REMAP_DELAY_MS	420
 
 #define DRAIN_TIMEOUT_MS_PER_GB	10000UL
 
@@ -96,7 +86,11 @@ static void *reuser_thread(void *arg)
 	unsigned char *buf;
 	size_t i;
 
-	usleep(REMAP_DELAY_MS * 1000);
+	/*
+	 * No sleep - just do the remap. This thread is frozen during Phase 1.
+	 * When it unfreezes, Phase 2 is active and UFFD events will be
+	 * delivered. The padding region keeps Phase 2 going long enough.
+	 */
 
 	if (munmap(addr, REGION_BYTES) < 0) {
 		atomic_store(&reuse_errno, errno);

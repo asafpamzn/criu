@@ -39,10 +39,11 @@ const char *test_author = "Asaf Pamuk <asafp@anthropic.com>";
 #define MARKER_MOVED	0xBB
 
 /*
- * Sleep before mremap (wall-clock milliseconds from thread creation).
- * Similar timing to munmap_reuse_unwritten test.
+ * No sleep needed: the thread is frozen during Phase 1 and unfrozen when
+ * Phase 2 begins. UFFD_EVENT_REMAP is delivered synchronously when mremap()
+ * is called, regardless of bulk transfer progress. The padding region ensures
+ * Phase 2 lasts long enough for the remap to complete before Phase 3 freeze.
  */
-#define MREMAP_DELAY_MS	100
 
 #define DRAIN_TIMEOUT_MS_PER_GB	10000UL
 
@@ -74,7 +75,11 @@ static void *mremap_thread(void *arg)
 	unsigned char *new_addr;
 	size_t i;
 
-	usleep(MREMAP_DELAY_MS * 1000);
+	/*
+	 * No sleep - just do the mremap. This thread is frozen during Phase 1.
+	 * When it unfreezes, Phase 2 is active and UFFD_EVENT_REMAP will be
+	 * delivered. The padding region keeps Phase 2 going long enough.
+	 */
 
 	new_addr = mremap(region, REGION_BYTES, REGION_BYTES, MREMAP_MAYMOVE);
 	if (new_addr == MAP_FAILED) {

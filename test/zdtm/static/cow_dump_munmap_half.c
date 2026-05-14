@@ -43,19 +43,21 @@ static atomic_int    stop_workers;
 static atomic_int    munmap_errno;	/* non-zero on munmap failure */
 
 /*
- * Munmapper thread: one-shot. Sleeps briefly so the action lands during
- * Phase 2 (after Phase 1's freeze + WP_ASYNC registration of the drop
- * VMA), then drops the entire 'drop' region in a single munmap call.
+ * Munmapper thread: one-shot. No sleep needed - the thread is frozen during
+ * Phase 1 and unfrozen when Phase 2 begins. UFFD_EVENT_UNMAP is delivered
+ * synchronously when munmap() is called. The kept region serves as padding
+ * to ensure Phase 2 lasts long enough.
+ *
  * This triggers a UFFD REMOVE event covering the full DROP_BYTES range,
  * which CRIU routes through cow_handle_remove_event ->
  * page_state_mark_range_unmapped + unmapped_tracker_mark_range +
  * cow_page_buffer_remove_range.
- *
- * Same 50 ms settle delay as cow_dump_grow.c's grower_thread.
  */
 static void *munmapper_thread(void *arg)
 {
-	usleep(50 * 1000);
+	/*
+	 * No sleep - just do the munmap. UFFD events are synchronous.
+	 */
 
 	if (munmap(drop_region, HALF_BYTES) < 0) {
 		atomic_store(&munmap_errno, errno);

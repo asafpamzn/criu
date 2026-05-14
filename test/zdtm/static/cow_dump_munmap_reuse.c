@@ -65,8 +65,12 @@ static void *reuser_thread(void *arg)
 	unsigned char *buf;
 	size_t i;
 
-	/* Let Phase 2 settle before we do the munmap+remap. */
-	usleep(50 * 1000);
+	/*
+	 * No sleep needed - the thread is frozen during Phase 1 and unfrozen
+	 * when Phase 2 begins. UFFD_EVENT_UNMAP is delivered synchronously
+	 * when munmap() is called. The large region size (32GB default) ensures
+	 * Phase 2 lasts long enough for the remap to complete.
+	 */
 
 	if (munmap(addr, REGION_BYTES) < 0) {
 		atomic_store(&reuse_errno, errno);

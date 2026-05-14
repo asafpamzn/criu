@@ -55,9 +55,10 @@ const char *test_author = "Asaf Pamuk <asafp@anthropic.com>";
 #define MARKER_UNPOPULATED_WRITE 0x22
 
 /*
- * Sleep before writing to unpopulated pages
+ * No sleep needed: the thread is frozen during Phase 1 and unfrozen when
+ * Phase 2 begins. Writes to unpopulated pages are tracked via WP_UNPOPULATED.
+ * The padding region ensures Phase 2 lasts long enough.
  */
-#define WRITE_DELAY_MS	100
 
 #define DRAIN_TIMEOUT_MS_PER_GB	10000UL
 
@@ -77,7 +78,11 @@ static void *writer_thread(void *arg)
 {
 	size_t i;
 
-	usleep(WRITE_DELAY_MS * 1000);
+	/*
+	 * No sleep - just do the writes. This thread is frozen during Phase 1.
+	 * When it unfreezes, Phase 2 is active. With WP_UNPOPULATED, writes to
+	 * pages without PTEs are tracked. The padding keeps Phase 2 going.
+	 */
 
 	for (i = 1; i < REGION_PAGES; i += POPULATE_STRIDE) {
 		memset(region + i * PAGE_SIZE, MARKER_UNPOPULATED_WRITE, PAGE_SIZE);
