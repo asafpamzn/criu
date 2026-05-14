@@ -46,8 +46,11 @@ static int cow_recv_skeleton_file(struct page_server_iov *pi)
 		return -1;
 	}
 
-	if (page_server_recv(sk, filename, name_len, MSG_WAITALL) != name_len)
+	if (page_server_recv(sk, filename, name_len, MSG_WAITALL) != name_len) {
+		pr_err("cow_recv_skeleton_file: failed to recv filename (name_len=%d, errno=%d)\n",
+		       name_len, errno);
 		return -1;
+	}
 	filename[name_len] = '\0';
 
 	snprintf(path, sizeof(path), "%s/%s", opts.imgs_dir, filename);
@@ -57,6 +60,8 @@ static int cow_recv_skeleton_file(struct page_server_iov *pi)
 		return -1;
 
 	if (page_server_recv(sk, buf, file_size, MSG_WAITALL) != (int)file_size) {
+		pr_err("cow_recv_skeleton_file: failed to recv file data '%s' (file_size=%lu, errno=%d)\n",
+		       filename, (unsigned long)file_size, errno);
 		xfree(buf);
 		return -1;
 	}
@@ -107,7 +112,13 @@ static int bulk_recv(void *buf, int need, int flags)
 	if (ret < 0) {
 		if (flags == MSG_DONTWAIT && (errno == EAGAIN || errno == EINTR))
 			return -EAGAIN;
+		pr_err("bulk_recv: page_server_recv returned %d, errno=%d (%s), sk=%d, need=%d, flags=0x%x\n",
+		       ret, errno, strerror(errno), sk, need, flags);
 		return -1;
+	}
+	if (ret == 0) {
+		pr_err("bulk_recv: page_server_recv returned 0 (EOF), sk=%d, need=%d\n",
+		       sk, need);
 	}
 
 	return ret;
@@ -145,8 +156,12 @@ static int read_bulk_header(struct ps_async_read_bulk *ar, int flags)
 	cmd = decode_ps_cmd(ar->pi.cmd);
 
 	if (cmd == PS_IOV_SKELETON_FILE) {
-		if (cow_recv_skeleton_file(&ar->pi) < 0)
+		pr_err("read_bulk_header: SKELETON_FILE nr_pages(name_len)=%lu vaddr(file_size)=%lu\n",
+		       (unsigned long)ar->pi.nr_pages, (unsigned long)ar->pi.vaddr);
+		if (cow_recv_skeleton_file(&ar->pi) < 0) {
+			pr_err("read_bulk_header: cow_recv_skeleton_file FAILED\n");
 			return -1;
+		}
 		return BULK_STREAM_PROGRESS;
 	}
 

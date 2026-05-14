@@ -2253,8 +2253,11 @@ int cow_start_p3_threads(int *sockets, int num_sockets, u64 dst_id, pid_t source
 	}
 
 	/* Initialize per-connection TLS credentials before spawning threads */
-	if (opts.tls)
+	if (opts.tls) {
+		pr_err("P3 sender: calling tls_global_init()\n");
 		BUG_ON(tls_global_init());
+		pr_err("P3 sender: tls_global_init() OK\n");
+	}
 
 	/* Start one sender thread per socket */
 	p3_total_pages_sent = 0;
@@ -2270,8 +2273,14 @@ int cow_start_p3_threads(int *sockets, int num_sockets, u64 dst_id, pid_t source
 		p3_threads[i].thread = 0;
 
 		if (opts.tls) {
+			pr_err("P3 sender[%d] starting TLS handshake on fd=%d\n",
+			       i, sockets[i]);
 			p3_threads[i].tls = tls_conn_new(sockets[i], true);
-			BUG_ON(!p3_threads[i].tls);
+			if (!p3_threads[i].tls) {
+				pr_err("P3 sender[%d] TLS handshake FAILED\n", i);
+				BUG();
+			}
+			pr_err("P3 sender[%d] TLS handshake OK\n", i);
 		} else {
 			p3_threads[i].tls = NULL;
 		}

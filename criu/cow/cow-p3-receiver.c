@@ -262,8 +262,14 @@ static void *p3_receiver_thread_func(void *arg)
 
 	/* Per-connection TLS handshake (client side — REPLICA connects to PRIMARY) */
 	if (opts.tls) {
+		pr_err("P3 receiver[%d] starting TLS handshake on fd=%d\n",
+		       ctx->thread_id, ctx->socket);
 		ctx->tls = tls_conn_new(ctx->socket, false);
-		BUG_ON(!ctx->tls);
+		if (!ctx->tls) {
+			pr_err("P3 receiver[%d] TLS handshake FAILED\n", ctx->thread_id);
+			BUG();
+		}
+		pr_err("P3 receiver[%d] TLS handshake OK\n", ctx->thread_id);
 	}
 
 	/* Receive pages until socket closes */
@@ -386,8 +392,11 @@ int start_p3_receiver_connections(int num_connections)
 		return 0;
 
 	/* Initialize per-connection TLS credentials before spawning threads */
-	if (opts.tls)
+	if (opts.tls) {
+		pr_err("P3 receiver: calling tls_global_init()\n");
 		BUG_ON(tls_global_init());
+		pr_err("P3 receiver: tls_global_init() OK\n");
+	}
 
 	/* Start receiver thread for each connection */
 	for (i = 0; i < num_sockets; i++) {
