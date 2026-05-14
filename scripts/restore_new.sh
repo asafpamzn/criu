@@ -88,21 +88,31 @@ if [ $LP_EXIT -ne 0 ]; then
 fi
 log_timing "Lazy-pages completed (restore done)"
 
-# Verify valkey-server is running and enable core dumps on it
+# Verify valkey-server is running and attach strace to catch exit
 VALKEY_PID=$(pgrep -x valkey-server | head -n1 || true)
 if [ -z "$VALKEY_PID" ]; then
   log_timing "ERROR: valkey-server not running after restore!"
   ls -la /tmp/core.* 2>/dev/null && log_timing "Core dump found" || log_timing "No core dump in /tmp"
-  dmesg | tail -20 | sudo tee -a "$TIMING_LOG"
+  sudo dmesg | tail -20 | sudo tee -a "$TIMING_LOG"
   exit 1
 fi
 log_timing "valkey-server alive (PID: $VALKEY_PID)"
 sudo prlimit --pid "$VALKEY_PID" --core=unlimited:unlimited
-log_timing "Core dump limit set to unlimited for PID $VALKEY_PID"
+
+# Attach strace to capture syscalls leading up to exit
+sudo strace -p "$VALKEY_PID" -tt -f -e trace=write,exit_group,kill,signal \
+  -s 512 -o "$IMAGES_DIR/valkey-strace.log" &
+STRACE_PID=$!
+log_timing "strace attached (PID: $STRACE_PID)"
+sleep 0.5
 
 # Configure replication
 log_timing "Configuring replication..."
 "$SCRIPT_DIR/wait_and_replicate_new.sh"
 log_timing "Replication configured"
+
+# Stop strace
+sudo kill $STRACE_PID 2>/dev/null || true
+wait $STRACE_PID 2>/dev/null || true
 
 log_timing "=== Restore complete ==="
