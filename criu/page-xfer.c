@@ -205,6 +205,36 @@ int page_server_recv(int sk, void *buf, size_t sz, int fl)
 	return __recv(sk, buf, sz, fl);
 }
 
+/* Raw wrappers for P3 parallel sockets — always use plain TCP */
+int page_server_send_raw(int sk, const void *buf, size_t sz, int fl)
+{
+	const char *cursor = buf;
+	size_t remaining = sz;
+
+	if (fl & MSG_DONTWAIT)
+		return send(sk, buf, sz, fl);
+
+	while (remaining > 0) {
+		int ret = send(sk, cursor, remaining, fl);
+
+		if (ret < 0) {
+			if (errno == EINTR)
+				continue;
+			return -1;
+		}
+		if (ret == 0)
+			return 0;
+		cursor += ret;
+		remaining -= ret;
+	}
+	return sz;
+}
+
+int page_server_recv_raw(int sk, void *buf, size_t sz, int fl)
+{
+	return recv(sk, buf, sz, fl);
+}
+
 /* Exported wrapper for encode_pm */
 u64 encode_pm_id(int type, unsigned long id)
 {

@@ -38,6 +38,7 @@
 #include "atomic-bitmap.h"
 #include "cr_options.h"
 #include "tls.h"
+#include "cow/tls-conn.h"
 #include "pagemap.h"
 #include "pagemap_scan.h"
 #include "common/bug.h"
@@ -100,6 +101,7 @@ struct p3_thread_ctx {
 	pthread_t thread;
 	int thread_id;
 	int socket;           /* Per-thread socket for parallel transfer */
+	struct tls_conn *tls; /* Per-thread TLS session (NULL if TLS disabled) */
 	u64 dst_id;
 	pid_t source_pid;
 	unsigned long pages_sent;
@@ -1496,8 +1498,8 @@ static __thread unsigned long tls_total_sent_pages;
  * Phase 2/3 convergence where CPU is the bottleneck and the payload is
  * already mostly modified (poorly-compressible) pages.
  */
-int send_pages_batch_compressed(int sk, const void *data,
-				int nr_pages, u64 dst_id,
+int send_pages_batch_compressed(struct tls_conn *tls, int sk,
+				const void *data, int nr_pages, u64 dst_id,
 				unsigned long base_vaddr,
 				int acceleration)
 {
@@ -1545,7 +1547,10 @@ int send_pages_batch_compressed(int sk, const void *data,
 
 	/* Single send: header + size + compressed data */
 	total_len = sizeof(*pi) + sizeof(int) + *compressed_size;
-	ret = page_server_send(sk, send_buf, total_len, 0);
+	if (tls)
+		ret = tls_conn_send_all(tls, send_buf, total_len, 0);
+	else
+		ret = page_server_send_raw(sk, send_buf, total_len, 0);
 
 	if (ret != total_len) {
 		pr_perror("Failed to send compressed batch (sent %d/%d)", ret, total_len);
@@ -1574,7 +1579,8 @@ static inline char *cow_get_read_buf(void)
  * Read and send a batch of contiguous pages from source process.
  * Returns number of pages actually sent, or -1 on error.
  */
-static int send_lazy_vma_pages_batch(int sk, struct lazy_vma_entry *lve,
+static int send_lazy_vma_pages_batch(struct tls_conn *tls, int sk,
+				     struct lazy_vma_entry *lve,
 				     unsigned long base_vaddr, int max_pages,
 				     u64 dst_id, pid_t source_pid)
 {
@@ -1639,7 +1645,7 @@ static int send_lazy_vma_pages_batch(int sk, struct lazy_vma_entry *lve,
 	 * Pre-freeze bulk transfer: we have CPU time to spare because the
 	 * process is still running; use best-ratio LZ4 to save network.
 	 */
-	ret = send_pages_batch_compressed(sk, buffer, nr_pages, dst_id,
+	ret = send_pages_batch_compressed(tls, sk, buffer, nr_pages, dst_id,
 					  base_vaddr, 1);
 	if (ret < 0)
 		return -1;
@@ -1717,7 +1723,7 @@ static int send_dirty_slices(struct p3_thread_ctx *ctx,
 			int nr_pages = slices[i].nr_pages;
 			int srv;
 
-			srv = send_pages_batch_compressed(ctx->socket,
+			srv = send_pages_batch_compressed(ctx->tls, ctx->socket,
 							  (char *)buffer + offset,
 							  nr_pages, slices[i].dst_id,
 							  slices[i].start, 1);
@@ -1774,8 +1780,9 @@ static int send_dirty_slices(struct p3_thread_ctx *ctx,
 			return -1;
 		}
 
-		srv = send_pages_batch_compressed(ctx->socket, buffer,
-						  nr_pages, slices[i].dst_id,
+		srv = send_pages_batch_compressed(ctx->tls, ctx->socket,
+						  buffer, nr_pages,
+						  slices[i].dst_id,
 						  slices[i].start, 1);
 		if (srv < 0)
 			return -1;
@@ -1871,9 +1878,9 @@ static unsigned long send_new_vma_pages(struct p3_thread_ctx *ctx)
 			 * P3 wall-clock 2.3s -> 4.8s by shifting the
 			 * bottleneck to tcp_sendmsg.
 			 */
-			ret = send_pages_batch_compressed(ctx->socket, buffer,
-							  batch_pages, ctx->dst_id,
-							  vaddr, 1);
+			ret = send_pages_batch_compressed(ctx->tls, ctx->socket,
+							  buffer, batch_pages,
+							  ctx->dst_id, vaddr, 1);
 			if (ret < 0) {
 				pr_err("P3[%d] failed to send new VMA pages at %lx, aborting\n",
 				       thread_id, vaddr);
@@ -1943,7 +1950,8 @@ static void *p3_bulk_sender_thread(void *arg)
 					int sent;
 
 					sent = send_lazy_vma_pages_batch(
-						ctx->socket, work->lve, vaddr, batch_pages,
+						ctx->tls, ctx->socket, work->lve,
+						vaddr, batch_pages,
 						ctx->dst_id, ctx->source_pid);
 
 					if (sent < 0) {
@@ -2244,6 +2252,10 @@ int cow_start_p3_threads(int *sockets, int num_sockets, u64 dst_id, pid_t source
 		return -1;
 	}
 
+	/* Initialize per-connection TLS credentials before spawning threads */
+	if (opts.tls)
+		BUG_ON(tls_global_init());
+
 	/* Start one sender thread per socket */
 	p3_total_pages_sent = 0;
 
@@ -2256,6 +2268,14 @@ int cow_start_p3_threads(int *sockets, int num_sockets, u64 dst_id, pid_t source
 		p3_threads[i].active = true;
 		p3_threads[i].error = false;
 		p3_threads[i].thread = 0;
+
+		if (opts.tls) {
+			p3_threads[i].tls = tls_conn_new(sockets[i], true);
+			BUG_ON(!p3_threads[i].tls);
+		} else {
+			p3_threads[i].tls = NULL;
+		}
+
 		__sync_fetch_and_add(&p3_threads_active, 1);
 
 		if (pthread_create(&p3_threads[i].thread, NULL,
@@ -2296,8 +2316,12 @@ void cow_wait_p3_threads(void)
 	}
 	clock_gettime(CLOCK_MONOTONIC, &t_senders_done);
 
-	/* Close P3 sockets so replica receivers get EOF */
+	/* Tear down TLS sessions and close P3 sockets so replica receivers get EOF */
 	for (i = 0; i < COW_NUM_P3_THREADS; i++) {
+		if (p3_threads[i].tls) {
+			tls_conn_free(p3_threads[i].tls);
+			p3_threads[i].tls = NULL;
+		}
 		if (p3_threads[i].socket >= 0) {
 			close(p3_threads[i].socket);
 			p3_threads[i].socket = -1;

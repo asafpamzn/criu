@@ -44,9 +44,13 @@ static inline u32 decode_ps_cmd(u32 cmd)
 	return cmd & PS_CMD_MASK;
 }
 
-/* TLS-aware send/recv wrappers */
+/* TLS-aware send/recv wrappers (use global TLS session — main socket only) */
 extern int page_server_send(int sk, const void *buf, size_t sz, int fl);
 extern int page_server_recv(int sk, void *buf, size_t sz, int fl);
+
+/* Raw send/recv — bypasses TLS, for P3 parallel sockets */
+extern int page_server_send_raw(int sk, const void *buf, size_t sz, int fl);
+extern int page_server_recv_raw(int sk, void *buf, size_t sz, int fl);
 extern int send_psi(int sk, struct page_server_iov *pi);
 extern void page_server_tcp_nodelay(int sk, bool on);
 

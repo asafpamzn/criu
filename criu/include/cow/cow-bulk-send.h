@@ -6,6 +6,8 @@
 #include "cow/cow-conf.h"
 #include <pthread.h>
 
+struct tls_conn;
+
 /*
  * Dirty region entry - passed from scanner thread to sender threads via SPSC queue.
  * Each entry represents a contiguous range of dirty pages to be transferred.
@@ -44,8 +46,8 @@ struct sender_queue {
  *   99 - minimum CPU, poorer ratio; use during Phase 2/3 convergence where
  *        process is frozen and CPU dominates the downtime window.
  */
-int send_pages_batch_compressed(int sk, const void *data,
-				int nr_pages, u64 dst_id,
+int send_pages_batch_compressed(struct tls_conn *tls, int sk,
+				const void *data, int nr_pages, u64 dst_id,
 				unsigned long base_vaddr,
 				int acceleration);
 

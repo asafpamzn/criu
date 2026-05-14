@@ -24,6 +24,7 @@
 #include "cow/cow-bulk-send.h"
 #include "cr_options.h"
 #include "tls.h"
+#include "cow/tls-conn.h"
 #include "cow/page-pool.h"
 #include "cow/cow-uffd.h"
 #include "util.h"
@@ -43,6 +44,7 @@ struct p3_receiver_ctx {
 	pthread_t thread;
 	int thread_id;
 	int socket;
+	struct tls_conn *tls;
 	unsigned long pages_received;
 	volatile bool active;
 	/* Pre-allocated buffers to avoid malloc/mprotect contention */
@@ -68,7 +70,10 @@ static int p3_receive_and_buffer(struct p3_receiver_ctx *ctx)
 	int decomp_ret;
 
 	/* Receive header */
-	ret = page_server_recv(sk, &pi, sizeof(pi), MSG_WAITALL);
+	if (ctx->tls)
+		ret = tls_conn_recv_all(ctx->tls, &pi, sizeof(pi), 0);
+	else
+		ret = page_server_recv_raw(sk, &pi, sizeof(pi), MSG_WAITALL);
 	if (ret == 0)
 		return 0;  /* EOF */
 	if (ret != sizeof(pi)) {
@@ -83,7 +88,11 @@ static int p3_receive_and_buffer(struct p3_receiver_ctx *ctx)
 	}
 
 	/* Receive compressed size */
-	if (page_server_recv(sk, &compressed_size, sizeof(compressed_size), MSG_WAITALL) != sizeof(compressed_size)) {
+	if (ctx->tls)
+		ret = tls_conn_recv_all(ctx->tls, &compressed_size, sizeof(compressed_size), 0);
+	else
+		ret = page_server_recv_raw(sk, &compressed_size, sizeof(compressed_size), MSG_WAITALL);
+	if (ret != sizeof(compressed_size)) {
 		pr_perror("P3 receive: failed to read compressed size");
 		return -1;
 	}
@@ -94,7 +103,11 @@ static int p3_receive_and_buffer(struct p3_receiver_ctx *ctx)
 	}
 
 	/* Receive compressed data (using pre-allocated buffer) */
-	if (page_server_recv(sk, compressed_buf, compressed_size, MSG_WAITALL) != compressed_size) {
+	if (ctx->tls)
+		ret = tls_conn_recv_all(ctx->tls, compressed_buf, compressed_size, 0);
+	else
+		ret = page_server_recv_raw(sk, compressed_buf, compressed_size, MSG_WAITALL);
+	if (ret != compressed_size) {
 		pr_perror("P3 receive: failed to read compressed data");
 		return -1;
 	}
@@ -247,8 +260,11 @@ static void *p3_receiver_thread_func(void *arg)
 	/* Initialize per-thread page pool for lock-free allocation */
 	BUG_ON(cow_page_buffer_thread_init(ctx->thread_id) < 0);
 
-	/* Initialize TLS if enabled */
-	BUG_ON(tls_x509_init(ctx->socket, true));
+	/* Per-connection TLS handshake (client side — REPLICA connects to PRIMARY) */
+	if (opts.tls) {
+		ctx->tls = tls_conn_new(ctx->socket, false);
+		BUG_ON(!ctx->tls);
+	}
 
 	/* Receive pages until socket closes */
 	while ((ret = p3_receive_and_buffer(ctx)) > 0)
@@ -302,9 +318,6 @@ int accept_p3_connections(int *sockets, int max_connections, int timeout_ms)
 			BUG();
 		}
 
-		/* Initialize TLS if enabled */
-		BUG_ON(tls_x509_init(sk, true));
-
 		sockets[num_accepted] = sk;
 		num_accepted++;
 		pr_info("Accepted P3 connection %d (fd=%d)\n", num_accepted, sk);
@@ -331,9 +344,6 @@ static int connect_p3_sockets(int *sockets, int num_requested)
 	for (i = 0; i < num_requested; i++) {
 		int sk = setup_tcp_client(opts.addr);
 		BUG_ON(sk < 0);
-
-		/* Initialize TLS if enabled */
-		BUG_ON(tls_x509_init(sk, false));
 
 		sockets[i] = sk;
 		num_created++;
@@ -375,10 +385,15 @@ int start_p3_receiver_connections(int num_connections)
 	if (num_sockets == 0)
 		return 0;
 
+	/* Initialize per-connection TLS credentials before spawning threads */
+	if (opts.tls)
+		BUG_ON(tls_global_init());
+
 	/* Start receiver thread for each connection */
 	for (i = 0; i < num_sockets; i++) {
 		p3_receivers[i].thread_id = i;
 		p3_receivers[i].socket = p3_sockets[i];
+		p3_receivers[i].tls = NULL;
 		p3_receivers[i].pages_received = 0;
 		p3_receivers[i].active = true;
 
@@ -415,6 +430,10 @@ void stop_p3_receiver_connections(void)
 		if (p3_receivers[i].thread) {
 			pthread_join(p3_receivers[i].thread, NULL);
 			total_pages += p3_receivers[i].pages_received;
+			if (p3_receivers[i].tls) {
+				tls_conn_free(p3_receivers[i].tls);
+				p3_receivers[i].tls = NULL;
+			}
 			if (p3_receivers[i].socket >= 0) {
 				close(p3_receivers[i].socket);
 				p3_receivers[i].socket = -1;
