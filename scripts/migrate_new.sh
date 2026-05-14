@@ -111,7 +111,9 @@ log_timing "Polling for master_link_status:up..."
 REPLICA_PORT="${REPLICA_PORT:-6379}"
 REMOTE_CLI_TLS=""
 if [ "$USE_TLS" = true ] && [ -n "${TLS_CERT:-}" ]; then
-  REMOTE_CLI_TLS="--tls --cert $TLS_CERT --key $TLS_KEY --cacert $TLS_CACERT"
+  _CLI_CERT="${TLS_CLIENT_CERT:-$TLS_CERT}"
+  _CLI_KEY="${TLS_CLIENT_KEY:-$TLS_KEY}"
+  REMOTE_CLI_TLS="--tls --cert $_CLI_CERT --key $_CLI_KEY --cacert $TLS_CACERT"
 fi
 STATUS=""
 for i in $(seq 1 120); do
