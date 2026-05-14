@@ -85,9 +85,13 @@ log_timing "Sent START $PID to replica"
 # Poll for replica master_link_status:up
 log_timing "Polling for master_link_status:up..."
 REPLICA_PORT="${REPLICA_PORT:-6379}"
+REMOTE_CLI_TLS=""
+if [ -n "${VALKEY_TLS_CERT:-}" ]; then
+  REMOTE_CLI_TLS="--tls --cert $VALKEY_TLS_CERT --key $VALKEY_TLS_KEY --cacert $VALKEY_TLS_CACERT"
+fi
 STATUS=""
 for i in $(seq 1 120); do
-  STATUS=$($SSH ubuntu@$REPLICA_SSH_HOST "valkey-cli -p $REPLICA_PORT info replication 2>/dev/null | grep master_link_status" || true)
+  STATUS=$($SSH ubuntu@$REPLICA_SSH_HOST "valkey-cli -p $REPLICA_PORT $REMOTE_CLI_TLS info replication 2>/dev/null | grep master_link_status" || true)
   if [[ "$STATUS" == *"master_link_status:up"* ]]; then
     END_TIME=$(date +%s%3N)
     ELAPSED=$((END_TIME - START_TIME))
