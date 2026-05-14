@@ -46,6 +46,8 @@ log_timing() {
 
 WAIT_START=$(date +%s%3N)
 
+echo "(wait_replicate) USE_TLS=$USE_TLS CLI='$CLI' PRIMARY_IP=$PRIMARY_IP VALKEY_PORT=$VALKEY_PORT" | sudo tee -a "$TIMING_LOG"
+
 echo "Waiting for Valkey to respond to PING..."
 for i in $(seq 1 "$MAX_WAIT"); do
   if $CLI ping &>/dev/null; then
@@ -55,26 +57,30 @@ for i in $(seq 1 "$MAX_WAIT"); do
     echo "[$(date '+%H:%M:%S.%3N') +${WAIT_ELAPSED}ms] (wait_replicate) Valkey responsive after iter $i" | sudo tee -a "$TIMING_LOG"
     break
   fi
+  if [ "$i" -le 3 ] || [ $((i % 50)) -eq 0 ]; then
+    echo "(wait_replicate) PING attempt $i failed: $($CLI ping 2>&1 || true)" | sudo tee -a "$TIMING_LOG"
+  fi
   sleep 0.1
 done
 
 if ! $CLI ping &>/dev/null; then
+  echo "(wait_replicate) FINAL PING failed: $($CLI ping 2>&1 || true)" | sudo tee -a "$TIMING_LOG"
   echo "ERROR: Valkey not responsive after ${MAX_WAIT}x0.1s"
   exit 1
 fi
 
 echo "Running CLEAN_STATE_FOR_DOLLY_SAVE..."
 CLEAN_START=$(date +%s%3N)
-$CLI CLEAN_STATE_FOR_DOLLY_SAVE
+CLEAN_RESULT=$($CLI CLEAN_STATE_FOR_DOLLY_SAVE 2>&1) || true
 CLEAN_END=$(date +%s%3N)
 CLEAN_ELAPSED=$((CLEAN_END - CLEAN_START))
-echo "[$(date '+%H:%M:%S.%3N') +${CLEAN_ELAPSED}ms] (wait_replicate) CLEAN_STATE_FOR_DOLLY_SAVE done" | sudo tee -a "$TIMING_LOG"
+echo "[$(date '+%H:%M:%S.%3N') +${CLEAN_ELAPSED}ms] (wait_replicate) CLEAN_STATE_FOR_DOLLY_SAVE: $CLEAN_RESULT" | sudo tee -a "$TIMING_LOG"
 
 echo "Configuring as replica of ${PRIMARY_IP}:${VALKEY_PORT}..."
 REPL_START=$(date +%s%3N)
-$CLI replicaof "$PRIMARY_IP" "$VALKEY_PORT"
+REPL_RESULT=$($CLI replicaof "$PRIMARY_IP" "$VALKEY_PORT" 2>&1) || true
 REPL_END=$(date +%s%3N)
 REPL_ELAPSED=$((REPL_END - REPL_START))
-echo "[$(date '+%H:%M:%S.%3N') +${REPL_ELAPSED}ms] (wait_replicate) replicaof command done" | sudo tee -a "$TIMING_LOG"
+echo "[$(date '+%H:%M:%S.%3N') +${REPL_ELAPSED}ms] (wait_replicate) replicaof: $REPL_RESULT" | sudo tee -a "$TIMING_LOG"
 
 echo "Replica configured"
