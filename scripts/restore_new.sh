@@ -23,6 +23,12 @@ sudo mkdir -p "$IMAGES_DIR"
 sudo rm -f "$TIMING_LOG"
 log_timing "=== CRIU Restore - Replica ==="
 
+# Enable core dumps for debugging
+log_timing "Enabling core dumps..."
+sudo bash -c 'echo "/tmp/core.%e.%p.%t" > /proc/sys/kernel/core_pattern'
+sudo bash -c 'echo 0 > /proc/sys/kernel/core_pipe_limit'
+ulimit -c unlimited
+
 # Kill leftover criu processes
 log_timing "Killing leftover criu processes..."
 sudo pkill -9 -f "criu lazy-pages" 2>/dev/null || true
@@ -81,6 +87,18 @@ if [ $LP_EXIT -ne 0 ]; then
   exit 1
 fi
 log_timing "Lazy-pages completed (restore done)"
+
+# Verify valkey-server is running and enable core dumps on it
+VALKEY_PID=$(pgrep -x valkey-server | head -n1 || true)
+if [ -z "$VALKEY_PID" ]; then
+  log_timing "ERROR: valkey-server not running after restore!"
+  ls -la /tmp/core.* 2>/dev/null && log_timing "Core dump found" || log_timing "No core dump in /tmp"
+  dmesg | tail -20 | sudo tee -a "$TIMING_LOG"
+  exit 1
+fi
+log_timing "valkey-server alive (PID: $VALKEY_PID)"
+sudo prlimit --pid "$VALKEY_PID" --core=unlimited:unlimited
+log_timing "Core dump limit set to unlimited for PID $VALKEY_PID"
 
 # Configure replication
 log_timing "Configuring replication..."
