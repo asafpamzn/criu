@@ -6,6 +6,9 @@ source "$SCRIPT_DIR/.env"
 
 IMAGES_DIR="/dev/shm/criu-migrate"
 CRIU_BIN="${CRIU_BIN:-$SCRIPT_DIR/../criu/criu}"
+TLS_CERT="${TLS_CERT:-}"
+TLS_KEY="${TLS_KEY:-}"
+TLS_CACERT="${TLS_CACERT:-}"
 SSH="ssh -i $SSH_KEY -o StrictHostKeyChecking=no -o ConnectTimeout=10"
 REPLICA_SSH_HOST="${REPLICA_IP:-$REPLICA_HOST}"
 TIMING_LOG="$IMAGES_DIR/migrate-timing.log"
@@ -52,6 +55,12 @@ log_timing "READY received"
 log_timing "Starting CRIU dump for PID $PID..."
 START_TIME=$(date +%s%3N)
 
+TLS_OPTS=""
+if [ -n "$TLS_CERT" ]; then
+  TLS_OPTS="--tls --tls-cert $TLS_CERT --tls-key $TLS_KEY --tls-cacert $TLS_CACERT --tls-no-cn-verify"
+  log_timing "TLS enabled: cert=$TLS_CERT"
+fi
+
 sudo "$CRIU_BIN" dump \
   --tree "$PID" \
   --images-dir "$IMAGES_DIR" \
@@ -64,6 +73,7 @@ sudo "$CRIU_BIN" dump \
   --ext-unix-sk \
   --leave-running \
   --display-stats \
+  $TLS_OPTS \
   -v2 -o "$IMAGES_DIR/lazy-primary.log" &
 DUMP_PID=$!
 log_timing "CRIU dump started (PID: $DUMP_PID)"

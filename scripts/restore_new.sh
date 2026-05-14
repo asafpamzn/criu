@@ -6,6 +6,9 @@ source "$SCRIPT_DIR/.env"
 
 export IMAGES_DIR="/dev/shm/criu-migrate"
 CRIU_BIN="${CRIU_BIN:-$SCRIPT_DIR/../criu/criu}"
+TLS_CERT="${TLS_CERT:-}"
+TLS_KEY="${TLS_KEY:-}"
+TLS_CACERT="${TLS_CACERT:-}"
 TIMING_LOG="$IMAGES_DIR/restore-timing.log"
 
 START_MS=$(date +%s%3N)
@@ -50,6 +53,13 @@ log_timing "START received (tree PID: $TREE_PID)"
 
 # Start lazy-pages (connects to page server, buffers pages, starts restore)
 log_timing "Starting lazy-pages..."
+
+TLS_OPTS=""
+if [ -n "$TLS_CERT" ]; then
+  TLS_OPTS="--tls --tls-cert $TLS_CERT --tls-key $TLS_KEY --tls-cacert $TLS_CACERT --tls-no-cn-verify"
+  log_timing "TLS enabled: cert=$TLS_CERT"
+fi
+
 sudo "$CRIU_BIN" lazy-pages \
   --images-dir "$IMAGES_DIR" \
   --page-server \
@@ -58,6 +68,7 @@ sudo "$CRIU_BIN" lazy-pages \
   --cow-dump \
   --tree "$TREE_PID" \
   --tcp-close \
+  $TLS_OPTS \
   -v1 -o "$IMAGES_DIR/lazy-server.log" &
 LAZY_PAGES_PID=$!
 
