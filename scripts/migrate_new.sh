@@ -4,6 +4,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/.env"
 
+# TLS flag: pass --no-tls to disable
+USE_TLS=true
+if [[ "${1:-}" == "--no-tls" ]]; then
+  USE_TLS=false
+  shift
+fi
+
 IMAGES_DIR="/dev/shm/criu-migrate"
 CRIU_BIN="${CRIU_BIN:-$SCRIPT_DIR/../criu/criu}"
 TLS_CERT="${TLS_CERT:-}"
@@ -39,7 +46,11 @@ sudo rm -rf "$IMAGES_DIR"/*
 
 # Start replica over SSH (bidirectional protocol via coproc)
 log_timing "Starting restore on replica..."
-coproc REPLICA { $SSH ubuntu@$REPLICA_SSH_HOST "sudo $SCRIPT_DIR/restore_new.sh"; }
+RESTORE_TLS_FLAG=""
+if [ "$USE_TLS" = true ]; then
+  RESTORE_TLS_FLAG="--tls"
+fi
+coproc REPLICA { $SSH ubuntu@$REPLICA_SSH_HOST "sudo $SCRIPT_DIR/restore_new.sh $RESTORE_TLS_FLAG"; }
 REPLICA_SAVED_PID=$REPLICA_PID
 log_timing "SSH launched (PID: $REPLICA_SAVED_PID)"
 
@@ -56,9 +67,11 @@ log_timing "Starting CRIU dump for PID $PID..."
 START_TIME=$(date +%s%3N)
 
 TLS_OPTS=""
-if [ -n "$TLS_CERT" ]; then
+if [ "$USE_TLS" = true ] && [ -n "$TLS_CERT" ]; then
   TLS_OPTS="--tls --tls-cert $TLS_CERT --tls-key $TLS_KEY --tls-cacert $TLS_CACERT --tls-no-cn-verify"
   log_timing "TLS enabled: cert=$TLS_CERT"
+else
+  log_timing "TLS disabled"
 fi
 
 sudo "$CRIU_BIN" dump \
@@ -86,7 +99,7 @@ log_timing "Sent START $PID to replica"
 log_timing "Polling for master_link_status:up..."
 REPLICA_PORT="${REPLICA_PORT:-6379}"
 REMOTE_CLI_TLS=""
-if [ -n "${TLS_CERT:-}" ]; then
+if [ "$USE_TLS" = true ] && [ -n "${TLS_CERT:-}" ]; then
   REMOTE_CLI_TLS="--tls --cert $TLS_CERT --key $TLS_KEY --cacert $TLS_CACERT"
 fi
 STATUS=""

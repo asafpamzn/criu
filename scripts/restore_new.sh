@@ -4,6 +4,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/.env"
 
+# TLS flag: pass --tls to enable
+USE_TLS=false
+if [[ "${1:-}" == "--tls" ]]; then
+  USE_TLS=true
+  shift
+fi
+
 export IMAGES_DIR="/dev/shm/criu-migrate"
 CRIU_BIN="${CRIU_BIN:-$SCRIPT_DIR/../criu/criu}"
 TLS_CERT="${TLS_CERT:-}"
@@ -61,10 +68,21 @@ log_timing "START received (tree PID: $TREE_PID)"
 log_timing "Starting lazy-pages..."
 
 TLS_OPTS=""
-if [ -n "$TLS_CERT" ]; then
+if [ "$USE_TLS" = true ] && [ -n "$TLS_CERT" ]; then
   TLS_OPTS="--tls --tls-cert $TLS_CERT --tls-key $TLS_KEY --tls-cacert $TLS_CACERT --tls-no-cn-verify"
   log_timing "TLS enabled: cert=$TLS_CERT"
+else
+  log_timing "TLS disabled"
 fi
+
+# Monitor: wait for restored process to appear then attach strace immediately
+(
+  while [ ! -d "/proc/$TREE_PID/fd" ]; do sleep 0.01; done
+  sudo strace -p "$TREE_PID" -tt -f -e trace=write,exit_group,openat \
+    -s 1024 -o /dev/shm/criu-migrate/valkey-strace.log
+) &
+MONITOR_PID=$!
+log_timing "strace monitor launched for PID $TREE_PID"
 
 sudo "$CRIU_BIN" lazy-pages \
   --images-dir "$IMAGES_DIR" \
@@ -88,31 +106,35 @@ if [ $LP_EXIT -ne 0 ]; then
 fi
 log_timing "Lazy-pages completed (restore done)"
 
-# Verify valkey-server is running and attach strace to catch exit
-VALKEY_PID=$(pgrep -x valkey-server | head -n1 || true)
-if [ -z "$VALKEY_PID" ]; then
-  log_timing "ERROR: valkey-server not running after restore!"
-  ls -la /tmp/core.* 2>/dev/null && log_timing "Core dump found" || log_timing "No core dump in /tmp"
-  sudo dmesg | tail -20 | sudo tee -a "$TIMING_LOG"
+# Give a moment for valkey to stabilize or die
+sleep 1
+
+# Check valkey-server state
+PROC_STATE=$(cat /proc/$TREE_PID/status 2>/dev/null | grep "^State:" || echo "State: GONE")
+log_timing "valkey-server PID=$TREE_PID $PROC_STATE"
+
+if [[ "$PROC_STATE" == *"zombie"* ]] || [[ "$PROC_STATE" == *"GONE"* ]]; then
+  log_timing "ERROR: valkey-server is dead!"
+  log_timing "--- valkey-strace.log (last 50 lines) ---"
+  sudo tail -50 /dev/shm/criu-migrate/valkey-strace.log 2>/dev/null | sudo tee -a "$TIMING_LOG" || true
+  sudo dmesg -T | tail -10 | sudo tee -a "$TIMING_LOG"
+  kill $MONITOR_PID 2>/dev/null || true
   exit 1
 fi
-log_timing "valkey-server alive (PID: $VALKEY_PID)"
-sudo prlimit --pid "$VALKEY_PID" --core=unlimited:unlimited
 
-# Attach strace to capture syscalls leading up to exit
-sudo strace -p "$VALKEY_PID" -tt -f -e trace=write,exit_group,kill,signal \
-  -s 512 -o "$IMAGES_DIR/valkey-strace.log" &
-STRACE_PID=$!
-log_timing "strace attached (PID: $STRACE_PID)"
-sleep 0.5
+sudo prlimit --pid "$TREE_PID" --core=unlimited:unlimited
+log_timing "Core dump limit set to unlimited for PID $TREE_PID"
 
 # Configure replication
 log_timing "Configuring replication..."
-"$SCRIPT_DIR/wait_and_replicate_new.sh"
+REPLICATE_TLS_FLAG=""
+if [ "$USE_TLS" = true ]; then
+  REPLICATE_TLS_FLAG="--tls"
+fi
+"$SCRIPT_DIR/wait_and_replicate_new.sh" $REPLICATE_TLS_FLAG
 log_timing "Replication configured"
 
-# Stop strace
-sudo kill $STRACE_PID 2>/dev/null || true
-wait $STRACE_PID 2>/dev/null || true
+# Stop strace monitor
+kill $MONITOR_PID 2>/dev/null || true
 
 log_timing "=== Restore complete ==="

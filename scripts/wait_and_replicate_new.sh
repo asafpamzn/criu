@@ -4,13 +4,20 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/.env"
 
+# TLS flag: pass --tls to enable
+USE_TLS=false
+if [[ "${1:-}" == "--tls" ]]; then
+  USE_TLS=true
+  shift
+fi
+
 IMAGES_DIR="/dev/shm/criu-migrate"
 MAX_WAIT=${MAX_WAIT:-600}
 TIMING_LOG="$IMAGES_DIR/restore-timing.log"
 
-# Build valkey-cli TLS options if TLS is configured
+# Build valkey-cli TLS options if TLS is enabled
 CLI_TLS_OPTS=""
-if [ -n "${TLS_CERT:-}" ]; then
+if [ "$USE_TLS" = true ] && [ -n "${TLS_CERT:-}" ]; then
   CLI_TLS_OPTS="--tls --cert $TLS_CERT --key $TLS_KEY --cacert $TLS_CACERT"
   echo "valkey-cli TLS enabled: cert=$TLS_CERT"
 fi
