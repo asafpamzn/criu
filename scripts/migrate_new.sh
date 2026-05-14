@@ -86,8 +86,8 @@ log_timing "Sent START $PID to replica"
 log_timing "Polling for master_link_status:up..."
 REPLICA_PORT="${REPLICA_PORT:-6379}"
 REMOTE_CLI_TLS=""
-if [ -n "${VALKEY_TLS_CERT:-}" ]; then
-  REMOTE_CLI_TLS="--tls --cert $VALKEY_TLS_CERT --key $VALKEY_TLS_KEY --cacert $VALKEY_TLS_CACERT"
+if [ -n "${TLS_CERT:-}" ]; then
+  REMOTE_CLI_TLS="--tls --cert $TLS_CERT --key $TLS_KEY --cacert $TLS_CACERT"
 fi
 STATUS=""
 for i in $(seq 1 120); do

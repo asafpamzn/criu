@@ -9,11 +9,12 @@ MAX_WAIT=${MAX_WAIT:-600}
 TIMING_LOG="$IMAGES_DIR/restore-timing.log"
 
 # Build valkey-cli TLS options if TLS is configured
-VALKEY_TLS_OPTS=""
-if [ -n "${VALKEY_TLS_CERT:-}" ]; then
-  VALKEY_TLS_OPTS="--tls --cert $VALKEY_TLS_CERT --key $VALKEY_TLS_KEY --cacert $VALKEY_TLS_CACERT"
+CLI_TLS_OPTS=""
+if [ -n "${TLS_CERT:-}" ]; then
+  CLI_TLS_OPTS="--tls --cert $TLS_CERT --key $TLS_KEY --cacert $TLS_CACERT"
+  echo "valkey-cli TLS enabled: cert=$TLS_CERT"
 fi
-CLI="valkey-cli $VALKEY_TLS_OPTS"
+CLI="valkey-cli $CLI_TLS_OPTS"
 
 # Timing helper - append to same log as restore_new.sh
 log_timing() {
