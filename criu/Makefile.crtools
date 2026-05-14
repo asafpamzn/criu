@@ -98,6 +98,7 @@ obj-y			+= cow/cow-bulk-send.o
 obj-y			+= cow/cow-mem.o
 obj-y			+= cow/cow-page-xfer.o
 obj-y			+= cow/cow-p3-receiver.o
+obj-y			+= cow/tls-conn.o
 obj-y			+= cow/cow-unified-thread.o
 obj-y			+= cow/cow-bulk-recv.o
 obj-y			+= cow/cow-compare.o
