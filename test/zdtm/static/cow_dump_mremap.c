@@ -47,6 +47,7 @@ const char *test_author = "Asaf Pamuk <asafp@anthropic.com>";
 #define DRAIN_TIMEOUT_MS_PER_GB	10000UL
 
 static unsigned char *region;
+static unsigned char *blocker;	/* Blocks in-place growth, forces mremap to move */
 static unsigned char *padding;
 static unsigned char *moved_region;
 static atomic_int    mremap_done;
@@ -88,9 +89,16 @@ static void *mremap_thread(void *arg)
 	}
 
 	if (new_addr == region) {
-		test_msg("mremap returned same address (kernel chose not to move)\n");
+		/*
+		 * If the blocker was placed correctly, this shouldn't happen.
+		 * Not a test failure, but log it for debugging.
+		 */
+		test_msg("WARNING: mremap returned same address %p "
+			 "(blocker may not have been adjacent)\n", new_addr);
 	} else {
-		test_msg("mremap moved region: %p -> %p\n", region, new_addr);
+		test_msg("mremap moved region: %p -> %p (delta=%ld MB)\n",
+			 region, new_addr,
+			 (long)((new_addr - region) >> 20));
 	}
 
 	for (i = 0; i < REGION_PAGES; i += 4) {
@@ -194,6 +202,30 @@ int main(int argc, char **argv)
 	if (region == MAP_FAILED) {
 		pr_perror("mmap region");
 		return 1;
+	}
+
+	/*
+	 * Allocate a blocker region immediately after the main region.
+	 * This forces mremap(MREMAP_MAYMOVE) to actually move the pages
+	 * to a new address rather than keeping them in place.
+	 */
+	blocker = mmap(region + REGION_BYTES, PAGE_SIZE, PROT_READ | PROT_WRITE,
+		       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+	if (blocker == MAP_FAILED) {
+		/*
+		 * MAP_FIXED_NOREPLACE may fail if address already taken.
+		 * Try without the hint - we just need something allocated.
+		 */
+		blocker = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE,
+			       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (blocker == MAP_FAILED) {
+			pr_perror("mmap blocker");
+			return 1;
+		}
+		test_msg("blocker at %p (not adjacent, mremap may not move)\n", blocker);
+	} else {
+		test_msg("blocker at %p (adjacent to region end %p)\n",
+			 blocker, region + REGION_BYTES);
 	}
 
 	padding = mmap(NULL, PADDING_BYTES, PROT_READ | PROT_WRITE,
