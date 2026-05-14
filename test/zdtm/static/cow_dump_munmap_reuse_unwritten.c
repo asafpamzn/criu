@@ -247,11 +247,10 @@ int main(int argc, char **argv)
 	test_init(argc, argv);
 
 	test_msg("cow_dump_munmap_reuse_unwritten: TARGET=%u MB (%zu pages), "
-		 "PADDING=%u MB, TOTAL=%u MB, WRITE_STRIDE=%d, "
-		 "REMAP_DELAY=%d ms\n",
+		 "PADDING=%u MB, TOTAL=%u MB, WRITE_STRIDE=%d\n",
 		 (unsigned)REGION_MB, (size_t)REGION_PAGES,
 		 (unsigned)PADDING_MB, (unsigned)TOTAL_MB,
-		 WRITE_STRIDE, REMAP_DELAY_MS);
+		 WRITE_STRIDE);
 
 	/*
 	 * Allocate TARGET + PADDING as one contiguous region.

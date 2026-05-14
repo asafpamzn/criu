@@ -186,9 +186,9 @@ int main(int argc, char **argv)
 	test_init(argc, argv);
 
 	test_msg("cow_dump_wp_unpopulated: REGION=%u MB (%zu pages), "
-		 "PADDING=%u MB, POPULATE_STRIDE=%d, WRITE_DELAY=%d ms\n",
+		 "PADDING=%u MB, POPULATE_STRIDE=%d\n",
 		 (unsigned)REGION_MB, (size_t)REGION_PAGES,
-		 (unsigned)PADDING_MB, POPULATE_STRIDE, WRITE_DELAY_MS);
+		 (unsigned)PADDING_MB, POPULATE_STRIDE);
 
 	region = mmap(NULL, REGION_BYTES, PROT_READ | PROT_WRITE,
 		      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);

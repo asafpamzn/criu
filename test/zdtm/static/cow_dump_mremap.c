@@ -186,10 +186,9 @@ int main(int argc, char **argv)
 	test_init(argc, argv);
 
 	test_msg("cow_dump_mremap: REGION=%u MB (%zu pages), "
-		 "PADDING=%u MB, TOTAL=%u MB, MREMAP_DELAY=%d ms\n",
+		 "PADDING=%u MB, TOTAL=%u MB\n",
 		 (unsigned)REGION_MB, (size_t)REGION_PAGES,
-		 (unsigned)PADDING_MB, (unsigned)TOTAL_MB,
-		 MREMAP_DELAY_MS);
+		 (unsigned)PADDING_MB, (unsigned)TOTAL_MB);
 
 	region = mmap(NULL, REGION_BYTES, PROT_READ | PROT_WRITE,
 		      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
