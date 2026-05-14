@@ -75,15 +75,6 @@ else
   log_timing "TLS disabled"
 fi
 
-# Monitor: wait for restored process to appear then attach strace immediately
-(
-  while [ ! -d "/proc/$TREE_PID/fd" ]; do sleep 0.01; done
-  sudo strace -p "$TREE_PID" -tt -f -e trace=write,exit_group,openat \
-    -s 1024 -o /dev/shm/criu-migrate/valkey-strace.log
-) &
-MONITOR_PID=$!
-log_timing "strace monitor launched for PID $TREE_PID"
-
 sudo "$CRIU_BIN" lazy-pages \
   --images-dir "$IMAGES_DIR" \
   --page-server \
@@ -115,10 +106,7 @@ log_timing "valkey-server PID=$TREE_PID $PROC_STATE"
 
 if [[ "$PROC_STATE" == *"zombie"* ]] || [[ "$PROC_STATE" == *"GONE"* ]]; then
   log_timing "ERROR: valkey-server is dead!"
-  log_timing "--- valkey-strace.log (last 50 lines) ---"
-  sudo tail -50 /dev/shm/criu-migrate/valkey-strace.log 2>/dev/null | sudo tee -a "$TIMING_LOG" || true
   sudo dmesg -T | tail -10 | sudo tee -a "$TIMING_LOG"
-  kill $MONITOR_PID 2>/dev/null || true
   exit 1
 fi
 
@@ -133,8 +121,5 @@ if [ "$USE_TLS" = true ]; then
 fi
 "$SCRIPT_DIR/wait_and_replicate_new.sh" $REPLICATE_TLS_FLAG
 log_timing "Replication configured"
-
-# Stop strace monitor
-kill $MONITOR_PID 2>/dev/null || true
 
 log_timing "=== Restore complete ==="
