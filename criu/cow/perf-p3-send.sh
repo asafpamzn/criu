@@ -49,10 +49,12 @@ if [ ! -x "$PERF" ]; then
 fi
 
 # Start marker: P3 threads starting or bulk transfer beginning
-START_RE='Starting P3 threads|P3 thread .* started|cow_start_p3_threads|Starting .* P3 sender|bulk transfer|Starting bulk'
+START_RE='Starting P3 threads|P3 thread .* started|cow_start_p3_threads|Starting .* P3 sender|Starting bulk'
 
-# End marker: bulk transfer complete (before freeze)
-END_RE='bulk transfer (complete|done)|Bulk transfer took|All sender threads completed bulk|TIMING:.*bulk.*took|Phase 2 complete|ready to freeze'
+# End marker: ALL P3 threads done (not individual thread completion)
+# Key message: "all sender threads completed bulk transfer" from scanner
+# Avoid matching individual "P3[N] done" or "Bulk transfer done" from single threads
+END_RE='all sender threads completed bulk|All P3 threads done|cow_wait_p3_threads took|P3 TIMING from freeze'
 
 mkdir -p "$OUTDIR"
 OUT="$OUTDIR/perf.data"
@@ -130,33 +132,24 @@ stop_perf() {
         echo "=== Top Functions ===" >&2
         "$PERF" report -i "$OUT" --stdio -g none --no-children 2>/dev/null | head -30 | tee "$REPORT" >&2
 
-        # CPU vs IO analysis: look for syscalls and wait states
+        # CPU vs IO analysis: look at top functions
         echo "" >&2
         echo "=== CPU-bound Analysis ===" >&2
-        echo "Checking for IO/wait overhead in samples..." >&2
 
-        # Count samples in various categories
-        local total_samples io_samples cpu_samples
-        total_samples=$("$PERF" report -i "$OUT" --stdio 2>/dev/null | grep -c "^[[:space:]]*[0-9]" || echo 0)
+        # Extract overhead percentages for key functions
+        local lz4_pct io_pct
+        lz4_pct=$("$PERF" report -i "$OUT" --stdio -g none 2>/dev/null | grep -i 'lz4\|compress' | head -1 | awk '{print $1}' | tr -d '%')
+        io_pct=$("$PERF" report -i "$OUT" --stdio -g none 2>/dev/null | grep -iE 'poll|epoll|futex|schedule|wait|__read|__write|tcp_send' | awk '{sum += $1} END {print sum}')
 
-        # IO-related: poll, epoll, select, read, write, send, recv, futex, nanosleep
-        io_samples=$("$PERF" report -i "$OUT" --stdio 2>/dev/null | grep -cE 'poll|epoll|select|__read|__write|send|recv|futex|nanosleep|schedule|wait' || echo 0)
+        echo "  LZ4/compress overhead: ${lz4_pct:-0}%" >&2
+        echo "  IO/wait overhead:      ${io_pct:-0}%" >&2
 
-        # Compute ratio
-        if [ "$total_samples" -gt 0 ]; then
-            cpu_samples=$((total_samples - io_samples))
-            io_pct=$((io_samples * 100 / total_samples))
-            cpu_pct=$((100 - io_pct))
-            echo "  Total samples: $total_samples" >&2
-            echo "  CPU work:      $cpu_samples ($cpu_pct%)" >&2
-            echo "  IO/wait:       $io_samples ($io_pct%)" >&2
-            if [ "$cpu_pct" -ge 80 ]; then
-                echo "  => CPU-BOUND (good! CPU is the bottleneck)" >&2
-            elif [ "$cpu_pct" -ge 50 ]; then
-                echo "  => MIXED (some IO waiting)" >&2
-            else
-                echo "  => IO-BOUND (waiting on network/disk)" >&2
-            fi
+        if [ -n "$lz4_pct" ] && [ "${lz4_pct%.*}" -ge 40 ]; then
+            echo "  => CPU-BOUND by compression (LZ4 dominates)" >&2
+        elif [ -n "$io_pct" ] && [ "${io_pct%.*}" -ge 30 ]; then
+            echo "  => IO-BOUND (significant wait time)" >&2
+        else
+            echo "  => Check flamegraph for details" >&2
         fi
 
         # Try flamegraph
@@ -174,12 +167,10 @@ stop_perf() {
         echo "=== Hardware Counters ===" >&2
         cat "$STAT_OUT" >&2
 
-        # Calculate IPC (instructions per cycle)
-        local cycles instructions ipc
-        cycles=$(grep -oP 'cycles[^0-9]*\K[0-9,]+' "$STAT_OUT" | tr -d ',' | head -1)
-        instructions=$(grep -oP 'instructions[^0-9]*\K[0-9,]+' "$STAT_OUT" | tr -d ',' | head -1)
-        if [ -n "$cycles" ] && [ -n "$instructions" ] && [ "$cycles" -gt 0 ]; then
-            ipc=$(echo "scale=2; $instructions / $cycles" | bc 2>/dev/null || echo "?")
+        # Extract IPC from perf stat output (format: "# X.XX insn per cycle")
+        local ipc
+        ipc=$(grep -oP '[0-9]+\.[0-9]+\s+insn per cycle' "$STAT_OUT" | grep -oP '^[0-9.]+' | head -1)
+        if [ -n "$ipc" ]; then
             echo "" >&2
             echo "  IPC (instructions/cycle): $ipc" >&2
             echo "    IPC > 1.0 = good CPU utilization" >&2
