@@ -49,7 +49,10 @@ if [ ! -x "$PERF" ]; then
 fi
 
 # Start marker: P3 threads starting or bulk transfer beginning
-START_RE='Starting P3 threads|P3 thread .* started|cow_start_p3_threads|Starting .* P3 sender|Starting bulk'
+# Match actual log messages like:
+#   "Starting 4 P3 bulk sender threads"
+#   "P3[0]: Starting bulk transfer"
+START_RE='Starting [0-9]+ P3|P3\[0\]: Starting bulk|Starting bulk transfer|cow_start_p3_threads'
 
 # End marker: ALL P3 threads done (not individual thread completion)
 # Key message: "all sender threads completed bulk transfer" from scanner
@@ -191,6 +194,20 @@ echo "perf-p3-send: Waiting for log file..." >&2
 
 while [ ! -r "$LOG" ]; do sleep 0.5; done
 echo "perf-p3-send: Log ready, waiting for START marker..." >&2
+
+# Check if START marker already exists in log (migration already started)
+if grep -qE "$START_RE" "$LOG" 2>/dev/null; then
+    echo "perf-p3-send: START marker already in log, checking if still in progress..." >&2
+    if grep -qE "$END_RE" "$LOG" 2>/dev/null; then
+        echo "perf-p3-send: ERROR - migration already completed (END marker found)" >&2
+        echo "perf-p3-send: Start this script BEFORE running migration" >&2
+        exit 1
+    fi
+    # Migration in progress - start profiling immediately
+    echo "perf-p3-send: Migration in progress, starting perf NOW" >&2
+    START_EPOCH=$(date +%s)
+    start_perf
+fi
 
 exec 3< <(exec tail -n0 -F "$LOG" 2>/dev/null)
 TAIL_PID=$!
