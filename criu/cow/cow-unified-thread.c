@@ -78,7 +78,7 @@ static void *unified_page_server_thread(void *arg)
 	struct lazy_vma_entry *lve;
 	pid_t source_pid = 0;
 	int num_threads, num_sockets;
-	int p3_sockets[COW_NUM_P3_THREADS];
+	int p3_sockets[COW_MAX_P3_THREADS];
 
 	pthread_setname_np(pthread_self(), "criu-page-srv");
 	pr_info("Page server thread started for dst_id=%lu\n", args->dst_id);

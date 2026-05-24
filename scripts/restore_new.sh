@@ -18,6 +18,33 @@ TLS_KEY="${TLS_KEY:-}"
 TLS_CACERT="${TLS_CACERT:-}"
 TIMING_LOG="$IMAGES_DIR/restore-timing.log"
 
+# Auto-detect COW thread configuration based on CPU cores
+NUM_CORES=$(nproc)
+COW_PRE_SCAN_FLAG=""
+if [ "$NUM_CORES" -ge 64 ]; then
+  COW_P3_THREADS=15
+  COW_P3_THREADS_BULK=15
+  COW_SCANNERS=20
+  COW_PRE_SCANNERS=1
+  COW_DRAIN_THREADS=20
+elif [ "$NUM_CORES" -ge 8 ]; then
+  COW_P3_THREADS=15
+  COW_P3_THREADS_BULK=15
+  COW_SCANNERS=20
+  COW_PRE_SCANNERS=1
+  COW_DRAIN_THREADS=20
+elif [ "$NUM_CORES" -ge 4 ]; then
+  COW_P3_THREADS=4
+  COW_P3_THREADS_BULK=1
+  COW_SCANNERS=4
+  COW_PRE_SCANNERS=1
+  COW_DRAIN_THREADS=4
+  COW_PRE_SCAN_FLAG="--cow-pre-scan"
+else
+  echo "ERROR: machine has only $NUM_CORES cores, need at least 4"
+  exit 1
+fi
+
 START_MS=$(date +%s%3N)
 log_timing() {
   local now=$(date +%s%3N)
@@ -29,6 +56,7 @@ log_timing() {
 sudo mkdir -p "$IMAGES_DIR"
 sudo rm -f "$TIMING_LOG"
 log_timing "=== CRIU Restore - Replica ==="
+log_timing "COW config: cores=$NUM_CORES p3=$COW_P3_THREADS p3_bulk=$COW_P3_THREADS_BULK scanners=$COW_SCANNERS pre_scanners=$COW_PRE_SCANNERS drain=$COW_DRAIN_THREADS pre_scan=${COW_PRE_SCAN_FLAG:+yes}"
 
 # Enable core dumps for debugging
 log_timing "Enabling core dumps..."
@@ -81,6 +109,12 @@ sudo "$CRIU_BIN" lazy-pages \
   --address "$PRIMARY_IP" \
   --port "$CRIU_PORT" \
   --cow-dump \
+  --cow-p3-threads "$COW_P3_THREADS" \
+  --cow-p3-threads-bulk "$COW_P3_THREADS_BULK" \
+  --cow-scanners "$COW_SCANNERS" \
+  --cow-pre-scanners "$COW_PRE_SCANNERS" \
+  --cow-drain-threads "$COW_DRAIN_THREADS" \
+  $COW_PRE_SCAN_FLAG \
   --tree "$TREE_PID" \
   --tcp-close \
   $TLS_OPTS \

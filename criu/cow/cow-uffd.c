@@ -96,15 +96,15 @@ static inline int lock_index(unsigned int hash)
 /*
  * Multithreaded drain configuration.
  * Each thread handles a range of chunks for parallel draining.
- * COW_NUM_DRAIN_THREADS now defined as COW_COW_NUM_DRAIN_THREADS in cow-conf.h
+ * Drain thread count is runtime-configurable via --cow-drain-threads.
  */
 
 struct drain_thread_args {
 	int thread_id;
 };
 
-static pthread_t drain_threads[COW_NUM_DRAIN_THREADS];
-static struct drain_thread_args drain_args[COW_NUM_DRAIN_THREADS];
+static pthread_t drain_threads[COW_MAX_DRAIN_THREADS];
+static struct drain_thread_args drain_args[COW_MAX_DRAIN_THREADS];
 static atomic_bool drain_thread_stop = false;
 static atomic_int drain_threads_active = 0;
 static struct list_head *drain_lpis = NULL;  /* lpis list for EAGAIN handling */
@@ -1140,7 +1140,7 @@ int cow_start_drain_thread(struct list_head *lpis)
 		total_chunks = COW_MAX_POOL_CHUNKS;  /* Fallback: scan all slots */
 
 	/* Divide chunks evenly among threads */
-	chunks_per_thread = (total_chunks + COW_NUM_DRAIN_THREADS - 1) / COW_NUM_DRAIN_THREADS;
+	chunks_per_thread = (total_chunks + cow_cfg.num_drain_threads - 1) / cow_cfg.num_drain_threads;
 	if (chunks_per_thread < 1)
 		chunks_per_thread = 1;
 
@@ -1148,7 +1148,7 @@ int cow_start_drain_thread(struct list_head *lpis)
 	atomic_store(&next_drain_chunk, 0);
 	max_drain_chunks = total_chunks;
 
-	for (i = 0; i < COW_NUM_DRAIN_THREADS; i++) {
+	for (i = 0; i < cow_cfg.num_drain_threads; i++) {
 		drain_args[i].thread_id = i;
 
 		BUG_ON(pthread_create(&drain_threads[i], NULL,
@@ -1179,7 +1179,7 @@ void cow_stop_drain_thread(void)
 	atomic_store(&drain_thread_stop, true);
 
 	/* Join all threads */
-	for (i = 0; i < COW_NUM_DRAIN_THREADS; i++) {
+	for (i = 0; i < cow_cfg.num_drain_threads; i++) {
 		if (drain_threads[i]) {
 			pthread_join(drain_threads[i], NULL);
 			drain_threads[i] = 0;

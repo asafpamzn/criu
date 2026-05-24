@@ -44,6 +44,7 @@
 #include "fault-injection.h"
 #include "proc_parse.h"
 #include "kerndat.h"
+#include "cow/cow-conf.h"
 
 #include "setproctitle.h"
 #include "sysctl.h"
@@ -311,6 +312,36 @@ int main(int argc, char *argv[], char *envp[])
 
 	if (opts.img_parent)
 		pr_info("Will do snapshot from %s\n", opts.img_parent);
+
+	if (opts.cow_dump) {
+		int p3 = opts.cow_num_p3_threads;
+		int p3_bulk = opts.cow_num_p3_threads_bulk;
+		int scan = opts.cow_num_scanners;
+		int pre_scan = opts.cow_num_pre_scanners;
+		int drain = opts.cow_num_drain_threads;
+
+		if (!p3) p3 = COW_DEFAULT_P3_THREADS;
+		if (!p3_bulk) p3_bulk = COW_DEFAULT_P3_THREADS_BULK;
+		if (!scan) scan = COW_DEFAULT_SCANNERS;
+		if (!pre_scan) pre_scan = COW_DEFAULT_PRE_SCANNERS;
+		if (!drain) drain = COW_DEFAULT_DRAIN_THREADS;
+
+		if (p3 > COW_MAX_P3_THREADS) {
+			pr_err("--cow-p3-threads %d exceeds max %d\n", p3, COW_MAX_P3_THREADS);
+			return 1;
+		}
+		if (scan > COW_MAX_SCANNERS) {
+			pr_err("--cow-scanners %d exceeds max %d\n", scan, COW_MAX_SCANNERS);
+			return 1;
+		}
+		if (drain > COW_MAX_DRAIN_THREADS) {
+			pr_err("--cow-drain-threads %d exceeds max %d\n", drain, COW_MAX_DRAIN_THREADS);
+			return 1;
+		}
+
+		cow_cfg_init(p3, p3_bulk, scan, pre_scan, drain,
+			     opts.cow_pre_scan);
+	}
 
 	switch (opts.mode) {
 	case CR_DUMP:

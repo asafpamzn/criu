@@ -33,8 +33,7 @@
 #undef LOG_PREFIX
 #define LOG_PREFIX "cow-p3-recv: "
 
-/* Use same thread count as sender (COW_NUM_P3_THREADS in cow-conf.h) */
-#define MAX_P3_RECEIVERS COW_NUM_P3_THREADS
+#define MAX_P3_RECEIVERS COW_MAX_P3_THREADS
 
 /* Max batch size for P3 transfer (COW_BATCH_PAGES in cow-conf.h) */
 #define P3_DECOMPRESS_BUF_SIZE (COW_BATCH_PAGES * PAGE_SIZE)

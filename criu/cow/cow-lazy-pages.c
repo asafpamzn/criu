@@ -255,7 +255,7 @@ int cr_lazy_pages_cow_phase2(bool daemon)
 	 * 7b. Create P3 parallel connections AFTER sending page requests.
 	 * PRIMARY is now in unified_page_server_thread and ready to accept.
 	 */
-	if (start_p3_receiver_connections(COW_NUM_P3_THREADS) > 0) {
+	if (start_p3_receiver_connections(cow_cfg.num_p3_threads) > 0) {
 		pr_info("P3 parallel receiver enabled\n");
 	}
 

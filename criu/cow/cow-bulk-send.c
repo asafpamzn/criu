@@ -109,7 +109,7 @@ struct p3_thread_ctx {
 	volatile bool error;  /* Set if thread encountered an error */
 };
 
-static struct p3_thread_ctx p3_threads[COW_NUM_P3_THREADS];
+static struct p3_thread_ctx p3_threads[COW_MAX_P3_THREADS];
 static volatile int p3_threads_active = 0;
 static unsigned long p3_total_pages_sent = 0;
 
@@ -150,7 +150,7 @@ struct scanner_ctx {
 	unsigned long dirty_count; /* Dirty pages found in current iteration */
 	volatile bool finished;    /* Set when scanner thread exits */
 };
-static struct scanner_ctx scanners[COW_NUM_SCANNERS];
+static struct scanner_ctx scanners[COW_MAX_SCANNERS];
 
 /* Synchronization: scanners coordinate on iteration and freeze */
 static volatile int g_scanners_iter_done = 0;  /* Count of scanners done with iteration */
@@ -299,7 +299,7 @@ void cow_signal_scanner_freeze(void)
 /*
  * Scanner thread. Each scanner:
  *   - Scans its own disjoint slice of every lazy VMA's address range
- *     (slice = vma_size / COW_NUM_SCANNERS, last scanner gets the remainder).
+ *     (slice = vma_size / cow_cfg.num_scanners, last scanner gets the remainder).
  *   - Enqueues dirty regions into the shared MPMC convergence queue,
  *     namely [scanner_id * COW_QUEUES_PER_THREAD, scanner_id * COW_QUEUES_PER_THREAD
  *     + COW_QUEUES_PER_THREAD). This preserves the SPSC single-producer invariant:
@@ -350,9 +350,11 @@ static void *dirty_scanner_thread(void *arg)
 
 	lazy_vmas = get_global_lazy_vmas();
 
-#ifdef COW_PRE_SCAN
-	/* Only first COW_NUM_PRE_SCANNERS participate in pre-scan */
-	if (scanner_id >= COW_NUM_PRE_SCANNERS)
+	if (!cow_cfg.pre_scan)
+		goto wait_for_freeze;
+
+	/* Only first cow_cfg.num_pre_scanners participate in pre-scan */
+	if (scanner_id >= cow_cfg.num_pre_scanners)
 		goto wait_for_freeze;
 
 	/* Iterative dirty scanning until freeze signal */
@@ -372,12 +374,12 @@ static void *dirty_scanner_thread(void *arg)
 			long regs_len;
 			unsigned long vma_size = lve->end - lve->start;
 			unsigned long total_pages = vma_size / PAGE_SIZE;
-			unsigned long pages_per_scanner = total_pages / COW_NUM_PRE_SCANNERS;
+			unsigned long pages_per_scanner = total_pages / cow_cfg.num_pre_scanners;
 			unsigned long my_start, my_end;
 
 			/* Calculate this scanner's range (page-aligned) */
 			my_start = lve->start + (scanner_id * pages_per_scanner * PAGE_SIZE);
-			if (scanner_id == COW_NUM_PRE_SCANNERS - 1)
+			if (scanner_id == cow_cfg.num_pre_scanners - 1)
 				my_end = lve->end;  /* Last pre-scanner gets remainder */
 			else
 				my_end = my_start + (pages_per_scanner * PAGE_SIZE);
@@ -466,12 +468,12 @@ static void *dirty_scanner_thread(void *arg)
 		/* Synchronize with other pre-scanners */
 		pthread_mutex_lock(&g_scanner_mutex);
 		g_scanners_iter_done++;
-		if (g_scanners_iter_done == COW_NUM_PRE_SCANNERS) {
+		if (g_scanners_iter_done == cow_cfg.num_pre_scanners) {
 			/* Last pre-scanner to finish - calculate total and reset */
 			int s;
 
 			g_total_dirty_pages = 0;
-			for (s = 0; s < COW_NUM_PRE_SCANNERS; s++)
+			for (s = 0; s < cow_cfg.num_pre_scanners; s++)
 				g_total_dirty_pages += scanners[s].dirty_count;
 			g_scanners_iter_done = 0;
 			pthread_cond_broadcast(&g_scanner_cond);
@@ -540,7 +542,6 @@ static void *dirty_scanner_thread(void *arg)
 	}
 
 wait_for_freeze:
-#endif /* COW_PRE_SCAN */
 
 	/* Wait for freeze signal from main thread */
 	if (scanner_id == 0) {
@@ -619,11 +620,11 @@ wait_for_freeze:
 			long regs_len;
 			unsigned long vma_size = lve->end - lve->start;
 			unsigned long total_pages = vma_size / PAGE_SIZE;
-			unsigned long pages_per_scanner = total_pages / COW_NUM_SCANNERS;
+			unsigned long pages_per_scanner = total_pages / cow_cfg.num_scanners;
 			unsigned long my_start, my_end;
 
 			my_start = lve->start + (scanner_id * pages_per_scanner * PAGE_SIZE);
-			if (scanner_id == COW_NUM_SCANNERS - 1)
+			if (scanner_id == cow_cfg.num_scanners - 1)
 				my_end = lve->end;
 			else
 				my_end = my_start + (pages_per_scanner * PAGE_SIZE);
@@ -689,12 +690,12 @@ skip_pagemap_scan:
 		/* Synchronize final scan completion */
 		pthread_mutex_lock(&g_scanner_mutex);
 		g_scanners_iter_done++;
-		if (g_scanners_iter_done == COW_NUM_SCANNERS) {
+		if (g_scanners_iter_done == cow_cfg.num_scanners) {
 			unsigned long total_final = 0;
 			long fs_ms;
 			int s;
 
-			for (s = 0; s < COW_NUM_SCANNERS; s++)
+			for (s = 0; s < cow_cfg.num_scanners; s++)
 				total_final += scanners[s].dirty_count;
 			fs_ms = (fs_end.tv_sec - fs_start.tv_sec) * 1000 +
 				(fs_end.tv_nsec - fs_start.tv_nsec) / 1000000;
@@ -733,7 +734,7 @@ out:
 		bool all_done = true;
 		int s;
 
-		for (s = 0; s < COW_NUM_SCANNERS; s++) {
+		for (s = 0; s < cow_cfg.num_scanners; s++) {
 			if (!scanners[s].finished) {
 				all_done = false;
 				break;
@@ -808,7 +809,7 @@ int cow_start_scanner_thread(pid_t source_pid)
 	g_using_bpf_mode = false;
 
 	/* Initialize and start dual scanners (non-BPF path) */
-	for (i = 0; i < COW_NUM_SCANNERS; i++) {
+	for (i = 0; i < cow_cfg.num_scanners; i++) {
 		scanners[i].id = i;
 		scanners[i].pagemap_fd = -1;
 		scanners[i].dirty_count = 0;
@@ -821,7 +822,7 @@ int cow_start_scanner_thread(pid_t source_pid)
 		}
 	}
 
-	pr_info("Started %d scanner threads for pid %d\n", COW_NUM_SCANNERS, source_pid);
+	pr_info("Started %d scanner threads for pid %d\n", cow_cfg.num_scanners, source_pid);
 	return 0;
 }
 
@@ -837,7 +838,7 @@ void cow_wait_scanner_thread(void)
 	}
 #endif
 
-	for (i = 0; i < COW_NUM_SCANNERS; i++) {
+	for (i = 0; i < cow_cfg.num_scanners; i++) {
 		if (scanners[i].thread) {
 			pthread_join(scanners[i].thread, NULL);
 			scanners[i].thread = 0;
@@ -1825,7 +1826,7 @@ static unsigned long send_new_vma_pages(struct p3_thread_ctx *ctx)
 		return 0;
 
 	/* Split ranges among threads */
-	ranges_per_thread = (g_nr_new_vma_ranges + COW_NUM_P3_THREADS - 1) / COW_NUM_P3_THREADS;
+	ranges_per_thread = (g_nr_new_vma_ranges + cow_cfg.num_p3_threads - 1) / cow_cfg.num_p3_threads;
 	my_start_idx = thread_id * ranges_per_thread;
 	my_end_idx = my_start_idx + ranges_per_thread;
 	if (my_end_idx > g_nr_new_vma_ranges)
@@ -1929,11 +1930,11 @@ static void *p3_bulk_sender_thread(void *arg)
 		clock_gettime(CLOCK_MONOTONIC, &bulk_start);
 
 		/*
-		 * Only COW_NUM_P3_THREADS_BULK threads participate in bulk transfer.
+		 * Only cow_cfg.num_p3_threads_bulk threads participate in bulk transfer.
 		 * Other threads skip to phase 2 (dirty scanning) where all threads
 		 * are needed to keep up with parallel scanners.
 		 */
-		if (thread_id < COW_NUM_P3_THREADS_BULK) {
+		if (thread_id < cow_cfg.num_p3_threads_bulk) {
 #ifdef COW_P3_SENDER_CPU
 			pin_to_cpu(COW_P3_SENDER_CPU);
 #endif
@@ -2001,7 +2002,7 @@ static void *p3_bulk_sender_thread(void *arg)
 
 #ifdef COW_P3_SENDER_CPU
 		/* Unpin CPU for phase 2 - all threads need full CPU access */
-		if (thread_id < COW_NUM_P3_THREADS_BULK)
+		if (thread_id < cow_cfg.num_p3_threads_bulk)
 			unpin_cpu();
 #endif
 	}
@@ -2024,12 +2025,12 @@ static void *p3_bulk_sender_thread(void *arg)
 		unsigned long queue_in_bytes, queue_out_bytes;
 		float queue_ratio_pct = 0.0f;
 
-#ifndef COW_PRE_SCAN
-		/* Without pre-scan, wait for freeze signal before consuming queue */
-		while (!__atomic_load_n(&g_scanner_freeze_signal, __ATOMIC_ACQUIRE)) {
-			usleep(COW_USLEEP_1MS);
+		if (!cow_cfg.pre_scan) {
+			/* Without pre-scan, wait for freeze signal before consuming queue */
+			while (!__atomic_load_n(&g_scanner_freeze_signal, __ATOMIC_ACQUIRE)) {
+				usleep(COW_USLEEP_1MS);
+			}
 		}
-#endif
 		/* With pre-scan, start consuming immediately - don't wait for freeze */
 
 		clock_gettime(CLOCK_MONOTONIC, &loop_start);
@@ -2243,7 +2244,7 @@ int cow_start_p3_threads(int *sockets, int num_sockets, u64 dst_id, pid_t source
 	}
 
 	/* Calculate number of threads to start (before starting scanner) */
-	threads_to_start = num_sockets < COW_NUM_P3_THREADS ? num_sockets : COW_NUM_P3_THREADS;
+	threads_to_start = num_sockets < cow_cfg.num_p3_threads ? num_sockets : cow_cfg.num_p3_threads;
 	g_num_sender_threads = threads_to_start;
 
 	/* Start scanner thread */
@@ -2314,7 +2315,7 @@ void cow_wait_p3_threads(void)
 	clock_gettime(CLOCK_MONOTONIC, &t_scanner_done);
 
 	/* Then wait for sender threads */
-	for (i = 0; i < COW_NUM_P3_THREADS; i++) {
+	for (i = 0; i < cow_cfg.num_p3_threads; i++) {
 		if (p3_threads[i].thread) {
 			pthread_join(p3_threads[i].thread, NULL);
 			total += p3_threads[i].pages_sent;
@@ -2326,7 +2327,7 @@ void cow_wait_p3_threads(void)
 	clock_gettime(CLOCK_MONOTONIC, &t_senders_done);
 
 	/* Tear down TLS sessions and close P3 sockets so replica receivers get EOF */
-	for (i = 0; i < COW_NUM_P3_THREADS; i++) {
+	for (i = 0; i < cow_cfg.num_p3_threads; i++) {
 		if (p3_threads[i].tls) {
 			tls_conn_free(p3_threads[i].tls);
 			p3_threads[i].tls = NULL;
@@ -2418,13 +2419,13 @@ unsigned long cow_p3_pages_sent(void)
 
 int cow_get_num_p3_threads(void)
 {
-	return COW_NUM_P3_THREADS;
+	return cow_cfg.num_p3_threads;
 }
 
 /*
  * Check if ready to freeze.
- * In scanner architecture with COW_PRE_SCAN: returns true when scanner signals freeze.
- * In BPF mode or without COW_PRE_SCAN: returns true immediately after bulk transfer completes.
+ * With pre-scan enabled: returns true when scanner signals freeze.
+ * In BPF mode or without pre-scan: returns true immediately after bulk transfer completes.
  */
 bool cow_all_threads_below_threshold(void)
 {
@@ -2440,15 +2441,15 @@ bool cow_all_threads_below_threshold(void)
 	}
 #endif
 
-#ifdef COW_PRE_SCAN
-	/* Scanner decides when to freeze based on total dirty pages < threshold */
-	return g_last_scan_flag && p3_threads_active > 0;
-#else
-	/* No pre-scan: freeze immediately after bulk transfer completes */
-	int done = __atomic_load_n(&g_bulk_transfer_done_count, __ATOMIC_ACQUIRE);
-	int total = __atomic_load_n(&g_num_sender_threads, __ATOMIC_ACQUIRE);
-	return done >= total && p3_threads_active > 0;
-#endif
+	if (cow_cfg.pre_scan) {
+		/* Scanner decides when to freeze based on total dirty pages < threshold */
+		return g_last_scan_flag && p3_threads_active > 0;
+	} else {
+		/* No pre-scan: freeze immediately after bulk transfer completes */
+		int done = __atomic_load_n(&g_bulk_transfer_done_count, __ATOMIC_ACQUIRE);
+		int total = __atomic_load_n(&g_num_sender_threads, __ATOMIC_ACQUIRE);
+		return done >= total && p3_threads_active > 0;
+	}
 }
 
 /*

@@ -15,6 +15,8 @@
 #ifndef __CR_COW_CONF_H__
 #define __CR_COW_CONF_H__
 
+#include <stdbool.h>
+
 /* ================================================================
  * SECTION 0: Compile-time Feature Flags
  * ================================================================
@@ -41,7 +43,8 @@
 // #define SCAN_COMPARE
 
 /*
- * COW_PRE_SCAN - Enable iterative dirty scanning before freeze.
+ * COW_PRE_SCAN - Iterative dirty scanning before freeze.
+ * Now runtime-configurable via --cow-pre-scan CLI option (cow_cfg.pre_scan).
  * When enabled: Scanners do iterative PAGEMAP_SCAN while process runs,
  *               waiting for dirty pages to converge below threshold before
  *               requesting freeze.
@@ -49,9 +52,6 @@
  *               bulk transfer completes, then do a single final PAGEMAP_SCAN
  *               on the frozen process. This is faster and simpler.
  */
-#ifdef COW_PROFILE_SMALL
-#define COW_PRE_SCAN
-#endif
 
 /*
  * CONFIG_HUNG_PAGE_TRACKER - Enable hung page detection.
@@ -136,29 +136,29 @@
  * ================================================================ */
 
 /*
- * Machine profiles - uncomment ONE to select thread counts.
- * SMALL: 4-core machines (4 scanners, 4 drain, 4 P3 but 1 active in bulk)
- * LARGE: 32+ core machines (20 scanners, 10 drain, 15 P3)
+ * Thread counts are now runtime-configurable via CLI options:
+ *   --cow-p3-threads, --cow-p3-threads-bulk, --cow-scanners,
+ *   --cow-pre-scanners, --cow-drain-threads
+ *
+ * The MAX defines below are used for static array sizing only.
+ * Runtime values are accessed via cow_cfg_*() functions from cow-conf.h.
+ *
+ * Defaults (used when CLI options are not specified):
+ *   15 P3, 15 P3-bulk, 20 scanners, 1 pre-scanner, 20 drain
  */
-/* #define COW_PROFILE_LARGE */
-//#define COW_PROFILE_SMALL
 
-#ifdef COW_PROFILE_SMALL
-#define COW_NUM_P3_THREADS		4
-#define COW_NUM_P3_THREADS_BULK		1   /* Active P3 threads during bulk transfer */
-//#define COW_P3_SENDER_CPU		40   /* CPU to pin bulk senders to (share 1 core) */
-#define COW_NUM_SCANNERS		4
-#define COW_NUM_PRE_SCANNERS		1   /* Scanners active during pre-scan (before freeze) */
-#define COW_NUM_DRAIN_THREADS		4
-#define COW_MAX_THREADS			16
-#else /* COW_PROFILE_LARGE (default) */
-#define COW_NUM_P3_THREADS		15
-#define COW_NUM_P3_THREADS_BULK		15
-#define COW_NUM_SCANNERS		20
-#define COW_NUM_PRE_SCANNERS		1   /* Scanners active during pre-scan (before freeze) */
-#define COW_NUM_DRAIN_THREADS		20
-#define COW_MAX_THREADS			33
-#endif
+/* Maximum values for static array declarations */
+#define COW_MAX_P3_THREADS		20
+#define COW_MAX_SCANNERS		24
+#define COW_MAX_DRAIN_THREADS		24
+#define COW_MAX_THREADS			64
+
+/* Default values (used when CLI options are not specified) */
+#define COW_DEFAULT_P3_THREADS			15
+#define COW_DEFAULT_P3_THREADS_BULK		15
+#define COW_DEFAULT_SCANNERS			20
+#define COW_DEFAULT_PRE_SCANNERS		1
+#define COW_DEFAULT_DRAIN_THREADS		20
 
 /*
  * Number of queues per scanner (producer). Scanner i owns queues
@@ -167,7 +167,7 @@
  * consumers (P3 threads) round-robin over the full set.
  */
 #define COW_QUEUES_PER_THREAD		5
-#define COW_TOTAL_QUEUES		(COW_NUM_SCANNERS * COW_QUEUES_PER_THREAD)
+#define COW_TOTAL_QUEUES		(COW_MAX_SCANNERS * COW_QUEUES_PER_THREAD)
 
 /* Maximum epoll fds for COW lazy-pages */
 #define COW_MAX_EPOLL_FDS		128
@@ -360,5 +360,28 @@
  * Will be dynamically grown if needed.
  */
 #define COW_BPF_DRAIN_INITIAL_CAP	65536
+
+/* ================================================================
+ * SECTION 14: Runtime Thread Configuration
+ * ================================================================ */
+
+/*
+ * Runtime-configurable thread counts, initialized from CLI options.
+ * Access via cow_cfg() after cow_cfg_init() has been called.
+ */
+struct cow_runtime_cfg {
+	int num_p3_threads;
+	int num_p3_threads_bulk;
+	int num_scanners;
+	int num_pre_scanners;
+	int num_drain_threads;
+	bool pre_scan;
+};
+
+extern struct cow_runtime_cfg cow_cfg;
+
+void cow_cfg_init(int p3_threads, int p3_threads_bulk,
+		  int scanners, int pre_scanners, int drain_threads,
+		  bool pre_scan);
 
 #endif /* __CR_COW_CONF_H__ */

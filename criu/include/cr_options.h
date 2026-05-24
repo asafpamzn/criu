@@ -191,6 +191,12 @@ struct cr_options {
 	int tcp_skip_in_flight;
 	bool lazy_pages;
 	bool cow_dump;
+	int cow_num_p3_threads;
+	int cow_num_p3_threads_bulk;
+	int cow_num_scanners;
+	int cow_num_pre_scanners;
+	int cow_num_drain_threads;
+	bool cow_pre_scan;
 	char *work_dir;
 	int network_lock_method;
 	int skip_file_rwx_check;

@@ -36,6 +36,23 @@
 #undef LOG_PREFIX
 #define LOG_PREFIX "cow-dump: "
 
+struct cow_runtime_cfg cow_cfg;
+
+void cow_cfg_init(int p3_threads, int p3_threads_bulk,
+		  int scanners, int pre_scanners, int drain_threads,
+		  bool pre_scan)
+{
+	cow_cfg.num_p3_threads = p3_threads;
+	cow_cfg.num_p3_threads_bulk = p3_threads_bulk;
+	cow_cfg.num_scanners = scanners;
+	cow_cfg.num_pre_scanners = pre_scanners;
+	cow_cfg.num_drain_threads = drain_threads;
+	cow_cfg.pre_scan = pre_scan;
+
+	pr_info("COW config: p3=%d p3_bulk=%d scanners=%d pre_scanners=%d drain=%d pre_scan=%d\n",
+		p3_threads, p3_threads_bulk, scanners, pre_scanners, drain_threads, pre_scan);
+}
+
 struct cow_tracked_vma {
 	unsigned long start;
 	unsigned long end;
