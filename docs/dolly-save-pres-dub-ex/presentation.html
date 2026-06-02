@@ -364,8 +364,7 @@
                 <div class="problem-box">
                     <h3 style="color: #f44336; margin-top: 0;">Clients Get Blocked</h3>
                     <ul>
-                        <li>P90 value size at fleet: <strong>9.2MB</strong></li>
-                        <li>Serializing + compressing 9.2MB takes <strong>50-150ms</strong></li>
+                        <li>Serializing + compressing large objects takes <strong>50-150ms</strong></li>
                         <li>Main thread must wait for lock on large objects</li>
                         <li>Direct impact on P99 latency (or P50 with pipeline)</li>
                     </ul>
@@ -397,20 +396,6 @@
                         <li>Cascading delays across all pipelined commands</li>
                     </ul>
                 </div>
-            </section>
-
-            <section>
-                <h2>ThreadSave Problem #5: Sync Failures</h2>
-                <div class="problem-box">
-                    <h3 style="color: #f44336; margin-top: 0;">58.5% Full Sync Failure Rate</h3>
-                    <ul>
-                        <li>Save takes so long (20+ min), replica times out</li>
-                        <li>Replica disconnects, retries full sync</li>
-                        <li>Triggers another slow save</li>
-                        <li><strong>Cascading failure loop</strong></li>
-                    </ul>
-                </div>
-                <p style="font-size: 0.7em; color: #888; margin-top: 15px;">Data: us-east-1, Valkey 8+, last 30 days — 52K ThreadSave sync ops, 58.5% failed</p>
             </section>
 
             <!-- Part 3: DollySave -->
