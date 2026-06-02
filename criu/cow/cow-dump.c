@@ -1101,7 +1101,7 @@ int cow_detect_new_vmas(struct vm_area_list *vmas,
 			ranges[nr_ranges * 2 + 1] = len;
 			nr_ranges++;
 
-			pr_err("COW REMAP: 0x%lx-0x%lx was unmapped then new VMA "
+			pr_debug("COW REMAP: 0x%lx-0x%lx was unmapped then new VMA "
 			       "appeared - treating as new for full resend\n",
 			       u_start, u_end);
 		} else {
@@ -1136,7 +1136,7 @@ int cow_detect_new_vmas(struct vm_area_list *vmas,
 		for (i = 0; i < nr_ranges; i++) {
 			unsigned long start = ranges[i * 2];
 			unsigned long len = ranges[i * 2 + 1];
-			pr_err("  NEW VMA [%u]: 0x%lx-0x%lx (size=%luKB)\n",
+			pr_debug("  NEW VMA [%u]: 0x%lx-0x%lx (size=%luKB)\n",
 			       i, start, start + len, len / 1024);
 		}
 		pr_err("COW NEW VMAs: WARNING - These VMAs will NOT exist on REPLICA!\n");
