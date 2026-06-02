@@ -1,0 +1,1215 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DollySave - Next Generation Persistence for Valkey</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.0.4/dist/reveal.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.0.4/dist/theme/night.css">
+    <style>
+        :root {
+            --r-background-color: #1a1a2e;
+            --r-main-font-size: 38px;
+            --r-heading-color: #eee;
+            --r-main-color: #ddd;
+        }
+        .reveal {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+        }
+        .reveal h1 {
+            font-size: 2.5em;
+            color: #4fc3f7;
+            text-transform: none;
+        }
+        .reveal h2 {
+            font-size: 1.6em;
+            color: #81d4fa;
+            text-transform: none;
+        }
+        .reveal h3 {
+            font-size: 1.2em;
+            color: #b3e5fc;
+            text-transform: none;
+        }
+        .reveal ul {
+            font-size: 0.85em;
+        }
+        .reveal li {
+            margin-bottom: 0.4em;
+        }
+        .reveal img {
+            max-height: 55vh;
+            border: none !important;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.5) !important;
+            border-radius: 8px;
+        }
+        .reveal table {
+            font-size: 0.7em;
+            margin: 0 auto;
+            border-collapse: collapse;
+        }
+        .reveal th {
+            background: #2d4a6f;
+            color: #fff;
+            padding: 10px 16px;
+            border: 1px solid #456;
+        }
+        .reveal td {
+            padding: 8px 16px;
+            border: 1px solid #456;
+        }
+        .reveal tr:nth-child(even) {
+            background: rgba(255,255,255,0.05);
+        }
+        .highlight-green {
+            color: #4caf50 !important;
+            font-weight: bold;
+        }
+        .highlight-red {
+            color: #f44336 !important;
+            font-weight: bold;
+        }
+        .highlight-yellow {
+            color: #ffeb3b !important;
+            font-weight: bold;
+        }
+        .highlight-blue {
+            color: #4fc3f7 !important;
+            font-weight: bold;
+        }
+        .big-number {
+            font-size: 3em;
+            color: #4caf50;
+            font-weight: bold;
+        }
+        .problem-box {
+            background: rgba(244, 67, 54, 0.2);
+            border-left: 4px solid #f44336;
+            padding: 15px 20px;
+            margin: 15px 0;
+            text-align: left;
+        }
+        .solution-box {
+            background: rgba(76, 175, 80, 0.2);
+            border-left: 4px solid #4caf50;
+            padding: 15px 20px;
+            margin: 15px 0;
+            text-align: left;
+        }
+        .diagram-box {
+            background: rgba(255,255,255,0.05);
+            border-radius: 12px;
+            padding: 20px;
+            margin: 15px auto;
+            max-width: 800px;
+            font-size: 0.85em;
+        }
+        .diagram-box p {
+            margin: 8px 0;
+        }
+        .arrow {
+            font-size: 1.5em;
+            color: #4fc3f7;
+        }
+        .section-title {
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+        }
+        .part-indicator {
+            font-size: 0.6em;
+            color: #888;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+        }
+        .small-list li {
+            font-size: 0.75em;
+            margin-bottom: 0.3em;
+        }
+        .cow-diagram {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            gap: 40px;
+            margin: 20px 0;
+        }
+        .memory-box {
+            background: #2d4a6f;
+            border-radius: 8px;
+            padding: 15px 25px;
+            text-align: center;
+        }
+        .memory-box.copied {
+            background: #6b4a2d;
+            border: 2px dashed #f44336;
+        }
+        .architecture-diagram {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            gap: 20px;
+            margin: 20px auto;
+            flex-wrap: wrap;
+        }
+        .arch-box {
+            background: linear-gradient(135deg, #2d4a6f 0%, #1a3a5c 100%);
+            border-radius: 12px;
+            padding: 20px 30px;
+            text-align: center;
+            min-width: 150px;
+        }
+        .arch-box.highlight {
+            background: linear-gradient(135deg, #2d6b4a 0%, #1a5c3a 100%);
+            border: 2px solid #4caf50;
+        }
+        .arch-arrow {
+            font-size: 2em;
+            color: #4fc3f7;
+        }
+        /* Animations for DollySave diagrams */
+        @keyframes pulse {
+            0%, 100% { opacity: 0.6; }
+            50% { opacity: 1; }
+        }
+        @keyframes flow {
+            0% { transform: translateX(-30px); }
+            100% { transform: translateX(120px); }
+        }
+        @keyframes glow {
+            0%, 100% { box-shadow: 0 0 5px rgba(76,175,80,0.5); }
+            50% { box-shadow: 0 0 20px rgba(76,175,80,0.8); }
+        }
+        /* Persistent mascot in corner */
+        .mascot-corner {
+            position: fixed;
+            top: 10px;
+            right: 10px;
+            width: 180px;
+            height: auto;
+            z-index: 100;
+            opacity: 0.95;
+            transition: opacity 0.3s;
+        }
+        /* Hide mascot on first slide */
+        .reveal .slides section:first-child.present ~ .mascot-corner,
+        body.slide-0 .mascot-corner {
+            opacity: 0;
+        }
+    </style>
+</head>
+<body>
+    <!-- Persistent mascot in top-right corner -->
+    <img src="images/dollysave_mascot.png" alt="DollySave" class="mascot-corner">
+
+    <div class="reveal">
+        <div class="slides">
+            <!-- Title Slide -->
+            <section data-background="linear-gradient(135deg, #0f0c29 0%, #302b63 50%, #24243e 100%)">
+                <div style="display: flex; align-items: center; justify-content: center; gap: 40px;">
+                    <div>
+                        <h1>DollySave</h1>
+                        <h3>A Faster Way to Save Valkey</h3>
+                        <p style="margin-top: 40px; color: #888;">
+                            Up to 70x Faster Saves<br>
+                            Zero OOM Risk<br>
+                            Minimal Latency Impact
+                        </p>
+                    </div>
+                    <img src="images/dollysave_title.png" alt="DollySave Mascot" style="height: 350px; box-shadow: none !important; border-radius: 0;">
+                </div>
+            </section>
+
+            <!-- Agenda -->
+            <section>
+                <h2>Agenda</h2>
+                <ol style="font-size: 1.1em;">
+                    <li><strong>BGSAVE</strong> - How it works and its limitations</li>
+                    <li><strong>ThreadSave</strong> - The attempted fix and its problems</li>
+                    <li><strong>DollySave</strong> - The solution</li>
+                </ol>
+            </section>
+
+            <!-- Part 1: BGSAVE -->
+            <section class="section-title">
+                <p class="part-indicator">Part 1</p>
+                <h1>BGSAVE</h1>
+                <h3>The Traditional Approach</h3>
+            </section>
+
+            <section>
+                <h2>How BGSAVE Works</h2>
+                <div class="diagram-box" style="font-size: 0.8em; padding: 15px;">
+                    <p><strong>1. fork()</strong> creates a child process</p>
+                    <p class="arrow" style="font-size: 1.2em;">↓</p>
+                    <p><strong>2. Copy-on-Write (COW)</strong> shares memory pages initially</p>
+                    <p class="arrow" style="font-size: 1.2em;">↓</p>
+                    <p><strong>3. Child</strong> serializes data to RDB file</p>
+                    <p class="arrow" style="font-size: 1.2em;">↓</p>
+                    <p><strong>4. Parent</strong> continues serving requests</p>
+                </div>
+            </section>
+
+            <section>
+                <h2>Copy-on-Write Mechanism</h2>
+                <div style="display: flex; justify-content: space-around; align-items: flex-start; margin-top: 20px;">
+                    <div style="text-align: center;">
+                        <p style="font-size: 0.7em; color: #81d4fa; margin-bottom: 10px;">Before Write</p>
+                        <div style="display: flex; gap: 20px;">
+                            <div class="memory-box">
+                                <div style="font-size: 0.7em;">Parent</div>
+                                <div style="font-size: 0.6em; color: #888;">Page A</div>
+                            </div>
+                            <div style="font-size: 2em; color: #4fc3f7; line-height: 60px;">⟷</div>
+                            <div class="memory-box">
+                                <div style="font-size: 0.7em;">Child</div>
+                                <div style="font-size: 0.6em; color: #888;">Page A</div>
+                            </div>
+                        </div>
+                        <p style="font-size: 0.6em; color: #4caf50; margin-top: 5px;">Shared memory</p>
+                    </div>
+                    <div style="font-size: 3em; color: #f44336; line-height: 100px;">→</div>
+                    <div style="text-align: center;">
+                        <p style="font-size: 0.7em; color: #81d4fa; margin-bottom: 10px;">After Write</p>
+                        <div style="display: flex; gap: 20px;">
+                            <div class="memory-box copied">
+                                <div style="font-size: 0.7em;">Parent</div>
+                                <div style="font-size: 0.6em; color: #f44336;">Page A'</div>
+                            </div>
+                            <div style="font-size: 2em; color: #666; line-height: 60px;">✗</div>
+                            <div class="memory-box">
+                                <div style="font-size: 0.7em;">Child</div>
+                                <div style="font-size: 0.6em; color: #888;">Page A</div>
+                            </div>
+                        </div>
+                        <p style="font-size: 0.6em; color: #f44336; margin-top: 5px;">Page copied!</p>
+                    </div>
+                </div>
+                <p style="font-size: 0.7em; color: #888; margin-top: 25px;">Every modified page = 4KB copy → Memory grows with write rate</p>
+            </section>
+
+            <section>
+                <h2>BGSAVE Limitation #1: Fork Freeze</h2>
+                <div class="problem-box">
+                    <h3 style="color: #f44336; margin-top: 0;">Hundreds of ms to 10 Seconds Freeze</h3>
+                    <ul>
+                        <li>Kernel must copy all page tables</li>
+                        <li>Large dataset = millions of page table entries</li>
+                        <li><strong>Valkey process is completely blocked</strong></li>
+                        <li>All client requests queue up</li>
+                    </ul>
+                </div>
+            </section>
+
+            <section>
+                <h2>BGSAVE Limitation #2: Memory Overhead</h2>
+                <div class="problem-box">
+                    <h3 style="color: #f44336; margin-top: 0;">COW Memory Scales with Write Rate</h3>
+                    <ul>
+                        <li>Each modified page = full 4KB page copy</li>
+                        <li>High write rates = massive memory growth</li>
+                        <li><strong>Can double the used memory</strong> during save</li>
+                        <li>Requires reserving 25% memory headroom — <strong>which is not always enough</strong></li>
+                        <li>Requests accumulate in client output buffer (delta)</li>
+                    </ul>
+                </div>
+            </section>
+
+            <section>
+                <h2>BGSAVE Limitation #3: OOM</h2>
+                <div class="problem-box">
+                    <h3 style="color: #f44336; margin-top: 0;">Out-of-Memory Under Load</h3>
+                    <ul>
+                        <li>If COW exceeds available memory:</li>
+                        <li style="margin-left: 30px;"><strong>Either crash</strong> — Linux OOM killer terminates process</li>
+                        <li style="margin-left: 30px;"><strong>Or start swapping</strong> — disk is slow, latency spikes</li>
+                        <li>Cannot safely run at high memory utilization</li>
+                    </ul>
+                </div>
+            </section>
+
+            <!-- Part 2: ThreadSave -->
+            <section class="section-title">
+                <p class="part-indicator">Part 2</p>
+                <h1>ThreadSave</h1>
+                <h3>The Attempted Solution</h3>
+            </section>
+
+            <section>
+                <h2>How ThreadSave Works</h2>
+                <div class="diagram-box" style="font-size: 0.8em; padding: 15px;">
+                    <p><strong>1. Track each dict entry</strong> with version numbers</p>
+                    <p class="arrow" style="font-size: 1.2em;">↓</p>
+                    <p><strong>2. Background thread</strong> iterates through dict</p>
+                    <p class="arrow" style="font-size: 1.2em;">↓</p>
+                    <p><strong>3. Serialize</strong> each entry to RDB format</p>
+                    <p class="arrow" style="font-size: 1.2em;">↓</p>
+                    <p><strong>4. Skip entries</strong> modified during save</p>
+                </div>
+                <p style="font-size: 0.8em; color: #888; margin-top: 20px;">Goal: No fork() freeze, no COW overhead</p>
+            </section>
+
+            <section>
+                <h2>ThreadSave Problem #1: Main Thread Impact</h2>
+                <div class="problem-box">
+                    <h3 style="color: #f44336; margin-top: 0;">Takes Time from Main Thread</h3>
+                    <ul>
+                        <li>Background thread competes for CPU with main thread</li>
+                        <li>Serialization requires coordination with main thread</li>
+                        <li>Latency can elevate significantly during save</li>
+                        <li>p50 can rise 3-14× throughout the save duration</li>
+                    </ul>
+                </div>
+            </section>
+
+            <section>
+                <h2>ThreadSave Problem #2: Large Object Blocking</h2>
+                <div class="problem-box">
+                    <h3 style="color: #f44336; margin-top: 0;">Clients Get Blocked</h3>
+                    <ul>
+                        <li>P90 value size at fleet: <strong>9.2MB</strong></li>
+                        <li>Serializing + compressing 9.2MB takes <strong>50-150ms</strong></li>
+                        <li>Main thread must wait for lock on large objects</li>
+                        <li>Direct impact on P99 latency (or P50 with pipeline)</li>
+                    </ul>
+                </div>
+            </section>
+
+            <section>
+                <h2>ThreadSave Problem #3: Multi-Key Commands</h2>
+                <div class="problem-box">
+                    <h3 style="color: #f44336; margin-top: 0;">MSET and Similar Commands Block</h3>
+                    <ul class="small-list">
+                        <li>ThreadSave serializes keys in order</li>
+                        <li>If a write touches an <strong>already-transferred</strong> key → client blocked</li>
+                        <li>MSET writes 20 keys → high probability of hitting transferred key</li>
+                        <li>Blocking probability <strong>grows as save progresses</strong></li>
+                    </ul>
+                </div>
+                <p style="font-size: 0.6em; color: #888; margin-top: 10px;">Affected: MSET, MSETNX, DEL, UNLINK, RENAME, SMOVE, LMOVE, EVAL, FCALL...</p>
+            </section>
+
+            <section>
+                <h2>ThreadSave Problem #4: Pipeline Blocking</h2>
+                <div class="problem-box">
+                    <h3 style="color: #f44336; margin-top: 0;">Head-of-Line Blocking</h3>
+                    <ul>
+                        <li>Pipelining is the <strong>recommended way</strong> to use Valkey</li>
+                        <li>Used by: valkey-GLIDE, Lettuce, Redisson, valkey-py, SE.Redis, node.js clients</li>
+                        <li>If one key in pipeline is being serialized → entire pipeline waits</li>
+                        <li>Cascading delays across all pipelined commands</li>
+                    </ul>
+                </div>
+            </section>
+
+            <section>
+                <h2>ThreadSave Problem #5: Sync Failures</h2>
+                <div class="problem-box">
+                    <h3 style="color: #f44336; margin-top: 0;">58.5% Full Sync Failure Rate</h3>
+                    <ul>
+                        <li>Save takes so long (20+ min), replica times out</li>
+                        <li>Replica disconnects, retries full sync</li>
+                        <li>Triggers another slow save</li>
+                        <li><strong>Cascading failure loop</strong></li>
+                    </ul>
+                </div>
+                <p style="font-size: 0.7em; color: #888; margin-top: 15px;">Data: us-east-1, Valkey 8+, last 30 days — 52K ThreadSave sync ops, 58.5% failed</p>
+            </section>
+
+            <!-- Part 3: DollySave -->
+            <section class="section-title" data-background="linear-gradient(135deg, #0f0c29 0%, #1a4332 50%, #24243e 100%)">
+                <p class="part-indicator">Part 3</p>
+                <h1>DollySave</h1>
+                <h3>The Solution</h3>
+            </section>
+
+            <!-- Scenario 1: No traffic -->
+            <section>
+                <h2>Scenario 1: No Traffic (Baseline)</h2>
+                <p style="font-size: 0.8em;">300GB dataset, no background load</p>
+                <table style="font-size: 0.75em; margin-top: 20px;">
+                    <thead>
+                        <tr>
+                            <th>Metric</th>
+                            <th>BGSAVE</th>
+                            <th>ThreadSave</th>
+                            <th>DollySave</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>Duration</td>
+                            <td>1102s (~18 min)</td>
+                            <td>1144s (~19 min)</td>
+                            <td class="highlight-green">20.9s (52x faster)</td>
+                        </tr>
+                        <tr>
+                            <td>Extra Memory</td>
+                            <td class="highlight-yellow">2.28 GB</td>
+                            <td class="highlight-green">&lt; 0.1 GB</td>
+                            <td class="highlight-green">&lt; 0.1 GB</td>
+                        </tr>
+                        <tr>
+                            <td>Process Freeze</td>
+                            <td class="highlight-red">4207 ms</td>
+                            <td class="highlight-green">0</td>
+                            <td class="highlight-yellow">233 ms</td>
+                        </tr>
+                    </tbody>
+                </table>
+                <p style="font-size: 0.7em; color: #888; margin-top: 20px;">Even with no traffic, BGSAVE takes 18 minutes. DollySave: 21 seconds.</p>
+            </section>
+
+            <!-- Scenario 3: Mixed traffic - Table -->
+            <section>
+                <h2>Scenario 2: Mixed Traffic</h2>
+                <p style="font-size: 0.8em;">400K GET/s + 100K SET/s</p>
+                <table style="font-size: 0.75em; margin-top: 20px;">
+                    <thead>
+                        <tr>
+                            <th>Metric</th>
+                            <th>BGSAVE</th>
+                            <th>ThreadSave</th>
+                            <th>DollySave</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>Duration</td>
+                            <td class="highlight-red">OOM crash</td>
+                            <td>1313s (~22 min)</td>
+                            <td class="highlight-green">22.5s (58x faster)</td>
+                        </tr>
+                        <tr>
+                            <td>Extra Memory</td>
+                            <td class="highlight-red">~200 GB (OOM)</td>
+                            <td class="highlight-green">&lt; 0.1 GB</td>
+                            <td class="highlight-green">&lt; 0.15 GB</td>
+                        </tr>
+                        <tr>
+                            <td>Process Freeze</td>
+                            <td class="highlight-red">8346 ms</td>
+                            <td class="highlight-green">0</td>
+                            <td class="highlight-yellow">1736 ms</td>
+                        </tr>
+                    </tbody>
+                </table>
+                <p style="font-size: 0.7em; color: #f44336; margin-top: 20px; font-weight: bold;">BGSAVE crashed with OOM!</p>
+            </section>
+
+            <!-- Scenario 3: Mixed traffic - DollySave vs BGSAVE chart -->
+            <section>
+                <h2>Scenario 2: DollySave vs BGSAVE</h2>
+                <p style="font-size: 0.8em;">Latency recovery comparison</p>
+                <img src="images/dollysave_scenario3_latency.png" alt="DollySave vs BGSAVE Latency">
+                <p style="font-size: 0.7em; color: #888;">DollySave (blue) recovers in ~4s; BGSAVE (red) takes ~49s before OOM</p>
+            </section>
+
+            <!-- Scenario 3: Mixed traffic - ThreadSave chart -->
+            <section>
+                <h2>Scenario 2: ThreadSave Latency</h2>
+                <p style="font-size: 0.8em;">Sustained elevated latency for 22 minutes</p>
+                <img src="images/threadsave_scenario3_latency.png" alt="ThreadSave Scenario 3 Latency">
+                <p style="font-size: 0.7em; color: #888;">p50 at 2.8ms, p99 at 5-7ms for the entire 1313-second save</p>
+            </section>
+
+            <!-- Scenario 4: MSET - Table -->
+            <section>
+                <h2>Scenario 3: MSET Workload</h2>
+                <p style="font-size: 0.8em;">400K GET/s + 100K SET ops/s via MSET(20)</p>
+                <table style="font-size: 0.75em; margin-top: 20px;">
+                    <thead>
+                        <tr>
+                            <th>Metric</th>
+                            <th>BGSAVE</th>
+                            <th>ThreadSave</th>
+                            <th>DollySave</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>Duration</td>
+                            <td class="highlight-red">OOM crash</td>
+                            <td>1747s (~29 min)</td>
+                            <td class="highlight-green">24.6s (71x faster)</td>
+                        </tr>
+                        <tr>
+                            <td>Extra Memory</td>
+                            <td class="highlight-red">~200 GB (OOM)</td>
+                            <td class="highlight-green">&lt; 0.1 GB</td>
+                            <td class="highlight-green">&lt; 0.15 GB</td>
+                        </tr>
+                        <tr>
+                            <td>Process Freeze</td>
+                            <td class="highlight-red">9564 ms</td>
+                            <td class="highlight-green">0</td>
+                            <td class="highlight-yellow">1950 ms</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </section>
+
+            <!-- Scenario 4: MSET - DollySave chart -->
+            <section>
+                <h2>Scenario 3: DollySave MSET Latency</h2>
+                <p style="font-size: 0.8em;">Immediate recovery after save starts</p>
+                <img src="images/mset_dolly_latency.png" alt="DollySave MSET Latency">
+                <p style="font-size: 0.7em; color: #4caf50;">Clean latency profile - minimal impact</p>
+            </section>
+
+            <!-- Scenario 4: MSET - ThreadSave chart -->
+            <section>
+                <h2>Scenario 3: ThreadSave MSET Latency</h2>
+                <p style="font-size: 0.8em;">Multi-key blocking pattern</p>
+                <img src="images/mset_threadsave_latency.png" alt="ThreadSave MSET Blocking">
+                <p style="font-size: 0.7em; color: #888;">p50 at 6-11ms sustained for ~1747 seconds (29 minutes)</p>
+            </section>
+
+            <!-- Scenario 5: Large objects - Table -->
+            <section>
+                <h2>Scenario 4: Large Objects (Hash Tables)</h2>
+                <p style="font-size: 0.8em;">3,000 hash tables × 100MB each, 140K HGET/s + 20K HSET/s</p>
+                <table style="font-size: 0.75em; margin-top: 20px;">
+                    <thead>
+                        <tr>
+                            <th>Metric</th>
+                            <th>BGSAVE</th>
+                            <th>ThreadSave</th>
+                            <th>DollySave</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>Duration</td>
+                            <td>878s (~15 min)</td>
+                            <td>836s (~14 min)</td>
+                            <td class="highlight-green">42.2s (20x faster)</td>
+                        </tr>
+                        <tr>
+                            <td>Extra Memory</td>
+                            <td class="highlight-red">102 GB</td>
+                            <td class="highlight-green">&lt; 0.1 GB</td>
+                            <td class="highlight-green">&lt; 0.1 GB</td>
+                        </tr>
+                        <tr>
+                            <td>p50/p99 Impact</td>
+                            <td class="highlight-green">None</td>
+                            <td class="highlight-red">50ms timeout!</td>
+                            <td class="highlight-green">Minimal</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </section>
+
+            <!-- Scenario 5: Large objects - ThreadSave chart -->
+            <section>
+                <h2>Scenario 4: ThreadSave Large Objects</h2>
+                <p style="font-size: 0.8em;">Clients blocked for entire save duration</p>
+                <img src="images/hset_threadsave_latency.png" alt="ThreadSave HSET Blocking">
+                <p style="font-size: 0.7em; color: #f44336;">Both p50 and p99 at client timeout for 836 seconds</p>
+            </section>
+
+            <!-- Skeptical quote -->
+            <section>
+                <div style="margin-top: 40px;">
+                    <!-- Skeptical face -->
+                    <div style="font-size: 5em; margin-bottom: 20px;">🤔</div>
+                    <p style="font-size: 1.4em; font-style: italic; color: #ffeb3b; max-width: 800px; margin: 0 auto; line-height: 1.5;">
+                        "DollySave is only fast because it's multi-threaded..."
+                    </p>
+                    <p style="font-size: 0.9em; color: #888; margin-top: 30px;">— Skeptics</p>
+                </div>
+            </section>
+
+            <!-- Scenario 6: Small instance -->
+            <section>
+                <h2>Scenario 5: Small Instance (Single-Threaded)</h2>
+                <p style="font-size: 0.8em;">r7g.xlarge, 220M keys × 50 bytes, no traffic</p>
+                <table style="font-size: 0.75em; margin-top: 20px;">
+                    <thead>
+                        <tr>
+                            <th>Metric</th>
+                            <th>BGSAVE</th>
+                            <th>DollySave</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>Duration</td>
+                            <td>149.7s (~2.5 min)</td>
+                            <td class="highlight-green">23.2s (6.5x faster)</td>
+                        </tr>
+                        <tr>
+                            <td>Extra Memory</td>
+                            <td class="highlight-yellow">149 MB</td>
+                            <td class="highlight-green">9 MB</td>
+                        </tr>
+                        <tr>
+                            <td>Process Freeze</td>
+                            <td class="highlight-yellow">329 ms</td>
+                            <td class="highlight-green">85 ms</td>
+                        </tr>
+                    </tbody>
+                </table>
+                <div class="solution-box" style="margin-top: 25px; max-width: 700px; margin-left: auto; margin-right: auto;">
+                    <p style="margin: 0; text-align: center; font-size: 0.85em;">
+                        <strong>Not just parallelism:</strong> DollySave streams raw memory pages<br>
+                        instead of serializing objects — fundamentally faster
+                    </p>
+                </div>
+            </section>
+
+            <!-- How DollySave works - High Level Architecture -->
+            <section>
+                <h2>How DollySave Works</h2>
+                <p style="font-size: 0.75em; color: #888; margin-bottom: 20px;">CRIU-based live process cloning</p>
+                <div style="position: relative; margin: 0 auto; max-width: 1000px;">
+                    <!-- Step labels at top -->
+                    <div style="display: flex; justify-content: space-between; margin-bottom: 30px; padding: 0 50px;">
+                        <div style="text-align: center; flex: 1;">
+                            <div style="background: rgba(79,195,247,0.2); border-radius: 20px; padding: 8px 15px; display: inline-block;">
+                                <span style="font-size: 0.7em; color: #4fc3f7; font-weight: bold;">① Clone Process</span>
+                            </div>
+                        </div>
+                        <div style="text-align: center; flex: 1;">
+                            <div style="background: rgba(76,175,80,0.2); border-radius: 20px; padding: 8px 15px; display: inline-block;">
+                                <span style="font-size: 0.7em; color: #4caf50; font-weight: bold;">② PSYNC Catch-up</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Main architecture diagram -->
+                    <div style="display: flex; justify-content: space-between; align-items: center; gap: 20px;">
+                        <!-- Source Node -->
+                        <div style="background: linear-gradient(135deg, #1a3a5c 0%, #0d2137 100%); border-radius: 16px; padding: 20px; width: 280px; border: 2px solid #2d4a6f;">
+                            <div style="font-size: 0.65em; color: #888; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 10px;">Source Node</div>
+                            <!-- Valkey Process -->
+                            <div style="background: linear-gradient(135deg, #2d6b4a 0%, #1a5c3a 100%); border-radius: 12px; padding: 15px; margin-bottom: 12px; border: 2px solid #4caf50;">
+                                <div style="display: flex; align-items: center; gap: 10px;">
+                                    <div style="width: 40px; height: 40px; background: #4caf50; border-radius: 8px; display: flex; align-items: center; justify-content: center;">
+                                        <span style="font-size: 1.2em;">V</span>
+                                    </div>
+                                    <div>
+                                        <div style="font-size: 0.9em; font-weight: bold;">Valkey Primary</div>
+                                        <div style="font-size: 0.6em; color: #81c784;">Serving 500K req/s</div>
+                                    </div>
+                                </div>
+                            </div>
+                            <!-- CRIU Process -->
+                            <div style="background: rgba(255,152,0,0.15); border-radius: 12px; padding: 12px; border: 1px solid rgba(255,152,0,0.4);">
+                                <div style="display: flex; align-items: center; gap: 8px;">
+                                    <div style="width: 30px; height: 30px; background: #ff9800; border-radius: 6px; display: flex; align-items: center; justify-content: center; font-size: 0.7em;">C</div>
+                                    <div>
+                                        <div style="font-size: 0.75em; font-weight: bold; color: #ffb74d;">CRIU</div>
+                                        <div style="font-size: 0.55em; color: #aaa;">Streams memory pages</div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Transfer arrows -->
+                        <div style="display: flex; flex-direction: column; gap: 15px; align-items: center;">
+                            <!-- Memory stream -->
+                            <div style="text-align: center;">
+                                <div style="display: flex; align-items: center; gap: 5px;">
+                                    <div style="width: 100px; height: 8px; background: linear-gradient(90deg, #4caf50, #81c784); border-radius: 4px; position: relative; overflow: hidden;">
+                                        <div style="position: absolute; width: 20px; height: 100%; background: rgba(255,255,255,0.4); animation: flow 0.8s linear infinite;"></div>
+                                    </div>
+                                    <span style="font-size: 1.2em; color: #4caf50;">→</span>
+                                </div>
+                                <div style="font-size: 0.55em; color: #81c784; margin-top: 3px;">300GB in ~20s</div>
+                            </div>
+                            <!-- PSYNC stream -->
+                            <div style="text-align: center; margin-top: 30px;">
+                                <div style="font-size: 0.6em; color: #4fc3f7; margin-bottom: 5px;">After clone completes:</div>
+                                <div style="display: flex; align-items: center; gap: 5px;">
+                                    <div style="width: 100px; height: 6px; background: linear-gradient(90deg, #4fc3f7, #81d4fa); border-radius: 3px; position: relative; overflow: hidden;">
+                                        <div style="position: absolute; width: 15px; height: 100%; background: rgba(255,255,255,0.4); animation: flow 1.2s linear infinite;"></div>
+                                    </div>
+                                    <span style="font-size: 1em; color: #4fc3f7;">→</span>
+                                </div>
+                                <div style="font-size: 0.55em; color: #81d4fa; margin-top: 3px;">PSYNC catch-up</div>
+                            </div>
+                        </div>
+
+                        <!-- Target Node -->
+                        <div style="background: linear-gradient(135deg, #1a3a5c 0%, #0d2137 100%); border-radius: 16px; padding: 20px; width: 280px; border: 2px solid #2d4a6f;">
+                            <div style="font-size: 0.65em; color: #888; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 10px;">Target Node</div>
+                            <!-- CRIU Process -->
+                            <div style="background: rgba(255,152,0,0.15); border-radius: 12px; padding: 12px; margin-bottom: 12px; border: 1px solid rgba(255,152,0,0.4);">
+                                <div style="display: flex; align-items: center; gap: 8px;">
+                                    <div style="width: 30px; height: 30px; background: #ff9800; border-radius: 6px; display: flex; align-items: center; justify-content: center; font-size: 0.7em;">C</div>
+                                    <div>
+                                        <div style="font-size: 0.75em; font-weight: bold; color: #ffb74d;">CRIU</div>
+                                        <div style="font-size: 0.55em; color: #aaa;">Receives & restores</div>
+                                    </div>
+                                </div>
+                            </div>
+                            <!-- Cloned Valkey Process -->
+                            <div style="background: linear-gradient(135deg, #2d4a6f 0%, #1a3a5c 100%); border-radius: 12px; padding: 15px; border: 2px solid #4fc3f7;">
+                                <div style="display: flex; align-items: center; gap: 10px;">
+                                    <div style="width: 40px; height: 40px; background: #4fc3f7; border-radius: 8px; display: flex; align-items: center; justify-content: center;">
+                                        <span style="font-size: 1.2em;">V</span>
+                                    </div>
+                                    <div>
+                                        <div style="font-size: 0.9em; font-weight: bold;">Valkey Clone</div>
+                                        <div style="font-size: 0.6em; color: #81d4fa;">Exact copy of primary</div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Key insight -->
+                    <div style="margin-top: 30px; text-align: center;">
+                        <div style="display: inline-block; background: rgba(76,175,80,0.1); border: 1px solid rgba(76,175,80,0.3); border-radius: 12px; padding: 15px 30px;">
+                            <div style="font-size: 0.8em; color: #81c784;">
+                                <strong style="color: #4caf50;">Key insight:</strong> Clone the running process, then PSYNC to catch up
+                            </div>
+                            <div style="font-size: 0.65em; color: #888; margin-top: 5px;">
+                                No serialization • No fork • No COW • Process keeps serving
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- DollySave Under the Hood - The Phases Timeline -->
+            <section>
+                <h2>Under the Hood: The Five Phases</h2>
+                <div style="position: relative; margin-top: 30px; padding: 0 20px;">
+                    <!-- Timeline bar -->
+                    <div style="position: relative; height: 60px; margin-bottom: 20px;">
+                        <div style="position: absolute; top: 25px; left: 0; right: 0; height: 10px; background: linear-gradient(90deg, #4caf50 0%, #4caf50 15%, #81c784 15%, #81c784 55%, #66bb6a 55%, #66bb6a 80%, #ff9800 80%, #ff9800 90%, #4caf50 90%, #4caf50 100%); border-radius: 5px;"></div>
+                        <!-- Phase markers -->
+                        <div style="position: absolute; top: 0; left: 7.5%; transform: translateX(-50%); text-align: center;">
+                            <div style="font-size: 0.6em; color: #4caf50; font-weight: bold;">1</div>
+                        </div>
+                        <div style="position: absolute; top: 0; left: 35%; transform: translateX(-50%); text-align: center;">
+                            <div style="font-size: 0.6em; color: #81c784; font-weight: bold;">2a</div>
+                        </div>
+                        <div style="position: absolute; top: 0; left: 67.5%; transform: translateX(-50%); text-align: center;">
+                            <div style="font-size: 0.6em; color: #66bb6a; font-weight: bold;">2b</div>
+                        </div>
+                        <div style="position: absolute; top: 0; left: 85%; transform: translateX(-50%); text-align: center;">
+                            <div style="font-size: 0.6em; color: #ff9800; font-weight: bold;">3</div>
+                        </div>
+                        <div style="position: absolute; top: 0; left: 95%; transform: translateX(-50%); text-align: center;">
+                            <div style="font-size: 0.6em; color: #4caf50; font-weight: bold;">4</div>
+                        </div>
+                        <!-- Running/Frozen labels -->
+                        <div style="position: absolute; top: 45px; left: 40%; transform: translateX(-50%); font-size: 0.55em; color: #4caf50;">PROCESS RUNNING</div>
+                        <div style="position: absolute; top: 45px; left: 85%; transform: translateX(-50%); font-size: 0.55em; color: #ff9800;">FROZEN</div>
+                    </div>
+                    <!-- Phase details -->
+                    <div style="display: flex; gap: 10px; margin-top: 20px;">
+                        <div style="flex: 1; background: rgba(76,175,80,0.15); border-radius: 12px; padding: 12px; border-top: 3px solid #4caf50;">
+                            <div style="font-size: 0.7em; color: #4caf50; font-weight: bold;">Phase 1: Setup</div>
+                            <div style="font-size: 0.55em; color: #aaa; margin-top: 8px;">
+                                Write-protect all pages with <strong>userfaultfd WP_ASYNC</strong>
+                            </div>
+                        </div>
+                        <div style="flex: 2; background: rgba(129,199,132,0.15); border-radius: 12px; padding: 12px; border-top: 3px solid #81c784;">
+                            <div style="font-size: 0.7em; color: #81c784; font-weight: bold;">Phase 2a: Bulk Transfer</div>
+                            <div style="font-size: 0.55em; color: #aaa; margin-top: 8px;">
+                                Stream <strong>entire memory</strong> via N parallel TCP + LZ4
+                            </div>
+                        </div>
+                        <div style="flex: 1.5; background: rgba(102,187,106,0.15); border-radius: 12px; padding: 12px; border-top: 3px solid #66bb6a;">
+                            <div style="font-size: 0.7em; color: #66bb6a; font-weight: bold;">Phase 2b: Converge</div>
+                            <div style="font-size: 0.55em; color: #aaa; margin-top: 8px;">
+                                Re-send only <strong>dirty pages</strong> until set is small
+                            </div>
+                        </div>
+                        <div style="flex: 0.8; background: rgba(255,152,0,0.15); border-radius: 12px; padding: 12px; border-top: 3px solid #ff9800;">
+                            <div style="font-size: 0.7em; color: #ff9800; font-weight: bold;">Phase 3: Freeze</div>
+                            <div style="font-size: 0.55em; color: #aaa; margin-top: 8px;">
+                                Capture final dirty pages + metadata (locks, threads, timers, signals...)
+                            </div>
+                        </div>
+                        <div style="flex: 0.6; background: rgba(76,175,80,0.15); border-radius: 12px; padding: 12px; border-top: 3px solid #4caf50;">
+                            <div style="font-size: 0.7em; color: #4caf50; font-weight: bold;">Phase 4: Handoff</div>
+                            <div style="font-size: 0.55em; color: #aaa; margin-top: 8px;">
+                                Restore process on target
+                            </div>
+                        </div>
+                    </div>
+                    <!-- Key design principle -->
+                    <div style="margin-top: 25px; text-align: center;">
+                        <div style="display: inline-block; background: rgba(76,175,80,0.1); border: 1px solid rgba(76,175,80,0.3); border-radius: 12px; padding: 12px 25px;">
+                            <div style="font-size: 0.75em; color: #81c784;">
+                                <strong style="color: #4caf50;">Design principle:</strong> Minimize freeze time by iteratively reducing the dirty page set
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- DollySave Under the Hood - Dirty Page Tracking -->
+            <section>
+                <h2>Under the Hood: userfaultfd WP_ASYNC</h2>
+                <p style="font-size: 0.7em; color: #888; margin-bottom: 15px;">Kernel tracks dirty pages without page faults - process runs at full speed</p>
+                <div style="display: flex; gap: 30px; justify-content: center; align-items: flex-start;">
+                    <!-- Memory pages visualization -->
+                    <div style="background: rgba(255,255,255,0.05); border-radius: 16px; padding: 20px; width: 400px;">
+                        <div style="font-size: 0.8em; color: #81d4fa; margin-bottom: 15px; text-align: center;">Memory Pages</div>
+                        <!-- Page grid -->
+                        <div style="display: grid; grid-template-columns: repeat(10, 1fr); gap: 4px; margin-bottom: 15px;">
+                            <!-- Mix of clean (blue) and dirty (orange) pages -->
+                            <div style="width: 28px; height: 28px; background: #2d4a6f; border-radius: 4px;"></div>
+                            <div style="width: 28px; height: 28px; background: #ff9800; border-radius: 4px; box-shadow: 0 0 8px rgba(255,152,0,0.5);"></div>
+                            <div style="width: 28px; height: 28px; background: #2d4a6f; border-radius: 4px;"></div>
+                            <div style="width: 28px; height: 28px; background: #2d4a6f; border-radius: 4px;"></div>
+                            <div style="width: 28px; height: 28px; background: #ff9800; border-radius: 4px; box-shadow: 0 0 8px rgba(255,152,0,0.5);"></div>
+                            <div style="width: 28px; height: 28px; background: #2d4a6f; border-radius: 4px;"></div>
+                            <div style="width: 28px; height: 28px; background: #2d4a6f; border-radius: 4px;"></div>
+                            <div style="width: 28px; height: 28px; background: #2d4a6f; border-radius: 4px;"></div>
+                            <div style="width: 28px; height: 28px; background: #ff9800; border-radius: 4px; box-shadow: 0 0 8px rgba(255,152,0,0.5);"></div>
+                            <div style="width: 28px; height: 28px; background: #2d4a6f; border-radius: 4px;"></div>
+                            <div style="width: 28px; height: 28px; background: #2d4a6f; border-radius: 4px;"></div>
+                            <div style="width: 28px; height: 28px; background: #2d4a6f; border-radius: 4px;"></div>
+                            <div style="width: 28px; height: 28px; background: #ff9800; border-radius: 4px; box-shadow: 0 0 8px rgba(255,152,0,0.5);"></div>
+                            <div style="width: 28px; height: 28px; background: #2d4a6f; border-radius: 4px;"></div>
+                            <div style="width: 28px; height: 28px; background: #2d4a6f; border-radius: 4px;"></div>
+                            <div style="width: 28px; height: 28px; background: #2d4a6f; border-radius: 4px;"></div>
+                            <div style="width: 28px; height: 28px; background: #2d4a6f; border-radius: 4px;"></div>
+                            <div style="width: 28px; height: 28px; background: #ff9800; border-radius: 4px; box-shadow: 0 0 8px rgba(255,152,0,0.5);"></div>
+                            <div style="width: 28px; height: 28px; background: #2d4a6f; border-radius: 4px;"></div>
+                            <div style="width: 28px; height: 28px; background: #2d4a6f; border-radius: 4px;"></div>
+                        </div>
+                        <!-- Legend -->
+                        <div style="display: flex; justify-content: center; gap: 20px; font-size: 0.6em;">
+                            <div style="display: flex; align-items: center; gap: 5px;">
+                                <div style="width: 12px; height: 12px; background: #2d4a6f; border-radius: 2px;"></div>
+                                <span style="color: #81d4fa;">Clean</span>
+                            </div>
+                            <div style="display: flex; align-items: center; gap: 5px;">
+                                <div style="width: 12px; height: 12px; background: #ff9800; border-radius: 2px;"></div>
+                                <span style="color: #ffb74d;">Dirty (written)</span>
+                            </div>
+                        </div>
+                    </div>
+                    <!-- Process flow - horizontal -->
+                    <div style="display: flex; align-items: center; gap: 10px;">
+                        <div style="background: linear-gradient(135deg, rgba(79,195,247,0.2) 0%, rgba(79,195,247,0.05) 100%); border-radius: 10px; padding: 12px; border-top: 3px solid #4fc3f7; flex: 1;">
+                            <div style="font-size: 0.7em; color: #4fc3f7; font-weight: bold;">1. Write-Protect</div>
+                            <div style="font-size: 0.55em; color: #aaa; margin-top: 4px;">userfaultfd marks pages</div>
+                        </div>
+                        <div style="color: #4fc3f7; font-size: 1.2em;">→</div>
+                        <div style="background: linear-gradient(135deg, rgba(255,152,0,0.2) 0%, rgba(255,152,0,0.05) 100%); border-radius: 10px; padding: 12px; border-top: 3px solid #ff9800; flex: 1;">
+                            <div style="font-size: 0.7em; color: #ff9800; font-weight: bold;">2. Process Writes</div>
+                            <div style="font-size: 0.55em; color: #aaa; margin-top: 4px;">Kernel records in bitmap</div>
+                            <div style="font-size: 0.5em; color: #81c784;">No page fault!</div>
+                        </div>
+                        <div style="color: #4fc3f7; font-size: 1.2em;">→</div>
+                        <div style="background: linear-gradient(135deg, rgba(76,175,80,0.2) 0%, rgba(76,175,80,0.05) 100%); border-radius: 10px; padding: 12px; border-top: 3px solid #4caf50; flex: 1;">
+                            <div style="font-size: 0.7em; color: #4caf50; font-weight: bold;">3. PAGEMAP_SCAN</div>
+                            <div style="font-size: 0.55em; color: #aaa; margin-top: 4px;">Query modified pages</div>
+                        </div>
+                    </div>
+                </div>
+                <div style="margin-top: 15px; text-align: center;">
+                    <div style="display: inline-block; background: rgba(76,175,80,0.15); padding: 8px 20px; border-radius: 20px; border: 1px solid rgba(76,175,80,0.3);">
+                        <span style="font-size: 0.65em; color: #81c784;">Requires Linux 6.7+ for</span>
+                        <span style="font-size: 0.75em; color: #4caf50; font-weight: bold;"> UFFD_FEATURE_WP_ASYNC</span>
+                    </div>
+                </div>
+            </section>
+
+            <!-- DollySave Under the Hood - Parallel Transfer Architecture -->
+            <section>
+                <h2>Under the Hood: Parallel Transfer</h2>
+                <div style="display: flex; gap: 40px; justify-content: center; align-items: center; margin-top: 20px;">
+                    <!-- Source side -->
+                    <div style="text-align: center;">
+                        <div style="background: linear-gradient(135deg, #2d6b4a 0%, #1a5c3a 100%); border-radius: 16px; padding: 20px 30px; border: 2px solid #4caf50; min-width: 180px;">
+                            <div style="font-size: 0.7em; color: #a5d6a7;">SOURCE</div>
+                            <div style="font-size: 1.3em; margin: 10px 0;">Valkey</div>
+                            <div style="font-size: 0.6em; color: #81c784;">300GB Memory</div>
+                        </div>
+                        <div style="margin-top: 15px; font-size: 0.6em; color: #888;">Process keeps running</div>
+                    </div>
+                    <!-- Transfer channels -->
+                    <div style="display: flex; flex-direction: column; gap: 8px;">
+                        <!-- Channel labels -->
+                        <div style="text-align: center; font-size: 0.7em; color: #81d4fa; margin-bottom: 8px; font-weight: bold;">N Parallel TCP Connections</div>
+                        <!-- Channels with flowing data -->
+                        <div style="display: flex; align-items: center; gap: 5px;">
+                            <div style="width: 120px; height: 12px; background: linear-gradient(90deg, #4caf50 0%, #81c784 50%, #4caf50 100%); border-radius: 6px; position: relative; overflow: hidden;">
+                                <div style="position: absolute; width: 30px; height: 100%; background: rgba(255,255,255,0.3); animation: flow 1s linear infinite;"></div>
+                            </div>
+                            <div style="font-size: 0.5em; color: #81c784; width: 40px;">LZ4</div>
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 5px;">
+                            <div style="width: 120px; height: 12px; background: linear-gradient(90deg, #4caf50 0%, #81c784 50%, #4caf50 100%); border-radius: 6px; position: relative; overflow: hidden;">
+                                <div style="position: absolute; width: 30px; height: 100%; background: rgba(255,255,255,0.3); animation: flow 1s linear infinite 0.2s;"></div>
+                            </div>
+                            <div style="font-size: 0.5em; color: #81c784; width: 40px;">LZ4</div>
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 5px;">
+                            <div style="width: 120px; height: 12px; background: linear-gradient(90deg, #4caf50 0%, #81c784 50%, #4caf50 100%); border-radius: 6px; position: relative; overflow: hidden;">
+                                <div style="position: absolute; width: 30px; height: 100%; background: rgba(255,255,255,0.3); animation: flow 1s linear infinite 0.4s;"></div>
+                            </div>
+                            <div style="font-size: 0.5em; color: #81c784; width: 40px;">LZ4</div>
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 5px;">
+                            <div style="width: 120px; height: 12px; background: linear-gradient(90deg, #4caf50 0%, #81c784 50%, #4caf50 100%); border-radius: 6px; position: relative; overflow: hidden;">
+                                <div style="position: absolute; width: 30px; height: 100%; background: rgba(255,255,255,0.3); animation: flow 1s linear infinite 0.6s;"></div>
+                            </div>
+                            <div style="font-size: 0.5em; color: #81c784; width: 40px;">LZ4</div>
+                        </div>
+                        <!-- Batch info -->
+                        <div style="text-align: center; margin-top: 10px; font-size: 0.55em; color: #aaa;">1MB batches per transfer</div>
+                    </div>
+                    <!-- Target side -->
+                    <div style="text-align: center;">
+                        <div style="background: linear-gradient(135deg, #2d4a6f 0%, #1a3a5c 100%); border-radius: 16px; padding: 20px 30px; border: 2px solid #4fc3f7; min-width: 180px;">
+                            <div style="font-size: 0.7em; color: #81d4fa;">TARGET</div>
+                            <div style="font-size: 1.3em; margin: 10px 0;">Replica</div>
+                            <div style="font-size: 0.6em; color: #4fc3f7;">Staging Buffer</div>
+                        </div>
+                        <div style="margin-top: 15px; font-size: 0.6em; color: #888;">Pages installed in-place</div>
+                    </div>
+                </div>
+                <!-- Key metrics -->
+                <div style="display: flex; justify-content: center; gap: 30px; margin-top: 30px;">
+                    <div style="background: rgba(76,175,80,0.1); border-radius: 12px; padding: 15px 25px; text-align: center; border: 1px solid rgba(76,175,80,0.3);">
+                        <div style="font-size: 1.8em; color: #4caf50; font-weight: bold;">15 GB/s</div>
+                        <div style="font-size: 0.6em; color: #81c784;">Transfer throughput</div>
+                    </div>
+                    <div style="background: rgba(79,195,247,0.1); border-radius: 12px; padding: 15px 25px; text-align: center; border: 1px solid rgba(79,195,247,0.3);">
+                        <div style="font-size: 1.8em; color: #4fc3f7; font-weight: bold;">0</div>
+                        <div style="font-size: 0.6em; color: #81d4fa;">Extra memory allocation</div>
+                    </div>
+                    <div style="background: rgba(255,152,0,0.1); border-radius: 12px; padding: 15px 25px; text-align: center; border: 1px solid rgba(255,152,0,0.3);">
+                        <div style="font-size: 1.8em; color: #ff9800; font-weight: bold;">In-place</div>
+                        <div style="font-size: 0.6em; color: #ffb74d;">Dirty pages overwrite old</div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- DollySave Limitations -->
+            <section>
+                <h2>DollySave: Limitations</h2>
+                <div class="problem-box" style="max-width: 800px; margin: 20px auto;">
+                    <ul style="font-size: 0.9em;">
+                        <li><strong>Linux kernel ≥ 6.7 required</strong><br>
+                            <span style="font-size: 0.8em; color: #aaa;">Older kernels don't support userfaultfd WP_ASYNC</span></li>
+                        <li style="margin-top: 15px;"><strong>Identical binaries required</strong><br>
+                            <span style="font-size: 0.8em; color: #aaa;">Source and target must have same Valkey version and kernel</span></li>
+                    </ul>
+                </div>
+                <div style="margin-top: 30px; text-align: center;">
+                    <div style="display: inline-block; background: rgba(76,175,80,0.1); border: 1px solid rgba(76,175,80,0.3); border-radius: 12px; padding: 15px 25px;">
+                        <div style="font-size: 0.85em; color: #81c784;">
+                            <strong style="color: #4caf50;">Scale up/down:</strong> No issues as long as binaries and kernel match
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- How to handle upgrades -->
+            <section>
+                <h2>Handling Upgrades</h2>
+                <p style="font-size: 0.75em; color: #888; margin-bottom: 20px;">DollySave requires identical binaries — how do we upgrade?</p>
+                <div style="display: flex; justify-content: center; align-items: center; gap: 15px; margin-top: 20px;">
+                    <!-- Primary -->
+                    <div style="background: linear-gradient(135deg, #2d6b4a 0%, #1a5c3a 100%); border-radius: 12px; padding: 15px 20px; text-align: center; border: 2px solid #4caf50;">
+                        <div style="font-size: 0.6em; color: #a5d6a7;">PRIMARY</div>
+                        <div style="font-size: 0.9em; margin-top: 5px;">Valkey v8.1</div>
+                    </div>
+                    <!-- Arrow 1 -->
+                    <div style="text-align: center;">
+                        <div style="font-size: 1.2em; color: #4caf50;">→</div>
+                        <div style="font-size: 0.5em; color: #81c784;">DollySave</div>
+                    </div>
+                    <!-- Intermediate -->
+                    <div style="background: linear-gradient(135deg, #6b4a2d 0%, #5c3a1a 100%); border-radius: 12px; padding: 15px 20px; text-align: center; border: 2px dashed #ff9800;">
+                        <div style="font-size: 0.6em; color: #ffb74d;">INTERMEDIATE</div>
+                        <div style="font-size: 0.9em; margin-top: 5px;">Valkey v8.1</div>
+                        <div style="font-size: 0.5em; color: #aaa;">(ephemeral)</div>
+                    </div>
+                    <!-- Arrow 2 -->
+                    <div style="text-align: center;">
+                        <div style="font-size: 1.2em; color: #4fc3f7;">→</div>
+                        <div style="font-size: 0.5em; color: #81d4fa;">UPGRADE</div>
+                    </div>
+                    <!-- Target -->
+                    <div style="background: linear-gradient(135deg, #2d4a6f 0%, #1a3a5c 100%); border-radius: 12px; padding: 15px 20px; text-align: center; border: 2px solid #4fc3f7;">
+                        <div style="font-size: 0.6em; color: #81d4fa;">TARGET</div>
+                        <div style="font-size: 0.9em; margin-top: 5px;">Valkey v8.2</div>
+                    </div>
+                </div>
+                <div style="margin-top: 30px; display: flex; justify-content: center; gap: 20px;">
+                    <div style="background: rgba(76,175,80,0.1); border-radius: 10px; padding: 12px 20px; border-left: 3px solid #4caf50;">
+                        <div style="font-size: 0.7em; color: #4caf50; font-weight: bold;">Step 1: DollySave</div>
+                        <div style="font-size: 0.6em; color: #aaa;">Clone to intermediate node (same version)</div>
+                    </div>
+                    <div style="background: rgba(79,195,247,0.1); border-radius: 10px; padding: 12px 20px; border-left: 3px solid #4fc3f7;">
+                        <div style="font-size: 0.7em; color: #4fc3f7; font-weight: bold;">Step 2: UPGRADE</div>
+                        <div style="font-size: 0.6em; color: #aaa;">Multi-threaded transfer to new version</div>
+                    </div>
+                </div>
+                <div style="margin-top: 20px; text-align: center;">
+                    <span style="font-size: 0.7em; color: #888;">Intermediate node is ephemeral — destroyed after upgrade completes</span>
+                </div>
+            </section>
+
+            <!-- How to handle snapshots -->
+            <section>
+                <h2>Handling Snapshots</h2>
+                <p style="font-size: 0.75em; color: #888; margin-bottom: 20px;">DollySave produces memory images, not RDB files — how do we snapshot?</p>
+                <div style="display: flex; justify-content: center; align-items: center; gap: 20px; margin-top: 30px;">
+                    <!-- Primary -->
+                    <div style="background: linear-gradient(135deg, #2d6b4a 0%, #1a5c3a 100%); border-radius: 12px; padding: 20px 25px; text-align: center; border: 2px solid #4caf50;">
+                        <div style="font-size: 0.6em; color: #a5d6a7;">PRIMARY</div>
+                        <div style="font-size: 1em; margin-top: 5px;">Valkey</div>
+                        <div style="font-size: 0.55em; color: #81c784;">300GB memory</div>
+                    </div>
+                    <!-- Arrow -->
+                    <div style="text-align: center;">
+                        <div style="font-size: 1.5em; color: #4caf50;">→</div>
+                        <div style="font-size: 0.55em; color: #81c784;">DollySave</div>
+                    </div>
+                    <!-- Snapshot storage -->
+                    <div style="background: linear-gradient(135deg, #4a2d6b 0%, #3a1a5c 100%); border-radius: 12px; padding: 20px 25px; text-align: center; border: 2px solid #9c27b0;">
+                        <div style="font-size: 0.6em; color: #ce93d8;">SNAPSHOT</div>
+                        <div style="font-size: 1em; margin-top: 5px;">Memory Image</div>
+                        <div style="font-size: 0.55em; color: #ba68c8;">Stored to disk/S3</div>
+                    </div>
+                    <!-- Arrow -->
+                    <div style="text-align: center;">
+                        <div style="font-size: 1.5em; color: #4fc3f7;">→</div>
+                        <div style="font-size: 0.55em; color: #81d4fa;">Restore</div>
+                    </div>
+                    <!-- Restored -->
+                    <div style="background: linear-gradient(135deg, #2d4a6f 0%, #1a3a5c 100%); border-radius: 12px; padding: 20px 25px; text-align: center; border: 2px solid #4fc3f7;">
+                        <div style="font-size: 0.6em; color: #81d4fa;">RESTORED</div>
+                        <div style="font-size: 1em; margin-top: 5px;">Valkey</div>
+                        <div style="font-size: 0.55em; color: #4fc3f7;">Ready in ~20s</div>
+                    </div>
+                </div>
+                <div class="solution-box" style="margin-top: 35px; max-width: 700px; margin-left: auto; margin-right: auto;">
+                    <p style="margin: 0; text-align: center; font-size: 0.85em;">
+                        <strong>Faster recovery:</strong> Restore 300GB dataset in ~20 seconds<br>
+                        <span style="font-size: 0.9em; color: #aaa;">vs minutes for RDB parsing</span>
+                    </p>
+                </div>
+            </section>
+
+            <!-- Snapshot conversion to RDB -->
+            <section>
+                <h2>Snapshot Conversion</h2>
+                <p style="font-size: 0.75em; color: #888; margin-bottom: 20px;">Background process converts memory images to RDB format</p>
+                <div style="display: flex; justify-content: center; align-items: center; gap: 20px; margin-top: 30px;">
+                    <!-- S3 storage -->
+                    <div style="background: linear-gradient(135deg, #4a2d6b 0%, #3a1a5c 100%); border-radius: 12px; padding: 20px 25px; text-align: center; border: 2px solid #9c27b0;">
+                        <div style="font-size: 2em; margin-bottom: 5px;">☁️</div>
+                        <div style="font-size: 0.6em; color: #ce93d8;">S3</div>
+                        <div style="font-size: 0.9em; margin-top: 5px;">Memory Images</div>
+                    </div>
+                    <!-- Arrow -->
+                    <div style="text-align: center;">
+                        <div style="font-size: 1.5em; color: #ff9800;">→</div>
+                        <div style="font-size: 0.5em; color: #ffb74d;">Background</div>
+                        <div style="font-size: 0.5em; color: #ffb74d;">Process</div>
+                    </div>
+                    <!-- Converter -->
+                    <div style="background: linear-gradient(135deg, #6b4a2d 0%, #5c3a1a 100%); border-radius: 12px; padding: 20px 25px; text-align: center; border: 2px solid #ff9800;">
+                        <div style="font-size: 2em; margin-bottom: 5px;">⚙️</div>
+                        <div style="font-size: 0.6em; color: #ffb74d;">CONVERTER</div>
+                        <div style="font-size: 0.9em; margin-top: 5px;">Image → RDB</div>
+                    </div>
+                    <!-- Arrow -->
+                    <div style="text-align: center;">
+                        <div style="font-size: 1.5em; color: #4caf50;">→</div>
+                    </div>
+                    <!-- RDB storage -->
+                    <div style="background: linear-gradient(135deg, #2d6b4a 0%, #1a5c3a 100%); border-radius: 12px; padding: 20px 25px; text-align: center; border: 2px solid #4caf50;">
+                        <div style="font-size: 2em; margin-bottom: 5px;">📄</div>
+                        <div style="font-size: 0.6em; color: #a5d6a7;">S3</div>
+                        <div style="font-size: 0.9em; margin-top: 5px;">RDB Files</div>
+                    </div>
+                </div>
+                <div style="margin-top: 35px; display: flex; justify-content: center; gap: 25px;">
+                    <div style="background: rgba(156,39,176,0.1); border-radius: 10px; padding: 12px 20px; border-left: 3px solid #9c27b0;">
+                        <div style="font-size: 0.7em; color: #ce93d8; font-weight: bold;">Fast Path</div>
+                        <div style="font-size: 0.6em; color: #aaa;">Restore from memory image</div>
+                        <div style="font-size: 0.6em; color: #aaa;">Same version only</div>
+                    </div>
+                    <div style="background: rgba(76,175,80,0.1); border-radius: 10px; padding: 12px 20px; border-left: 3px solid #4caf50;">
+                        <div style="font-size: 0.7em; color: #4caf50; font-weight: bold;">Compatible Path</div>
+                        <div style="font-size: 0.6em; color: #aaa;">Restore from RDB</div>
+                        <div style="font-size: 0.6em; color: #aaa;">Any compatible version</div>
+                    </div>
+                </div>
+            </section>
+
+            <section>
+                <h2>The Numbers</h2>
+                <div style="display: flex; justify-content: space-around; margin-top: 40px;">
+                    <div style="text-align: center;">
+                        <div class="big-number">6-70x</div>
+                        <p>Faster Saves</p>
+                    </div>
+                    <div style="text-align: center;">
+                        <div class="big-number">0</div>
+                        <p>OOM Risk</p>
+                    </div>
+                    <div style="text-align: center;">
+                        <div class="big-number">0</div>
+                        <p>Reserved Memory</p>
+                    </div>
+                </div>
+            </section>
+
+            <section data-background="linear-gradient(135deg, #0f0c29 0%, #302b63 50%, #24243e 100%)">
+                <h1>Questions?</h1>
+                <p style="margin-top: 60px; color: #888;">
+                    DollySave - Next Generation Persistence for Valkey
+                </p>
+            </section>
+
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.0.4/dist/reveal.js"></script>
+    <script>
+        Reveal.initialize({
+            hash: true,
+            slideNumber: true,
+            transition: 'slide',
+            backgroundTransition: 'fade',
+            center: true,
+            width: 1280,
+            height: 720,
+            margin: 0.1,
+        });
+
+        // Different mascots for different slides
+        const mascot = document.querySelector('.mascot-corner');
+        const mascotImages = [
+            'images/mascot_flying1.png',   // flying
+            'images/mascot_flying2.png',   // flying cliff
+            'images/mascot_eating.png',    // eating
+            'images/mascot_pow.png',       // pow punch
+            'images/mascot_skating.png',   // skateboarding
+            'images/mascot_strong.png',    // lifting weights
+            'images/mascot_fast.png',      // running fast
+            'images/mascot_standing.png',  // standing
+            'images/mascot_saving.png',    // at computer
+        ];
+
+        function updateMascot() {
+            const slideIndex = Reveal.getIndices().h;
+            if (slideIndex === 0) {
+                mascot.style.opacity = '0';
+            } else {
+                mascot.style.opacity = '0.95';
+                // Cycle through mascot images based on slide number
+                const imgIndex = (slideIndex - 1) % mascotImages.length;
+                mascot.src = mascotImages[imgIndex];
+            }
+        }
+        Reveal.on('slidechanged', updateMascot);
+        updateMascot();
+    </script>
+</body>
+</html>
