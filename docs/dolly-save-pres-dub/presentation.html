@@ -307,7 +307,6 @@
                         <li>High write rates = massive memory growth</li>
                         <li><strong>Can double the used memory</strong> during save</li>
                         <li>Requires reserving 25% memory headroom — <strong>which is not always enough</strong></li>
-                        <li>Requests accumulate in client output buffer (delta)</li>
                     </ul>
                 </div>
             </section>
@@ -315,13 +314,18 @@
             <section>
                 <h2>BGSAVE Limitation #3: OOM</h2>
                 <div class="problem-box">
-                    <h3 style="color: #f44336; margin-top: 0;">Out-of-Memory Under Load</h3>
-                    <ul>
-                        <li>If COW exceeds available memory:</li>
-                        <li style="margin-left: 30px;"><strong>Either crash</strong> — Linux OOM killer terminates process</li>
-                        <li style="margin-left: 30px;"><strong>Or start swapping</strong> — disk is slow, latency spikes</li>
-                        <li>Cannot safely run at high memory utilization</li>
-                    </ul>
+                    <div style="display: flex; align-items: center; justify-content: space-between;">
+                        <div>
+                            <h3 style="color: #f44336; margin-top: 0;">Out-of-Memory Under Load</h3>
+                            <ul>
+                                <li>If COW exceeds available memory:</li>
+                                <li style="margin-left: 30px;"><strong>Either crash</strong> — Linux OOM killer terminates process</li>
+                                <li style="margin-left: 30px;"><strong>Or start swapping</strong> — disk is slow, latency spikes</li>
+                                <li>Cannot safely run at high memory utilization</li>
+                            </ul>
+                        </div>
+                        <div style="font-size: 4em; margin-left: 20px;">💥</div>
+                    </div>
                 </div>
             </section>
 
@@ -414,7 +418,7 @@
                 <div class="problem-box">
                     <h3 style="color: #f44336; margin-top: 0;">Takes Time from Main Thread</h3>
                     <ul>
-                        <li>Background thread competes for CPU with main thread</li>
+                        <li>Main thread must feed data to the save thread</li>
                         <li>Serialization requires coordination with main thread</li>
                         <li>Latency can elevate significantly during save</li>
                         <li>p50 can rise 3-14× throughout the save duration</li>
@@ -441,9 +445,8 @@
                     <h3 style="color: #f44336; margin-top: 0;">MSET and Similar Commands Block</h3>
                     <ul class="small-list">
                         <li>ThreadSave serializes keys in order</li>
-                        <li>If a write touches an <strong>already-transferred</strong> key → client blocked</li>
+                        <li>If a write touches both transferred and non-transferred keys → client blocked</li>
                         <li>MSET writes 20 keys → high probability of hitting transferred key</li>
-                        <li>Blocking probability <strong>grows as save progresses</strong></li>
                     </ul>
                 </div>
                 <p style="font-size: 0.6em; color: #888; margin-top: 10px;">Affected: MSET, MSETNX, DEL, UNLINK, RENAME, SMOVE, LMOVE, EVAL, FCALL...</p>
@@ -460,20 +463,6 @@
                         <li>Cascading delays across all pipelined commands</li>
                     </ul>
                 </div>
-            </section>
-
-            <section>
-                <h2>ThreadSave Problem #5: Sync Failures</h2>
-                <div class="problem-box">
-                    <h3 style="color: #f44336; margin-top: 0;">58.5% Full Sync Failure Rate</h3>
-                    <ul>
-                        <li>Save takes so long (20+ min), replica times out</li>
-                        <li>Replica disconnects, retries full sync</li>
-                        <li>Triggers another slow save</li>
-                        <li><strong>Cascading failure loop</strong></li>
-                    </ul>
-                </div>
-                <p style="font-size: 0.7em; color: #888; margin-top: 15px;">Data: us-east-1, Valkey 8+, last 30 days — 52K ThreadSave sync ops, 58.5% failed</p>
             </section>
 
             <!-- Part 3: DollySave -->
