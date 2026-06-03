@@ -223,7 +223,7 @@
                 <ol style="font-size: 1.1em;">
                     <li><strong>BGSAVE</strong> - How it works and its limitations</li>
                     <li><strong>ThreadSave</strong> - The attempted fix and its problems</li>
-                    <li><strong>DollySave</strong> - The solution</li>
+                    <li><strong>DollySave</strong> - Experiment results and under the hood</li>
                 </ol>
             </section>
 
@@ -346,6 +346,69 @@
                 <p style="font-size: 0.8em; color: #888; margin-top: 20px;">Goal: No fork() freeze, no COW overhead</p>
             </section>
 
+            <!-- ThreadSave Architecture -->
+            <section>
+                <h2>ThreadSave Architecture</h2>
+                <div style="display: flex; justify-content: center; align-items: center; gap: 25px; margin-top: 30px;">
+                    <!-- Primary Node -->
+                    <div style="background: linear-gradient(135deg, #1a3a5c 0%, #0d2137 100%); border-radius: 16px; padding: 20px; border: 2px solid #2d4a6f; width: 320px;">
+                        <div style="font-size: 0.65em; color: #888; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 15px;">Primary Node</div>
+                        <div style="display: flex; gap: 15px; align-items: center;">
+                            <!-- Main Thread -->
+                            <div style="background: linear-gradient(135deg, #2d6b4a 0%, #1a5c3a 100%); border-radius: 10px; padding: 12px; text-align: center; flex: 1; border: 2px solid #4caf50;">
+                                <div style="font-size: 0.7em; color: #a5d6a7;">Main Thread</div>
+                                <div style="font-size: 0.9em; font-weight: bold; margin-top: 5px;">Serving</div>
+                                <div style="font-size: 0.5em; color: #81c784; margin-top: 3px;">Clients</div>
+                            </div>
+                            <!-- Bidirectional arrows -->
+                            <div style="display: flex; flex-direction: column; align-items: center; gap: 3px;">
+                                <div style="font-size: 0.8em; color: #ff9800;">⇄</div>
+                                <div style="font-size: 0.45em; color: #ffb74d;">Lock</div>
+                            </div>
+                            <!-- Save Thread -->
+                            <div style="background: linear-gradient(135deg, #6b4a2d 0%, #5c3a1a 100%); border-radius: 10px; padding: 12px; text-align: center; flex: 1; border: 2px solid #ff9800;">
+                                <div style="font-size: 0.7em; color: #ffb74d;">Save Thread</div>
+                                <div style="font-size: 0.9em; font-weight: bold; margin-top: 5px;">Serialize</div>
+                                <div style="font-size: 0.5em; color: #ffcc80; margin-top: 3px;">RDB Format</div>
+                            </div>
+                        </div>
+                        <!-- Queue -->
+                        <div style="margin-top: 15px; background: rgba(156,39,176,0.15); border-radius: 8px; padding: 10px; border: 1px solid rgba(156,39,176,0.4);">
+                            <div style="font-size: 0.6em; color: #ce93d8; text-align: center;">Output Queue</div>
+                            <div style="display: flex; justify-content: center; gap: 5px; margin-top: 5px;">
+                                <div style="width: 20px; height: 15px; background: #9c27b0; border-radius: 3px; opacity: 0.9;"></div>
+                                <div style="width: 20px; height: 15px; background: #9c27b0; border-radius: 3px; opacity: 0.7;"></div>
+                                <div style="width: 20px; height: 15px; background: #9c27b0; border-radius: 3px; opacity: 0.5;"></div>
+                                <div style="width: 20px; height: 15px; background: #9c27b0; border-radius: 3px; opacity: 0.3;"></div>
+                            </div>
+                        </div>
+                    </div>
+                    <!-- Arrow to replica -->
+                    <div style="text-align: center;">
+                        <div style="display: flex; align-items: center; gap: 5px;">
+                            <div style="width: 60px; height: 6px; background: linear-gradient(90deg, #9c27b0, #ce93d8); border-radius: 3px;"></div>
+                            <span style="font-size: 1.2em; color: #9c27b0;">→</span>
+                        </div>
+                        <div style="font-size: 0.55em; color: #ce93d8; margin-top: 3px;">RDB Stream</div>
+                    </div>
+                    <!-- Replica Node -->
+                    <div style="background: linear-gradient(135deg, #2d4a6f 0%, #1a3a5c 100%); border-radius: 16px; padding: 20px; text-align: center; border: 2px solid #4fc3f7; width: 150px;">
+                        <div style="font-size: 0.65em; color: #888; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 10px;">Replica</div>
+                        <div style="font-size: 2em; margin: 10px 0;">V</div>
+                        <div style="font-size: 0.7em; color: #81d4fa;">Receiving</div>
+                        <div style="font-size: 0.5em; color: #4fc3f7; margin-top: 3px;">& Parsing RDB</div>
+                    </div>
+                </div>
+                <!-- Problem highlight -->
+                <div style="margin-top: 25px; text-align: center;">
+                    <div style="display: inline-block; background: rgba(255,152,0,0.1); border: 1px solid rgba(255,152,0,0.3); border-radius: 12px; padding: 12px 25px;">
+                        <div style="font-size: 0.75em; color: #ffb74d;">
+                            <strong style="color: #ff9800;">Contention:</strong> Main thread and save thread must coordinate on shared data
+                        </div>
+                    </div>
+                </div>
+            </section>
+
             <section>
                 <h2>ThreadSave Problem #1: Main Thread Impact</h2>
                 <div class="problem-box">
@@ -417,7 +480,7 @@
             <section class="section-title" data-background="linear-gradient(135deg, #0f0c29 0%, #1a4332 50%, #24243e 100%)">
                 <p class="part-indicator">Part 3</p>
                 <h1>DollySave</h1>
-                <h3>The Solution</h3>
+                <h3>Experiment Results</h3>
             </section>
 
             <!-- Scenario 1: No traffic -->
@@ -656,117 +719,110 @@
                 </div>
             </section>
 
-            <!-- How DollySave works - High Level Architecture -->
+            <!-- Part 4: DollySave Under the Hood -->
+            <section class="section-title" data-background="linear-gradient(135deg, #0f0c29 0%, #1a4332 50%, #24243e 100%)">
+                <p class="part-indicator">Part 4</p>
+                <h1>DollySave</h1>
+                <h3>Under the Hood</h3>
+            </section>
+
+            <!-- How DollySave works - Step 1: Clone Process -->
             <section>
-                <h2>How DollySave Works</h2>
-                <p style="font-size: 0.75em; color: #888; margin-bottom: 20px;">CRIU-based live process cloning</p>
-                <div style="position: relative; margin: 0 auto; max-width: 1000px;">
-                    <!-- Step labels at top -->
-                    <div style="display: flex; justify-content: space-between; margin-bottom: 30px; padding: 0 50px;">
-                        <div style="text-align: center; flex: 1;">
-                            <div style="background: rgba(79,195,247,0.2); border-radius: 20px; padding: 8px 15px; display: inline-block;">
-                                <span style="font-size: 0.7em; color: #4fc3f7; font-weight: bold;">① Clone Process</span>
-                            </div>
+                <h2>Step 1: Clone the Process</h2>
+                <p style="font-size: 0.75em; color: #888; margin-bottom: 20px;">CRIU creates an exact copy of the running Valkey process</p>
+                <div style="display: flex; justify-content: center; align-items: center; gap: 40px; margin-top: 30px;">
+                    <!-- Source -->
+                    <div style="background: linear-gradient(135deg, #2d6b4a 0%, #1a5c3a 100%); border-radius: 16px; padding: 25px; text-align: center; border: 2px solid #4caf50; width: 200px;">
+                        <div style="font-size: 2.5em; margin-bottom: 10px;">V</div>
+                        <div style="font-size: 1em; font-weight: bold;">Valkey Primary</div>
+                        <div style="font-size: 0.6em; color: #81c784; margin-top: 5px;">Running & Serving</div>
+                    </div>
+                    <!-- Arrow -->
+                    <div style="text-align: center;">
+                        <div style="font-size: 2em; color: #4caf50;">→</div>
+                        <div style="font-size: 0.7em; color: #81c784;">Clone</div>
+                    </div>
+                    <!-- Target -->
+                    <div style="background: linear-gradient(135deg, #2d4a6f 0%, #1a3a5c 100%); border-radius: 16px; padding: 25px; text-align: center; border: 2px solid #4fc3f7; width: 200px;">
+                        <div style="font-size: 2.5em; margin-bottom: 10px;">V</div>
+                        <div style="font-size: 1em; font-weight: bold;">Valkey Clone</div>
+                        <div style="font-size: 0.6em; color: #81d4fa; margin-top: 5px;">Exact Copy</div>
+                    </div>
+                </div>
+                <!-- What gets cloned -->
+                <div style="margin-top: 40px; text-align: center;">
+                    <div style="font-size: 0.85em; color: #81d4fa; margin-bottom: 15px;">Everything is cloned:</div>
+                    <div style="display: flex; justify-content: center; gap: 15px; flex-wrap: wrap;">
+                        <div style="background: rgba(79,195,247,0.15); padding: 10px 20px; border-radius: 20px; font-size: 0.75em;">
+                            <span style="color: #4fc3f7;">Memory</span>
                         </div>
-                        <div style="text-align: center; flex: 1;">
-                            <div style="background: rgba(76,175,80,0.2); border-radius: 20px; padding: 8px 15px; display: inline-block;">
-                                <span style="font-size: 0.7em; color: #4caf50; font-weight: bold;">② PSYNC Catch-up</span>
-                            </div>
+                        <div style="background: rgba(79,195,247,0.15); padding: 10px 20px; border-radius: 20px; font-size: 0.75em;">
+                            <span style="color: #4fc3f7;">Threads</span>
+                        </div>
+                        <div style="background: rgba(79,195,247,0.15); padding: 10px 20px; border-radius: 20px; font-size: 0.75em;">
+                            <span style="color: #4fc3f7;">Locks</span>
+                        </div>
+                        <div style="background: rgba(79,195,247,0.15); padding: 10px 20px; border-radius: 20px; font-size: 0.75em;">
+                            <span style="color: #4fc3f7;">Signals</span>
+                        </div>
+                        <div style="background: rgba(79,195,247,0.15); padding: 10px 20px; border-radius: 20px; font-size: 0.75em;">
+                            <span style="color: #4fc3f7;">Timers</span>
+                        </div>
+                        <div style="background: rgba(79,195,247,0.15); padding: 10px 20px; border-radius: 20px; font-size: 0.75em;">
+                            <span style="color: #4fc3f7;">File Descriptors</span>
                         </div>
                     </div>
-
-                    <!-- Main architecture diagram -->
-                    <div style="display: flex; justify-content: space-between; align-items: center; gap: 20px;">
-                        <!-- Source Node -->
-                        <div style="background: linear-gradient(135deg, #1a3a5c 0%, #0d2137 100%); border-radius: 16px; padding: 20px; width: 280px; border: 2px solid #2d4a6f;">
-                            <div style="font-size: 0.65em; color: #888; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 10px;">Source Node</div>
-                            <!-- Valkey Process -->
-                            <div style="background: linear-gradient(135deg, #2d6b4a 0%, #1a5c3a 100%); border-radius: 12px; padding: 15px; margin-bottom: 12px; border: 2px solid #4caf50;">
-                                <div style="display: flex; align-items: center; gap: 10px;">
-                                    <div style="width: 40px; height: 40px; background: #4caf50; border-radius: 8px; display: flex; align-items: center; justify-content: center;">
-                                        <span style="font-size: 1.2em;">V</span>
-                                    </div>
-                                    <div>
-                                        <div style="font-size: 0.9em; font-weight: bold;">Valkey Primary</div>
-                                        <div style="font-size: 0.6em; color: #81c784;">Serving 500K req/s</div>
-                                    </div>
-                                </div>
-                            </div>
-                            <!-- CRIU Process -->
-                            <div style="background: rgba(255,152,0,0.15); border-radius: 12px; padding: 12px; border: 1px solid rgba(255,152,0,0.4);">
-                                <div style="display: flex; align-items: center; gap: 8px;">
-                                    <div style="width: 30px; height: 30px; background: #ff9800; border-radius: 6px; display: flex; align-items: center; justify-content: center; font-size: 0.7em;">C</div>
-                                    <div>
-                                        <div style="font-size: 0.75em; font-weight: bold; color: #ffb74d;">CRIU</div>
-                                        <div style="font-size: 0.55em; color: #aaa;">Streams memory pages</div>
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-
-                        <!-- Transfer arrows -->
-                        <div style="display: flex; flex-direction: column; gap: 15px; align-items: center;">
-                            <!-- Memory stream -->
-                            <div style="text-align: center;">
-                                <div style="display: flex; align-items: center; gap: 5px;">
-                                    <div style="width: 100px; height: 8px; background: linear-gradient(90deg, #4caf50, #81c784); border-radius: 4px; position: relative; overflow: hidden;">
-                                        <div style="position: absolute; width: 20px; height: 100%; background: rgba(255,255,255,0.4); animation: flow 0.8s linear infinite;"></div>
-                                    </div>
-                                    <span style="font-size: 1.2em; color: #4caf50;">→</span>
-                                </div>
-                                <div style="font-size: 0.55em; color: #81c784; margin-top: 3px;">300GB in ~20s</div>
-                            </div>
-                            <!-- PSYNC stream -->
-                            <div style="text-align: center; margin-top: 30px;">
-                                <div style="font-size: 0.6em; color: #4fc3f7; margin-bottom: 5px;">After clone completes:</div>
-                                <div style="display: flex; align-items: center; gap: 5px;">
-                                    <div style="width: 100px; height: 6px; background: linear-gradient(90deg, #4fc3f7, #81d4fa); border-radius: 3px; position: relative; overflow: hidden;">
-                                        <div style="position: absolute; width: 15px; height: 100%; background: rgba(255,255,255,0.4); animation: flow 1.2s linear infinite;"></div>
-                                    </div>
-                                    <span style="font-size: 1em; color: #4fc3f7;">→</span>
-                                </div>
-                                <div style="font-size: 0.55em; color: #81d4fa; margin-top: 3px;">PSYNC catch-up</div>
-                            </div>
-                        </div>
-
-                        <!-- Target Node -->
-                        <div style="background: linear-gradient(135deg, #1a3a5c 0%, #0d2137 100%); border-radius: 16px; padding: 20px; width: 280px; border: 2px solid #2d4a6f;">
-                            <div style="font-size: 0.65em; color: #888; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 10px;">Target Node</div>
-                            <!-- CRIU Process -->
-                            <div style="background: rgba(255,152,0,0.15); border-radius: 12px; padding: 12px; margin-bottom: 12px; border: 1px solid rgba(255,152,0,0.4);">
-                                <div style="display: flex; align-items: center; gap: 8px;">
-                                    <div style="width: 30px; height: 30px; background: #ff9800; border-radius: 6px; display: flex; align-items: center; justify-content: center; font-size: 0.7em;">C</div>
-                                    <div>
-                                        <div style="font-size: 0.75em; font-weight: bold; color: #ffb74d;">CRIU</div>
-                                        <div style="font-size: 0.55em; color: #aaa;">Receives & restores</div>
-                                    </div>
-                                </div>
-                            </div>
-                            <!-- Cloned Valkey Process -->
-                            <div style="background: linear-gradient(135deg, #2d4a6f 0%, #1a3a5c 100%); border-radius: 12px; padding: 15px; border: 2px solid #4fc3f7;">
-                                <div style="display: flex; align-items: center; gap: 10px;">
-                                    <div style="width: 40px; height: 40px; background: #4fc3f7; border-radius: 8px; display: flex; align-items: center; justify-content: center;">
-                                        <span style="font-size: 1.2em;">V</span>
-                                    </div>
-                                    <div>
-                                        <div style="font-size: 0.9em; font-weight: bold;">Valkey Clone</div>
-                                        <div style="font-size: 0.6em; color: #81d4fa;">Exact copy of primary</div>
-                                    </div>
-                                </div>
-                            </div>
+                </div>
+                <div style="margin-top: 30px; text-align: center;">
+                    <div style="display: inline-block; background: rgba(76,175,80,0.1); border: 1px solid rgba(76,175,80,0.3); border-radius: 12px; padding: 12px 25px;">
+                        <div style="font-size: 0.8em; color: #81c784;">
+                            The clone is <strong style="color: #4caf50;">identical</strong> — same state, same data, ready to run
                         </div>
                     </div>
+                </div>
+            </section>
 
-                    <!-- Key insight -->
-                    <div style="margin-top: 30px; text-align: center;">
-                        <div style="display: inline-block; background: rgba(76,175,80,0.1); border: 1px solid rgba(76,175,80,0.3); border-radius: 12px; padding: 15px 30px;">
-                            <div style="font-size: 0.8em; color: #81c784;">
-                                <strong style="color: #4caf50;">Key insight:</strong> Clone the running process, then PSYNC to catch up
+            <!-- How DollySave works - Step 2: PSYNC -->
+            <section>
+                <h2>Step 2: PSYNC to Catch Up</h2>
+                <p style="font-size: 0.75em; color: #888; margin-bottom: 20px;">Now we have the same process — just need to sync the delta</p>
+                <div style="display: flex; justify-content: center; align-items: center; gap: 30px; margin-top: 30px;">
+                    <!-- Primary -->
+                    <div style="background: linear-gradient(135deg, #2d6b4a 0%, #1a5c3a 100%); border-radius: 16px; padding: 25px; text-align: center; border: 2px solid #4caf50; width: 200px;">
+                        <div style="font-size: 2em; margin-bottom: 10px;">V</div>
+                        <div style="font-size: 0.9em; font-weight: bold;">Primary</div>
+                        <div style="font-size: 0.55em; color: #81c784; margin-top: 5px;">Continued serving during clone</div>
+                    </div>
+                    <!-- PSYNC Arrow -->
+                    <div style="text-align: center;">
+                        <div style="display: flex; align-items: center; gap: 5px;">
+                            <div style="width: 80px; height: 6px; background: linear-gradient(90deg, #4fc3f7, #81d4fa); border-radius: 3px; position: relative; overflow: hidden;">
+                                <div style="position: absolute; width: 15px; height: 100%; background: rgba(255,255,255,0.4); animation: flow 1s linear infinite;"></div>
                             </div>
-                            <div style="font-size: 0.65em; color: #888; margin-top: 5px;">
-                                No serialization • No fork • No COW • Process keeps serving
-                            </div>
+                            <span style="font-size: 1.2em; color: #4fc3f7;">→</span>
                         </div>
+                        <div style="font-size: 0.7em; color: #4fc3f7; margin-top: 5px; font-weight: bold;">PSYNC</div>
+                        <div style="font-size: 0.55em; color: #888;">Only the delta</div>
+                    </div>
+                    <!-- Clone -->
+                    <div style="background: linear-gradient(135deg, #2d4a6f 0%, #1a3a5c 100%); border-radius: 16px; padding: 25px; text-align: center; border: 2px solid #4fc3f7; width: 200px;">
+                        <div style="font-size: 2em; margin-bottom: 10px;">V</div>
+                        <div style="font-size: 0.9em; font-weight: bold;">Clone</div>
+                        <div style="font-size: 0.55em; color: #81d4fa; margin-top: 5px;">Catches up via replication</div>
+                    </div>
+                </div>
+                <!-- Timeline -->
+                <div style="margin-top: 40px; max-width: 700px; margin-left: auto; margin-right: auto;">
+                    <div style="display: flex; align-items: center; gap: 10px;">
+                        <div style="flex: 3; text-align: center;">
+                            <div style="height: 8px; background: linear-gradient(90deg, #4caf50, #81c784); border-radius: 4px;"></div>
+                            <div style="font-size: 0.6em; color: #81c784; margin-top: 5px;">Clone transfer</div>
+                        </div>
+                        <div style="flex: 1; text-align: center;">
+                            <div style="height: 8px; background: linear-gradient(90deg, #4fc3f7, #81d4fa); border-radius: 4px;"></div>
+                            <div style="font-size: 0.6em; color: #81d4fa; margin-top: 5px;">PSYNC</div>
+                        </div>
+                        <div style="font-size: 0.7em; color: #4caf50;">✓</div>
                     </div>
                 </div>
             </section>
