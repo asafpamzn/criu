@@ -431,8 +431,6 @@
                 <div class="problem-box">
                     <h3 style="color: #f44336; margin-top: 0;">Clients Get Blocked</h3>
                     <ul>
-                        <li>P90 value size at fleet: <strong>9.2MB</strong></li>
-                        <li>Serializing + compressing 9.2MB takes <strong>50-150ms</strong></li>
                         <li>Main thread must wait for lock on large objects</li>
                         <li>Direct impact on P99 latency (or P50 with pipeline)</li>
                     </ul>
