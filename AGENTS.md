@@ -81,25 +81,25 @@ address space. It is a separate project because the logic for generating and
 injecting Position-Independent Executable (PIE) code is complex and
 self-contained.
 
-### COW Dump (this fork)
+### CLONE Dump (this fork)
 
-This repository contains an experimental COW (copy-on-write) dump implementation
+This repository contains an experimental CLONE (copy-on-write) dump implementation
 aimed at minimizing source downtime during migration by tracking writes while
 the process continues to run.
 
-- User-facing docs: `COW_DUMP_README.md`
-- Design doc + code pointers: `docs/cow-dump-design.html`
+- User-facing docs: `CLONE_DUMP_README.md`
+- Design doc + code pointers: `docs/clone-dump-design.html`
 - Entry points and key files:
-  - `criu/config.c` parses `--cow-dump`
-  - `criu/cr-dump.c` initializes COW tracking on dump and resumes the process
+  - `criu/config.c` parses `--clone-dump`
+  - `criu/cr-dump.c` initializes CLONE tracking on dump and resumes the process
     early when combined with lazy pages
   - `criu/pie/parasite.c` registers VMAs for userfaultfd write-protect inside
     the target process via parasite RPC
-  - `criu/cow-dump.c` monitors userfaultfd events and snapshots pages on first
+  - `criu/clone-dump.c` monitors userfaultfd events and snapshots pages on first
     write (WP fault)
-  - `criu/mem.c` changes lazy-capable VMA handling for COW mode
-  - `criu/page-xfer.c` integrates COW pages into page-server transfer
-  - `criu/uffd.c` has restore-side changes for bulk transfer in COW mode
+  - `criu/mem.c` changes lazy-capable VMA handling for CLONE mode
+  - `criu/page-xfer.c` integrates CLONE pages into page-server transfer
+  - `criu/uffd.c` has restore-side changes for bulk transfer in CLONE mode
 
 ### Coding Style
 

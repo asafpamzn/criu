@@ -869,7 +869,7 @@ static int parasite_dump_cgroup(struct parasite_dump_cgroup_args *args)
 	return 0;
 }
 
-static int parasite_cow_dump_init(struct parasite_cow_dump_args *args)
+static int parasite_clone_dump_init(struct parasite_clone_dump_args *args)
 {
 	struct parasite_vma_entry *vmas, *vma;
 	struct uffdio_register reg;
@@ -881,10 +881,10 @@ static int parasite_cow_dump_init(struct parasite_cow_dump_args *args)
 	unsigned int *failed_indices;
 
 
-	pr_info("COW dump init: registering %d VMAs\n", args->nr_vmas);
+	pr_info("CLONE dump init: registering %d VMAs\n", args->nr_vmas);
 	
 	args->nr_failed_vmas = 0;
-	failed_indices = cow_dump_failed_indices(args);
+	failed_indices = clone_dump_failed_indices(args);
 
 	/* Create userfaultfd in target process context */
 	uffd = sys_userfaultfd(O_CLOEXEC | O_NONBLOCK);
@@ -927,7 +927,7 @@ static int parasite_cow_dump_init(struct parasite_cow_dump_args *args)
 		return -1;
 	}
 
-	vmas = cow_dump_vmas(args);
+	vmas = clone_dump_vmas(args);
 
 	/* Register each VMA with write-protection */
 	for (i = 0; i < args->nr_vmas; i++) {
@@ -989,7 +989,7 @@ static int parasite_cow_dump_init(struct parasite_cow_dump_args *args)
 			addr, addr + len, len / PAGE_SIZE);
 	}
 
-	pr_info("COW dump init complete: %lu total pages\n", total_pages);
+	pr_info("CLONE dump init complete: %lu total pages\n", total_pages);
 
 	/* Send userfaultfd back to CRIU before setting return status */
 	tsock = parasite_get_rpc_sock();
@@ -1070,8 +1070,8 @@ int parasite_daemon_cmd(int cmd, void *args)
 	case PARASITE_CMD_DUMP_CGROUP:
 		ret = parasite_dump_cgroup(args);
 		break;
-	case PARASITE_CMD_COW_DUMP_INIT:
-		ret = parasite_cow_dump_init(args);
+	case PARASITE_CMD_CLONE_DUMP_INIT:
+		ret = parasite_clone_dump_init(args);
 		break;
 	default:
 		pr_err("Unknown command in parasite daemon thread leader: %d\n", cmd);

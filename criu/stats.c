@@ -140,7 +140,7 @@ static void display_stats(int what, StatsEntry *stats)
 		pr_msg("Displaying restore stats:\n");
 		pr_msg("Pages compared: %" PRIu64 " (0x%" PRIx64 ")\n", stats->restore->pages_compared,
 		       stats->restore->pages_compared);
-		pr_msg("Pages skipped COW: %" PRIu64 " (0x%" PRIx64 ")\n", stats->restore->pages_skipped_cow,
+		pr_msg("Pages skipped CLONE: %" PRIu64 " (0x%" PRIx64 ")\n", stats->restore->pages_skipped_cow,
 		       stats->restore->pages_skipped_cow);
 		if (stats->restore->has_pages_restored)
 			pr_msg("Pages restored: %" PRIu64 " (0x%" PRIx64 ")\n", stats->restore->pages_restored,

@@ -10,7 +10,7 @@
 #include "common/lock.h"
 
 /*
- * Internal uffd structures shared between uffd.c and uffd_cow.c
+ * Internal uffd structures shared between uffd.c and uffd_clone.c
  */
 
 struct lazy_iov {
@@ -62,20 +62,20 @@ struct uffd_eagain_request {
 #define lp_err(lpi, fmt, arg...)    pr_err("%d-%d: " fmt, lpi->pid, lpi->lpfd.fd, ##arg)
 #define lp_perror(lpi, fmt, arg...) pr_perror("%d-%d: " fmt, lpi->pid, lpi->lpfd.fd, ##arg)
 
-/* Helper functions from uffd.c needed by cow-uffd.c */
+/* Helper functions from uffd.c needed by clone-uffd.c */
 extern void lpi_put(struct lazy_pages_info *lpi);
 extern void lazy_pages_summary(struct lazy_pages_info *lpi);
 
 /*
- * COW-specific functions from uffd_cow.c
+ * CLONE-specific functions from uffd_clone.c
  */
 
 /*
- * Handle COW mode exit conditions.
+ * Handle CLONE mode exit conditions.
  * Waits for: all_pages_sent signal, drain thread done, buffer empty.
  * Sends ACK to primary, cleans up lpis.
  * Returns: 1 = exit main loop, 0 = continue
  */
-extern int cow_handle_exit(struct list_head *lpis);
+extern int clone_handle_exit(struct list_head *lpis);
 
 #endif /* __CR_UFFD_INTERNAL_H_ */

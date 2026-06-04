@@ -1,5 +1,5 @@
 <section>
-  <h2>Freeze Time: Standard vs COW Mode</h2>
+  <h2>Freeze Time: Standard vs CLONE Mode</h2>
 
   <div style="display:flex; gap:16px; justify-content:center; margin:16px 0;">
     <!-- Standard column -->
@@ -44,9 +44,9 @@
       </div>
     </div>
 
-    <!-- COW column -->
+    <!-- CLONE column -->
     <div style="flex:1; max-width:520px;">
-      <h4 class="green" style="text-align:center;">COW Dump (200GB Valkey)</h4>
+      <h4 class="green" style="text-align:center;">CLONE Dump (200GB Valkey)</h4>
       <div style="position:relative; background:#1e293b; border:2px solid #4ade80; border-radius:8px; padding:10px; font-size:0.52em;">
         <div style="display:flex; align-items:stretch; height:220px; gap:2px;">
           <!-- Seize -->
@@ -129,7 +129,7 @@
       <strong style="color:#4ade80;">100× improvement</strong><br>
       <div style="color:#86efac; margin-top:4px;">
         Standard: <strong>3-8 seconds</strong><br>
-        COW mode: <strong>51 milliseconds</strong><br><br>
+        CLONE mode: <strong>51 milliseconds</strong><br><br>
         Valkey clients see <strong>zero errors</strong> — the 51ms is within TCP retransmit timeout.
       </div>
     </div>

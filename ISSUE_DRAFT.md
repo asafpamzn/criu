@@ -1,4 +1,4 @@
-# A new way to SAVE: DollySave — up to 35× faster, no COW memory blow-up, OOM-safe
+# A new way to SAVE: DollySave — up to 35× faster, no CLONE memory blow-up, OOM-safe
 
 ## TL;DR
 
@@ -70,7 +70,7 @@ light (1.5K SET/s) and push reads up to a steady **400,000 GET/s**.
 
 Duration is essentially unchanged from Scenario 1 — even though
 we've added a large read load, only the 1,500 SET/s actually dirty
-pages, so `BGSAVE`'s COW cost stays relatively manageable.
+pages, so `BGSAVE`'s CLONE cost stays relatively manageable.
 
 Look at the extra-memory row, though: **`BGSAVE` has already
 jumped from 2.28 GB (Scenario 1) to 24 GB, and we haven't even
@@ -163,7 +163,7 @@ being a liability.
 
 Remember the setup: we're on a **512 GB machine using only 300 GB
 for Valkey data**, which leaves ~200 GB of headroom. Under this
-workload, `BGSAVE`'s COW cost alone **consumed that entire ~200 GB
+workload, `BGSAVE`'s CLONE cost alone **consumed that entire ~200 GB
 of headroom** before the snapshot could finish — at which point the
 host ran out of memory.
 
@@ -250,7 +250,7 @@ total, different shape.
 Even **single-threaded**, with none of the parallel-sender machinery
 engaged, DollySave is **6.5× faster** than `BGSAVE`. The advantage
 isn't coming from threads — it's coming from *not* relying on
-`fork()` + COW.
+`fork()` + CLONE.
 
 ---
 
@@ -308,7 +308,7 @@ Three moves, at a high level:
    the process's memory (via `UFFD_FEATURE_WP_ASYNC`) so we can
    later ask which pages got dirtied. When the process writes to a
    tracked page, the kernel just marks it as dirty — no copies, no
-   userspace fault handler, no COW page duplication. Dirty bits are
+   userspace fault handler, no CLONE page duplication. Dirty bits are
    read back in bulk via `PAGEMAP_SCAN`.
 2. **Stream memory while the process runs.** Parallel workers copy
    memory out, compressed. Pages that get re-dirtied are simply
@@ -341,8 +341,8 @@ change is just the one admin command above.
 
 Full design docs:
 
-- **High-level design:** TODO (link to `COW_DUMP_HIGH_LEVEL_DESIGN.html`)
-- **Detailed design:**   TODO (link to `COW_DUMP_DESIGN.html`)
+- **High-level design:** TODO (link to `CLONE_DUMP_HIGH_LEVEL_DESIGN.html`)
+- **Detailed design:**   TODO (link to `CLONE_DUMP_DESIGN.html`)
 
 ---
 

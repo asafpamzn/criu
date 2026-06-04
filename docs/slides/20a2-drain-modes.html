@@ -35,11 +35,11 @@
         </div>
       </div>
 
-      <h4 class="cyan" style="margin-top:12px;">COW Mode: Neither!</h4>
+      <h4 class="cyan" style="margin-top:12px;">CLONE Mode: Neither!</h4>
       <div class="state-grid" style="grid-template-columns: 1fr;">
         <div class="state-box">
           <span class="title">Skip both drain and pagemap</span>
-          <div class="desc">COW mode doesn't drain pages during freeze at all. It registers VMAs for UFFD-WP tracking and reads pages <strong>after unfreeze</strong> via <code>process_vm_readv()</code> in the bulk transfer phase. Changes tracked by WP faults.</div>
+          <div class="desc">CLONE mode doesn't drain pages during freeze at all. It registers VMAs for UFFD-WP tracking and reads pages <strong>after unfreeze</strong> via <code>process_vm_readv()</code> in the bulk transfer phase. Changes tracked by WP faults.</div>
         </div>
       </div>
     </div>

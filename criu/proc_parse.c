@@ -797,7 +797,7 @@ static void set_maps_derived_flags(struct vma_area *vma_area, const char *file_p
 	 * mmap() flags to restore mappings correctly. For stacks the kernel
 	 * typically exposes "[stack]" (and "[stack:<tid>]") names.
 	 *
-	 * This is intentionally minimal: COW dump uses maps parsing only to
+	 * This is intentionally minimal: CLONE dump uses maps parsing only to
 	 * avoid the /proc/<pid>/smaps page-table walk overhead.
 	 */
 	if (!strncmp(file_path, "[stack", 6))

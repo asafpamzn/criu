@@ -2,7 +2,7 @@
   <h2>maps vs smaps: The Performance Gap</h2>
 
   <pre style="font-size:0.6em;"><code class="language-c">// collect_mappings() in cr-dump.c
-use_maps = opts.cow_dump && opts.lazy_pages;
+use_maps = opts.clone_dump && opts.lazy_pages;
 ret = use_maps ? parse_maps(pid, vma_area_list, dump_file)
                : parse_smaps(pid, vma_area_list, dump_file);</code></pre>
 

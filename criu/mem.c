@@ -11,13 +11,13 @@
 #include "cr_options.h"
 #include "servicefd.h"
 #include "mem.h"
-#include "cow/cow-mem.h"
+#include "clone/clone-mem.h"
 #include "mman.h"
 #include "parasite-syscall.h"
 #include "parasite.h"
 #include "page-pipe.h"
 #include "page-xfer.h"
-#include "cow/cow-dump.h"
+#include "clone/clone-dump.h"
 #include "log.h"
 #include "kerndat.h"
 #include "stats.h"
@@ -160,7 +160,7 @@ int should_dump_page(pmc_t *pmc, VmaEntry *vmae, u64 vaddr, struct page_info *pa
 
 		/*
 		 * Optimisation for private mapping pages, that haven't
-		 * yet being COW-ed
+		 * yet being CLONE-ed
 		 */
 		if (vma_entry_is(vmae, VMA_FILE_PRIVATE) && (pme & PME_FILE)) {
 			page_info->next = vaddr + PAGE_SIZE;
@@ -222,7 +222,7 @@ static bool is_stack(struct pstree_item *item, unsigned long vaddr)
  */
 
 static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct page_pipe *pp, pmc_t *pmc, u64 *pvaddr,
-			 bool has_parent, struct page_xfer *xfer, bool cow_skeleton_non_lazy)
+			 bool has_parent, struct page_xfer *xfer, bool clone_skeleton_non_lazy)
 {
 	unsigned long nr_scanned;
 	unsigned long pages[3] = {};
@@ -230,8 +230,8 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 	bool dump_all_pages;
 	int ret = 0;
 	unsigned long vma_start = *pvaddr;
-	bool cow_tracked = !opts.cow_dump ||
-			   cow_dump_is_vma_tracked(item->pid->real,
+	bool clone_tracked = !opts.clone_dump ||
+			   clone_dump_is_vma_tracked(item->pid->real,
 						   vma->e->start,
 						   vma->e->end);
 
@@ -242,39 +242,39 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 		!(vma->e->flags & MAP_DROPPABLE) &&
 		(vma->e->prot & PROT_READ) &&
 		!is_stack(item, vma_start) &&
-		cow_tracked;
+		clone_tracked;
 
 
 	dump_all_pages = should_dump_entire_vma(vma->e);
 
 	/*
-	 * COW-dump optimization: Skip expensive per-page pagemap scanning.
+	 * CLONE-dump optimization: Skip expensive per-page pagemap scanning.
 	 * Create one iov for entire VMA and detect holes lazily on-demand
 	 * when trying to read pages via process_vm_readv.
 	 * 
-	 * Note: We don't use pipes in COW mode - pages are read directly
+	 * Note: We don't use pipes in CLONE mode - pages are read directly
 	 * via process_vm_readv on-demand, so ppb->pages_in stays 0.
 	 *
 	 * IMPORTANT: VMAs marked with dump_all_pages (VDSO, AIORING) must use
 	 * traditional dump because they're read-only and won't generate write
-	 * faults for COW tracking. Their content must be captured immediately.
+	 * faults for CLONE tracking. Their content must be captured immediately.
 	 */
 
-	if (opts.cow_dump && lazy_capable) {
+	if (opts.clone_dump && lazy_capable) {
 		unsigned long nr_pages = vma_entry_len(vma->e) / PAGE_SIZE;
 
 		/*
-		 * Phase-3 skeleton dump (cow_skeleton_non_lazy): the lazy VMAs
+		 * Phase-3 skeleton dump (clone_skeleton_non_lazy): the lazy VMAs
 		 * have already been streamed by the P3 sender threads, so we
 		 * must not push their pages into the pipe again. Also do not
 		 * re-add to global_lazy_vmas — the list was built at pre-dump.
 		 */
-		if (cow_skeleton_non_lazy) {
+		if (clone_skeleton_non_lazy) {
 			return 0;
 		}
 
 		/*
-		 * COW pre-dump: Add this VMA to the global lazy VMA list.
+		 * CLONE pre-dump: Add this VMA to the global lazy VMA list.
 		 * The dst_id is vpid(item) to match what the REPLICA sends
 		 * in request_all_remote_pages(img_id).
 		 *
@@ -283,7 +283,7 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 		 * dst_id with the pmi/pi pointers, so xfer->dst_id
 		 * contains a raw pointer value — garbage.
 		 */
-		return cow_mem_add_lazy_vma(vma, nr_pages, vpid(item),
+		return clone_mem_add_lazy_vma(vma, nr_pages, vpid(item),
 					    item->pid->real);
 	}
 
@@ -471,11 +471,11 @@ static int detect_pid_reuse(struct pstree_item *item, struct proc_pid_stat *pps,
 static int generate_vma_iovs(struct pstree_item *item, struct vma_area *vma, struct page_pipe *pp,
 			     struct page_xfer *xfer, struct parasite_dump_pages_args *args, struct parasite_ctl *ctl,
 			     pmc_t *pmc, bool has_parent, bool pre_dump, int parent_predump_mode,
-			     bool cow_skeleton_non_lazy)
+			     bool clone_skeleton_non_lazy)
 {
 	u64 vaddr;
 	int ret;
-	bool cow_lazy_opt;
+	bool clone_lazy_opt;
 
 	if (!vma_area_is_private(vma, kdat.task_size) && !vma_area_is(vma, VMA_ANON_SHARED))
 		return 0;
@@ -558,26 +558,26 @@ static int generate_vma_iovs(struct pstree_item *item, struct vma_area *vma, str
 		has_parent = false;
 	}
 
-	cow_lazy_opt = opts.cow_dump &&
+	clone_lazy_opt = opts.clone_dump &&
 		       vma_area_is_private(vma, kdat.task_size) &&
 		       vma_entry_can_be_lazy(vma->e) &&
 		       !vma_area_is(vma, VMA_AREA_GUARD) &&
 		       ((vma->e->prot & (PROT_READ | PROT_WRITE)) ==
 			(PROT_READ | PROT_WRITE)) &&
 		       !is_stack(item, vma->e->start) &&
-		       cow_dump_is_vma_tracked(item->pid->real,
+		       clone_dump_is_vma_tracked(item->pid->real,
 					       vma->e->start,
 					       vma->e->end);
 
 	/*
-	 * COW dump can skip expensive per-page pagemap scanning for VMAs that
+	 * CLONE dump can skip expensive per-page pagemap scanning for VMAs that
 	 * are tracked and lazy-capable. Let generate_iovs() take the fast-path
 	 * without touching pagemap at all (avoids PAGEMAP_SCAN for large VMAs).
 	 */
-	if (cow_lazy_opt) {
+	if (clone_lazy_opt) {
 		vaddr = vma->e->start;
 		return generate_iovs(item, vma, pp, pmc, &vaddr, has_parent,
-				     xfer, cow_skeleton_non_lazy);
+				     xfer, clone_skeleton_non_lazy);
 	}
 
 	if (pmc_get_map(pmc, vma))
@@ -588,7 +588,7 @@ static int generate_vma_iovs(struct pstree_item *item, struct vma_area *vma, str
 	vaddr = vma->e->start;
 again:
 	ret = generate_iovs(item, vma, pp, pmc, &vaddr, has_parent, xfer,
-			    cow_skeleton_non_lazy);
+			    clone_skeleton_non_lazy);
 	if (ret == -EAGAIN) {
 		BUG_ON(!(pp->flags & PP_CHUNK_MODE));
 
@@ -645,12 +645,12 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 		cpp_flags |= PP_CHUNK_MODE;
 	
 	nr_segs = vma_area_list->nr_priv_pages;
-	if (opts.cow_dump && mdc->lazy) {
+	if (opts.clone_dump && mdc->lazy) {
 		unsigned long pages = 0;
 
 		list_for_each_entry(vma_area, &vma_area_list->h, list) {
 			unsigned long vma_pages;
-			bool cow_tracked;
+			bool clone_tracked;
 			bool lazy_capable;
 
 			if (vma_area_is(vma_area, VMA_AREA_GUARD))
@@ -667,7 +667,7 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 
 			vma_pages = vma_area_len(vma_area) / PAGE_SIZE;
 
-			cow_tracked = cow_dump_is_vma_tracked(item->pid->real,
+			clone_tracked = clone_dump_is_vma_tracked(item->pid->real,
 							      vma_area->e->start,
 							      vma_area->e->end);
 			lazy_capable = vma_entry_can_be_lazy(vma_area->e) &&
@@ -676,7 +676,7 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 				       !(vma_area->e->flags & MAP_DROPPABLE) &&
 				       (vma_area->e->prot & PROT_READ) &&
 				       !is_stack(item, vma_area->e->start) &&
-				       cow_tracked;
+				       clone_tracked;
 
 			if (lazy_capable)
 				continue;
@@ -699,19 +699,19 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 		goto out;
 
 	/*
-	 * COW pre-dump (cow_lazy_build_only): do not open any xfer.
+	 * CLONE pre-dump (clone_lazy_build_only): do not open any xfer.
 	 * The VMA walk below still runs generate_vma_iovs so lazy VMAs get
-	 * registered in global_lazy_vmas (via generate_iovs -> cow_mem_add_lazy_vma).
+	 * registered in global_lazy_vmas (via generate_iovs -> clone_mem_add_lazy_vma).
 	 * Non-lazy VMAs that push iovs into the page pipe are discarded at
 	 * out_pp — we skip drain_pages and xfer_pages below so no pages are
 	 * read from the target process and nothing is written to disk.
 	 * All on-disk images for non-lazy VMAs are produced in Phase-3
 	 * skeleton (while frozen).
 	 */
-	if (mdc->cow_lazy_build_only) {
+	if (mdc->clone_lazy_build_only) {
 		/*
 		 * Create an empty pagemap image so the replica's
-		 * discover_tasks_from_pagemaps() (cow-lazy-pages.c) can find
+		 * discover_tasks_from_pagemaps() (clone-lazy-pages.c) can find
 		 * this task at Phase-2 startup. No page entries are written
 		 * here — Phase-3 skeleton reopens with O_DUMP|O_TRUNC and
 		 * fills in the real content.
@@ -761,7 +761,7 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 			continue;
 
 		ret = generate_vma_iovs(item, vma_area, pp, &xfer, args, ctl, &pmc, has_parent, mdc->pre_dump,
-					parent_predump_mode, mdc->cow_skeleton_non_lazy);
+					parent_predump_mode, mdc->clone_skeleton_non_lazy);
 		if (ret < 0)
 			goto out_xfer;
 	}
@@ -769,12 +769,12 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 		memcpy(pargs_iovs(args), pp->iovs, sizeof(struct iovec) * pp->free_iov);
 
 	/*
-	 * COW pre-dump (cow_lazy_build_only): bail out early. global_lazy_vmas
+	 * CLONE pre-dump (clone_lazy_build_only): bail out early. global_lazy_vmas
 	 * has been populated by generate_iovs for lazy VMAs. Non-lazy VMAs
 	 * pushed iovs into pp but we discard them — their pages will be
 	 * dumped in Phase-3 skeleton while frozen.
 	 */
-	if (mdc->cow_lazy_build_only) {
+	if (mdc->clone_lazy_build_only) {
 		exit_code = 0;
 		ret = 0;
 		goto out_pp;
@@ -977,13 +977,13 @@ int prepare_mm_pid(struct pstree_item *i)
 	return ret;
 }
 
-static inline bool check_cow_vmas(struct vma_area *vma, struct vma_area *pvma)
+static inline bool check_clone_vmas(struct vma_area *vma, struct vma_area *pvma)
 {
 	/*
-	 * VMAs that _may_[1] have COW-ed pages should ...
+	 * VMAs that _may_[1] have CLONE-ed pages should ...
 	 *
 	 * [1] I say "may" because whether or not particular pages are
-	 * COW-ed is determined later in restore_priv_vma_content() by
+	 * CLONE-ed is determined later in restore_priv_vma_content() by
 	 * memcmp'aring the contents.
 	 */
 
@@ -1005,16 +1005,16 @@ static inline bool check_cow_vmas(struct vma_area *vma, struct vma_area *pvma)
 	if (!(vma->e->flags & MAP_ANONYMOUS) && vma->e->shmid != pvma->e->shmid)
 		return false;
 
-	pr_debug("Found two COW VMAs @0x%" PRIx64 "-0x%" PRIx64 "\n", vma->e->start, pvma->e->end);
+	pr_debug("Found two CLONE VMAs @0x%" PRIx64 "-0x%" PRIx64 "\n", vma->e->start, pvma->e->end);
 	return true;
 }
 
 static inline bool vma_inherited(struct vma_area *vma)
 {
-	return (vma->pvma != NULL && vma->pvma != VMA_COW_ROOT);
+	return (vma->pvma != NULL && vma->pvma != VMA_CLONE_ROOT);
 }
 
-static void prepare_cow_vmas_for(struct vm_area_list *vmas, struct vm_area_list *pvmas)
+static void prepare_clone_vmas_for(struct vm_area_list *vmas, struct vm_area_list *pvmas)
 {
 	struct vma_area *vma, *pvma;
 
@@ -1022,10 +1022,10 @@ static void prepare_cow_vmas_for(struct vm_area_list *vmas, struct vm_area_list 
 	pvma = list_first_entry(&pvmas->h, struct vma_area, list);
 
 	while (1) {
-		if ((vma->e->start == pvma->e->start) && check_cow_vmas(vma, pvma)) {
+		if ((vma->e->start == pvma->e->start) && check_clone_vmas(vma, pvma)) {
 			vma->pvma = pvma;
 			if (pvma->pvma == NULL)
-				pvma->pvma = VMA_COW_ROOT;
+				pvma->pvma = VMA_CLONE_ROOT;
 		}
 
 		/* <= here to shift from matching VMAs and ... */
@@ -1044,7 +1044,7 @@ static void prepare_cow_vmas_for(struct vm_area_list *vmas, struct vm_area_list 
 	}
 }
 
-void prepare_cow_vmas(void)
+void prepare_clone_vmas(void)
 {
 	struct pstree_item *pi;
 
@@ -1068,12 +1068,12 @@ void prepare_cow_vmas(void)
 		if (rsti(pi)->mm->exe_file_id != rsti(ppi)->mm->exe_file_id)
 			/*
 			 * Tasks running different executables have
-			 * close to zero chance of having cow-ed areas
+			 * close to zero chance of having clone-ed areas
 			 * and actually kernel never creates such.
 			 */
 			continue;
 
-		prepare_cow_vmas_for(vmas, pvmas);
+		prepare_clone_vmas_for(vmas, pvmas);
 	}
 }
 
@@ -1123,7 +1123,7 @@ static int premap_private_vma(struct pstree_item *t, struct vma_area *vma, void 
 		 * All mappings here get PROT_WRITE regardless of whether we
 		 * put any data into it or not, because this area will get
 		 * mremap()-ed (branch below) so we MIGHT need to have WRITE
-		 * bits there. Ideally we'd check for the whole COW-chain
+		 * bits there. Ideally we'd check for the whole CLONE-chain
 		 * having any data in.
 		 */
 		addr = mmap(*tgt_addr, size, vma->e->prot | PROT_WRITE, vma->e->flags | MAP_FIXED | flag, vma->e->fd,
@@ -1378,7 +1378,7 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 			}
 
 			/*
-			 * Otherwise to the COW restore
+			 * Otherwise to the CLONE restore
 			 */
 
 			off = (va - vma->e->start) / PAGE_SIZE;
@@ -1590,7 +1590,7 @@ bool vma_has_guard_gap_hidden(struct vma_area *vma)
 
 /*
  * A guard page must be unmapped after restoring content and
- * forking children to restore COW memory.
+ * forking children to restore CLONE memory.
  */
 int unmap_guard_pages(struct pstree_item *t)
 {

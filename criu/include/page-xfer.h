@@ -10,7 +10,7 @@ struct ps_info {
 
 /*
  * Wire protocol constants and structures.
- * Shared by page-xfer.c, cow-page-xfer.c, and cow-bulk-send.c.
+ * Shared by page-xfer.c, clone-page-xfer.c, and clone-bulk-send.c.
  */
 #define PS_IOV_ADD    1
 #define PS_IOV_HOLE   2
@@ -129,10 +129,10 @@ extern int request_all_remote_pages(unsigned long img_id);
 typedef int (*ps_async_read_complete)(unsigned long img_id, unsigned long vaddr, unsigned long nr_pages, void *);
 extern int page_server_start_read(void *buf, unsigned long nr_pages, ps_async_read_complete complete, void *priv, unsigned flags);
 
-/* COW phased migration: signal replica all pages sent, can zero-fill rest */
+/* CLONE phased migration: signal replica all pages sent, can zero-fill rest */
 extern int send_all_pages_sent_signal(int sk);
 
-/* COW phased migration: replica ACK for all_pages_sent, primary can close */
+/* CLONE phased migration: replica ACK for all_pages_sent, primary can close */
 extern int send_all_pages_sent_ack(void);
 
 /* P3 parallel transfer: REPLICA creates connections and receiver threads */

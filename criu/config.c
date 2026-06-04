@@ -706,13 +706,13 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		BOOL_OPT("unprivileged", &opts.unprivileged),
 		BOOL_OPT("ghost-fiemap", &opts.ghost_fiemap),
 		BOOL_OPT(OPT_ALLOW_UPROBES, &opts.allow_uprobes),
-		{ "cow-dump", no_argument, 0, 1105 },
-		{ "cow-p3-threads", required_argument, 0, 1106 },
-		{ "cow-p3-threads-bulk", required_argument, 0, 1107 },
-		{ "cow-scanners", required_argument, 0, 1108 },
-		{ "cow-pre-scanners", required_argument, 0, 1109 },
-		{ "cow-drain-threads", required_argument, 0, 1110 },
-		{ "cow-pre-scan", no_argument, 0, 1111 },
+		{ "clone-dump", no_argument, 0, 1105 },
+		{ "clone-p3-threads", required_argument, 0, 1106 },
+		{ "clone-p3-threads-bulk", required_argument, 0, 1107 },
+		{ "clone-scanners", required_argument, 0, 1108 },
+		{ "clone-pre-scanners", required_argument, 0, 1109 },
+		{ "clone-drain-threads", required_argument, 0, 1110 },
+		{ "clone-pre-scan", no_argument, 0, 1111 },
 		{},
 	};
 
@@ -1054,25 +1054,25 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 			}
 			break;
 		case 1105:
-			opts.cow_dump = true;
+			opts.clone_dump = true;
 			break;
 		case 1106:
-			opts.cow_num_p3_threads = atoi(optarg);
+			opts.clone_num_p3_threads = atoi(optarg);
 			break;
 		case 1107:
-			opts.cow_num_p3_threads_bulk = atoi(optarg);
+			opts.clone_num_p3_threads_bulk = atoi(optarg);
 			break;
 		case 1108:
-			opts.cow_num_scanners = atoi(optarg);
+			opts.clone_num_scanners = atoi(optarg);
 			break;
 		case 1109:
-			opts.cow_num_pre_scanners = atoi(optarg);
+			opts.clone_num_pre_scanners = atoi(optarg);
 			break;
 		case 1110:
-			opts.cow_num_drain_threads = atoi(optarg);
+			opts.clone_num_drain_threads = atoi(optarg);
 			break;
 		case 1111:
-			opts.cow_pre_scan = true;
+			opts.clone_pre_scan = true;
 			break;
 		case 'V':
 			pr_msg("Version: %s\n", CRIU_VERSION);

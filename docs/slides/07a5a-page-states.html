@@ -11,7 +11,7 @@
         </div>
         <div class="state-box" style="border-left: 3px solid #f87171;">
           <span class="title">Anonymous</span>
-          <div class="desc">Pages with <strong>NO file backing</strong> — they exist only in RAM (and swap). Created by: heap (<code>brk</code>/<code>mmap(MAP_ANONYMOUS)</code>), stack, COW'd pages after <code>fork()</code>. <strong>All anonymous pages must be dumped by CRIU</strong> — there's no file to re-read them from.</div>
+          <div class="desc">Pages with <strong>NO file backing</strong> — they exist only in RAM (and swap). Created by: heap (<code>brk</code>/<code>mmap(MAP_ANONYMOUS)</code>), stack, CLONE'd pages after <code>fork()</code>. <strong>All anonymous pages must be dumped by CRIU</strong> — there's no file to re-read them from.</div>
         </div>
         <div class="state-box" style="border-left: 3px solid #a78bfa;">
           <span class="title">LazyFree</span>

@@ -191,19 +191,19 @@ TST_NOFILE	:=				\
 		socket-ext			\
 		unhashed_proc			\
 		cow00				\
-		cow_dump_basic			\
-		cow_dump_mmap_munmap		\
-		cow_dump_write_storm		\
-		cow_dump_large_memory		\
-		cow_dump_multi_thread		\
-		cow_dump_file_backed		\
-		cow_dump_new_vma		\
-		cow_dump_grow			\
-		cow_dump_munmap_half		\
-		cow_dump_munmap_reuse		\
-		cow_dump_munmap_reuse_unwritten	\
-		cow_dump_mremap			\
-		cow_dump_wp_unpopulated		\
+		clone_dump_basic			\
+		clone_dump_mmap_munmap		\
+		clone_dump_write_storm		\
+		clone_dump_large_memory		\
+		clone_dump_multi_thread		\
+		clone_dump_file_backed		\
+		clone_dump_new_vma		\
+		clone_dump_grow			\
+		clone_dump_munmap_half		\
+		clone_dump_munmap_reuse		\
+		clone_dump_munmap_reuse_unwritten	\
+		clone_dump_mremap			\
+		clone_dump_wp_unpopulated		\
 		child_opened_proc		\
 		posix_timers			\
 		sigpending			\
@@ -622,18 +622,18 @@ socket_aio:		LDLIBS += -lrt -pthread
 uptime_grow:		LDLIBS += -lrt -pthread
 unlink_largefile:	CFLAGS += -D_FILE_OFFSET_BITS=64 -D_LARGEFILE64_SOURCE
 inotify_system_nodel:	CFLAGS += -DNO_DEL
-cow_dump_mmap_munmap:	LDLIBS += -pthread
-cow_dump_write_storm:	LDLIBS += -pthread
-cow_dump_large_memory:	LDLIBS += -pthread
-cow_dump_multi_thread:	LDLIBS += -pthread
-cow_dump_file_backed:	LDLIBS += -pthread
-cow_dump_new_vma:	LDLIBS += -pthread
-cow_dump_grow:		LDLIBS += -pthread
-cow_dump_munmap_half:	LDLIBS += -pthread
-cow_dump_munmap_reuse:	LDLIBS += -pthread
-cow_dump_munmap_reuse_unwritten:	LDLIBS += -pthread
-cow_dump_mremap:	LDLIBS += -pthread
-cow_dump_wp_unpopulated:	LDLIBS += -pthread
+clone_dump_mmap_munmap:	LDLIBS += -pthread
+clone_dump_write_storm:	LDLIBS += -pthread
+clone_dump_large_memory:	LDLIBS += -pthread
+clone_dump_multi_thread:	LDLIBS += -pthread
+clone_dump_file_backed:	LDLIBS += -pthread
+clone_dump_new_vma:	LDLIBS += -pthread
+clone_dump_grow:		LDLIBS += -pthread
+clone_dump_munmap_half:	LDLIBS += -pthread
+clone_dump_munmap_reuse:	LDLIBS += -pthread
+clone_dump_munmap_reuse_unwritten:	LDLIBS += -pthread
+clone_dump_mremap:	LDLIBS += -pthread
+clone_dump_wp_unpopulated:	LDLIBS += -pthread
 pthread00:		LDLIBS += -pthread
 pthread00-pac:		CFLAGS += ${PAC_CFLAGS}
 pthread00-pac:		LDLIBS += -pthread

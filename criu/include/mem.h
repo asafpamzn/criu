@@ -8,7 +8,7 @@
 #include "proc_parse.h"
 #include "inventory.pb-c.h"
 #include "pagemap-cache.h"
-#include "cow/cow-mem.h"
+#include "clone/clone-mem.h"
 
 struct parasite_ctl;
 struct vm_area_list;
@@ -19,18 +19,18 @@ struct mem_dump_ctl {
 	bool pre_dump;
 	bool lazy;
 	/*
-	 * COW pre-dump: populate global_lazy_vmas only. No page pipe,
-	 * no xfer, no pagemap/pages file is written. Disk writes for COW
+	 * CLONE pre-dump: populate global_lazy_vmas only. No page pipe,
+	 * no xfer, no pagemap/pages file is written. Disk writes for CLONE
 	 * mode happen only in Phase-3 skeleton dump (while frozen).
 	 */
-	bool cow_lazy_build_only;
+	bool clone_lazy_build_only;
 	/*
-	 * COW Phase-3 skeleton dump: write non-lazy VMAs only. Lazy VMAs
+	 * CLONE Phase-3 skeleton dump: write non-lazy VMAs only. Lazy VMAs
 	 * have already streamed via the P3 sender threads, so generate_iovs
 	 * short-circuits them without pushing into the page pipe and
 	 * without re-adding them to global_lazy_vmas.
 	 */
-	bool cow_skeleton_non_lazy;
+	bool clone_skeleton_non_lazy;
 	struct proc_pid_stat *stat;
 	InventoryEntry *parent_ie;
 };
@@ -39,7 +39,7 @@ extern bool vma_has_guard_gap_hidden(struct vma_area *vma);
 extern bool page_is_zero(u64 pme);
 extern bool page_in_parent(bool dirty);
 extern int prepare_mm_pid(struct pstree_item *i);
-extern void prepare_cow_vmas(void);
+extern void prepare_clone_vmas(void);
 extern int do_task_reset_dirty_track(int pid);
 extern unsigned long dump_pages_args_size(struct vm_area_list *vmas);
 extern int parasite_dump_pages_seized(struct pstree_item *item, struct vm_area_list *vma_area_list,

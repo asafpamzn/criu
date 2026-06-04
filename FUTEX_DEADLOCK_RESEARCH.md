@@ -17,7 +17,7 @@ a page server streams the data to a replica over TCP.
 By **Feb 7**, FAST_CUTOVER mode is born — restore the process stopped,
 transfer ALL pages while it's frozen, then SIGCONT.  No demand paging.
 The process wakes up with all its memory in place.  **15 commits in a
-single day.**  By evening: *"cow: harden close ack path and stabilize
+single day.**  By evening: *"clone: harden close ack path and stabilize
 40GB migration runs."*
 
 Forty gigabytes.  It works.
@@ -133,7 +133,7 @@ actively contending for a mutex whose internal state is corrupted.
 
 At 2am, I bring in reinforcements.  Codex 5.3 (gpt-5.3-codex, high
 effort) ranks five theories.  #1: "Dump-point is not allocator-
-quiescent."  #2: "Lazy-pages/COW page divergence."  Recommended
+quiescent."  #2: "Lazy-pages/CLONE page divergence."  Recommended
 diagnostic: symbolize the PCs, compare the mutex word across the
 dump boundary.
 
@@ -188,7 +188,7 @@ kill-9 that didn't propagate.)
 
 ### Test: Non-lazy eager restore
 
-Plain `criu restore` without `--lazy-pages`, without `--cow-dump`.
+Plain `criu restore` without `--lazy-pages`, without `--clone-dump`.
 All pages loaded from a local image file before the process starts.
 
 ```
@@ -275,7 +275,7 @@ standalone `tools/page-recv` binary (~300 lines of C) that:
 4. Installs via `process_vm_writev` into the stopped process
 
 Also replaced `compel_unmap` (ptrace thread hijack) with
-`process_madvise(MADV_DONTNEED)` for bootstrap cleanup in COW
+`process_madvise(MADV_DONTNEED)` for bootstrap cleanup in CLONE
 mode — no register corruption, releases physical pages.
 
 ### 1.5GB: PONG
@@ -382,12 +382,12 @@ than what the eager dump captured.
 ### Root Cause: Page Divergence
 
 The eager dump freezes the process and snapshots ALL pages at once
-(consistent point-in-time).  The COW dump freezes briefly (~35ms),
+(consistent point-in-time).  The CLONE dump freezes briefly (~35ms),
 captures metadata, then reads pages over ~90 seconds while the
 source process continues running.  `process_vm_readv` on the source
 reads live memory that the process is actively modifying.
 
-The COW write-protect mechanism (WP_ASYNC + PAGEMAP_SCAN) should
+The CLONE write-protect mechanism (WP_ASYNC + PAGEMAP_SCAN) should
 catch writes, but:
 1. Pages written between freeze-end and WP-register aren't tracked
 2. Kernel-side writes (futex wake, signal delivery) bypass WP
@@ -417,7 +417,7 @@ background thread).
 | Page install timing | DISPROVEN | Before detach = same deadlock as after |
 | Cache coherency (icache) | DISPROVEN | Futex addrs are in heap, not text |
 | X0 register stale | Separate issue | Not the deadlock cause |
-| **COW page divergence** | **ROOT CAUSE** | Binary diff: 1-13 bytes differ between eager and COW-transferred pages |
+| **CLONE page divergence** | **ROOT CAUSE** | Binary diff: 1-13 bytes differ between eager and CLONE-transferred pages |
 
 ---
 
@@ -451,8 +451,8 @@ page-recv: 30979268 pages (121012.8 MB) in 85.654s (1412.8 MB/s)
   stream 3: 0 pages
 
 Source freeze: 402μs (freezing) + 86ms (frozen)
-COW converge iter 0: 21 dirty pages re-sent
-COW converge final-freeze: 11 dirty pages
+CLONE converge iter 0: 21 dirty pages re-sent
+CLONE converge final-freeze: 11 dirty pages
 Migration completed successfully!
   Duration: 108s
   Replica Memory: 118.04G
@@ -495,12 +495,12 @@ stream 2: 65.0M pages (269 GB)
 stream 3: 59.4M pages (246 GB)
 page-recv: 268M pages (1050 GB) in 641s (1638 MB/s)
 
-COW converge iter 0: 14.3M dirty pages
-COW converge iter 1: 15.6M dirty (stall 1/3)
-COW converge iter 2: 16.0M dirty (stall 2/3)
-COW converge iter 3: 15.8M dirty
-COW converge iter 4: 16.0M dirty (stall 3/3 → freeze)
-COW converge final-freeze: 307K dirty pages across 4 streams
+CLONE converge iter 0: 14.3M dirty pages
+CLONE converge iter 1: 15.6M dirty (stall 1/3)
+CLONE converge iter 2: 16.0M dirty (stall 2/3)
+CLONE converge iter 3: 15.8M dirty
+CLONE converge iter 4: 16.0M dirty (stall 3/3 → freeze)
+CLONE converge final-freeze: 307K dirty pages across 4 streams
 ```
 
 The convergence architecture works.  The final-freeze catches 307K
@@ -524,7 +524,7 @@ confirmed PONG.  Regression-clean.
 
 Eager dump (all pages to disk) WITH benchmark running at 53K ops/s.
 Eager restore on replica — restorer blob loads all pages internally.
-No COW, no page-recv, no convergence.  Pure consistent snapshot.
+No CLONE, no page-recv, no convergence.  Pure consistent snapshot.
 
 ### Result: EAGER ALSO DEADLOCKS
 
@@ -556,7 +556,7 @@ linked library that bypasses jemalloc.
 ### What This Means
 
 The deadlock was NEVER about:
-- COW page divergence (benign byte diffs, not locks)
+- CLONE page divergence (benign byte diffs, not locks)
 - Convergence page drops (important for consistency, but not
   the deadlock cause)
 - UFFDIO_COPY vs process_vm_writev
@@ -586,7 +586,7 @@ allocator state.  Sequence:
 
 1. `CLIENT PAUSE ALL` — stops all client command processing
 2. Wait for in-flight commands to complete (~10ms)
-3. Dump (COW mode, ~35ms freeze)
+3. Dump (CLONE mode, ~35ms freeze)
 4. Source resumes, CLIENT PAUSE expires
 5. Benchmark reconnects/retries, traffic resumes
 6. Convergence handles the pages dirtied after resume
@@ -730,13 +730,13 @@ corrupts glibc's.
 
 **What works (proven at 118GB on aarch64):**
 - 118GB quiesced migration: **PONG** (stable, production-ready)
-- COW dump: 381μs + 84ms source freeze
+- CLONE dump: 381μs + 84ms source freeze
 - Multi-stream bulk: 4 TCP, 1.4 GB/s, LZ4
 - Parallel convergence: 14.6M → 1.0M dirty in 16 rounds
 - Stall detection + dynamic freeze trigger
 - All-threads idle poll at dump and convergence freeze
 - CLIENT PAUSE ALL quiesce before dump
-- COW_PRE_FREEZE_CMD hook for convergence freeze
+- CLONE_PRE_FREEZE_CMD hook for convergence freeze
 - libc rw- exclusion from all send paths
 - Allocator metadata re-read from frozen source
 - process_madvise bootstrap cleanup
@@ -841,9 +841,9 @@ the source but couldn't be installed on the replica.
 The CRIU log reveals the smoking gun:
 
 ```
-COW converge: re-reading 33129951 allocator metadata pages
+CLONE converge: re-reading 33129951 allocator metadata pages
   from frozen source (20 regions, 129413.9 MB)
-COW converge: sent 33129951 allocator pages
+CLONE converge: sent 33129951 allocator pages
 ```
 
 The allocator re-read (page-xfer.c:3316-3389) reads
@@ -1061,7 +1061,7 @@ Layer 2 (OPEN):  glibc heap temporal inconsistency → corrupted
    from convergence, send only during final freeze.
 
 5. **Force all convergence pages to come from a single snapshot**:
-   Fork the source briefly, read from the fork (COW copy) for a
+   Fork the source briefly, read from the fork (CLONE copy) for a
    consistent point-in-time snapshot.  ~50ms pause per convergence
    round.  But fork of 60 GB = bgsave overhead.
 
@@ -1157,7 +1157,7 @@ Layer 1: VMA mirroring (Act XVII)
   → zero EFAULT errors
 
 Layer 2: Skip convergence + fork snapshot (Act XVIII)
-  → read ALL dirty pages from one consistent COW snapshot
+  → read ALL dirty pages from one consistent CLONE snapshot
   → no cross-round temporal inconsistency
 
 Layer 3: Arena reset (Act XIX)
@@ -1191,7 +1191,7 @@ constraint: both windows combined under 100ms.
 
 First discovery: `UFFDIO_REGISTER` fails with `EBUSY` in WP_ASYNC
 mode for **every VMA**, including the 100GB heap.  But
-`cow_dump_is_vma_tracked()` gates on registration success.
+`clone_dump_is_vma_tracked()` gates on registration success.
 Result: the entire 100GB is pagemap-scanned page-by-page in the
 traditional `generate_vma_iovs` path.  `generate_vma_iovs` loop:
 **1.26 seconds**.  `dump_one_task`: **3.01 seconds**.
@@ -1211,7 +1211,7 @@ walking page tables starve the main dump thread.  Inner
 `parasite_dump_pages_seized` takes 5ms of CPU time but 78ms of
 wall time.
 
-Fix: increase `COW_WP_CHUNK_SIZE` from 64MB to 512MB.  Reduces
+Fix: increase `CLONE_WP_CHUNK_SIZE` from 64MB to 512MB.  Reduces
 ioctls from 1608 to 196.  Less kernel entry/exit overhead, less
 contention.  WP: 101ms to **72ms**.  `dump_one_task`: 112ms to
 **81ms**.
@@ -1247,7 +1247,7 @@ during the frozen window.  Copy to FSx after early resume.
 
 Standard CRIU writes pstree, mount info, file locks, namespace
 images after `dump_one_task` — all within the frozen window.
-In COW mode, this data is already collected.  Move
+In CLONE mode, this data is already collected.  Move
 `pstree_switch_state(TASK_ALIVE)` to right after `dump_one_task`,
 before image writing.
 
@@ -1257,7 +1257,7 @@ The sub-100ms milestone felt close.  Then the real hunt began.
 
 **compel_stop_daemon: 16ms → 0.06ms.**  The parasite teardown
 single-steps through the code blob to reach `rt_sigreturn` —
-14ms of ptrace round-trips.  In COW mode we detach anyway, so
+14ms of ptrace round-trips.  In CLONE mode we detach anyway, so
 `compel_stop_daemon_fast()` sends `PARASITE_CMD_FINI`, closes
 the socket, and stops.  No single-stepping.  275x faster.
 
@@ -1296,7 +1296,7 @@ frozen_time:          ~76ms
     dump_pages:          5ms  (overlapped with WP)
     compel_stop:         0.06ms
     dump_threads:        0.4ms (regs only, images deferred)
-    cow_dump_init:       4ms
+    clone_dump_init:       4ms
 cutover:                 1ms
 ────────────────────────
 TOTAL UNRESPONSIVE:     ~77ms
@@ -1323,7 +1323,7 @@ both 10GB and 100GB.
 The remaining 77ms: 21ms is pre-dump `/proc` and AppArmor I/O
 (can't skip without breaking the dump).  48ms is kernel
 `UFFDIO_WRITEPROTECT` page-table walk (hardware speed of
-walking 100GB of PTEs across 31 cores).  8ms is COW init +
+walking 100GB of PTEs across 31 cores).  8ms is CLONE init +
 parasite overhead.  There's no fat left.
 
 ---

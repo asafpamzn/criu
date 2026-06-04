@@ -34,21 +34,21 @@
 #include "stats.h"
 #include "tls.h"
 #include "uffd.h"
-#include "cow/cow-uffd.h"
-#include "cow/cow-dump.h"
-#include "cow/page-pool.h"
+#include "clone/clone-uffd.h"
+#include "clone/clone-dump.h"
+#include "clone/page-pool.h"
 #include "criu-plugin.h"
 #include "plugin.h"
 #include "dump.h"
 #include "mem.h"
 #include "atomic-bitmap.h"
-#include "cow/cow-bitmap.h"
-#include "cow/cow-bulk-send.h"
-#include "cow/spsc-queue.h"
+#include "clone/clone-bitmap.h"
+#include "clone/clone-bulk-send.h"
+#include "clone/spsc-queue.h"
 #include "xmalloc.h"
-#include "cow/cow-page-xfer.h"
-#include "cow/cow-unified-thread.h"
-#include "cow/cow-bulk-recv.h"
+#include "clone/clone-page-xfer.h"
+#include "clone/clone-unified-thread.h"
+#include "clone/clone-bulk-recv.h"
 
 static int page_server_sk = -1;
 
@@ -58,14 +58,14 @@ int get_page_server_sk(void)
 	return page_server_sk;
 }
 
-/* Wrapper for cow_wait_for_page_server_thread (called from cr-dump.c, cow-dump.c) */
+/* Wrapper for clone_wait_for_page_server_thread (called from cr-dump.c, clone-dump.c) */
 void wait_for_page_server_thread(void)
 {
-	cow_wait_for_page_server_thread();
+	clone_wait_for_page_server_thread();
 }
 
 
-/* Compression statistics are in cow-page-xfer.c */
+/* Compression statistics are in clone-page-xfer.c */
 
 /* struct page_server_iov is now in page-xfer.h */
 
@@ -76,7 +76,7 @@ static void psi2iovec(struct page_server_iov *ps, struct iovec *iov)
 }
 
 /* PS_IOV_* protocol commands (1-7), PS_IOV_CLOSE, PS_IOV_FORCE_CLOSE are now in page-xfer.h */
-/* COW-specific PS_IOV_* defines (8-17) are in cow-page-xfer.h */
+/* CLONE-specific PS_IOV_* defines (8-17) are in clone-page-xfer.h */
 /* PS_CMD_BITS, PS_CMD_MASK, encode_ps_cmd, decode_ps_cmd are now in page-xfer.h */
 
 #define PS_TYPE_BITS 8
@@ -163,8 +163,8 @@ static inline int __recv(int sk, void *buf, size_t sz, int fl)
  * delivered, the peer closes, or a real error occurs. Short writes
  * happen on blocking TCP sockets under socket-buffer pressure; the
  * old single-shot code treated them as fatal and callers would
- * BUG_ON on the short return (see cow-bulk-send.c:1680 /
- * cow-page-xfer.c:56). Retry EINTR too — it's recoverable.
+ * BUG_ON on the short return (see clone-bulk-send.c:1680 /
+ * clone-page-xfer.c:56). Retry EINTR too — it's recoverable.
  *
  * MSG_DONTWAIT callers have their own retry policy; don't break them.
  *
@@ -194,7 +194,7 @@ static int __send_all(int sk, const void *buf, size_t sz, int fl)
 	return sz;
 }
 
-/* Exported wrappers for cow-page-xfer.c and cow-bulk-send.c */
+/* Exported wrappers for clone-page-xfer.c and clone-bulk-send.c */
 int page_server_send(int sk, const void *buf, size_t sz, int fl)
 {
 	return __send_all(sk, buf, sz, fl);
@@ -267,7 +267,7 @@ u64 encode_pm_id(int type, unsigned long id)
 }
 
 /*
- * P3 parallel receiver code is now in cow-p3-receiver.c
+ * P3 parallel receiver code is now in clone-p3-receiver.c
  */
 
 static inline int send_psi_flags(int sk, struct page_server_iov *pi, int flags)
@@ -279,7 +279,7 @@ static inline int send_psi_flags(int sk, struct page_server_iov *pi, int flags)
 	return 0;
 }
 
-/* Non-static so cow-page-xfer.c can use it */
+/* Non-static so clone-page-xfer.c can use it */
 int send_psi(int sk, struct page_server_iov *pi)
 {
 	return send_psi_flags(sk, pi, 0);
@@ -299,7 +299,7 @@ static void tcp_nodelay(int sk, bool on)
 		pr_pwarn("Unable to set TCP_NODELAY=%d", val);
 }
 
-/* Exported wrapper for cow-bulk-recv.c */
+/* Exported wrapper for clone-bulk-recv.c */
 void page_server_tcp_nodelay(int sk, bool on)
 {
 	tcp_nodelay(sk, on);
@@ -593,9 +593,9 @@ int open_page_xfer(struct page_xfer *xfer, int fd_type, unsigned long img_id)
 	xfer->offset = 0;
 	xfer->transfer_lazy = true;
 
-	pr_debug("VMA_TRACE: phase=OPEN_PAGE_XFER fd_type=%d img_id=%lu use_page_server=%d cow_dump=%d\n",
+	pr_debug("VMA_TRACE: phase=OPEN_PAGE_XFER fd_type=%d img_id=%lu use_page_server=%d clone_dump=%d\n",
 	       fd_type, img_id, opts.use_page_server ? 1 : 0,
-	       opts.cow_dump ? 1 : 0);
+	       opts.clone_dump ? 1 : 0);
 
 	if (opts.use_page_server)
 		return open_page_server_xfer(xfer, fd_type, img_id);
@@ -1044,7 +1044,7 @@ err:
 	return -1;
 }
 
-/* write_lazy_vmas_before is now in cow-page-xfer.c (cow_write_lazy_vmas_before) */
+/* write_lazy_vmas_before is now in clone-page-xfer.c (clone_write_lazy_vmas_before) */
 
 int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 {
@@ -1055,8 +1055,8 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 
 	pr_debug("Transferring pages:\n");
 
-	/* In COW dump mode, we need to interleave lazy VMA entries with pipe entries */
-	if (opts.cow_dump) {
+	/* In CLONE dump mode, we need to interleave lazy VMA entries with pipe entries */
+	if (opts.clone_dump) {
 		pr_info("Writing pagemap entries (interleaved mode) for dst_id=%lu\n", 
 			(unsigned long)xfer->dst_id);
 	}
@@ -1082,8 +1082,8 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 			 * vaddr (shmem.c: do_dump_one_shmem), and shmem pagemap
 			 * entries must not be interleaved with lazy-VMA metadata.
 			 */
-			if (opts.cow_dump && xfer->offset == 0) {
-				ret = cow_write_lazy_vmas_before(xfer, seg_vaddr, &cur_lve);
+			if (opts.clone_dump && xfer->offset == 0) {
+				ret = clone_write_lazy_vmas_before(xfer, seg_vaddr, &cur_lve);
 				if (ret)
 					return ret;
 			}
@@ -1111,11 +1111,11 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 
 	/*
 	 * Write any remaining lazy VMAs after all pipe entries.
-	 * Task pagemap only — see comment on the first cow_write_lazy_vmas_before
+	 * Task pagemap only — see comment on the first clone_write_lazy_vmas_before
 	 * call above. Shmem pagemap must not carry lazy-VMA metadata.
 	 */
-	if (opts.cow_dump && xfer->offset == 0) {
-		ret = cow_write_lazy_vmas_before(xfer, ULONG_MAX, &cur_lve);
+	if (opts.clone_dump && xfer->offset == 0) {
+		ret = clone_write_lazy_vmas_before(xfer, ULONG_MAX, &cur_lve);
 		if (ret)
 			return ret;
 	}
@@ -1451,7 +1451,7 @@ static int page_server_serve(int sk)
 			ret = page_server_check_parent(sk, &pi);
 			break;
 		case PS_IOV_ADD_F_COMPRESS:
-			/* Compressed pages go through cow-bulk-recv.c */
+			/* Compressed pages go through clone-bulk-recv.c */
 			BUG();
 		case PS_IOV_ADD_F:
 		case PS_IOV_ADD_F_PF:
@@ -1496,15 +1496,15 @@ static int page_server_serve(int sk)
 		case PS_IOV_GET_ALL:
 		case PS_IOV_START_RESTORE:
 		case PS_IOV_ALL_PAGES_SENT_ACK:
-			/* COW-specific commands handled in cow-page-xfer.c */
-			if (!opts.cow_dump) {
-				pr_err("COW command %u requires COW mode\n", cmd);
+			/* CLONE-specific commands handled in clone-page-xfer.c */
+			if (!opts.clone_dump) {
+				pr_err("CLONE command %u requires CLONE mode\n", cmd);
 				ret = -1;
 				break;
 			}
-			ret = cow_handle_protocol_cmd(cmd, &pi, sk, &ret, &flushed, &bulk_ack_received);
+			ret = clone_handle_protocol_cmd(cmd, &pi, sk, &ret, &flushed, &bulk_ack_received);
 			if (ret == 1) {
-				pr_err("Unknown COW command %u\n", cmd);
+				pr_err("Unknown CLONE command %u\n", cmd);
 				ret = -1;
 			}
 			break;
@@ -1520,11 +1520,11 @@ static int page_server_serve(int sk)
 		if (pi.cmd == PS_IOV_CLOSE || pi.cmd == PS_IOV_FORCE_CLOSE)
 			break;
 		/*
-		 * COW mode: break immediately after PS_IOV_GET_ALL.
+		 * CLONE mode: break immediately after PS_IOV_GET_ALL.
 		 * Unified thread starts P3 senders, we store socket and return.
 		 * Main dump loop will send PS_IOV_ALL_PAGES_SENT later.
 		 */
-		if (opts.cow_dump && cmd == PS_IOV_GET_ALL)
+		if (opts.clone_dump && cmd == PS_IOV_GET_ALL)
 			break;
 	}
 
@@ -1534,17 +1534,17 @@ static int page_server_serve(int sk)
 	}
 
 	/*
-	 * COW mode: store socket after PS_IOV_GET_ALL and return.
+	 * CLONE mode: store socket after PS_IOV_GET_ALL and return.
 	 * No need to wait for ACK - main socket only carries control signals.
 	 */
-	if (opts.cow_dump && last_cmd == PS_IOV_GET_ALL) {
-		pr_err("COW mode: storing socket (sk=%d) after PS_IOV_GET_ALL\n", sk);
+	if (opts.clone_dump && last_cmd == PS_IOV_GET_ALL) {
+		pr_err("CLONE mode: storing socket (sk=%d) after PS_IOV_GET_ALL\n", sk);
 		page_server_sk = sk;
 		return 0;
 	}
 
 	/* Legacy path: wait for bulk ACK (kept for backwards compatibility) */
-	if (opts.cow_dump && bulk_ack_received) {
+	if (opts.clone_dump && bulk_ack_received) {
 		pr_info("Bulk ACK received, storing socket (sk=%d) for dirty bitmap\n", sk);
 		page_server_sk = sk;
 		pr_info("page_server_sk now set to %d\n", page_server_sk);
@@ -1714,7 +1714,7 @@ int cr_page_server(bool daemon_mode, bool lazy_dump, int cfd)
 	if (sk == -1)
 		return -1;
 
-	if (opts.cow_dump && lazy_dump)
+	if (opts.clone_dump && lazy_dump)
 		pr_info("Page server ready, replica will connect with retry\n");
 
 no_server:
@@ -1759,7 +1759,7 @@ static int connect_to_page_server(void)
 		goto out;
 	}
 
-	if (opts.cow_dump) {
+	if (opts.clone_dump) {
 		int retries = 300;
 
 		while (retries-- > 0) {
@@ -1791,12 +1791,12 @@ int connect_to_page_server_to_send(void)
 
 /*
  * Close the page server socket (server-side).
- * Used after sending dirty bitmap in COW phased migration.
- * Wrapper for cow_close_page_server_socket().
+ * Used after sending dirty bitmap in CLONE phased migration.
+ * Wrapper for clone_close_page_server_socket().
  */
 void close_page_server_socket(void)
 {
-	cow_close_page_server_socket();
+	clone_close_page_server_socket();
 }
 
 int disconnect_from_page_server(void)
@@ -1953,10 +1953,10 @@ static int page_server_async_read(struct epoll_rfd *f)
 
 static int page_server_hangup_event(struct epoll_rfd *rfd)
 {
-	pr_err("DEBUG_CALLBACK: page_server_hangup_event called fd=%d cow_dump=%d all_pages_sent=%d\n",
-	       rfd->fd, opts.cow_dump, cow_is_all_pages_sent_received());
+	pr_err("DEBUG_CALLBACK: page_server_hangup_event called fd=%d clone_dump=%d all_pages_sent=%d\n",
+	       rfd->fd, opts.clone_dump, clone_is_all_pages_sent_received());
 
-	if (opts.cow_dump && cow_is_all_pages_sent_received()) {
+	if (opts.clone_dump && clone_is_all_pages_sent_received()) {
 		pr_err("Page server closed connection after all pages sent\n");
 		return 1;
 	}
@@ -1974,7 +1974,7 @@ int connect_to_page_server_to_recv(int epfd)
 
 	ps_rfd.fd = page_server_sk;
 	/* Use bulk stream reader in bulk mode, regular reader in on-demand mode */
-	if (opts.cow_dump) {
+	if (opts.clone_dump) {
 		ps_rfd.read_event = page_server_async_read_bulk;
 		pr_err("DEBUG_CALLBACK: set read_event=page_server_async_read_bulk fd=%d\n", page_server_sk);
 	} else {
@@ -2019,10 +2019,10 @@ int request_remote_pages(unsigned long img_id, unsigned long addr, unsigned long
 	return 0;
 }
 
-/* COW batch mode request - wrapper for cow_request_all_remote_pages */
+/* CLONE batch mode request - wrapper for clone_request_all_remote_pages */
 int request_all_remote_pages(unsigned long img_id)
 {
-	return cow_request_all_remote_pages(img_id);
+	return clone_request_all_remote_pages(img_id);
 }
 
 static int page_server_start_sync_read(void *buf, unsigned long nr, ps_async_read_complete complete, void *priv)
@@ -2041,10 +2041,10 @@ int page_server_start_read(void *buf, unsigned long nr, ps_async_read_complete c
 	/* In bulk mode, use continuous stream reader */
 	pr_debug("page_server_start_read\n");
 
-	if (opts.cow_dump) {
+	if (opts.clone_dump) {
 		/*
-		 * COW mode: reader is already initialized by
-		 * cow_setup_prebuffer_reader(). Pages come via P3 threads,
+		 * CLONE mode: reader is already initialized by
+		 * clone_setup_prebuffer_reader(). Pages come via P3 threads,
 		 * not through this path.
 		 */
 		return 0;

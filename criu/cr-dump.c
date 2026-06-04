@@ -65,13 +65,13 @@
 #include "stats.h"
 #include "mem.h"
 #include "page-pipe.h"
-#include "cow/cow-conf.h"
-#include "cow/cow-dump.h"
-#include "cow/cow-page-xfer.h"
-#include "cow/cow-bulk-send.h"
-#include "cow/cow-compare.h"
+#include "clone/clone-conf.h"
+#include "clone/clone-dump.h"
+#include "clone/clone-page-xfer.h"
+#include "clone/clone-bulk-send.h"
+#include "clone/clone-compare.h"
 #ifdef CONFIG_HAS_LIBBPF
-#include "cow/cow-bpf.h"
+#include "clone/clone-bpf.h"
 #endif
 #include "posix-timer.h"
 #include "vdso.h"
@@ -113,20 +113,20 @@ int __attribute__((weak)) arch_set_thread_regs(struct pstree_item *item, bool wi
 #define PERSONALITY_LENGTH 9
 static char loc_buf[PERSONALITY_LENGTH];
 
-/* Phase 3 freeze start time - set in cr_dump_tasks_cow_phased, used in cr_dump_finish */
+/* Phase 3 freeze start time - set in cr_dump_tasks_clone_phased, used in cr_dump_finish */
 static struct timeval g_phase3_freeze_start;
 
-static int cr_dump_tasks_cow_phased(pid_t pid);
-#ifdef COW_CONF_TODO_ASK_AVI_cow_seize_cure_parasite
+static int cr_dump_tasks_clone_phased(pid_t pid);
+#ifdef CLONE_CONF_TODO_ASK_AVI_clone_seize_cure_parasite
 /* Stop parasite - optionally fast (skip rt_sigreturn single-stepping) */
-static int cow_seize_stop_parasite(struct parasite_ctl *ctl)
+static int clone_seize_stop_parasite(struct parasite_ctl *ctl)
 {
 	return compel_stop_daemon_fast(ctl);
 }
 
 
 /* Cure parasite without remote munmap (restorer handles cleanup) */
-static int cow_seize_cure_parasite(struct parasite_ctl *ctl)
+static int clone_seize_cure_parasite(struct parasite_ctl *ctl)
 {
 	return compel_cure_local(ctl);	
 }
@@ -154,7 +154,7 @@ int collect_mappings(pid_t pid, struct vm_area_list *vma_area_list, dump_filemap
 	pr_info("Collecting mappings (pid: %d)\n", pid);
 	pr_info("----------------------------------------\n");
 
-	use_maps = opts.cow_dump && opts.lazy_pages;
+	use_maps = opts.clone_dump && opts.lazy_pages;
 	ret = use_maps ? parse_maps(pid, vma_area_list, dump_file) : parse_smaps(pid, vma_area_list, dump_file);
 	if (ret < 0)
 		goto err;
@@ -1535,8 +1535,8 @@ static int pre_dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie
 		goto err;
 	}
 
-	if (opts.cow_dump)
-		pr_err("COW PHASE 1: Collected %lu VMAs for pid %d\n",
+	if (opts.clone_dump)
+		pr_err("CLONE PHASE 1: Collected %lu VMAs for pid %d\n",
 		       (unsigned long)vmas.nr, pid);
 
 	ret = -1;
@@ -1547,16 +1547,16 @@ static int pre_dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie
 	}
 
 	/*
-	 * For COW phased migration: set up WP_ASYNC tracking after infecting.
+	 * For CLONE phased migration: set up WP_ASYNC tracking after infecting.
 	 * The parasite creates the userfaultfd inside the target process context
 	 * (since /proc/<pid>/userfaultfd is deprecated/unavailable on some kernels).
 	 * This allows the process to run with async write tracking during bulk
 	 * page transfer. Dirty pages are later discovered via PAGEMAP_SCAN.
 	 */
-	if (opts.cow_dump) {
-		ret = cow_dump_init_async(item, &vmas, parasite_ctl);
+	if (opts.clone_dump) {
+		ret = clone_dump_init_async(item, &vmas, parasite_ctl);
 		if (ret) {
-			pr_err("Failed to init COW ASYNC (pid: %d)\n", pid);
+			pr_err("Failed to init CLONE ASYNC (pid: %d)\n", pid);
 			goto err_cure;
 		}
 	}
@@ -1582,19 +1582,19 @@ static int pre_dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie
 	item->pid->ns[0].virt = misc.pid;
 
 	/*
-	 * COW phased migration:
+	 * CLONE phased migration:
 	 *   pre_dump = false: treat as real dump for page collection
 	 *   lazy = true: use lazy VMA path in generate_iovs() to mark pages
 	 *                for deferred transfer instead of immediate dump
-	 *   cow_lazy_build_only = true: populate global_lazy_vmas only,
+	 *   clone_lazy_build_only = true: populate global_lazy_vmas only,
 	 *                do NOT write any pagemap/pages image. All disk
-	 *                writes for COW mode happen in Phase-3 skeleton
+	 *                writes for CLONE mode happen in Phase-3 skeleton
 	 *                (while frozen). Pre-dump is planning-only.
 	 */
-	mdc.pre_dump = !opts.cow_dump;
-	mdc.lazy = opts.cow_dump;
-	mdc.cow_lazy_build_only = opts.cow_dump;
-	mdc.cow_skeleton_non_lazy = false;
+	mdc.pre_dump = !opts.clone_dump;
+	mdc.lazy = opts.clone_dump;
+	mdc.clone_lazy_build_only = opts.clone_dump;
+	mdc.clone_skeleton_non_lazy = false;
 	mdc.stat = NULL;
 	mdc.parent_ie = parent_ie;
 
@@ -1770,20 +1770,20 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 
 	/*
 	 * Phase-3 skeleton dump:
-	 *   - Non-COW: standard dump — run parasite_dump_pages_seized to dump
+	 *   - Non-CLONE: standard dump — run parasite_dump_pages_seized to dump
 	 *     all page data.
-	 *   - COW: pre-dump was planning-only; lazy VMAs have already streamed
+	 *   - CLONE: pre-dump was planning-only; lazy VMAs have already streamed
 	 *     via P3 sender threads; we still need to dump *non-lazy* VMAs
 	 *     (file-backed private writable, etc.) now, while frozen.
-	 *     cow_skeleton_non_lazy=true makes generate_iovs short-circuit
+	 *     clone_skeleton_non_lazy=true makes generate_iovs short-circuit
 	 *     lazy VMAs so we only write non-lazy ones to pagemap/pages images.
 	 */
-	pr_debug("VMA_TRACE: phase=PHASE3_SKELETON pid=%d cow_is_phased_skeleton_dump=%d will_dump_pages=1\n",
-	       pid, cow_is_phased_skeleton_dump() ? 1 : 0);
+	pr_debug("VMA_TRACE: phase=PHASE3_SKELETON pid=%d clone_is_phased_skeleton_dump=%d will_dump_pages=1\n",
+	       pid, clone_is_phased_skeleton_dump() ? 1 : 0);
 	mdc.pre_dump = false;
-	mdc.lazy = cow_is_phased_skeleton_dump() ? false : opts.lazy_pages;
-	mdc.cow_lazy_build_only = false;
-	mdc.cow_skeleton_non_lazy = cow_is_phased_skeleton_dump();
+	mdc.lazy = clone_is_phased_skeleton_dump() ? false : opts.lazy_pages;
+	mdc.clone_lazy_build_only = false;
+	mdc.clone_skeleton_non_lazy = clone_is_phased_skeleton_dump();
 	mdc.stat = &pps_buf;
 	mdc.parent_ie = parent_ie;
 
@@ -1823,9 +1823,9 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 
 
 	/*
-	 * TODO(Avi): COW_CONF_TODO_ASK_AVI_cow_seize_stop_parasite
+	 * TODO(Avi): CLONE_CONF_TODO_ASK_AVI_clone_seize_stop_parasite
 	 *
-	 * Originally we had a "fast path" here using cow_seize_stop_parasite()
+	 * Originally we had a "fast path" here using clone_seize_stop_parasite()
 	 * which calls compel_stop_daemon_fast() - skipping rt_sigreturn
 	 * single-stepping. The theory was this would save ~14ms.
 	 *
@@ -1834,13 +1834,13 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	 * the regular compel_stop_daemon() path.
 	 *
 	 * If you want to re-enable the fast path, define
-	 * COW_CONF_TODO_ASK_AVI_cow_seize_stop_parasite in cow-conf.h.
-	 * The fast path is safe because COW mode overwrites registers via
+	 * CLONE_CONF_TODO_ASK_AVI_clone_seize_stop_parasite in clone-conf.h.
+	 * The fast path is safe because CLONE mode overwrites registers via
 	 * arch_set_thread_regs() and detaches via pstree_switch_state(TASK_ALIVE).
 	 */
-#ifdef COW_CONF_TODO_ASK_AVI_cow_seize_stop_parasite
-	if (opts.cow_dump && opts.lazy_pages)
-		ret = cow_seize_stop_parasite(parasite_ctl);
+#ifdef CLONE_CONF_TODO_ASK_AVI_clone_seize_stop_parasite
+	if (opts.clone_dump && opts.lazy_pages)
+		ret = clone_seize_stop_parasite(parasite_ctl);
 	else
 #endif
 		ret = compel_stop_daemon(parasite_ctl);
@@ -1856,29 +1856,29 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	}
 
 	/*
-	 * TODO(Avi): COW_CONF_TODO_ASK_AVI_cow_seize_cure_parasite
+	 * TODO(Avi): CLONE_CONF_TODO_ASK_AVI_clone_seize_cure_parasite
 	 *
 	 * On failure local map will be cured in cr_dump_finish()
-	 * for lazy pages. In COW phased skeleton dump, always use
+	 * for lazy pages. In CLONE phased skeleton dump, always use
 	 * compel_cure_remote() to keep mappings for convergence.
 	 *
-	 * Originally COW mode used local cure to skip remote munmap,
+	 * Originally CLONE mode used local cure to skip remote munmap,
 	 * with the theory that restorer handles parasite cleanup.
 	 * However, compel_cure() only takes ~9.6ms - optimization may
 	 * not be worth the complexity/risk.
 	 *
 	 * If you want to re-enable the local cure optimization, define
-	 * COW_CONF_TODO_ASK_AVI_cow_seize_cure_parasite in cow-conf.h.
+	 * CLONE_CONF_TODO_ASK_AVI_clone_seize_cure_parasite in clone-conf.h.
 	 */
-#ifdef COW_CONF_TODO_ASK_AVI_cow_seize_cure_parasite
-	if (opts.cow_dump && opts.lazy_pages)
-		ret = cow_seize_cure_parasite(parasite_ctl);
-	else if (opts.lazy_pages || cow_is_phased_skeleton_dump())
+#ifdef CLONE_CONF_TODO_ASK_AVI_clone_seize_cure_parasite
+	if (opts.clone_dump && opts.lazy_pages)
+		ret = clone_seize_cure_parasite(parasite_ctl);
+	else if (opts.lazy_pages || clone_is_phased_skeleton_dump())
 		ret = compel_cure_remote(parasite_ctl);
 	else
 		ret = compel_cure(parasite_ctl);
 #else
-	if (opts.lazy_pages || cow_is_phased_skeleton_dump())
+	if (opts.lazy_pages || clone_is_phased_skeleton_dump())
 		ret = compel_cure_remote(parasite_ctl);
 	else
 		ret = compel_cure(parasite_ctl);
@@ -2164,10 +2164,10 @@ static int cr_dump_finish(int ret)
 	int post_dump_ret = 0;
 
 	/*
-	 * For COW mode, don't disconnect yet - we need the socket open
+	 * For CLONE mode, don't disconnect yet - we need the socket open
 	 * to send all_pages_sent signal. It will be closed later.
 	 */
-	if (!(opts.cow_dump && cow_get_phase() == COW_PHASE_DONE)) {
+	if (!(opts.clone_dump && clone_get_phase() == CLONE_PHASE_DONE)) {
 		if (disconnect_from_page_server())
 			ret = -1;
 	}
@@ -2222,11 +2222,11 @@ static int cr_dump_finish(int ret)
 	if (ret || post_dump_ret || opts.final_state == TASK_ALIVE) {
 		unsuspend_lsm();
 		/*
-		 * TODO(Avi): COW_CONF_TODO_ASK_AVI_network_lock
-		 * COW mode skips network_unlock(). See cow-conf.h for details.
+		 * TODO(Avi): CLONE_CONF_TODO_ASK_AVI_network_lock
+		 * CLONE mode skips network_unlock(). See clone-conf.h for details.
 		 */
-#ifdef COW_CONF_TODO_ASK_AVI_network_lock
-		if (!opts.cow_dump)
+#ifdef CLONE_CONF_TODO_ASK_AVI_network_lock
+		if (!opts.clone_dump)
 		{
 			struct timeval t_start, t_end, t_delta;
 			gettimeofday(&t_start, NULL);
@@ -2251,14 +2251,14 @@ static int cr_dump_finish(int ret)
 	}
 
 	/*
-	 * COW phased dump path: signal replica and unfreeze.
-	 * Inventory was already written in cr_dump_tasks_cow_phased().
+	 * CLONE phased dump path: signal replica and unfreeze.
+	 * Inventory was already written in cr_dump_tasks_clone_phased().
 	 */
-	if (opts.cow_dump && cow_get_phase() == COW_PHASE_DONE) {
+	if (opts.clone_dump && clone_get_phase() == CLONE_PHASE_DONE) {
 		struct timeval t_start, t_end, t_delta;
 		int sk = get_page_server_sk();
 
-		pr_err("COW: Signaling replica (ret=%d, sk=%d)\n", ret, sk);
+		pr_err("CLONE: Signaling replica (ret=%d, sk=%d)\n", ret, sk);
 
 		/*
 		 * Send single completion signal while frozen (fast).
@@ -2266,12 +2266,12 @@ static int cr_dump_finish(int ret)
 		 */
 		gettimeofday(&t_start, NULL);
 		if (!ret && sk >= 0) {
-			if (cow_send_skeleton_files(sk) < 0) {
-				pr_err("COW: Failed to send skeleton files\n");
+			if (clone_send_skeleton_files(sk) < 0) {
+				pr_err("CLONE: Failed to send skeleton files\n");
 				ret = -1;
 			}
 			if (!ret && send_all_pages_sent_signal(sk) < 0) {
-				pr_err("COW: Failed to send completion signal\n");
+				pr_err("CLONE: Failed to send completion signal\n");
 				ret = -1;
 			}
 		}
@@ -2290,7 +2290,7 @@ static int cr_dump_finish(int ret)
 		}
 
 
-#ifdef CONFIG_COW_COMPARE
+#ifdef CONFIG_CLONE_COMPARE
 		/*
 		 * When comparing, wait for ACK before compare starts.
 		 * Replica sends ACK after it's ready for comparison.
@@ -2298,7 +2298,7 @@ static int cr_dump_finish(int ret)
 		gettimeofday(&t_start, NULL);
 		if (!ret && sk >= 0) {
 			if (wait_for_all_pages_sent_ack(sk) < 0) {
-				pr_err("COW: Failed to receive completion ACK\n");
+				pr_err("CLONE: Failed to receive completion ACK\n");
 				ret = -1;
 			}
 		}
@@ -2315,24 +2315,24 @@ static int cr_dump_finish(int ret)
 			pr_err("COMPARE: PRIMARY waiting for replica connection (PID %d running)\n",
 			       target_pid);
 
-			if (cow_compare_listen(&compare_sk) == 0) {
-				cow_compare_send_state(compare_sk, target_pid);
+			if (clone_compare_listen(&compare_sk) == 0) {
+				clone_compare_send_state(compare_sk, target_pid);
 				close(compare_sk);
 			}
 			pr_err("COMPARE: PRIMARY comparison done\n");
 		}
 
-		pr_err("COW: Unfreezing process\n");
+		pr_err("CLONE: Unfreezing process\n");
 		pstree_switch_state(root_item, TASK_ALIVE);
 #else
 
-		pr_err("COW: Unfreezing process\n");
+		pr_err("CLONE: Unfreezing process\n");
 		pstree_switch_state(root_item, TASK_ALIVE);
 		/* Wait for ACK AFTER unfreeze - not on critical path */
 		gettimeofday(&t_start, NULL);
 		if (!ret && sk >= 0) {
 			if (wait_for_all_pages_sent_ack(sk) < 0) {
-				pr_err("COW: Failed to receive completion ACK\n");
+				pr_err("CLONE: Failed to receive completion ACK\n");
 				ret = -1;
 			}
 		}
@@ -2343,12 +2343,12 @@ static int cr_dump_finish(int ret)
 #endif
 
 		/* Cleanup after unfreeze - not on critical path */
-		cow_cleanup_async_uffd();
+		clone_cleanup_async_uffd();
 
 		/* Close page server socket AFTER unfreeze */
 		close_page_server_socket();
 
-		goto out_release_cow;
+		goto out_release_clone;
 	}
 
 	/* Standard path: transfer pages then resume */
@@ -2366,11 +2366,11 @@ static int cr_dump_finish(int ret)
 		timing_stop(TIME_FROZEN);
 	}
 
-out_release_cow:
-	/* Wait for background page server thread before destroying COW session */
+out_release_clone:
+	/* Wait for background page server thread before destroying CLONE session */
 	wait_for_page_server_thread();
-	if (opts.cow_dump)
-		cow_dump_fini();
+	if (opts.clone_dump)
+		clone_dump_fini();
 	free_global_lazy_vmas();
 
 	free_pstree(root_item);
@@ -2465,17 +2465,17 @@ int cr_dump_tasks(pid_t pid)
 	int ret;
 	int exit_code = -1;
 
-	pr_debug("DEBUG_SOCKET: cr_dump_tasks ENTRY cow_dump=%d lazy_pages=%d\n",
-	       opts.cow_dump, opts.lazy_pages);
+	pr_debug("DEBUG_SOCKET: cr_dump_tasks ENTRY clone_dump=%d lazy_pages=%d\n",
+	       opts.clone_dump, opts.lazy_pages);
 
 	/*
-	 * COW phased migration: when both --cow-dump and --lazy-pages are
+	 * CLONE phased migration: when both --clone-dump and --lazy-pages are
 	 * enabled, use the phased WP_ASYNC → WP_SYNC flow for minimal
 	 * source downtime.
 	 */
-	if (opts.cow_dump && opts.lazy_pages) {
-		pr_debug("DEBUG_SOCKET: Redirecting to cr_dump_tasks_cow_phased\n");
-		return cr_dump_tasks_cow_phased(pid);
+	if (opts.clone_dump && opts.lazy_pages) {
+		pr_debug("DEBUG_SOCKET: Redirecting to cr_dump_tasks_clone_phased\n");
+		return cr_dump_tasks_clone_phased(pid);
 	}
 
 	kerndat_warn_about_madv_guards();
@@ -2555,12 +2555,12 @@ int cr_dump_tasks(pid_t pid)
 		goto err;
 
 	/*
-	 * TODO(Avi): COW_CONF_TODO_ASK_AVI_network_lock
-	 * COW mode skips network_lock(). See cow-conf.h for details.
-	 * Questions: Is this intentional? How does COW handle TCP state?
+	 * TODO(Avi): CLONE_CONF_TODO_ASK_AVI_network_lock
+	 * CLONE mode skips network_lock(). See clone-conf.h for details.
+	 * Questions: Is this intentional? How does CLONE handle TCP state?
 	 */
-#ifdef COW_CONF_TODO_ASK_AVI_network_lock
-	if (!opts.cow_dump) {
+#ifdef CLONE_CONF_TODO_ASK_AVI_network_lock
+	if (!opts.clone_dump) {
 		if (network_lock())
 			goto err;
 	}
@@ -2626,7 +2626,7 @@ err:
 }
 
 /*
- * cr_dump_tasks_cow_phased - COW phased migration orchestration
+ * cr_dump_tasks_clone_phased - CLONE phased migration orchestration
  *
  * Implements the WP_ASYNC → WP_SYNC phased migration flow:
  *   Phase 1: pre_dump → WP_ASYNC all VMAs → resume immediately
@@ -2634,7 +2634,7 @@ err:
  *   Phase 3: freeze → dump skeleton (no pages) → PAGEMAP_SCAN dirty pages
  *   Phase 4: WP_SYNC on dirty pages → resume → convergence
  */
-static int cr_dump_tasks_cow_phased(pid_t pid)
+static int cr_dump_tasks_clone_phased(pid_t pid)
 {
 	InventoryEntry he = INVENTORY_ENTRY__INIT;
 	InventoryEntry *parent_ie = NULL;
@@ -2646,7 +2646,7 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 	kerndat_warn_about_madv_guards();
 
 	pr_info("========================================\n");
-	pr_info("COW Phased dump (pid: %d comm: %s)\n", pid, __task_comm_info(pid));
+	pr_info("CLONE Phased dump (pid: %d comm: %s)\n", pid, __task_comm_info(pid));
 	pr_info("========================================\n");
 
 	rlimit_unlimit_nofile();
@@ -2738,7 +2738,7 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 	 * where faults could be missed.
 	 */
 #ifdef CONFIG_HAS_LIBBPF
-	if (cow_bpf_start(root_item->pid->real) == 0)
+	if (clone_bpf_start(root_item->pid->real) == 0)
 		pr_err("BPF dirty tracker started (before unfreeze)\n");
 	else
 		pr_info("BPF dirty tracker not available, using PAGEMAP_SCAN\n");
@@ -2794,7 +2794,7 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 	 * Threads are running iterative dirty scan loop.
 	 */
 	pr_err("=== Waiting for dirty page convergence ===\n");
-	while (!cow_all_threads_below_threshold()) {
+	while (!clone_all_threads_below_threshold()) {
 		usleep(10000);  /* 10ms poll */
 	}
 	pr_err("=== CONVERGENCE: All threads below threshold ===\n");
@@ -2830,12 +2830,12 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 
 #ifdef SCAN_COMPARE
 	/* DEBUG: Compare BPF vs PAGEMAP_SCAN and exit */
-	cow_debug_scan_compare();	
+	clone_debug_scan_compare();	
 #endif
 
 	/*
 	 * Collect pstree IDs now so vpid(item) is valid for the VMA detection.
-	 * This must happen before cow_detect_new_vmas() which uses dst_id.
+	 * This must happen before clone_detect_new_vmas() which uses dst_id.
 	 */
 	{
 		struct timeval t_start, t_end, t_delta;
@@ -2848,8 +2848,8 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 		       t_delta.tv_sec, t_delta.tv_usec);
 	}
 
-	/* Update COW dst_id now that collect_pstree_ids() has populated vpid */
-	cow_set_dst_id(vpid(root_item));
+	/* Update CLONE dst_id now that collect_pstree_ids() has populated vpid */
+	clone_set_dst_id(vpid(root_item));
 
 	/*
 	 * Detect VMAs that were created between Phase 1 and Phase 3.
@@ -2876,14 +2876,14 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 			goto err;
 		}
 
-		pr_err("COW PHASE 3: Collected %lu VMAs for pid %d (compare with Phase 1 count)\n",
+		pr_err("CLONE PHASE 3: Collected %lu VMAs for pid %d (compare with Phase 1 count)\n",
 		       (unsigned long)phase3_vmas.nr, root_item->pid->real);
 
 		gettimeofday(&t_start, NULL);
-		ret = cow_detect_new_vmas(&phase3_vmas, &new_vma_ranges, &nr_new_vma_ranges);
+		ret = clone_detect_new_vmas(&phase3_vmas, &new_vma_ranges, &nr_new_vma_ranges);
 		gettimeofday(&t_end, NULL);
 		timersub(&t_end, &t_start, &t_delta);
-		pr_err("TIMING: cow_detect_new_vmas took %ld.%06ld seconds\n",
+		pr_err("TIMING: clone_detect_new_vmas took %ld.%06ld seconds\n",
 		       t_delta.tv_sec, t_delta.tv_usec);
 		free_mappings(&phase3_vmas);
 
@@ -2893,33 +2893,33 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 		}
 
 		if (nr_new_vma_ranges > 0) {
-			pr_err("COW PHASE 3: Found %u new VMA regions since Phase 1!\n",
+			pr_err("CLONE PHASE 3: Found %u new VMA regions since Phase 1!\n",
 				nr_new_vma_ranges);
-			pr_err("COW PHASE 3: These VMAs were created while process ran during Phase 2.\n");
-			pr_err("COW PHASE 3: Their PAGE DATA will be sent, but VMA METADATA is missing from dump.\n");
-			pr_err("COW PHASE 3: REPLICA will NOT have these VMAs - expect comparison differences!\n");
+			pr_err("CLONE PHASE 3: These VMAs were created while process ran during Phase 2.\n");
+			pr_err("CLONE PHASE 3: Their PAGE DATA will be sent, but VMA METADATA is missing from dump.\n");
+			pr_err("CLONE PHASE 3: REPLICA will NOT have these VMAs - expect comparison differences!\n");
 
 			/* Pass new VMA ranges to P3 threads for sending during final scan */
-			cow_set_new_vma_ranges(new_vma_ranges, nr_new_vma_ranges);
+			clone_set_new_vma_ranges(new_vma_ranges, nr_new_vma_ranges);
 			/* Don't free - P3 threads will use it */
 		} else {
-			pr_err("COW PHASE 3: No new VMAs detected - VMA count unchanged since Phase 1.\n");
+			pr_err("CLONE PHASE 3: No new VMAs detected - VMA count unchanged since Phase 1.\n");
 			xfree(new_vma_ranges);
 		}
 	}
 
 	/*
 	 * Signal P3 threads to do final scan (process is frozen, new VMA ranges set).
-	 * Must be after cow_set_new_vma_ranges() so threads can send new VMA pages.
+	 * Must be after clone_set_new_vma_ranges() so threads can send new VMA pages.
 	 */
-	cow_signal_last_scan();
+	clone_signal_last_scan();
 
 	/*
-	 * TODO(Avi): COW_CONF_TODO_ASK_AVI_network_lock
-	 * COW mode skips network_lock(). See cow-conf.h for details.
+	 * TODO(Avi): CLONE_CONF_TODO_ASK_AVI_network_lock
+	 * CLONE mode skips network_lock(). See clone-conf.h for details.
 	 */
-#ifdef COW_CONF_TODO_ASK_AVI_network_lock
-	if (!opts.cow_dump) {
+#ifdef CLONE_CONF_TODO_ASK_AVI_network_lock
+	if (!opts.clone_dump) {
 	{
 		struct timeval t_start, t_end, t_delta;
 		gettimeofday(&t_start, NULL);
@@ -2987,7 +2987,7 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 		pr_err("TIMING: cr_glob_imgset_open took %ld.%06ld seconds\n",
 		       t_delta.tv_sec, t_delta.tv_usec);
 	}
-	pr_err("DEBUG: glob_imgset opened for skeleton dump (COW path)\n");
+	pr_err("DEBUG: glob_imgset opened for skeleton dump (CLONE path)\n");
 
 	{
 		struct timeval t_start, t_end, t_delta;
@@ -3000,8 +3000,8 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 		       t_delta.tv_sec, t_delta.tv_usec);
 	}
 
-	/* Set phase to SCAN so cow_is_phased_skeleton_dump() returns true */
-	cow_set_phase(COW_PHASE_SCAN);
+	/* Set phase to SCAN so clone_is_phased_skeleton_dump() returns true */
+	clone_set_phase(CLONE_PHASE_SCAN);
 
 	/* Dump skeleton (everything except pages) */
 	{
@@ -3054,32 +3054,32 @@ static int cr_dump_tasks_cow_phased(pid_t pid)
 		struct timeval t_start, t_end, t_delta, t_elapsed;
 		gettimeofday(&t_start, NULL);
 		timersub(&t_start, &freeze_start, &t_elapsed);
-		pr_warn("TIMING @%ld.%06ld: cow_wait_p3_threads starting\n",
+		pr_warn("TIMING @%ld.%06ld: clone_wait_p3_threads starting\n",
 		       t_elapsed.tv_sec, t_elapsed.tv_usec);
-		cow_wait_p3_threads();
+		clone_wait_p3_threads();
 		gettimeofday(&t_end, NULL);
 		timersub(&t_end, &t_start, &t_delta);
-		pr_err("TIMING: cow_wait_p3_threads took %ld.%06ld seconds\n",
+		pr_err("TIMING: clone_wait_p3_threads took %ld.%06ld seconds\n",
 		       t_delta.tv_sec, t_delta.tv_usec);
 	}
-	pr_err("P3 threads completed: %lu total pages sent\n", cow_p3_pages_sent());
+	pr_err("P3 threads completed: %lu total pages sent\n", clone_p3_pages_sent());
 
-	if (cow_p3_had_error()) {
-		pr_err("cow-dump: P3 bulk transfer reported errors — failing "
+	if (clone_p3_had_error()) {
+		pr_err("clone-dump: P3 bulk transfer reported errors — failing "
 		       "the dump rather than producing a torn image\n");
 		goto err_refreeze;
 	}
 
 	/* Free new VMA ranges after P3 threads are done using them */
-	cow_free_new_vma_ranges();
+	clone_free_new_vma_ranges();
 
 	/*
 	 * all_pages_sent signal is sent in cr_dump_finish() after unfreeze.
 	 */
 
-	cow_set_phase(COW_PHASE_DONE);
+	clone_set_phase(CLONE_PHASE_DONE);
 
-	/* NOTE: cow_cleanup_async_uffd() moved to cr_dump_finish() after unfreeze */
+	/* NOTE: clone_cleanup_async_uffd() moved to cr_dump_finish() after unfreeze */
 
 	/* Set up inventory fields and write - like standard path */
 	he.has_pre_dump_mode = false;

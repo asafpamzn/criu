@@ -1,0 +1,58 @@
+<section>
+  <h2>CLONE Mode: The Post-Freeze Tracking Flow</h2>
+
+  <div style="display:flex; gap:8px; justify-content:center; margin:12px 0;">
+    <div style="background:#1e293b; border:1px solid #475569; border-radius:6px; padding:8px 12px; text-align:center; font-size:0.55em; width:160px;">
+      <div style="color:#fbbf24; font-weight:bold;">During Freeze</div>
+      <div style="color:#94a3b8; margin-top:4px;"><code>clone_dump_init()</code><br>Registers VMAs with<br><strong>userfaultfd write-protect</strong></div>
+    </div>
+    <div style="color:#475569; align-self:center;">→</div>
+    <div style="background:#1e293b; border:1px solid #475569; border-radius:6px; padding:8px 12px; text-align:center; font-size:0.55em; width:160px;">
+      <div style="color:#4ade80; font-weight:bold;">After Unfreeze</div>
+      <div style="color:#94a3b8; margin-top:4px;">Process runs normally.<br>First write to any page<br>→ <strong>WP fault</strong> captured</div>
+    </div>
+    <div style="color:#475569; align-self:center;">→</div>
+    <div style="background:#1e293b; border:1px solid #475569; border-radius:6px; padding:8px 12px; text-align:center; font-size:0.55em; width:160px;">
+      <div style="color:#22d3ee; font-weight:bold;">Bulk Transfer</div>
+      <div style="color:#94a3b8; margin-top:4px;"><code>process_vm_readv()</code><br>reads pages on-demand<br>8 TCP streams to replica</div>
+    </div>
+    <div style="color:#475569; align-self:center;">→</div>
+    <div style="background:#1e293b; border:1px solid #475569; border-radius:6px; padding:8px 12px; text-align:center; font-size:0.55em; width:160px;">
+      <div style="color:#a78bfa; font-weight:bold;">Convergence</div>
+      <div style="color:#94a3b8; margin-top:4px;">Fork snapshot → read<br>only WP-faulted (dirty)<br>pages. Near-zero delta.</div>
+    </div>
+  </div>
+
+  <div class="two-col">
+    <div>
+      <h4 class="cyan">Bulk Transfer Phase</h4>
+      <div class="state-grid" style="grid-template-columns: 1fr;">
+        <div class="state-box">
+          <span class="title">How pages are read</span>
+          <div class="desc">8 parallel worker threads, each reading contiguous chunks of VMAs via <code>process_vm_readv()</code>. Pages are LZ4-compressed and sent over TCP to the replica's page-recv process.</div>
+        </div>
+        <div class="state-box">
+          <span class="title">Concurrent write tracking</span>
+          <div class="desc">While bulk transfer runs, the CLONE monitor thread handles WP faults. Each first-write to a page marks it in the <code>dirty_bitmap</code>. These pages will be re-sent during convergence.</div>
+        </div>
+      </div>
+    </div>
+    <div>
+      <h4 class="cyan">Convergence Phase</h4>
+      <div class="state-grid" style="grid-template-columns: 1fr;">
+        <div class="state-box">
+          <span class="title">Fork snapshot</span>
+          <div class="desc">CRIU calls <code>fork()</code> on the source process (via ptrace). The child gets a CLONE copy of all pages — a <strong>temporally consistent snapshot</strong>. Reads from the child see the exact state at fork time.</div>
+        </div>
+        <div class="state-box">
+          <span class="title">Only dirty pages re-sent</span>
+          <div class="desc">Only pages in the <code>dirty_bitmap</code> (WP-faulted during bulk) need re-sending. For Valkey at 100K ops/s, this is typically ~2-5% of pages. Convergence completes in seconds.</div>
+        </div>
+        <div class="state-box">
+          <span class="title">Cutover: 1ms</span>
+          <div class="desc">After convergence, the replica has all pages. Cutover is just a TCP connection handoff — <strong>~1ms</strong>. The source was never frozen during transfer.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>

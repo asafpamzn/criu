@@ -12,7 +12,7 @@ Current state: **~53ms frozen + 1ms cutover, 70s total migration** at 95GB.
 | Defer thread core writes | 8.5ms | 0.4ms | 8ms |
 | Pre-collect sockets before freeze | 13ms | 0.007ms | 13ms |
 | Pre-create uffd before freeze | N/A | N/A | 0ms (needs kernel 6.11+) |
-| Skip network_lock in COW mode | ~2ms | 0ms | 2ms |
+| Skip network_lock in CLONE mode | ~2ms | 0ms | 2ms |
 | compel_cure_local | ~1ms | 0ms | 1ms |
 | Cutover: bash builtins | 41ms | 1ms | 40ms |
 | 8 TCP streams + 16MB bufs + 512pg batch | 89s xfer | 58s xfer | 31s |
@@ -33,7 +33,7 @@ frozen_time: 79ms
 │   │   ├── dump_pages:     ~5ms real (wall from WP contention)
 │   │   ├── compel_stop:   0.06ms (fast path)
 │   │   └── dump_threads:  0.4ms (deferred writes)
-│   ├── cow_dump_init:      3.7ms  (VMA registration)
+│   ├── clone_dump_init:      3.7ms  (VMA registration)
 │   ├── collect_mappings:   7.4ms  (parse_maps)
 │   └── other:              ~5ms
 └── cutover:                 1ms
@@ -43,7 +43,7 @@ frozen_time: 79ms
 
 ### P1-A: Skip AppArmor/LSM collection (~5.7ms) — BLOCKED
 `collect_and_suspend_lsm` reads AppArmor profiles.  Previously tried
-skipping in COW mode — broke parasite communication ("Trimmed message
+skipping in CLONE mode — broke parasite communication ("Trimmed message
 received").  LSM suspension is required for parasite RPC.
 
 **Status**: Blocked.  Need to understand why parasite needs LSM.

@@ -1,7 +1,7 @@
 <section>
   <h2>⚠ NOT Re-captured After Early Resume</h2>
   <p style="font-size:0.55em; color:#94a3b8; margin-bottom:8px;">
-    In COW WP_ASYNC mode, the source process is <strong style="color:#f87171;">alive and running</strong> after the ~51ms dump freeze.
+    In CLONE WP_ASYNC mode, the source process is <strong style="color:#f87171;">alive and running</strong> after the ~51ms dump freeze.
     All non-memory state below is captured <strong>once</strong> at dump time and <strong>never re-synced</strong> at convergence.
     This is a <strong style="color:#f87171;">known limitation</strong> of the current implementation.
   </p>

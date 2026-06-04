@@ -14,7 +14,7 @@ notice. No multi-second freezes, no data loss, no connection errors.
 
 ## The Solution in One Sentence
 
-We use **CRIU** (Checkpoint/Restore In Userspace) with a **COW
+We use **CRIU** (Checkpoint/Restore In Userspace) with a **CLONE
 (Copy-On-Write) dump** to snapshot the Valkey process memory while it
 continues running, stream the snapshot to a replica machine, then do a
 sub-millisecond cutover.
@@ -28,7 +28,7 @@ sub-millisecond cutover.
 | **CRIU** | A Linux tool that can freeze a running process, save its entire state (memory, file descriptors, sockets, etc.) to files, and later restore it on another machine as if nothing happened. Think of it as "save game" for Linux processes. |
 | **Checkpoint / Dump** | The act of saving the process state. CRIU calls this a "dump". |
 | **Restore** | The act of recreating the process from the saved state on another machine. |
-| **COW dump** | Our custom mode where CRIU takes the snapshot while the process keeps running. "COW" means Copy-On-Write — the kernel tracks which memory pages the process modifies after the snapshot starts. |
+| **CLONE dump** | Our custom mode where CRIU takes the snapshot while the process keeps running. "CLONE" means Copy-On-Write — the kernel tracks which memory pages the process modifies after the snapshot starts. |
 | **Freeze / Frozen time** | The brief period (~42-76ms in our case) when the Valkey process is paused via cgroup freezer. During this window, CRIU collects process metadata and sets up page tracking. Clients see a brief latency spike but no errors. Measured as `dump_one_task` in our logs. |
 | **Page** | A 4KB block of memory. The kernel manages memory in pages. A 200GB Valkey instance has ~50 million pages. |
 | **Write-protect (WP)** | A kernel feature where we mark memory pages as read-only. We use WP_ASYNC mode: when Valkey writes to a protected page, the kernel allows the write immediately (no stall) but marks the page as dirty. CRIU later discovers which pages were dirtied by scanning the kernel's pagemap. This is how we track changes after the snapshot without slowing Valkey down. |
@@ -178,7 +178,7 @@ dirty pages and re-sends them from a consistent fork snapshot.
 After the bulk transfer, some pages may have been dirtied by Valkey.
 Instead of freezing Valkey again, we use a **fork-snapshot**:
 
-1. Fork the source Valkey (Linux COW fork — instant, no memory copy)
+1. Fork the source Valkey (Linux CLONE fork — instant, no memory copy)
 2. Scan for dirty pages since the bulk transfer
 3. Read dirty pages from the forked copy (guaranteed consistent)
 4. Send them to the replica
@@ -335,7 +335,7 @@ sudo env SKIP_FILL=1 KEEP_SOURCE_RUNNING=1 \
 criu dump \
   --tree $PID                    # Valkey's process ID
   --images-dir /tmp/criu-images  # local temp dir (no shared filesystem)
-  --cow-dump                     # COW mode (our fork's feature)
+  --clone-dump                     # CLONE mode (our fork's feature)
   --lazy-pages                   # stream pages, don't write to disk
   --address $SOURCE_IP           # page-server listens here
   --port 9002                    # page-server port (8 TCP streams)
@@ -353,7 +353,7 @@ criu dump \
 criu restore \
   --images-dir /tmp/criu-images  # local dir (images downloaded here)
   --fetch-images $SOURCE_IP:9005 # download .img files from source
-  --lazy-pages --tcp-close --cow-dump \
+  --lazy-pages --tcp-close --clone-dump \
   --restore-detached --leave-stopped \
   --skip-file-rwx-check --file-validation filesize
 ```
@@ -422,11 +422,11 @@ Source                                        Replica
 | `scripts/migrate.sh` | Source-side orchestration (prepare, dump, cutover) |
 | `scripts/restore.sh` | Replica-side orchestration (CRIU restore, page-recv, SIGCONT) |
 | `scripts/verify-migration.sh` | End-to-end test: fill, migrate, verify 7 checks |
-| `criu/cow-dump.c` | COW engine: write-protect setup, dirty page tracking |
+| `criu/clone-dump.c` | CLONE engine: write-protect setup, dirty page tracking |
 | `criu/page-xfer.c` | Page server: 8-stream bulk transfer, fork-snapshot convergence, VMA diff |
 | `tools/page-recv.c` | Replica page receiver: 8-thread TCP, LZ4, process_vm_writev |
 | `criu/cr-restore.c` | CRIU restore: fork process tree, VMA injection, run page-recv |
-| `criu/cr-dump.c` | CRIU dump: freeze, collect state, launch COW |
+| `criu/cr-dump.c` | CRIU dump: freeze, collect state, launch CLONE |
 
 ---
 

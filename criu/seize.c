@@ -1048,7 +1048,7 @@ static int cgroup_version(void)
 /*
  * reseize_pstree - Re-seize tasks after they were released
  *
- * Used in COW phased migration to re-attach to tasks after Phase 1
+ * Used in CLONE phased migration to re-attach to tasks after Phase 1
  * released them (via pstree_switch_state(TASK_ALIVE)). Threads may
  * have changed (created/destroyed) while the process was running,
  * so we reset the thread lists and delegate to collect_pstree()
@@ -1058,7 +1058,7 @@ int reseize_pstree(void)
 {
 	struct pstree_item *item;
 
-	pr_info("Re-seizing tasks for COW phased migration\n");
+	pr_info("Re-seizing tasks for CLONE phased migration\n");
 
 	/*
 	 * Reset thread lists so collect_pstree() -> collect_threads()

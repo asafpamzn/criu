@@ -124,7 +124,7 @@
             font-size: 0.75em;
             margin-bottom: 0.3em;
         }
-        .cow-diagram {
+        .clone-diagram {
             display: flex;
             justify-content: center;
             align-items: center;
@@ -239,7 +239,7 @@
                 <div class="diagram-box" style="font-size: 0.8em; padding: 15px;">
                     <p><strong>1. fork()</strong> creates a child process</p>
                     <p class="arrow" style="font-size: 1.2em;">↓</p>
-                    <p><strong>2. Copy-on-Write (COW)</strong> shares memory pages initially</p>
+                    <p><strong>2. Copy-on-Write (CLONE)</strong> shares memory pages initially</p>
                     <p class="arrow" style="font-size: 1.2em;">↓</p>
                     <p><strong>3. Child</strong> serializes data to RDB file</p>
                     <p class="arrow" style="font-size: 1.2em;">↓</p>
@@ -301,7 +301,7 @@
             <section>
                 <h2>BGSAVE Limitation #2: Memory Overhead</h2>
                 <div class="problem-box">
-                    <h3 style="color: #f44336; margin-top: 0;">COW Memory Scales with Write Rate</h3>
+                    <h3 style="color: #f44336; margin-top: 0;">CLONE Memory Scales with Write Rate</h3>
                     <ul>
                         <li>Each modified page = full 4KB page copy</li>
                         <li>High write rates = massive memory growth</li>
@@ -318,7 +318,7 @@
                         <div>
                             <h3 style="color: #f44336; margin-top: 0;">Out-of-Memory Under Load</h3>
                             <ul>
-                                <li>If COW exceeds available memory:</li>
+                                <li>If CLONE exceeds available memory:</li>
                                 <li style="margin-left: 30px;"><strong>Either crash</strong> — Linux OOM killer terminates process</li>
                                 <li style="margin-left: 30px;"><strong>Or start swapping</strong> — disk is slow, latency spikes</li>
                                 <li>Cannot safely run at high memory utilization</li>
@@ -347,7 +347,7 @@
                     <p class="arrow" style="font-size: 1.2em;">↓</p>
                     <p><strong>4. Skip entries</strong> modified during save</p>
                 </div>
-                <p style="font-size: 0.8em; color: #888; margin-top: 20px;">Goal: No fork() freeze, no COW overhead</p>
+                <p style="font-size: 0.8em; color: #888; margin-top: 20px;">Goal: No fork() freeze, no CLONE overhead</p>
             </section>
 
             <!-- ThreadSave Architecture -->

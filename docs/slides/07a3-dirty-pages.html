@@ -53,9 +53,9 @@ on first write — no software needed.</code></pre>
           </div>
         </div>
         <div class="state-box">
-          <span class="title">COW Mode Alternative</span>
+          <span class="title">CLONE Mode Alternative</span>
           <div class="desc">
-            Instead of querying kernel dirty bits, COW mode uses <strong>userfaultfd write-protect</strong>. Every VMA is write-protected; on first write the CPU traps, CRIU snapshots the <strong>original</strong> page, then allows the write. Real-time tracking — no page table walk needed.
+            Instead of querying kernel dirty bits, CLONE mode uses <strong>userfaultfd write-protect</strong>. Every VMA is write-protected; on first write the CPU traps, CRIU snapshots the <strong>original</strong> page, then allows the write. Real-time tracking — no page table walk needed.
           </div>
         </div>
       </div>

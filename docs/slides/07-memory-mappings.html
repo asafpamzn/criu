@@ -21,7 +21,7 @@
     <div>
       <h4 class="green">What does collect_mappings do?</h4>
       <ol class="small">
-        <li>Parses <code>/proc/PID/smaps</code> (or <code>/proc/PID/maps</code> in COW mode)</li>
+        <li>Parses <code>/proc/PID/smaps</code> (or <code>/proc/PID/maps</code> in CLONE mode)</li>
         <li>Builds a linked list of <code>vma_area</code> structs</li>
         <li>For file-backed VMAs, calls <code>dump_filemap()</code> to record the backing file</li>
         <li>Collects <code>MADV_GUARD_INSTALL</code> pages</li>

@@ -1,0 +1,58 @@
+<section>
+  <h2>Why CLONE Dump Can Use maps Instead of smaps</h2>
+
+  <pre><code class="language-c">// collect_mappings() in cr-dump.c
+use_maps = opts.clone_dump && opts.lazy_pages;
+ret = use_maps ? parse_maps(pid, vma_area_list, dump_file)
+               : parse_smaps(pid, vma_area_list, dump_file);
+</code></pre>
+
+  <div class="two-col">
+    <div>
+      <h4 class="red">What Standard CRIU Needs from smaps</h4>
+      <div class="state-grid" style="grid-template-columns: 1fr;">
+        <div class="state-box">
+          <span class="title">VmFlags line</span>
+          <div class="desc">
+            2-letter codes for kernel VM flags:<br>
+            <code>gd</code> = MAP_GROWSDOWN (stack)<br>
+            <code>lo</code> = MAP_LOCKED<br>
+            <code>nr</code> = MAP_NORESERVE<br>
+            <code>ht</code> = MAP_HUGETLB<br>
+            <code>dp</code> = MAP_DROPPABLE<br>
+            <code>io</code>/<code>pf</code> = VM_IO/VM_PFNMAP (unsupported)<br>
+            <code>ss</code> = shadow stack<br>
+            <code>sr</code>, <code>rr</code>, <code>dc</code>, <code>mg</code>, <code>hg</code>, <code>nh</code>, <code>wf</code> = madvise flags
+          </div>
+        </div>
+        <div class="state-box">
+          <span class="title">Memory accounting stats</span>
+          <div class="desc">RSS, PSS, Shared/Private Clean/Dirty — used by standard CRIU for page tracking decisions. The kernel must walk all PTEs to compute these.</div>
+        </div>
+      </div>
+    </div>
+    <div>
+      <h4 class="cyan">Why CLONE Doesn't Need Them</h4>
+      <div class="state-grid" style="grid-template-columns: 1fr;">
+        <div class="state-box">
+          <span class="title">No dirty-page accounting needed</span>
+          <div class="desc">CLONE mode uses <strong>userfaultfd write-protect (UFFD-WP)</strong> to track writes in real-time. Every first write triggers a WP fault → CRIU snapshots the page. No need for kernel's dirty-page stats.</div>
+        </div>
+        <div class="state-box">
+          <span class="title">VmFlags derived from filename</span>
+          <div class="desc">The critical flag is <code>MAP_GROWSDOWN</code> (stack). CLONE uses <code>set_maps_derived_flags()</code> to detect it from the <code>[stack]</code> filename in maps output — no VmFlags line needed.</div>
+        </div>
+        <div class="state-box">
+          <span class="title">All pages transferred anyway</span>
+          <div class="desc">CLONE dump sends <strong>all pages</strong> (bulk transfer), then converges on dirty pages. It doesn't need per-VMA RSS/PSS to decide what to transfer.</div>
+        </div>
+      </div>
+
+      <div class="code-note" style="margin-top: 12px;">
+        <strong>Performance impact:</strong> For a 100GB Valkey process, parsing smaps
+        takes <strong>2-5 seconds</strong> (page table walk). Parsing maps takes
+        <strong>&lt;1 millisecond</strong>. This saves precious frozen time.
+      </div>
+    </div>
+  </div>
+</section>

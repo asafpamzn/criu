@@ -39,7 +39,7 @@
 
 /*
  * The hash is filled with shared objects before we fork
- * any tasks. Thus the heads are private (COW-ed) and the
+ * any tasks. Thus the heads are private (CLONE-ed) and the
  * entries are all in shmem.
  */
 #define SHMEM_HASH_SIZE 32

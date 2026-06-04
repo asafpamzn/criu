@@ -11,7 +11,7 @@ extern int lazy_pages_setup_zombie(int pid);
 extern int prepare_lazy_pages_socket(void);
 extern int lazy_pages_finish_restore(void);
 
-/* COW phased migration: apply buffered pages after receiving dirty bitmap */
+/* CLONE phased migration: apply buffered pages after receiving dirty bitmap */
 extern int apply_buffered_pages(int uffd, unsigned long *dirty_ranges,
 				unsigned int nr_dirty_ranges);
 
@@ -19,22 +19,22 @@ extern int apply_buffered_pages(int uffd, unsigned long *dirty_ranges,
 extern int get_first_lpi_uffd(void);
 
 /*
- * COW state accessors are in cow-uffd.c (include cow/cow-uffd.h):
- * - cow_is_restore_connected(), cow_set_restore_connected()
- * - cow_is_all_pages_sent_received(), cow_set_all_pages_sent_received()
- * - cow_get_uffd_for_vaddr()
- * - cow_queue_drain_eagain_request(), cow_is_eagain_queue_empty()
+ * CLONE state accessors are in clone-uffd.c (include clone/clone-uffd.h):
+ * - clone_is_restore_connected(), clone_set_restore_connected()
+ * - clone_is_all_pages_sent_received(), clone_set_all_pages_sent_received()
+ * - clone_get_uffd_for_vaddr()
+ * - clone_queue_drain_eagain_request(), clone_is_eagain_queue_empty()
  */
 
 
 
-/* COW Phase 2: Initialize page buffer for pre-buffering */
+/* CLONE Phase 2: Initialize page buffer for pre-buffering */
 extern int page_buffer_init(void);
 
-/* COW Phase 2: Set up async bulk reader for pre-buffering pages */
-extern int cow_setup_prebuffer_reader(void);
+/* CLONE Phase 2: Set up async bulk reader for pre-buffering pages */
+extern int clone_setup_prebuffer_reader(void);
 
-/* COW Phase 3: Enter restore loop after pages buffered and pstree loaded */
-extern int cow_phase3_restore_loop(int epollfd, struct epoll_event **events, int nr_fds);
+/* CLONE Phase 3: Enter restore loop after pages buffered and pstree loaded */
+extern int clone_phase3_restore_loop(int epollfd, struct epoll_event **events, int nr_fds);
 
 #endif /* __CR_UFFD_H_ */

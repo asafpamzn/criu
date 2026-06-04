@@ -28,7 +28,7 @@
     <div>
       <h4 class="pink">The Cure — Removing the Parasite</h4>
       <pre><code class="language-c">// Three variants depending on mode:
-if (opts.cow_dump && opts.lazy_pages)
+if (opts.clone_dump && opts.lazy_pages)
     ret = compel_cure_local(parasite_ctl);
 else if (opts.lazy_pages)
     ret = compel_cure_remote(parasite_ctl);
@@ -47,7 +47,7 @@ else
         </div>
         <div class="state-box">
           <span class="title">compel_cure_local()</span>
-          <div class="desc">Only clean up CRIU-side state. Leave parasite blob in target (COW mode — it's harmless, covered by WP tracking)</div>
+          <div class="desc">Only clean up CRIU-side state. Leave parasite blob in target (CLONE mode — it's harmless, covered by WP tracking)</div>
         </div>
       </div>
     </div>

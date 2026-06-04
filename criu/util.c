@@ -1488,7 +1488,7 @@ static void check_and_print_epoll_stats(void)
 }
 
 extern void check_and_print_uffd_stats(void);
-extern int cow_process_eagain_requests(void);
+extern int clone_process_eagain_requests(void);
 
 int epoll_run_rfds(int epollfd, struct epoll_event *evs, int nr_fds, int timeout)
 {
@@ -1504,11 +1504,11 @@ int epoll_run_rfds(int epollfd, struct epoll_event *evs, int nr_fds, int timeout
 			/* Check and print statistics every second */
 		check_and_print_uffd_stats();
 
-		/* In COW dump mode, process pending EAGAIN requests */
-		if (opts.cow_dump) {
-			ret = cow_process_eagain_requests();
+		/* In CLONE dump mode, process pending EAGAIN requests */
+		if (opts.clone_dump) {
+			ret = clone_process_eagain_requests();
 			if (ret < 0) {
-				pr_err("DEBUG_EPOLL: cow_process_eagain_requests returned %d\n", ret);
+				pr_err("DEBUG_EPOLL: clone_process_eagain_requests returned %d\n", ret);
 				goto out;
 			}
 		}

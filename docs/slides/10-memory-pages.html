@@ -14,7 +14,7 @@ ret = parasite_dump_pages_seized(item, &vmas, &mdc, parasite_ctl);
       <h4 class="green">What gets dumped?</h4>
       <ul class="small">
         <li><strong>Private anonymous pages</strong> — heap, stack, mmap(MAP_PRIVATE|MAP_ANON)</li>
-        <li><strong>Private file-backed pages</strong> — COW'd pages of shared libraries</li>
+        <li><strong>Private file-backed pages</strong> — CLONE'd pages of shared libraries</li>
         <li><strong>Shared anonymous pages</strong> — shmem regions</li>
         <li class="dim">File-backed clean pages are <em>not</em> dumped — they can be re-read from disk</li>
       </ul>

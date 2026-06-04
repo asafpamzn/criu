@@ -1,7 +1,7 @@
 <section>
   <h2>What Can Change After Early Resume?</h2>
   <p style="font-size:0.55em; color:#94a3b8; margin-bottom:10px;">
-    In COW WP_ASYNC mode, the source process is <strong style="color:#f87171;">alive and running</strong> after the ~51ms dump freeze.
+    In CLONE WP_ASYNC mode, the source process is <strong style="color:#f87171;">alive and running</strong> after the ~51ms dump freeze.
     Everything the process can do at runtime can happen during the bulk transfer window (~58s for 100GB).
   </p>
 
@@ -10,7 +10,7 @@
       <h4 style="color:#f87171;">⚠ Can Change — NOT Re-captured</h4>
       <p style="font-size:0.5em; color:#fb923c; margin-bottom:6px;">
         These are captured <em>once</em> at dump freeze. If the source mutates them afterward,
-        the replica gets stale state. <strong>Known limitation</strong> of current COW implementation.
+        the replica gets stale state. <strong>Known limitation</strong> of current CLONE implementation.
       </p>
 
       <div class="state-grid" style="grid-template-columns: 1fr;">
@@ -63,7 +63,7 @@
       <div class="state-grid" style="grid-template-columns: 1fr;">
         <div class="state-box" style="border-left: 3px solid #4ade80;">
           <span class="title">✓ Dirty memory pages</span>
-          <div class="desc">The core of COW convergence. WP_ASYNC + <code>PAGEMAP_SCAN(PAGE_IS_WRITTEN)</code>
+          <div class="desc">The core of CLONE convergence. WP_ASYNC + <code>PAGEMAP_SCAN(PAGE_IS_WRITTEN)</code>
             finds all pages written since bulk transfer. Atomically re-arms WP. Multiple rounds until
             dirty count → 0.</div>
         </div>
@@ -77,7 +77,7 @@
         <div class="state-box" style="border-left: 3px solid #a78bfa;">
           <span class="title">✓ Temporal consistency (fork snapshot)</span>
           <div class="desc">Reading dirty pages from a live process creates cross-page inconsistency.
-            <strong>Solution:</strong> inject <code>clone(SIGCHLD)</code> via ptrace → COW fork snapshot →
+            <strong>Solution:</strong> inject <code>clone(SIGCHLD)</code> via ptrace → CLONE fork snapshot →
             read ALL dirty pages from fork → kill fork. All pages from one point in time.</div>
         </div>
         <div class="state-box" style="border-left: 3px solid #fbbf24;">
@@ -90,8 +90,8 @@
 
       <div style="font-size:0.48em; margin-top:8px; background:#0f172a; border:1px solid #22d3ee; border-radius:6px; padding:6px;">
         <strong class="cyan">The general pattern:</strong> Just like <code>pre_dump</code> only captures memory
-        and the full <code>dump</code> captures everything, COW convergence currently only handles
-        memory. A full general-purpose COW migration would need to re-dump threads, FDs, signals,
+        and the full <code>dump</code> captures everything, CLONE convergence currently only handles
+        memory. A full general-purpose CLONE migration would need to re-dump threads, FDs, signals,
         etc. at convergence time — essentially a "second dump" of the non-memory state.
       </div>
     </div>
