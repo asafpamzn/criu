@@ -287,7 +287,7 @@ int clone_uffd_copy(int uffd, unsigned long vaddr, void *data,
 		if (flags & CLONE_TRACK_RETRY)
 			return -EAGAIN;
 		__sync_fetch_and_add(&clone_buffer.nr_eagain, 1);
-		pr_err("EAGAIN_DEBUG: %s EAGAIN at 0x%lx nr_pages=%lu\n",
+		pr_debug("%s EAGAIN at 0x%lx nr_pages=%lu\n",
 		       caller, vaddr, nr_pages);
 		if (lpis) {
 			/* Drain mode - queue copies data, caller frees original */
@@ -1060,7 +1060,7 @@ static void *background_drain_worker(void *arg)
 				/* Log progress every 100k pages or 10 seconds */
 				if (drained - last_progress_drained >= CLONE_LOG_SAMPLE_1M ||
 				    time(NULL) - last_progress_time >= CLONE_DRAIN_PROGRESS_SEC) {
-					pr_err("Drain thread %d: drained=%lu chunk=%d remaining=%lu\n",
+					pr_debug("Drain thread %d: drained=%lu chunk=%d remaining=%lu\n",
 					       thread_id, drained, chunk_id, clone_buffer.nr_pages);
 					last_progress_drained = drained;
 					last_progress_time = time(NULL);
@@ -1099,7 +1099,7 @@ static void *background_drain_worker(void *arg)
 		clock_gettime(CLOCK_MONOTONIC, &drain_end_time);
 		elapsed_ms = (drain_end_time.tv_sec - drain_start_time.tv_sec) * 1000 +
 			     (drain_end_time.tv_nsec - drain_start_time.tv_nsec) / 1000000;
-		pr_err("TIMING: drain took %lu ms\n", elapsed_ms);
+		pr_debug("TIMING: drain took %lu ms\n", elapsed_ms);
 
 		pr_info("Drain complete: total=%lu applied=%lu discarded=%lu eagain=%lu remaining=%lu\n",
 		       atomic_load(&total_drained), clone_buffer.nr_applied,
@@ -1239,9 +1239,7 @@ int clone_handle_exit(struct list_head *lpis)
 }
 
 /*
- * ============================================================================
  * UFFD Statistics and Histogram (CLONE mode)
- * ============================================================================
  */
 
 /* Histogram statistics structure */
@@ -1344,7 +1342,7 @@ void check_and_print_uffd_stats(void)
 			struct tm *tm;
 			clock_gettime(CLOCK_REALTIME, &ts);
 			tm = localtime(&ts.tv_sec);
-			pr_err("[UFFD_STATS] [%02d:%02d:%02d.%03ld] reqs=%lu(pf:%lu,bg:%lu) pages=%lu\n",
+			pr_debug("[UFFD_STATS] [%02d:%02d:%02d.%03ld] reqs=%lu(pf:%lu,bg:%lu) pages=%lu\n",
 				tm->tm_hour, tm->tm_min, tm->tm_sec, ts.tv_nsec / 1000000,
 				uffd_stats.total_pf_reqs + uffd_stats.total_bg_reqs,
 				uffd_stats.total_pf_reqs,
@@ -1391,9 +1389,7 @@ void check_and_print_uffd_stats(void)
 }
 
 /*
- * ============================================================================
  * EAGAIN Request Handling (CLONE mode)
- * ============================================================================
  */
 
 /* Pending EAGAIN requests list - protected by eagain_mutex */
@@ -1436,7 +1432,7 @@ int clone_queue_eagain_request(struct lazy_pages_info *lpi, __u64 address,
 	/* Only set page state after successfully queueing */
 	page_state_set(address, PAGE_STATE_EAGAIN_QUEUED);
 
-	pr_err("EAGAIN_DEBUG: queued 0x%llx nr_pages=%lu op=%s buf=%p buf_copy=%p\n",
+	pr_debug("queued 0x%llx nr_pages=%lu op=%s buf=%p buf_copy=%p\n",
 	       address, nr_pages, op_name, buf, buf_copy);
 	return 0;
 }
@@ -1581,7 +1577,7 @@ int clone_process_eagain_requests(void)
 		/* Skip if process has exited */
 		if (req->lpi->exited) {
 			uffd_stats.eagain_skipped++;
-			pr_err("EAGAIN retry failed lpi unmapped for 0x%llx (op=%s)\n",
+			pr_warn("EAGAIN retry skipped, lpi unmapped for 0x%llx (op=%s)\n",
 				 req->address, req->buf ? "copy" : "zero");
 			page_state_set(req->address, PAGE_STATE_DISCARDED);
 			list_del(&req->l);
@@ -1593,7 +1589,7 @@ int clone_process_eagain_requests(void)
 
 		uffd_stats.eagain_processed++;
 
-		pr_err("EAGAIN_DEBUG: retrying 0x%llx nr_pages=%lu op=%s buf=%p\n",
+		pr_debug("retrying 0x%llx nr_pages=%lu op=%s buf=%p\n",
 		       req->address, req->nr_pages, req->buf ? "copy" : "zero", req->buf);
 
 		/* Call appropriate retry function based on operation type */
@@ -1605,7 +1601,7 @@ int clone_process_eagain_requests(void)
 		if (ret == -EAGAIN) {
 			/* Still blocked - keep in queue for next attempt */
 			uffd_stats.eagain_blocked++;
-			pr_err("EAGAIN_DEBUG: still blocked 0x%llx\n", req->address);
+			pr_debug("still blocked 0x%llx\n", req->address);
 			continue;
 		} else if (ret < 0) {
 			/* Error - remove from queue (state already set by retry func) */
@@ -1622,7 +1618,7 @@ int clone_process_eagain_requests(void)
 
 		/* Success! */
 		uffd_stats.eagain_succeeded++;
-		pr_err("EAGAIN_DEBUG: succeeded 0x%llx nr_pages=%lu\n",
+		pr_debug("succeeded 0x%llx nr_pages=%lu\n",
 		       req->address, req->nr_pages);
 
 		/* Clean up and remove from queue */
@@ -1642,9 +1638,7 @@ int clone_process_eagain_requests(void)
 }
 
 /*
- * ============================================================================
  * CLONE Restore State Management
- * ============================================================================
  *
  * State variables and accessors for CLONE phased migration.
  * These track the state of the restore process and communication with primary.
@@ -1691,9 +1685,7 @@ int clone_get_uffd_for_vaddr(struct list_head *lpis, unsigned long vaddr)
 }
 
 /*
- * ============================================================================
  * CLONE Phase 2/3 Infrastructure
- * ============================================================================
  *
  * Pre-buffer and convergence infrastructure for CLONE phased migration.
  * Pages arrive before criu restore connects, so we buffer them

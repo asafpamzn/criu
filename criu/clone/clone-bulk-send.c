@@ -291,7 +291,7 @@ bool clone_is_scan_complete(void)
 
 void clone_signal_scanner_freeze(void)
 {
-	pr_err("=== SCANNER: Signaling freeze ===\n");
+	pr_debug("Scanner: signaling freeze\n");
 	__atomic_store_n(&g_scanner_freeze_signal, true, __ATOMIC_RELEASE);
 	__sync_synchronize();
 }
@@ -317,13 +317,13 @@ static void *dirty_scanner_thread(void *arg)
 	char pagemap_path[64];
 	struct timespec t_start, t_end;
 
-	pr_err("Scanner[%d] started, source_pid=%d\n",
+	pr_debug("Scanner[%d] started, source_pid=%d\n",
 	       scanner_id, g_scanner_source_pid);
 	clock_gettime(CLOCK_MONOTONIC, &t_start);
 
 	/* Wait for all sender threads to complete bulk transfer first */
 	if (scanner_id == 0) {
-		pr_err("Scanner[0]: waiting for %d sender threads to complete bulk transfer...\n",
+		pr_debug("Scanner[0]: waiting for %d sender threads to complete bulk transfer...\n",
 		       g_num_sender_threads);
 	}
 	while (__atomic_load_n(&g_bulk_transfer_done_count, __ATOMIC_ACQUIRE) <
@@ -333,7 +333,7 @@ static void *dirty_scanner_thread(void *arg)
 		usleep(CLONE_USLEEP_10MS);
 	}
 	if (scanner_id == 0) {
-		pr_err("Scanner: all sender threads completed bulk transfer, starting dirty scan\n");
+		pr_debug("Scanner: all sender threads completed bulk transfer, starting dirty scan\n");
 	}
 
 	/* Open pagemap fd - each scanner needs its own fd */
@@ -487,20 +487,20 @@ static void *dirty_scanner_thread(void *arg)
 		{
 			long iter_ms = (iter_end.tv_sec - iter_start.tv_sec) * 1000 +
 				       (iter_end.tv_nsec - iter_start.tv_nsec) / 1000000;
-			pr_warn("DEBUG_PERF: Scanner[%d] iter=%u: pages=%lu regions=%lu scan=%lu ms dist=%lu ms total=%ld ms\n",
+			pr_debug("Scanner[%d] iter=%u: pages=%lu regions=%lu scan=%lu ms dist=%lu ms total=%ld ms\n",
 			       scanner_id, iteration, my_dirty_pages, num_regions,
 			       scan_time_ns / 1000000, dist_time_ns / 1000000, iter_ms);
 		}
 		/* Scanner 0 also logs combined stats */
 		if (scanner_id == 0) {
-			pr_err("Scanner: iter=%u, %lu total pages\n",
+			pr_debug("Scanner: iter=%u, %lu total pages\n",
 			       iteration, g_total_dirty_pages);
 		}
 
 		/* Check convergence - pre-scanners check the combined total */
 		if (g_total_dirty_pages < CLONE_DIRTY_SCAN_FREEZE_THRESHOLD) {
 			if (scanner_id == 0) {
-				pr_err("Scanner: %lu pages < %d threshold, will request freeze after queue drain\n",
+				pr_debug("Scanner: %lu pages < %d threshold, will request freeze after queue drain\n",
 				       g_total_dirty_pages, CLONE_DIRTY_SCAN_FREEZE_THRESHOLD);
 			}
 			break;
@@ -509,7 +509,7 @@ static void *dirty_scanner_thread(void *arg)
 		/* Check max iterations limit */
 		if (CLONE_PRE_SCAN_MAX_ITERATIONS > 0 && iteration >= CLONE_PRE_SCAN_MAX_ITERATIONS) {
 			if (scanner_id == 0) {
-				pr_err("Scanner: max iterations (%u) reached, will request freeze after queue drain\n", iteration);
+				pr_debug("Scanner: max iterations (%u) reached, will request freeze after queue drain\n", iteration);
 			}
 			break;
 		}
@@ -524,7 +524,7 @@ static void *dirty_scanner_thread(void *arg)
 		long drain_ms;
 
 		clock_gettime(CLOCK_MONOTONIC, &drain_start);
-		pr_err("Scanner: waiting for queue drain before freeze...\n");
+		pr_debug("Scanner: waiting for queue drain before freeze...\n");
 
 		while (1) {
 			head = __atomic_load_n(&g_conv_head, __ATOMIC_ACQUIRE);
@@ -537,7 +537,7 @@ static void *dirty_scanner_thread(void *arg)
 		clock_gettime(CLOCK_MONOTONIC, &drain_end);
 		drain_ms = (drain_end.tv_sec - drain_start.tv_sec) * 1000 +
 			   (drain_end.tv_nsec - drain_start.tv_nsec) / 1000000;
-		pr_err("Scanner: queue drained in %ld ms, requesting freeze\n", drain_ms);
+		pr_debug("Scanner: queue drained in %ld ms, requesting freeze\n", drain_ms);
 		g_last_scan_flag = true;
 	}
 
@@ -545,7 +545,7 @@ wait_for_freeze:
 
 	/* Wait for freeze signal from main thread */
 	if (scanner_id == 0) {
-		pr_err("Scanner: waiting for freeze signal...\n");
+		pr_debug("Scanner: waiting for freeze signal...\n");
 	}
 	while (!__atomic_load_n(&g_scanner_freeze_signal, __ATOMIC_ACQUIRE)) {
 		usleep(CLONE_USLEEP_1MS);
@@ -562,7 +562,7 @@ wait_for_freeze:
 
 		clock_gettime(CLOCK_MONOTONIC, &fs_start);
 		if (scanner_id == 0) {
-			pr_err("Scanner: final scan (frozen)\n");
+			pr_debug("Scanner: final scan (frozen)\n");
 		}
 
 #ifdef CONFIG_HAS_LIBBPF
@@ -580,7 +580,7 @@ wait_for_freeze:
 			if (bpf_regions) {
 				bpf_nr = clone_bpf_drain(bpf_regions, CLONE_PAGEMAP_SCAN_VEC_LEN, &bpf_pages);
 				if (bpf_nr >= 0) {
-					pr_err("BPF drain: %d regions, %lu pages\n", bpf_nr, bpf_pages);
+					pr_debug("BPF drain: %d regions, %lu pages\n", bpf_nr, bpf_pages);
 					for (i = 0; i < bpf_nr; i++) {
 						struct dirty_region_entry *entry;
 						unsigned long pages;
@@ -603,7 +603,7 @@ wait_for_freeze:
 					}
 				} else if (bpf_nr == -2) {
 					/* BPF ring drops - fall back to PAGEMAP_SCAN */
-					pr_err("BPF ring drops detected, falling back to PAGEMAP_SCAN\n");
+					pr_warn("BPF ring drops detected, falling back to PAGEMAP_SCAN\n");
 					use_bpf = false;
 				}
 				xfree(bpf_regions);
@@ -699,7 +699,7 @@ skip_pagemap_scan:
 				total_final += scanners[s].dirty_count;
 			fs_ms = (fs_end.tv_sec - fs_start.tv_sec) * 1000 +
 				(fs_end.tv_nsec - fs_start.tv_nsec) / 1000000;
-			pr_err("Scanner: PAGEMAP_SCAN done: %lu dirty pages found in %ld ms\n",
+			pr_debug("Scanner: PAGEMAP_SCAN done: %lu dirty pages found in %ld ms\n",
 			       total_final, fs_ms);
 			g_scanners_iter_done = 0;
 			pthread_cond_broadcast(&g_scanner_cond);
@@ -721,7 +721,7 @@ out:
 	{
 		long elapsed_ms = (t_end.tv_sec - t_start.tv_sec) * 1000 +
 				  (t_end.tv_nsec - t_start.tv_nsec) / 1000000;
-		pr_err("Scanner[%d] done: %u iterations, %ld ms\n",
+		pr_debug("Scanner[%d] done: %u iterations, %ld ms\n",
 		       scanner_id, iteration, elapsed_ms);
 	}
 
@@ -748,10 +748,10 @@ out:
 			clock_gettime(CLOCK_MONOTONIC, &now);
 			from_freeze_ms = (now.tv_sec - g_freeze_signal_time.tv_sec) * 1000 +
 					 (now.tv_nsec - g_freeze_signal_time.tv_nsec) / 1000000;
-			pr_err("Scanner: all scanners done, %ld ms from freeze signal\n", from_freeze_ms);
+			pr_debug("Scanner: all scanners done, %ld ms from freeze signal\n", from_freeze_ms);
 
 			total_pages = __atomic_load_n(&g_total_scanned_pages, __ATOMIC_RELAXED);
-			pr_warn("DEBUG_PERF: MPMC queue: %lu total scanned pages, %lu entries\n",
+			pr_debug("MPMC queue: %lu total scanned pages, %lu entries\n",
 			       total_pages, __atomic_load_n(&g_conv_head, __ATOMIC_RELAXED));
 
 			__atomic_store_n(&g_scan_complete, true, __ATOMIC_RELEASE);
@@ -801,7 +801,7 @@ int clone_start_scanner_thread(pid_t source_pid)
 	 */
 	if (clone_bpf_active()) {
 		g_using_bpf_mode = true;
-		pr_err("BPF mode: skipping scanner threads for pid %d\n", source_pid);
+		pr_debug("BPF mode: skipping scanner threads for pid %d\n", source_pid);
 		return 0;
 	}
 #endif
@@ -833,7 +833,7 @@ void clone_wait_scanner_thread(void)
 #ifdef CONFIG_HAS_LIBBPF
 	/* In BPF mode, no scanner threads to wait for */
 	if (g_using_bpf_mode) {
-		pr_err("BPF mode: no scanner threads to wait for\n");
+		pr_debug("BPF mode: no scanner threads to wait for\n");
 		return;
 	}
 #endif
@@ -1186,7 +1186,7 @@ void clone_debug_scan_compare(void)
 	unsigned long offset, vma_size;
 	unsigned long lo, hi, mid;
 
-	pr_err("=== SCAN_COMPARE DEBUG MODE ===\n");
+	pr_debug("SCAN_COMPARE debug mode\n");
 
 	/* Check BPF status */
 	if (!clone_bpf_active()) {
@@ -1196,7 +1196,7 @@ void clone_debug_scan_compare(void)
 
 	drops = clone_bpf_drop_count();
 	if (drops > 0) {
-		pr_err("BPF ring overflow: %llu drops\n", (unsigned long long)drops);
+		pr_warn("BPF ring overflow: %llu drops\n", (unsigned long long)drops);
 	}
 
 	/* Drain BPF addresses */
@@ -1204,7 +1204,7 @@ void clone_debug_scan_compare(void)
 		pr_err("BPF drain failed\n");
 		exit(1);
 	}
-	pr_err("BPF found: %lu unique pages\n", bpf_addr_count);
+	pr_debug("BPF found: %lu unique pages\n", bpf_addr_count);
 
 	/* Open pagemap for SCAN */
 	snprintf(path, sizeof(path), "/proc/%d/pagemap", g_scanner_source_pid);
@@ -1232,10 +1232,10 @@ void clone_debug_scan_compare(void)
 	{
 		unsigned long vma_count = 0;
 		list_for_each_entry(lve, lazy_vmas, list) {
-			pr_err("VMA[%lu]: 0x%lx-0x%lx\n", vma_count, lve->start, lve->end);
+			pr_debug("VMA[%lu]: 0x%lx-0x%lx\n", vma_count, lve->start, lve->end);
 			vma_count++;
 		}
-		pr_err("Scanning %lu VMAs\n", vma_count);
+		pr_debug("Scanning %lu VMAs\n", vma_count);
 	}
 
 	list_for_each_entry(lve, lazy_vmas, list) {
@@ -1286,7 +1286,7 @@ void clone_debug_scan_compare(void)
 	xfree(regs);
 	close(pagemap_fd);
 
-	pr_err("Raw SCAN returned: %lu addresses\n", scan_addrs_count);
+	pr_debug("Raw SCAN returned: %lu addresses\n", scan_addrs_count);
 
 	/* Sort SCAN addresses for dedup and binary search */
 	qsort(scan_addrs, scan_addrs_count, sizeof(*scan_addrs), scan_compare_addr_cmp);
@@ -1309,13 +1309,13 @@ void clone_debug_scan_compare(void)
 				}
 			}
 		}
-		pr_err("SCAN duplicates: %lu, unique: %lu\n", duplicates, unique);
+		pr_debug("SCAN duplicates: %lu, unique: %lu\n", duplicates, unique);
 		scan_count = unique;  /* Now scan_count = unique SCAN pages */
 	}
 
 	/* Get initial dirty pages from BPF start time */
 	initial_dirty = clone_bpf_get_initial_dirty(&initial_dirty_count);
-	pr_err("Initial dirty pages at BPF start: %lu\n", initial_dirty_count);
+	pr_debug("Initial dirty pages at BPF start: %lu\n", initial_dirty_count);
 
 	/* Now compare: both arrays are sorted and unique */
 	bpf_idx = 0;
@@ -1362,12 +1362,12 @@ void clone_debug_scan_compare(void)
 			if (vma_match) {
 				offset = scan_addrs[scan_idx] - vma_match->start;
 				vma_size = vma_match->end - vma_match->start;
-				pr_err("BPF MISSED: 0x%lx (VMA 0x%lx-0x%lx, offset=0x%lx, vma_size=%luMB) %s\n",
+				pr_debug("BPF MISSED: 0x%lx (VMA 0x%lx-0x%lx, offset=0x%lx, vma_size=%luMB) %s\n",
 				       scan_addrs[scan_idx], vma_match->start, vma_match->end,
 				       offset, vma_size / (1024 * 1024),
 				       was_initial ? "WAS_INITIAL_DIRTY" : "NEW_DIRTY");
 			} else {
-				pr_err("BPF MISSED: 0x%lx (NO VMA MATCH!) %s\n",
+				pr_debug("BPF MISSED: 0x%lx (NO VMA MATCH!) %s\n",
 				       scan_addrs[scan_idx],
 				       was_initial ? "WAS_INITIAL_DIRTY" : "NEW_DIRTY");
 			}
@@ -1410,12 +1410,12 @@ void clone_debug_scan_compare(void)
 		if (vma_match) {
 			offset = scan_addrs[scan_idx] - vma_match->start;
 			vma_size = vma_match->end - vma_match->start;
-			pr_err("BPF MISSED: 0x%lx (VMA 0x%lx-0x%lx, offset=0x%lx, vma_size=%luMB) %s\n",
+			pr_debug("BPF MISSED: 0x%lx (VMA 0x%lx-0x%lx, offset=0x%lx, vma_size=%luMB) %s\n",
 			       scan_addrs[scan_idx], vma_match->start, vma_match->end,
 			       offset, vma_size / (1024 * 1024),
 			       was_initial ? "WAS_INITIAL_DIRTY" : "NEW_DIRTY");
 		} else {
-			pr_err("BPF MISSED: 0x%lx (NO VMA MATCH!) %s\n",
+			pr_debug("BPF MISSED: 0x%lx (NO VMA MATCH!) %s\n",
 			       scan_addrs[scan_idx],
 			       was_initial ? "WAS_INITIAL_DIRTY" : "NEW_DIRTY");
 		}
@@ -1427,14 +1427,14 @@ void clone_debug_scan_compare(void)
 		scan_idx++;
 	}
 
-	pr_err("=== SCAN_COMPARE RESULTS ===\n");
-	pr_err("BPF found:  %lu unique pages\n", bpf_addr_count);
-	pr_err("SCAN found: %lu unique pages\n", scan_count);
-	pr_err("In both:    %lu pages\n", scan_in_bpf);
-	pr_err("SCAN only:  %lu pages (BPF MISSED)\n", scan_only);
-	pr_err("  - Was initial dirty: %lu (dirty before BPF started)\n", missed_in_initial);
-	pr_err("  - New dirty:         %lu (written after BPF, but BPF missed)\n", missed_not_initial);
-	pr_err("BPF only:   %lu pages (SCAN missed)\n",
+	pr_debug("SCAN_COMPARE results:\n");
+	pr_debug("BPF found:  %lu unique pages\n", bpf_addr_count);
+	pr_debug("SCAN found: %lu unique pages\n", scan_count);
+	pr_debug("In both:    %lu pages\n", scan_in_bpf);
+	pr_debug("SCAN only:  %lu pages (BPF MISSED)\n", scan_only);
+	pr_debug("  - Was initial dirty: %lu (dirty before BPF started)\n", missed_in_initial);
+	pr_debug("  - New dirty:         %lu (written after BPF, but BPF missed)\n", missed_not_initial);
+	pr_debug("BPF only:   %lu pages (SCAN missed)\n",
 	       bpf_addr_count > scan_in_bpf ? bpf_addr_count - scan_in_bpf : 0);
 
 	if (bpf_addrs)
@@ -1442,7 +1442,7 @@ void clone_debug_scan_compare(void)
 	if (scan_addrs)
 		xfree(scan_addrs);
 
-	pr_err("=== EXITING DEBUG MODE ===\n");
+	pr_debug("SCAN_COMPARE: exiting debug mode\n");
 
 }
 #endif /* SCAN_COMPARE */
@@ -1495,9 +1495,9 @@ static __thread unsigned long tls_total_sent_pages;
  * Header contains nr_pages and base_vaddr.
  *
  * acceleration: LZ4_compress_fast acceleration. 1 matches LZ4_compress_default
- * (best ratio). Larger values (e.g. 99) trade ratio for CPU - used during
- * Phase 2/3 convergence where CPU is the bottleneck and the payload is
- * already mostly modified (poorly-compressible) pages.
+ * (best ratio). Larger values trade ratio for CPU. All current callers pass 1;
+ * larger values were measured to regress total P3 wall-clock (see the note in
+ * send_dirty_slices()).
  */
 int send_pages_batch_compressed(struct tls_conn *tls, int sk,
 				const void *data, int nr_pages, u64 dst_id,
@@ -1938,7 +1938,7 @@ static void *p3_bulk_sender_thread(void *arg)
 #ifdef CLONE_P3_SENDER_CPU
 			pin_to_cpu(CLONE_P3_SENDER_CPU);
 #endif
-			pr_err("P3[%d]: Starting bulk transfer (work-stealing)\n", thread_id);
+			pr_debug("P3[%d]: Starting bulk transfer (work-stealing)\n", thread_id);
 
 			/* Pull work items from shared queue until exhausted */
 			while ((work = get_next_work_item()) != NULL) {
@@ -1981,7 +1981,7 @@ static void *p3_bulk_sender_thread(void *arg)
 				chunks_processed++;
 			}
 		} else {
-			pr_err("P3[%d]: Skipping bulk (idle until phase 2)\n", thread_id);
+			pr_debug("P3[%d]: Skipping bulk (idle until phase 2)\n", thread_id);
 		}
 
 		clock_gettime(CLOCK_MONOTONIC, &bulk_end);
@@ -1992,7 +1992,7 @@ static void *p3_bulk_sender_thread(void *arg)
 		bulk_out_bytes = tls_compress_out_bytes - bulk_out_start;
 		if (bulk_in_bytes > 0)
 			bulk_ratio_pct = (float)bulk_out_bytes * 100.0f / bulk_in_bytes;
-		pr_err("P3[%d] TIMING: Bulk transfer done: %lu pages, %d chunks in %ld ms "
+		pr_debug("P3[%d] TIMING: Bulk transfer done: %lu pages, %d chunks in %ld ms "
 		       "(compress: %lu -> %lu bytes, ratio=%.1f%%)\n",
 		       thread_id, total_sent, chunks_processed, bulk_elapsed_ms,
 		       bulk_in_bytes, bulk_out_bytes, bulk_ratio_pct);
@@ -2146,7 +2146,7 @@ static void *p3_bulk_sender_thread(void *arg)
 				send_after_scan_ms = (loop_end.tv_sec - scan_done_time.tv_sec) * 1000 +
 						     (loop_end.tv_nsec - scan_done_time.tv_nsec) / 1000000;
 			}
-			pr_err("P3[%d] TIMING P3: total=%ld ms (during_scan=%ld ms [%lu pages] + after_scan=%ld ms [%lu pages])\n",
+			pr_debug("P3[%d] TIMING P3: total=%ld ms (during_scan=%ld ms [%lu pages] + after_scan=%ld ms [%lu pages])\n",
 			       thread_id, p3_total_ms, send_during_scan_ms, pages_before_scan_done,
 			       send_after_scan_ms, p3_pages - pages_before_scan_done);
 		}
@@ -2161,7 +2161,7 @@ static void *p3_bulk_sender_thread(void *arg)
 				avg_slices = (float)slices_sent / packed_batches;
 				avg_pages = (float)loop_total_pages / packed_batches;
 			}
-			pr_err("P3[%d] TIMING: Queue consumption done: "
+			pr_debug("P3[%d] TIMING: Queue consumption done: "
 			       "%lu regions, %lu pages in %ld ms "
 			       "(packed_batches=%lu slices=%lu "
 			       "avg_slices/batch=%.2f avg_pages/batch=%.2f) "
@@ -2181,7 +2181,7 @@ static void *p3_bulk_sender_thread(void *arg)
 		unsigned long new_vma_pages = 0;
 
 		clock_gettime(CLOCK_MONOTONIC, &fs_start);
-		pr_err("P3[%d] sending new VMA pages (if any)\n", thread_id);
+		pr_debug("P3[%d] sending new VMA pages (if any)\n", thread_id);
 
 		/* Send pages from new VMAs detected in Phase 3 */
 		new_vma_pages = send_new_vma_pages(ctx);
@@ -2190,7 +2190,7 @@ static void *p3_bulk_sender_thread(void *arg)
 
 		fs_elapsed_ms = (fs_end.tv_sec - fs_start.tv_sec) * 1000 +
 				(fs_end.tv_nsec - fs_start.tv_nsec) / 1000000;
-		pr_err("P3[%d] new VMA pages done: %lu pages, TIMING: %ld ms\n",
+		pr_debug("P3[%d] new VMA pages done: %lu pages, TIMING: %ld ms\n",
 		       thread_id, new_vma_pages, fs_elapsed_ms);
 	}
 
@@ -2200,7 +2200,7 @@ static void *p3_bulk_sender_thread(void *arg)
 		long elapsed_ms = (t_end.tv_sec - t_start.tv_sec) * 1000 +
 				  (t_end.tv_nsec - t_start.tv_nsec) / 1000000;
 
-		pr_err("P3[%d] done: %lu pages, %ld ms\n",
+		pr_debug("P3[%d] done: %lu pages, %ld ms\n",
 		       thread_id, ctx->pages_sent, elapsed_ms);
 	}
 
@@ -2255,9 +2255,9 @@ int clone_start_p3_threads(int *sockets, int num_sockets, u64 dst_id, pid_t sour
 
 	/* Initialize per-connection TLS credentials before spawning threads */
 	if (opts.tls) {
-		pr_err("P3 sender: calling tls_global_init()\n");
+		pr_debug("P3 sender: calling tls_global_init()\n");
 		BUG_ON(tls_global_init());
-		pr_err("P3 sender: tls_global_init() OK\n");
+		pr_debug("P3 sender: tls_global_init() OK\n");
 	}
 
 	/* Start one sender thread per socket */
@@ -2274,14 +2274,14 @@ int clone_start_p3_threads(int *sockets, int num_sockets, u64 dst_id, pid_t sour
 		p3_threads[i].thread = 0;
 
 		if (opts.tls) {
-			pr_err("P3 sender[%d] starting TLS handshake on fd=%d\n",
+			pr_debug("P3 sender[%d] starting TLS handshake on fd=%d\n",
 			       i, sockets[i]);
 			p3_threads[i].tls = tls_conn_new(sockets[i], true);
 			if (!p3_threads[i].tls) {
 				pr_err("P3 sender[%d] TLS handshake FAILED\n", i);
 				BUG();
 			}
-			pr_err("P3 sender[%d] TLS handshake OK\n", i);
+			pr_debug("P3 sender[%d] TLS handshake OK\n", i);
 		} else {
 			p3_threads[i].tls = NULL;
 		}
@@ -2297,7 +2297,7 @@ int clone_start_p3_threads(int *sockets, int num_sockets, u64 dst_id, pid_t sour
 		}
 	}
 
-	pr_err("Started %d P3 bulk sender threads (%d sockets)\n",
+	pr_debug("Started %d P3 bulk sender threads (%d sockets)\n",
 		p3_threads_active, threads_to_start);
 	return p3_threads_active > 0 ? 0 : -1;
 }
@@ -2349,7 +2349,7 @@ void clone_wait_p3_threads(void)
 	total_ms = (t_senders_done.tv_sec - g_freeze_signal_time.tv_sec) * 1000 +
 		   (t_senders_done.tv_nsec - g_freeze_signal_time.tv_nsec) / 1000000;
 
-	pr_err("P3 TIMING from freeze: scanner=%ld ms, senders=%ld ms, total=%ld ms, %lu pages\n",
+	pr_debug("P3 TIMING from freeze: scanner=%ld ms, senders=%ld ms, total=%ld ms, %lu pages\n",
 	       scanner_ms, senders_ms, total_ms, total);
 
 	/*
@@ -2366,7 +2366,7 @@ void clone_wait_p3_threads(void)
 							__ATOMIC_ACQUIRE);
 		unsigned long expected_sent = (skipped > scanned) ? 0 : scanned - skipped;
 
-		pr_err("P3 verification: scanned=%lu sent=%lu vma_vanished_skipped=%lu expected_sent=%lu\n",
+		pr_debug("P3 verification: scanned=%lu sent=%lu vma_vanished_skipped=%lu expected_sent=%lu\n",
 		       scanned, sent, skipped, expected_sent);
 
 		if (sent != expected_sent) {
@@ -2458,7 +2458,7 @@ bool clone_all_threads_below_threshold(void)
  */
 void clone_signal_last_scan(void)
 {
-	pr_err("=== CONVERGENCE: Signaling last scan ===\n");
+	pr_debug("Convergence: signaling last scan\n");
 	clock_gettime(CLOCK_MONOTONIC, &g_freeze_signal_time);
 	g_last_scan_flag = true;
 
@@ -2473,7 +2473,7 @@ void clone_signal_last_scan(void)
 			pr_err("BPF drain failed!\n");
 			BUG();
 		}
-		pr_err("BPF mode: drained %d dirty pages to sender queues\n", dirty_pages);
+		pr_debug("BPF mode: drained %d dirty pages to sender queues\n", dirty_pages);
 		clone_bpf_stop();
 		__sync_synchronize();
 		return;

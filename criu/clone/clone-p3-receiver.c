@@ -168,7 +168,7 @@ static int p3_receive_and_buffer(struct p3_receiver_ctx *ctx)
 			int first_nr = CLONE_BATCH_PAGES - page_offset;
 			int second_nr = nr_pages - first_nr;
 
-			pr_debug("P3_RECV_DEBUG: CROSSES BOUNDARY vaddr=0x%lx base=0x%lx "
+			pr_debug("P3 receive: batch crosses boundary vaddr=0x%lx base=0x%lx "
 			       "offset=%d nr=%d first=%d second=%d thread=%d\n",
 			       (unsigned long)pi.vaddr, base, page_offset, nr_pages,
 			       first_nr, second_nr, ctx->thread_id);
@@ -261,14 +261,14 @@ static void *p3_receiver_thread_func(void *arg)
 
 	/* Per-connection TLS handshake (client side — REPLICA connects to PRIMARY) */
 	if (opts.tls) {
-		pr_err("P3 receiver[%d] starting TLS handshake on fd=%d\n",
+		pr_debug("P3 receiver[%d] starting TLS handshake on fd=%d\n",
 		       ctx->thread_id, ctx->socket);
 		ctx->tls = tls_conn_new(ctx->socket, false);
 		if (!ctx->tls) {
 			pr_err("P3 receiver[%d] TLS handshake FAILED\n", ctx->thread_id);
 			BUG();
 		}
-		pr_err("P3 receiver[%d] TLS handshake OK\n", ctx->thread_id);
+		pr_debug("P3 receiver[%d] TLS handshake OK\n", ctx->thread_id);
 	}
 
 	/* Receive pages until socket closes */
@@ -392,9 +392,9 @@ int start_p3_receiver_connections(int num_connections)
 
 	/* Initialize per-connection TLS credentials before spawning threads */
 	if (opts.tls) {
-		pr_err("P3 receiver: calling tls_global_init()\n");
+		pr_debug("P3 receiver: calling tls_global_init()\n");
 		BUG_ON(tls_global_init());
-		pr_err("P3 receiver: tls_global_init() OK\n");
+		pr_debug("P3 receiver: tls_global_init() OK\n");
 	}
 
 	/* Start receiver thread for each connection */

@@ -156,8 +156,8 @@ static int read_bulk_header(struct ps_async_read_bulk *ar, int flags)
 	cmd = decode_ps_cmd(ar->pi.cmd);
 
 	if (cmd == PS_IOV_SKELETON_FILE) {
-		pr_err("read_bulk_header: SKELETON_FILE nr_pages(name_len)=%lu vaddr(file_size)=%lu\n",
-		       (unsigned long)ar->pi.nr_pages, (unsigned long)ar->pi.vaddr);
+		pr_debug("read_bulk_header: SKELETON_FILE nr_pages(name_len)=%lu vaddr(file_size)=%lu\n",
+			 (unsigned long)ar->pi.nr_pages, (unsigned long)ar->pi.vaddr);
 		if (clone_recv_skeleton_file(&ar->pi) < 0) {
 			pr_err("read_bulk_header: clone_recv_skeleton_file FAILED\n");
 			return -1;
@@ -167,7 +167,7 @@ static int read_bulk_header(struct ps_async_read_bulk *ar, int flags)
 
 	if (cmd == PS_IOV_ALL_PAGES_SENT) {
 		/* Primary signals all pages sent - replica can zero-fill rest */
-		pr_err("=== REPLICA PHASE 4: All pages sent signal received ===\n");
+		pr_debug("All pages sent signal received\n");
 		clone_set_all_pages_sent_received();
 		/*
 		 * Return COMPLETE to stop reading - primary is waiting for ACK.

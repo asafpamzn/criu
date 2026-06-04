@@ -221,7 +221,7 @@ int page_pool_thread_init(int thread_id)
 	pools[thread_id].next_page = 1;  /* Skip header page */
 	pools[thread_id].initialized = true;
 
-	pr_info("Thread %d pool initialized\n", thread_id);
+	pr_debug("Thread %d pool initialized\n", thread_id);
 	return 0;
 }
 
@@ -383,7 +383,7 @@ void page_pool_put(void *page)
 		int freed_count = atomic_fetch_add(&total_chunks_freed, 1) + 1;
 		int chunk_idx = hdr->chunk_idx;
 
-		pr_info("PAGE_POOL_FREE: chunk=%p[%d] total_freed=%d\n",
+		pr_debug("PAGE_POOL_FREE: chunk=%p[%d] total_freed=%d\n",
 		       hdr, chunk_idx, freed_count);
 
 		/* Remove from tracking list - chunk must be tracked */
@@ -393,7 +393,7 @@ void page_pool_put(void *page)
 		all_chunks[chunk_idx] = NULL;
 		pthread_spin_unlock(&chunk_list_lock);
 
-		madvise(hdr, CLONE_CHUNK_SIZE, MADV_DONTNEED); //munmap(hdr, CLONE_CHUNK_SIZE);
+		madvise(hdr, CLONE_CHUNK_SIZE, MADV_DONTNEED);
 	}
 }
 
@@ -421,7 +421,7 @@ void page_pool_destroy_all(void)
 		pools[i].next_page = 0;
 	}
 
-	pr_warn("All page pools destroyed\n");
+	pr_debug("All page pools destroyed\n");
 }
 
 /* Print chunk stats */
@@ -451,7 +451,7 @@ void page_pool_dump_stats(void)
 	}
 	pthread_spin_unlock(&chunk_list_lock);
 
-	pr_info("PAGE_POOL: chunks=%d active=%d freed=%d | outstanding=%lu | "
+	pr_debug("PAGE_POOL: chunks=%d active=%d freed=%d | outstanding=%lu | "
 	       "alloc=%lu put=%lu diff=%lu | ref_range=[%d,%d]\n",
 	       n, active, atomic_load(&total_chunks_freed), total_outstanding,
 	       atomic_load(&total_alloc_count), atomic_load(&total_put_count),
@@ -480,14 +480,14 @@ void page_pool_dump_utilization(void)
 	}
 	pthread_spin_unlock(&chunk_list_lock);
 
-	pr_info("PAGE_POOL_UTIL: allocated=%lu capacity=%lu (%.1f%%)\n",
+	pr_debug("PAGE_POOL_UTIL: allocated=%lu capacity=%lu (%.1f%%)\n",
 	       total_allocated, total_capacity,
 	       total_capacity > 0 ? (float)total_allocated / total_capacity * 100 : 0);
 }
 
 void page_pool_mark_drain_started(void)
 {
-	pr_info("PAGE_POOL: Drain started, alloc=%lu put=%lu\n",
+	pr_debug("PAGE_POOL: Drain started, alloc=%lu put=%lu\n",
 	       atomic_load(&total_alloc_count), atomic_load(&total_put_count));
 }
 

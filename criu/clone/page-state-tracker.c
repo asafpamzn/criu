@@ -268,7 +268,7 @@ void page_state_print_history(unsigned long vaddr)
 	char ts_buf[32];
 
 	if (!g_page_state.initialized) {
-		pr_err("PAGE_HISTORY 0x%lx: tracker not initialized\n", vaddr);
+		pr_debug("PAGE_HISTORY 0x%lx: tracker not initialized\n", vaddr);
 		return;
 	}
 
@@ -280,11 +280,11 @@ void page_state_print_history(unsigned long vaddr)
 	entry = page_state_find_in_bucket(bucket, vaddr);
 	if (!entry) {
 		pthread_spin_unlock(&bucket->lock);
-		pr_err("PAGE_HISTORY 0x%lx: no history (page not tracked)\n", vaddr);
+		pr_debug("PAGE_HISTORY 0x%lx: no history (page not tracked)\n", vaddr);
 		return;
 	}
 
-	pr_err("PAGE_HISTORY 0x%lx: %d transitions, current=%s\n",
+	pr_debug("PAGE_HISTORY 0x%lx: %d transitions, current=%s\n",
 	       vaddr, entry->history_count, page_state_name(entry->state));
 
 	if (entry->history_count > 0) {
@@ -293,7 +293,7 @@ void page_state_print_history(unsigned long vaddr)
 		for (i = 0; i < entry->history_count; i++) {
 			format_timestamp(&entry->history[i].timestamp, base,
 					 ts_buf, sizeof(ts_buf));
-			pr_err("  [%d] %s sec: %s\n", i, ts_buf,
+			pr_debug("  [%d] %s sec: %s\n", i, ts_buf,
 			       page_state_name(entry->history[i].state));
 		}
 	}
@@ -597,7 +597,7 @@ void page_state_print_stats(void)
 		pthread_spin_unlock(&g_page_state.buckets[i].lock);
 	}
 
-	pr_info("=== PAGE STATE TRACKER STATS ===\n");
+	pr_info("PAGE STATE TRACKER STATS\n");
 	pr_info("Total pages tracked: %lu\n", total_pages);
 	pr_info("Illegal transitions: %lu\n", illegal_transitions);
 
@@ -617,7 +617,6 @@ void page_state_print_stats(void)
 			}
 		}
 	}
-	pr_info("=== END PAGE STATE STATS ===\n");
 }
 
 /*
@@ -746,7 +745,7 @@ bool page_state_check_crc(unsigned long vaddr, const void *data, u32 *stored_crc
 	if (entry && entry->last_crc != 0) {
 		saved_crc = entry->last_crc;
 		if (saved_crc != current_crc) {
-			pr_err("CRC_MISMATCH_AT_COPY: 0x%lx stored=0x%08x current=0x%08x "
+			pr_warn("CRC_MISMATCH_AT_COPY: 0x%lx stored=0x%08x current=0x%08x "
 			       "buffer_count=%u state=%s - DATA CHANGED!\n",
 			       vaddr, saved_crc, current_crc, entry->buffer_count,
 			       page_state_name(entry->state));

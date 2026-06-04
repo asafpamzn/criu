@@ -359,7 +359,7 @@ static int clone_register_vmas(struct clone_dump_info *cdi,
 			skip_reason = "droppable";
 
 		if (skip_reason) {
-			pr_err("VMA_TRACE: phase=WP_REGISTER vma=0x%lx-0x%lx flags=0x%x prot=0x%x status=0x%x shmid=%" PRIu64
+			pr_debug("VMA_TRACE: phase=WP_REGISTER vma=0x%lx-0x%lx flags=0x%x prot=0x%x status=0x%x shmid=%" PRIu64
 			       " skipped_by=%s\n",
 			       start, start + len,
 			       vma->e->flags, vma->e->prot, vma->e->status,
@@ -376,7 +376,7 @@ static int clone_register_vmas(struct clone_dump_info *cdi,
 		reg.mode = UFFDIO_REGISTER_MODE_WP;
 		ioctl_ret = ioctl(cdi->uffd, UFFDIO_REGISTER, &reg);
 
-		pr_err("VMA_TRACE: phase=WP_REGISTER vma=0x%lx-0x%lx flags=0x%x prot=0x%x status=0x%x shmid=%" PRIu64
+		pr_debug("VMA_TRACE: phase=WP_REGISTER vma=0x%lx-0x%lx flags=0x%x prot=0x%x status=0x%x shmid=%" PRIu64
 		       " registered ioctl_ret=%d errno=%d pages=%lu\n",
 		       start, start + len,
 		       vma->e->flags, vma->e->prot, vma->e->status,
@@ -952,7 +952,7 @@ static int __maybe_unused clone_check_tracked_vma_remapped(pid_t pid,
 	if (ret < 0) {
 		if (errno == EFAULT || errno == ENOMEM) {
 			/* VMA gone entirely */
-			pr_err("CLONE REMAP: 0x%lx-0x%lx probe failed (EFAULT/ENOMEM) - VMA gone\n",
+			pr_debug("CLONE REMAP: 0x%lx-0x%lx probe failed (EFAULT/ENOMEM) - VMA gone\n",
 			       start, end);
 			return 1;
 		}
@@ -965,7 +965,7 @@ static int __maybe_unused clone_check_tracked_vma_remapped(pid_t pid,
 	 * ret > 0: first page has WPALLOWED -> VMA still registered.
 	 */
 	if (ret == 0) {
-		pr_err("CLONE REMAP DETECTED: 0x%lx-0x%lx first page lacks "
+		pr_debug("CLONE REMAP DETECTED: 0x%lx-0x%lx first page lacks "
 		       "WPALLOWED (walk_end=0x%llx) -> remapped\n",
 		       start, end, (unsigned long long)args.walk_end);
 		return 1;
@@ -1028,7 +1028,7 @@ int clone_detect_new_vmas(struct vm_area_list *vmas,
 
 		/* Use same filtering as clone_register_vmas */
 		if (!clone_is_vma_trackable(vma)) {
-			pr_err("VMA_TRACE: phase=PHASE3_NEW_VMA_DETECT vma=0x%lx-0x%lx flags=0x%x prot=0x%x status=0x%x shmid=%" PRIu64
+			pr_debug("VMA_TRACE: phase=PHASE3_NEW_VMA_DETECT vma=0x%lx-0x%lx flags=0x%x prot=0x%x status=0x%x shmid=%" PRIu64
 			       " trackable=0 skipped\n",
 			       start, end,
 			       vma->e->flags, vma->e->prot, vma->e->status,
@@ -1043,7 +1043,7 @@ int clone_detect_new_vmas(struct vm_area_list *vmas,
 			xfree(ranges);
 			return -1;
 		}
-		pr_err("VMA_TRACE: phase=PHASE3_NEW_VMA_DETECT vma=0x%lx-0x%lx flags=0x%x prot=0x%x status=0x%x shmid=%" PRIu64
+		pr_debug("VMA_TRACE: phase=PHASE3_NEW_VMA_DETECT vma=0x%lx-0x%lx flags=0x%x prot=0x%x status=0x%x shmid=%" PRIu64
 		       " trackable=1 new_ranges_emitted=%u\n",
 		       start, end,
 		       vma->e->flags, vma->e->prot, vma->e->status,
@@ -1127,20 +1127,20 @@ int clone_detect_new_vmas(struct vm_area_list *vmas,
 	*new_ranges = ranges;
 	*nr_new_ranges = nr_ranges;
 
-	pr_err("CLONE NEW VMAs: Detected %u new VMA regions since Phase 1\n", nr_ranges);
+	pr_debug("CLONE NEW VMAs: Detected %u new VMA regions since Phase 1\n", nr_ranges);
 
 	/* Log details of each new VMA range */
 	if (nr_ranges > 0) {
 		unsigned int i;
-		pr_err("CLONE NEW VMAs: These VMAs exist on PRIMARY but were created AFTER Phase 1 dump:\n");
+		pr_warn("CLONE NEW VMAs: These VMAs exist on PRIMARY but were created AFTER Phase 1 dump:\n");
 		for (i = 0; i < nr_ranges; i++) {
 			unsigned long start = ranges[i * 2];
 			unsigned long len = ranges[i * 2 + 1];
 			pr_debug("  NEW VMA [%u]: 0x%lx-0x%lx (size=%luKB)\n",
 			       i, start, start + len, len / 1024);
 		}
-		pr_err("CLONE NEW VMAs: WARNING - These VMAs will NOT exist on REPLICA!\n");
-		pr_err("CLONE NEW VMAs: The VMA metadata was not re-dumped after Phase 1.\n");
+		pr_warn("CLONE NEW VMAs: These VMAs will NOT exist on REPLICA!\n");
+		pr_warn("CLONE NEW VMAs: The VMA metadata was not re-dumped after Phase 1.\n");
 	}
 
 	/* Extend tracked_vmas so fault handler can find new regions */
@@ -1172,9 +1172,6 @@ void clone_cleanup_async_uffd(void)
 	 * This spreads the kernel page-table walk time and allows
 	 * the target process to make progress between chunks.
 	 */
-	pr_err("Unregistering VMAs from uffd sleeping 15 seconds\n");
-	sleep(15);
-	pr_err("Unregistering VMAs from uffd sleeping 15 seconds done\n");
 	if (cdi->uffd >= 0 && cdi->tracked_vmas && cdi->nr_tracked_vmas > 0) {
 		pr_info("Unregistering %u VMAs from uffd fd=%d (chunked)\n",
 			cdi->nr_tracked_vmas, cdi->uffd);
@@ -1199,7 +1196,7 @@ void clone_cleanup_async_uffd(void)
 	}
 
 	if (cdi->uffd >= 0) {
-		pr_err("Closing uffd fd=%d\n", cdi->uffd);
+		pr_debug("Closing uffd fd=%d\n", cdi->uffd);
 		close(cdi->uffd);
 		cdi->uffd = -1;
 	}

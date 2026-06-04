@@ -430,7 +430,7 @@ int clone_compare_receive_and_verify(int sk, pid_t pid)
 			    remote_vmas[i].end == local_vmas[j].end) {
 				found = true;
 				if (remote_vmas[i].prot != local_vmas[j].prot) {
-					pr_err("COMPARE_DIFF: VMA 0x%lx prot: remote=%x local=%x\n",
+					pr_warn("COMPARE_DIFF: VMA 0x%lx prot: remote=%x local=%x\n",
 					       (unsigned long)remote_vmas[i].start,
 					       remote_vmas[i].prot, local_vmas[j].prot);
 					vma_diffs++;
@@ -444,18 +444,18 @@ int clone_compare_receive_and_verify(int sk, pid_t pid)
 			 * adjacent anon VMAs on restore when madvise flags don't
 			 * round-trip. The coverage check below is authoritative.
 			 */
-			pr_err("COMPARE_DIFF: VMA 0x%016lx-0x%016lx exists on PRIMARY but not REPLICA\n",
+			pr_warn("COMPARE_DIFF: VMA 0x%016lx-0x%016lx exists on PRIMARY but not REPLICA\n",
 			       (unsigned long)remote_vmas[i].start,
 			       (unsigned long)remote_vmas[i].end);
-			pr_err("  name=%s size=%luKB\n",
+			pr_warn("  name=%s size=%luKB\n",
 			       remote_vmas[i].name[0] ? remote_vmas[i].name : "(anon)",
 			       (unsigned long)(remote_vmas[i].end - remote_vmas[i].start) / 1024);
-			pr_err("  smaps: rss=%luKB pss=%luKB anon=%luKB swap=%luKB\n",
+			pr_warn("  smaps: rss=%luKB pss=%luKB anon=%luKB swap=%luKB\n",
 			       (unsigned long)remote_vmas[i].rss,
 			       (unsigned long)remote_vmas[i].pss,
 			       (unsigned long)remote_vmas[i].anonymous,
 			       (unsigned long)remote_vmas[i].swap);
-			pr_err("  vmflags: %s\n",
+			pr_warn("  vmflags: %s\n",
 			       remote_vmas[i].vmflags[0] ? remote_vmas[i].vmflags : "(none)");
 			vma_diffs++;
 		}
@@ -481,18 +481,18 @@ int clone_compare_receive_and_verify(int sk, pid_t pid)
 			}
 		}
 		if (!found) {
-			pr_err("COMPARE_DIFF: VMA 0x%016lx-0x%016lx exists on REPLICA but not PRIMARY\n",
+			pr_warn("COMPARE_DIFF: VMA 0x%016lx-0x%016lx exists on REPLICA but not PRIMARY\n",
 			       (unsigned long)local_vmas[j].start,
 			       (unsigned long)local_vmas[j].end);
-			pr_err("  name=%s size=%luKB\n",
+			pr_warn("  name=%s size=%luKB\n",
 			       local_vmas[j].name[0] ? local_vmas[j].name : "(anon)",
 			       (unsigned long)(local_vmas[j].end - local_vmas[j].start) / 1024);
-			pr_err("  smaps: rss=%luKB pss=%luKB anon=%luKB swap=%luKB\n",
+			pr_warn("  smaps: rss=%luKB pss=%luKB anon=%luKB swap=%luKB\n",
 			       (unsigned long)local_vmas[j].rss,
 			       (unsigned long)local_vmas[j].pss,
 			       (unsigned long)local_vmas[j].anonymous,
 			       (unsigned long)local_vmas[j].swap);
-			pr_err("  vmflags: %s\n",
+			pr_warn("  vmflags: %s\n",
 			       local_vmas[j].vmflags[0] ? local_vmas[j].vmflags : "(none)");
 			replica_only++;
 		}
@@ -532,7 +532,7 @@ int clone_compare_receive_and_verify(int sk, pid_t pid)
 						gap_end = local_vmas[j].start;
 				}
 				if (uncovered_ranges < 10) {
-					pr_err("COVERAGE_GAP: PRIMARY 0x%016lx-0x%016lx not covered by REPLICA\n",
+					pr_warn("COVERAGE_GAP: PRIMARY 0x%016lx-0x%016lx not covered by REPLICA\n",
 					       (unsigned long)addr, (unsigned long)gap_end);
 				}
 				uncovered_ranges++;
@@ -545,7 +545,7 @@ int clone_compare_receive_and_verify(int sk, pid_t pid)
 	}
 
 	if (uncovered_ranges > 0) {
-		pr_err("COVERAGE_RESULT: %d PRIMARY ranges (%lu KB) NOT covered by REPLICA\n",
+		pr_warn("COVERAGE_RESULT: %d PRIMARY ranges (%lu KB) NOT covered by REPLICA\n",
 		       uncovered_ranges, (unsigned long)(total_uncovered / 1024));
 	} else {
 		pr_warn("COVERAGE_RESULT: All PRIMARY memory ranges are covered by REPLICA (VMA merging OK)\n");
@@ -588,7 +588,7 @@ int clone_compare_receive_and_verify(int sk, pid_t pid)
 				} else {
 					page_diffs++;
 					if (page_diffs <= 100) {  /* Log first 100 */
-						pr_err("COMPARE_DIFF: Page 0x%lx hash mismatch: "
+						pr_warn("COMPARE_DIFF: Page 0x%lx hash mismatch: "
 						       "remote=%08x local=%08x\n",
 						       (unsigned long)remote_phi.vaddr,
 						       remote_phi.crc32, local_crc);
@@ -620,10 +620,10 @@ int clone_compare_receive_and_verify(int sk, pid_t pid)
 	xfree(remote_vmas);
 
 #ifdef CONFIG_CLONE_COMPARE_PAGES
-	pr_err("COMPARE_RESULT: Checked %d pages, coverage gaps=%d, %d page diffs, %d PF-served skipped (exact-boundary: %d PRIMARY-only, %d REPLICA-only)\n",
+	pr_warn("COMPARE_RESULT: Checked %d pages, coverage gaps=%d, %d page diffs, %d PF-served skipped (exact-boundary: %d PRIMARY-only, %d REPLICA-only)\n",
 	       pages_checked, uncovered_ranges, page_diffs, pf_skipped, vma_diffs, replica_only);
 #else
-	pr_err("COMPARE_RESULT: coverage gaps=%d (exact-boundary: %d PRIMARY-only, %d REPLICA-only; page comparison disabled)\n",
+	pr_warn("COMPARE_RESULT: coverage gaps=%d (exact-boundary: %d PRIMARY-only, %d REPLICA-only; page comparison disabled)\n",
 	       uncovered_ranges, vma_diffs, replica_only);
 #endif
 

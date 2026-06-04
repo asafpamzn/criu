@@ -30,8 +30,6 @@
 #define LOG_PREFIX "clone-thread: "
 
 
-/* ========== Thread State ========== */
-
 static pthread_t g_unified_thread;
 static _Atomic bool g_unified_thread_running = false;
 
@@ -48,7 +46,7 @@ void clone_wait_for_page_server_thread(void)
 		return;
 	}
 
-	pr_err("Waiting for page server thread to finish...\n");
+	pr_debug("Waiting for page server thread to finish...\n");
 	pthread_join(g_unified_thread, NULL);
 	g_unified_thread_running = false;
 	pr_info("Page server thread finished\n");
@@ -69,8 +67,6 @@ static void print_compress_stats(void)
 	g_compress_uncompressed_bytes = 0;
 	g_compress_compressed_bytes = 0;
 }
-
-/* ========== Unified Thread ========== */
 
 static void *unified_page_server_thread(void *arg)
 {
@@ -105,7 +101,7 @@ static void *unified_page_server_thread(void *arg)
 		goto out;
 	}
 
-	pr_err("Starting %d P3 bulk sender threads for dst_id=%lu\n",
+	pr_debug("Starting %d P3 bulk sender threads for dst_id=%lu\n",
 		num_sockets, args->dst_id);
 
 	if (clone_start_p3_threads(p3_sockets, num_sockets,
@@ -140,7 +136,7 @@ int clone_page_server_get_all_pages(int sk, u64 dst_id)
 
 	total_pages = count_lazy_vma_pages(dst_id);
 	if (total_pages == 0) {
-		pr_err("dst_id=%lu matched ZERO lazy VMA pages\n", dst_id);
+		pr_warn("dst_id=%lu matched ZERO lazy VMA pages\n", dst_id);
 		return 0;
 	}
 

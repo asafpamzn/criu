@@ -181,7 +181,7 @@ int cr_lazy_pages_clone_phase2(bool daemon)
 	int ret = -1;
 	int nr_fds;
 
-	pr_info("=== REPLICA PHASE 2: Page buffering mode ===\n");
+	pr_info("REPLICA PHASE 2: Page buffering mode\n");
 
 	/* 1. Discover tasks from pagemap files */
 	if (discover_tasks_from_pagemaps())
@@ -268,7 +268,7 @@ int cr_lazy_pages_clone_phase2(bool daemon)
 		goto err_disconnect;
 	}
 
-	pr_info("=== REPLICA PHASE 5: Starting restore ===\n");
+	pr_info("REPLICA PHASE 5: Starting restore\n");
 
 	/*
 	 * All pages received, primary closed connection.
@@ -338,7 +338,7 @@ int clone_phase2_handle_pages(int epollfd, struct epoll_event *events, int nr_fd
 
 		/* All pages sent = completion signal, ready for restore */
 		if (clone_is_all_pages_sent_received()) {
-			pr_err("=== REPLICA: Completion signal received, ready for restore ===\n");
+			pr_debug("REPLICA: Completion signal received, ready for restore\n");
 			BUG_ON(send_all_pages_sent_ack() < 0);
 			/* Clean up async bulk reader before socket is closed */
 			page_server_cleanup_async_bulk();

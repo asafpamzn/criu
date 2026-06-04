@@ -76,7 +76,7 @@ static int addr_cmp(const void *a, const void *b)
 
 #ifdef SCAN_COMPARE
 /*
- * DEBUG: Store initial dirty pages found at BPF start time.
+ * Store initial dirty pages found at BPF start time.
  * These are pages that were dirty BEFORE we started tracking.
  */
 static unsigned long *g_initial_dirty_addrs = NULL;
@@ -84,7 +84,7 @@ static unsigned long g_initial_dirty_count = 0;
 static pid_t g_debug_pid = 0;
 
 /*
- * DEBUG: Parse /proc/pid/maps and scan each VMA for dirty pages.
+ * Parse /proc/pid/maps and scan each VMA for dirty pages.
  * Returns count of dirty pages found.
  */
 static unsigned long debug_scan_dirty_pages(pid_t pid, unsigned long **out_addrs)
@@ -200,7 +200,7 @@ static unsigned long debug_scan_dirty_pages(pid_t pid, unsigned long **out_addrs
 
 	gettimeofday(&end, NULL);
 	timersub(&end, &start, &delta);
-	pr_err("SCAN_COMPARE: debug_scan_dirty_pages scanned %lu VMAs, took %ld.%06ld sec, found %lu pages\n",
+	pr_debug("SCAN_COMPARE: debug_scan_dirty_pages scanned %lu VMAs, took %ld.%06ld sec, found %lu pages\n",
 	       vma_count, delta.tv_sec, delta.tv_usec, count);
 
 	*out_addrs = addrs;
@@ -227,7 +227,7 @@ int clone_bpf_start(pid_t target_pid)
 
 	g_debug_pid = target_pid;
 	dirty_before_count = debug_scan_dirty_pages(target_pid, &dirty_before_addrs);
-	pr_err("SCAN_COMPARE: Dirty pages BEFORE BPF attach: %lu\n", dirty_before_count);
+	pr_debug("SCAN_COMPARE: Dirty pages BEFORE BPF attach: %lu\n", dirty_before_count);
 
 	/* Store for later comparison */
 	g_initial_dirty_addrs = dirty_before_addrs;
@@ -237,9 +237,9 @@ int clone_bpf_start(pid_t target_pid)
 	if (dirty_before_count > 0) {
 		unsigned long i;
 		unsigned long to_print = dirty_before_count < 20 ? dirty_before_count : 20;
-		pr_err("SCAN_COMPARE: First %lu initial dirty addresses:\n", to_print);
+		pr_debug("SCAN_COMPARE: First %lu initial dirty addresses:\n", to_print);
 		for (i = 0; i < to_print; i++) {
-			pr_err("  INITIAL_DIRTY[%lu]: 0x%lx\n", i, dirty_before_addrs[i]);
+			pr_debug("  INITIAL_DIRTY[%lu]: 0x%lx\n", i, dirty_before_addrs[i]);
 		}
 	}
 #endif
@@ -276,14 +276,14 @@ int clone_bpf_start(pid_t target_pid)
 		unsigned long dirty_after_count;
 
 		dirty_after_count = debug_scan_dirty_pages(target_pid, &dirty_after_addrs);
-		pr_err("SCAN_COMPARE: Dirty pages AFTER BPF attach: %lu\n", dirty_after_count);
+		pr_debug("SCAN_COMPARE: Dirty pages AFTER BPF attach: %lu\n", dirty_after_count);
 
 		if (dirty_after_addrs)
 			xfree(dirty_after_addrs);
 	}
 #endif
 
-	pr_warn("BPF dirty tracker: attached to do_wp_page "
+	pr_debug("BPF dirty tracker: attached to do_wp_page "
 	       "for pid %d (ring_fd=%d)\n", target_pid, g_ring_fd);
 	return 0;
 }
@@ -339,7 +339,7 @@ int clone_bpf_drain(struct clone_bpf_region *out_regions, int max_regions,
 		u64 drops = clone_bpf_drop_count();
 
 		if (drops > 0) {
-			pr_err("BPF drain: %llu events dropped (ring full) "
+			pr_warn("BPF drain: %llu events dropped (ring full) "
 			       "— falling back to PAGEMAP_SCAN\n",
 			       (unsigned long long)drops);
 			xfree(dc.addrs);
@@ -486,7 +486,7 @@ int clone_bpf_drain_addrs(unsigned long **out_addrs, unsigned long *out_count)
 		unsigned long total_cap;
 		unsigned long bpf_idx, init_idx, out_idx;
 
-		pr_err("BPF drain: merging %lu initial dirty pages with %d BPF pages\n",
+		pr_debug("BPF drain: merging %lu initial dirty pages with %d BPF pages\n",
 		       g_initial_dirty_count, dc.count);
 
 		/* Sort BPF addresses first */
@@ -545,7 +545,7 @@ int clone_bpf_drain_addrs(unsigned long **out_addrs, unsigned long *out_count)
 		*out_addrs = merged;
 		*out_count = out_idx;
 
-		pr_err("BPF drain: merged result has %lu unique pages\n", out_idx);
+		pr_debug("BPF drain: merged result has %lu unique pages\n", out_idx);
 		return 0;
 	}
 #endif

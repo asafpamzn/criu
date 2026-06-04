@@ -42,9 +42,10 @@ struct sender_queue {
  * Used by bulk sender and dirty page dump.
  *
  * acceleration: LZ4_compress_fast acceleration parameter.
- *   1  - best ratio (equivalent to LZ4_compress_default); use pre-freeze.
- *   99 - minimum CPU, poorer ratio; use during Phase 2/3 convergence where
- *        process is frozen and CPU dominates the downtime window.
+ *   1  - best ratio (equivalent to LZ4_compress_default). All current callers
+ *        pass 1: higher values were measured to regress total P3 wall-clock by
+ *        shifting the bottleneck into tcp_sendmsg (see send_dirty_slices()).
+ *   Larger values trade compression ratio for less CPU.
  */
 int send_pages_batch_compressed(struct tls_conn *tls, int sk,
 				const void *data, int nr_pages, u64 dst_id,
