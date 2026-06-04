@@ -117,20 +117,6 @@ static char loc_buf[PERSONALITY_LENGTH];
 static struct timeval g_phase3_freeze_start;
 
 static int cr_dump_tasks_clone_phased(pid_t pid);
-#ifdef CLONE_CONF_TODO_ASK_AVI_clone_seize_cure_parasite
-/* Stop parasite - optionally fast (skip rt_sigreturn single-stepping) */
-static int clone_seize_stop_parasite(struct parasite_ctl *ctl)
-{
-	return compel_stop_daemon_fast(ctl);
-}
-
-
-/* Cure parasite without remote munmap (restorer handles cleanup) */
-static int clone_seize_cure_parasite(struct parasite_ctl *ctl)
-{
-	return compel_cure_local(ctl);	
-}
-#endif
 
 void free_mappings(struct vm_area_list *vma_area_list)
 {
@@ -1822,28 +1808,7 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	}
 
 
-	/*
-	 * TODO(Avi): CLONE_CONF_TODO_ASK_AVI_clone_seize_stop_parasite
-	 *
-	 * Originally we had a "fast path" here using clone_seize_stop_parasite()
-	 * which calls compel_stop_daemon_fast() - skipping rt_sigreturn
-	 * single-stepping. The theory was this would save ~14ms.
-	 *
-	 * However, actual timing shows compel_stop_daemon() only takes ~126us.
-	 * The optimization is not worth the complexity/risk. We now always use
-	 * the regular compel_stop_daemon() path.
-	 *
-	 * If you want to re-enable the fast path, define
-	 * CLONE_CONF_TODO_ASK_AVI_clone_seize_stop_parasite in clone-conf.h.
-	 * The fast path is safe because CLONE mode overwrites registers via
-	 * arch_set_thread_regs() and detaches via pstree_switch_state(TASK_ALIVE).
-	 */
-#ifdef CLONE_CONF_TODO_ASK_AVI_clone_seize_stop_parasite
-	if (opts.clone_dump && opts.lazy_pages)
-		ret = clone_seize_stop_parasite(parasite_ctl);
-	else
-#endif
-		ret = compel_stop_daemon(parasite_ctl);
+	ret = compel_stop_daemon(parasite_ctl);
 	if (ret) {
 		pr_err("Can't stop daemon in parasite (pid: %d)\n", pid);
 		goto err_cure;
@@ -1856,33 +1821,14 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	}
 
 	/*
-	 * TODO(Avi): CLONE_CONF_TODO_ASK_AVI_clone_seize_cure_parasite
-	 *
 	 * On failure local map will be cured in cr_dump_finish()
 	 * for lazy pages. In CLONE phased skeleton dump, always use
 	 * compel_cure_remote() to keep mappings for convergence.
-	 *
-	 * Originally CLONE mode used local cure to skip remote munmap,
-	 * with the theory that restorer handles parasite cleanup.
-	 * However, compel_cure() only takes ~9.6ms - optimization may
-	 * not be worth the complexity/risk.
-	 *
-	 * If you want to re-enable the local cure optimization, define
-	 * CLONE_CONF_TODO_ASK_AVI_clone_seize_cure_parasite in clone-conf.h.
 	 */
-#ifdef CLONE_CONF_TODO_ASK_AVI_clone_seize_cure_parasite
-	if (opts.clone_dump && opts.lazy_pages)
-		ret = clone_seize_cure_parasite(parasite_ctl);
-	else if (opts.lazy_pages || clone_is_phased_skeleton_dump())
-		ret = compel_cure_remote(parasite_ctl);
-	else
-		ret = compel_cure(parasite_ctl);
-#else
 	if (opts.lazy_pages || clone_is_phased_skeleton_dump())
 		ret = compel_cure_remote(parasite_ctl);
 	else
 		ret = compel_cure(parasite_ctl);
-#endif
 	if (ret) {
 		pr_err("Can't cure (pid: %d) from parasite\n", pid);
 		goto err;
@@ -2221,32 +2167,7 @@ static int cr_dump_finish(int ret)
 	 */
 	if (ret || post_dump_ret || opts.final_state == TASK_ALIVE) {
 		unsuspend_lsm();
-		/*
-		 * TODO(Avi): CLONE_CONF_TODO_ASK_AVI_network_lock
-		 * CLONE mode skips network_unlock(). See clone-conf.h for details.
-		 */
-#ifdef CLONE_CONF_TODO_ASK_AVI_network_lock
-		if (!opts.clone_dump)
-		{
-			struct timeval t_start, t_end, t_delta;
-			gettimeofday(&t_start, NULL);
-			network_unlock();
-			gettimeofday(&t_end, NULL);
-			timersub(&t_end, &t_start, &t_delta);
-			pr_err("TIMING: network_unlock took %ld.%06ld seconds\n",
-			       t_delta.tv_sec, t_delta.tv_usec);
-		}
-#else
-		{
-			struct timeval t_start, t_end, t_delta;
-			gettimeofday(&t_start, NULL);
-			network_unlock();
-			gettimeofday(&t_end, NULL);
-			timersub(&t_end, &t_start, &t_delta);
-			pr_err("TIMING: network_unlock took %ld.%06ld seconds\n",
-			       t_delta.tv_sec, t_delta.tv_usec);
-		}
-#endif
+		network_unlock();
 		delete_link_remaps();
 	}
 
@@ -2554,21 +2475,8 @@ int cr_dump_tasks(pid_t pid)
 	if (collect_pstree_ids())
 		goto err;
 
-	/*
-	 * TODO(Avi): CLONE_CONF_TODO_ASK_AVI_network_lock
-	 * CLONE mode skips network_lock(). See clone-conf.h for details.
-	 * Questions: Is this intentional? How does CLONE handle TCP state?
-	 */
-#ifdef CLONE_CONF_TODO_ASK_AVI_network_lock
-	if (!opts.clone_dump) {
-		if (network_lock())
-			goto err;
-	}
-#else	
 	if (network_lock())
 		goto err;
-	
-#endif
 
 	if (rpc_query_external_files())
 		goto err;
@@ -2914,12 +2822,6 @@ static int cr_dump_tasks_clone_phased(pid_t pid)
 	 */
 	clone_signal_last_scan();
 
-	/*
-	 * TODO(Avi): CLONE_CONF_TODO_ASK_AVI_network_lock
-	 * CLONE mode skips network_lock(). See clone-conf.h for details.
-	 */
-#ifdef CLONE_CONF_TODO_ASK_AVI_network_lock
-	if (!opts.clone_dump) {
 	{
 		struct timeval t_start, t_end, t_delta;
 		gettimeofday(&t_start, NULL);
@@ -2930,18 +2832,6 @@ static int cr_dump_tasks_clone_phased(pid_t pid)
 		pr_err("TIMING: network_lock took %ld.%06ld seconds\n",
 		       t_delta.tv_sec, t_delta.tv_usec);
 	}
-#else
-	{	
-		struct timeval t_start, t_end, t_delta;
-		gettimeofday(&t_start, NULL);
-		if (network_lock())
-			goto err;
-		gettimeofday(&t_end, NULL);
-		timersub(&t_end, &t_start, &t_delta);
-		pr_err("TIMING: network_lock took %ld.%06ld seconds\n",
-		       t_delta.tv_sec, t_delta.tv_usec);
-	}
-#endif
 
 	{
 		struct timeval t_start, t_end, t_delta;

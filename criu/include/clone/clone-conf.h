@@ -82,47 +82,6 @@
  */
 // #define CONFIG_CLONE_WAIT_REPLICA_TOUCH
 
-/*
- * CLONE_CONF_TODO_ASK_AVI_clone_seize_stop_parasite - Use fast parasite stop.
- * When enabled, uses compel_stop_daemon_fast() which skips rt_sigreturn
- * single-stepping. Measured at ~126us - not worth optimizing.
- * TODO: ask maintainers if this is actually needed.
- */
-// #define CLONE_CONF_TODO_ASK_AVI_clone_seize_stop_parasite
-
-/*
- * CLONE_CONF_TODO_ASK_AVI_network_lock - Enable network locking for CLONE mode.
- * Currently CLONE mode skips network_lock() entirely. This means:
- * 1. Process can do network I/O while running during Phase 2
- * 2. TCP connections are not locked/checkpointed in the traditional way
- *
- * Questions for maintainers:
- * - Is this intentional? Process keeps running, so locking would block I/O.
- * - How does CLONE handle TCP connection state consistency?
- * - If process does network I/O between T1 and T3, does REPLICA get correct state?
- *
- * Timing shows network_lock takes ~0us, so perf is not the reason to skip it.
- * TODO: ask maintainers why we skip network lock in CLONE mode.
- */
-// #define CLONE_CONF_TODO_ASK_AVI_network_lock
-
-/*
- * CLONE_CONF_TODO_ASK_AVI_clone_seize_cure_parasite - Use local-only parasite cure.
- * When enabled, uses compel_cure_local() which skips remote munmap.
- * The theory was that restorer handles parasite cleanup anyway.
- *
- * However, actual timing shows compel_cure() only takes ~9.6ms.
- * The optimization may not be worth the complexity/risk.
- *
- * Questions for maintainers:
- * - Is skipping remote munmap actually needed for CLONE correctness?
- * - Or was it just a perf optimization that's not worth ~9.6ms?
- * - Does the restorer actually clean up the parasite mapping?
- *
- * TODO: ask maintainers if this is actually needed.
- */
-// #define CLONE_CONF_TODO_ASK_AVI_clone_seize_cure_parasite
-
 /* ================================================================
  * SECTION 1: Batch Transfer Configuration
  * ================================================================ */
