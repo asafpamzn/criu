@@ -691,7 +691,7 @@ void *clone_page_buffer_lookup_and_remove(unsigned long vaddr)
 	pthread_spin_lock(&hash_locks[lock_idx]);
 	hlist_for_each_entry(entry, &clone_buffer.hash_table[hash], hash) {
 		if (entry->magic != BATCH_ENTRY_MAGIC) {
-			pr_err("RACE_DEBUG: lookup_and_remove found DEAD entry in hash! "
+			pr_err("lookup_and_remove found DEAD entry in hash! "
 			       "vaddr=0x%lx base=0x%lx magic=0x%x\n",
 			       vaddr, base, entry->magic);
 			BUG();
@@ -926,7 +926,7 @@ static unsigned long drain_apply_batch(struct batch_buffer_entry *entry,
 	int uffd, i;
 
 	if (entry->magic != BATCH_ENTRY_MAGIC) {
-		pr_err("RACE_DEBUG: drain_apply_batch got DEAD entry! "
+		pr_err("drain_apply_batch got DEAD entry! "
 		       "base=0x%lx magic=0x%x data=%p\n",
 		       base, entry->magic, data);
 		BUG();
@@ -980,7 +980,7 @@ static unsigned long drain_apply_batch(struct batch_buffer_entry *entry,
 		pf_served = clone_batch_bitmap_popcount(&pf_served_bm);
 
 		if (pf_served > 0) {
-			pr_debug("DRAIN_FREE_DEBUG: base=0x%lx "
+			pr_debug("drain_apply_batch: base=0x%lx "
 			       "pf_served=%d freeing=%d of %d\n",
 			       base, pf_served, free_count, CLONE_BATCH_PAGES);
 		}

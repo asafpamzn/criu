@@ -2198,7 +2198,7 @@ static int cr_dump_finish(int ret)
 		}
 		gettimeofday(&t_end, NULL);
 		timersub(&t_end, &t_start, &t_delta);
-		pr_err("TIMING: send_completion_signal took %ld.%06ld seconds\n",
+		pr_debug("TIMING: send_completion_signal took %ld.%06ld seconds\n",
 		       t_delta.tv_sec, t_delta.tv_usec);
 
 		/* Unfreeze IMMEDIATELY - don't wait for ACK while frozen */
@@ -2206,7 +2206,7 @@ static int cr_dump_finish(int ret)
 			struct timeval freeze_end, freeze_delta;
 			gettimeofday(&freeze_end, NULL);
 			timersub(&freeze_end, &g_phase3_freeze_start, &freeze_delta);
-			pr_err("TIMING: Phase 3 total freeze time: %ld.%06ld seconds\n",
+			pr_debug("TIMING: Phase 3 total freeze time: %ld.%06ld seconds\n",
 			       freeze_delta.tv_sec, freeze_delta.tv_usec);
 		}
 
@@ -2225,7 +2225,7 @@ static int cr_dump_finish(int ret)
 		}
 		gettimeofday(&t_end, NULL);
 		timersub(&t_end, &t_start, &t_delta);
-		pr_err("TIMING: wait_for_completion_ack took %ld.%06ld seconds (before compare)\n",
+		pr_debug("TIMING: wait_for_completion_ack took %ld.%06ld seconds (before compare)\n",
 		       t_delta.tv_sec, t_delta.tv_usec);
 
 		/* Process comparison with replica (source already unfrozen) */
@@ -2259,7 +2259,7 @@ static int cr_dump_finish(int ret)
 		}
 		gettimeofday(&t_end, NULL);
 		timersub(&t_end, &t_start, &t_delta);
-		pr_err("TIMING: wait_for_completion_ack took %ld.%06ld seconds (after unfreeze)\n",
+		pr_debug("TIMING: wait_for_completion_ack took %ld.%06ld seconds (after unfreeze)\n",
 		       t_delta.tv_sec, t_delta.tv_usec);
 #endif
 
@@ -2614,7 +2614,7 @@ static int cr_dump_tasks_clone_phased(pid_t pid)
 	pr_err("=== PHASE 1: Seize + Pre-dump + WP_ASYNC ===\n");
 
 	gettimeofday(&freeze_start, NULL);
-	pr_err("TIMING: Phase 1 freeze started\n");
+	pr_debug("TIMING: Phase 1 freeze started\n");
 
 	if (collect_pstree())
 		goto err;
@@ -2661,7 +2661,7 @@ static int cr_dump_tasks_clone_phased(pid_t pid)
 
 	gettimeofday(&freeze_end, NULL);
 	timersub(&freeze_end, &freeze_start, &freeze_delta);
-	pr_err("TIMING: Phase 1 freeze ended - process frozen for %ld.%06ld seconds\n",
+	pr_debug("TIMING: Phase 1 freeze ended - process frozen for %ld.%06ld seconds\n",
 	       freeze_delta.tv_sec, freeze_delta.tv_usec);
 
 	/* === PHASE 2: Bulk page transfer + iterative dirty scan === */
@@ -2712,7 +2712,7 @@ static int cr_dump_tasks_clone_phased(pid_t pid)
 
 	gettimeofday(&freeze_start, NULL);
 	g_phase3_freeze_start = freeze_start;  /* Save for cr_dump_finish */
-	pr_err("TIMING: Phase 3 freeze started\n");
+	pr_debug("TIMING: Phase 3 freeze started\n");
 
 	/*
 	 * Re-seize all tasks. After Phase 1, tasks were released via
@@ -2723,12 +2723,12 @@ static int cr_dump_tasks_clone_phased(pid_t pid)
 		struct timeval t_start, t_end, t_delta, t_elapsed;
 		gettimeofday(&t_start, NULL);
 		timersub(&t_start, &freeze_start, &t_elapsed);
-		pr_warn("TIMING @%ld.%06ld: reseize_pstree starting\n",
+		pr_debug("TIMING @%ld.%06ld: reseize_pstree starting\n",
 		       t_elapsed.tv_sec, t_elapsed.tv_usec);
 		ret = reseize_pstree();
 		gettimeofday(&t_end, NULL);
 		timersub(&t_end, &t_start, &t_delta);
-		pr_err("TIMING: reseize_pstree took %ld.%06ld seconds\n",
+		pr_debug("TIMING: reseize_pstree took %ld.%06ld seconds\n",
 		       t_delta.tv_sec, t_delta.tv_usec);
 	}
 	if (ret) {
@@ -2752,7 +2752,7 @@ static int cr_dump_tasks_clone_phased(pid_t pid)
 			goto err;
 		gettimeofday(&t_end, NULL);
 		timersub(&t_end, &t_start, &t_delta);
-		pr_err("TIMING: collect_pstree_ids took %ld.%06ld seconds\n",
+		pr_debug("TIMING: collect_pstree_ids took %ld.%06ld seconds\n",
 		       t_delta.tv_sec, t_delta.tv_usec);
 	}
 
@@ -2777,7 +2777,7 @@ static int cr_dump_tasks_clone_phased(pid_t pid)
 		ret = collect_mappings(root_item->pid->real, &phase3_vmas, NULL);
 		gettimeofday(&t_end, NULL);
 		timersub(&t_end, &t_start, &t_delta);
-		pr_err("TIMING: Phase3 collect_mappings took %ld.%06ld seconds\n",
+		pr_debug("TIMING: Phase3 collect_mappings took %ld.%06ld seconds\n",
 		       t_delta.tv_sec, t_delta.tv_usec);
 		if (ret) {
 			pr_err("Failed to collect Phase 3 VMAs\n");
@@ -2791,7 +2791,7 @@ static int cr_dump_tasks_clone_phased(pid_t pid)
 		ret = clone_detect_new_vmas(&phase3_vmas, &new_vma_ranges, &nr_new_vma_ranges);
 		gettimeofday(&t_end, NULL);
 		timersub(&t_end, &t_start, &t_delta);
-		pr_err("TIMING: clone_detect_new_vmas took %ld.%06ld seconds\n",
+		pr_debug("TIMING: clone_detect_new_vmas took %ld.%06ld seconds\n",
 		       t_delta.tv_sec, t_delta.tv_usec);
 		free_mappings(&phase3_vmas);
 
@@ -2829,7 +2829,7 @@ static int cr_dump_tasks_clone_phased(pid_t pid)
 			goto err;
 		gettimeofday(&t_end, NULL);
 		timersub(&t_end, &t_start, &t_delta);
-		pr_err("TIMING: network_lock took %ld.%06ld seconds\n",
+		pr_debug("TIMING: network_lock took %ld.%06ld seconds\n",
 		       t_delta.tv_sec, t_delta.tv_usec);
 	}
 
@@ -2840,7 +2840,7 @@ static int cr_dump_tasks_clone_phased(pid_t pid)
 			goto err;
 		gettimeofday(&t_end, NULL);
 		timersub(&t_end, &t_start, &t_delta);
-		pr_err("TIMING: rpc_query_external_files took %ld.%06ld seconds\n",
+		pr_debug("TIMING: rpc_query_external_files took %ld.%06ld seconds\n",
 		       t_delta.tv_sec, t_delta.tv_usec);
 	}
 
@@ -2851,7 +2851,7 @@ static int cr_dump_tasks_clone_phased(pid_t pid)
 			goto err;
 		gettimeofday(&t_end, NULL);
 		timersub(&t_end, &t_start, &t_delta);
-		pr_err("TIMING: collect_file_locks took %ld.%06ld seconds\n",
+		pr_debug("TIMING: collect_file_locks took %ld.%06ld seconds\n",
 		       t_delta.tv_sec, t_delta.tv_usec);
 	}
 
@@ -2862,7 +2862,7 @@ static int cr_dump_tasks_clone_phased(pid_t pid)
 			goto err;
 		gettimeofday(&t_end, NULL);
 		timersub(&t_end, &t_start, &t_delta);
-		pr_err("TIMING: collect_namespaces took %ld.%06ld seconds\n",
+		pr_debug("TIMING: collect_namespaces took %ld.%06ld seconds\n",
 		       t_delta.tv_sec, t_delta.tv_usec);
 	}
 
@@ -2874,7 +2874,7 @@ static int cr_dump_tasks_clone_phased(pid_t pid)
 			goto err;
 		gettimeofday(&t_end, NULL);
 		timersub(&t_end, &t_start, &t_delta);
-		pr_err("TIMING: cr_glob_imgset_open took %ld.%06ld seconds\n",
+		pr_debug("TIMING: cr_glob_imgset_open took %ld.%06ld seconds\n",
 		       t_delta.tv_sec, t_delta.tv_usec);
 	}
 	pr_err("DEBUG: glob_imgset opened for skeleton dump (CLONE path)\n");
@@ -2886,7 +2886,7 @@ static int cr_dump_tasks_clone_phased(pid_t pid)
 			goto err;
 		gettimeofday(&t_end, NULL);
 		timersub(&t_end, &t_start, &t_delta);
-		pr_err("TIMING: seccomp_collect_dump_filters took %ld.%06ld seconds\n",
+		pr_debug("TIMING: seccomp_collect_dump_filters took %ld.%06ld seconds\n",
 		       t_delta.tv_sec, t_delta.tv_usec);
 	}
 
@@ -2898,7 +2898,7 @@ static int cr_dump_tasks_clone_phased(pid_t pid)
 		struct timeval t_start, t_end, t_delta, t_elapsed;
 		gettimeofday(&t_start, NULL);
 		timersub(&t_start, &freeze_start, &t_elapsed);
-		pr_warn("TIMING @%ld.%06ld: skeleton dump loop starting\n",
+		pr_debug("TIMING @%ld.%06ld: skeleton dump loop starting\n",
 		       t_elapsed.tv_sec, t_elapsed.tv_usec);
 		for_each_pstree_item(item) {
 			if (dump_one_task(item, parent_ie))
@@ -2906,7 +2906,7 @@ static int cr_dump_tasks_clone_phased(pid_t pid)
 		}
 		gettimeofday(&t_end, NULL);
 		timersub(&t_end, &t_start, &t_delta);
-		pr_err("TIMING: skeleton dump loop took %ld.%06ld seconds\n",
+		pr_debug("TIMING: skeleton dump loop took %ld.%06ld seconds\n",
 		       t_delta.tv_sec, t_delta.tv_usec);
 	}
 
@@ -2920,13 +2920,13 @@ static int cr_dump_tasks_clone_phased(pid_t pid)
 		struct timeval t_start, t_end, t_delta, t_elapsed;
 		gettimeofday(&t_start, NULL);
 		timersub(&t_start, &freeze_start, &t_elapsed);
-		pr_warn("TIMING @%ld.%06ld: cr_dump_post_task_operations starting\n",
+		pr_debug("TIMING @%ld.%06ld: cr_dump_post_task_operations starting\n",
 		       t_elapsed.tv_sec, t_elapsed.tv_usec);
 		if (cr_dump_post_task_operations(&he))
 			goto err;
 		gettimeofday(&t_end, NULL);
 		timersub(&t_end, &t_start, &t_delta);
-		pr_err("TIMING: cr_dump_post_task_operations took %ld.%06ld seconds\n",
+		pr_debug("TIMING: cr_dump_post_task_operations took %ld.%06ld seconds\n",
 		       t_delta.tv_sec, t_delta.tv_usec);
 	}
 
@@ -2944,12 +2944,12 @@ static int cr_dump_tasks_clone_phased(pid_t pid)
 		struct timeval t_start, t_end, t_delta, t_elapsed;
 		gettimeofday(&t_start, NULL);
 		timersub(&t_start, &freeze_start, &t_elapsed);
-		pr_warn("TIMING @%ld.%06ld: clone_wait_p3_threads starting\n",
+		pr_debug("TIMING @%ld.%06ld: clone_wait_p3_threads starting\n",
 		       t_elapsed.tv_sec, t_elapsed.tv_usec);
 		clone_wait_p3_threads();
 		gettimeofday(&t_end, NULL);
 		timersub(&t_end, &t_start, &t_delta);
-		pr_err("TIMING: clone_wait_p3_threads took %ld.%06ld seconds\n",
+		pr_debug("TIMING: clone_wait_p3_threads took %ld.%06ld seconds\n",
 		       t_delta.tv_sec, t_delta.tv_usec);
 	}
 	pr_err("P3 threads completed: %lu total pages sent\n", clone_p3_pages_sent());
