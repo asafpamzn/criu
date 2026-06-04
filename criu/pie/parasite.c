@@ -881,8 +881,8 @@ static int parasite_clone_dump_init(struct parasite_clone_dump_args *args)
 	unsigned int *failed_indices;
 
 
-	pr_info("CLONE dump init: registering %d VMAs\n", args->nr_vmas);
-	
+	pr_debug("CLONE dump init: registering %d VMAs\n", args->nr_vmas);
+
 	args->nr_failed_vmas = 0;
 	failed_indices = clone_dump_failed_indices(args);
 
@@ -913,8 +913,8 @@ static int parasite_clone_dump_init(struct parasite_clone_dump_args *args)
 		return -1;
 	}
 
-	pr_info("UFFD created with features: 0x%llx (requested 0x%lx)\n",
-		(unsigned long long)api.features, args->uffd_features);
+	pr_debug("UFFD created with features: 0x%llx (requested 0x%lx)\n",
+		 (unsigned long long)api.features, args->uffd_features);
 	if (args->uffd_features && !(api.features & args->uffd_features)) {
 		pr_err("Kernel userfaultfd does not support requested features 0x%lx\n",
 		       args->uffd_features);
@@ -942,13 +942,14 @@ static int parasite_clone_dump_init(struct parasite_clone_dump_args *args)
 		}
 #endif
 
-		pr_err("Registering VMA %d: %lx-%lx prot=%x len=%lu\n",
-			i, addr, addr + len, vma->prot, len);
+		pr_debug("Registering VMA %d: %lx-%lx prot=%x len=%lu\n",
+			 i, addr, addr + len, vma->prot, len);
 
 		/* Skip non-writable VMAs */
 		if (!(vma->prot & PROT_WRITE)) {
-			pr_err("Skipping non-writable VMA: %lx-%lx len=%lu\n", addr, addr + len, len);
-			
+			pr_debug("Skipping non-writable VMA: %lx-%lx len=%lu\n", addr, addr + len, len);
+
+
 			/* Mark for later dump by CRIU */
     		failed_indices[args->nr_failed_vmas++] = i;
 			continue;
@@ -968,8 +969,8 @@ static int parasite_clone_dump_init(struct parasite_clone_dump_args *args)
 				
 				/* Record the index of this failed VMA */
 				failed_indices[args->nr_failed_vmas++] = i;
-				pr_info("Marked VMA index %d for later dump (%u failed VMAs total)\n", 
-					i, args->nr_failed_vmas);
+				pr_debug("Marked VMA index %d for later dump (%u failed VMAs total)\n",
+					 i, args->nr_failed_vmas);
 				continue;
 			} else {
 							/* Any failure to register - just dump instead of trying to track */
@@ -977,19 +978,19 @@ static int parasite_clone_dump_init(struct parasite_clone_dump_args *args)
 			       addr, addr + len, ret, len);
 				
 				failed_indices[args->nr_failed_vmas++] = i;
-				pr_info("Marked VMA index %d for immediate dump (%u total)\n", 
-						i, args->nr_failed_vmas);
+				pr_debug("Marked VMA index %d for immediate dump (%u total)\n",
+					 i, args->nr_failed_vmas);
     			continue;
 			}
 
 		}
 
 		total_pages += len / PAGE_SIZE;
-		pr_info("Successfully registered VMA for WP tracking: %lx-%lx (%lu pages)\n",
-			addr, addr + len, len / PAGE_SIZE);
+		pr_debug("Successfully registered VMA for WP tracking: %lx-%lx (%lu pages)\n",
+			 addr, addr + len, len / PAGE_SIZE);
 	}
 
-	pr_info("CLONE dump init complete: %lu total pages\n", total_pages);
+	pr_debug("CLONE dump init complete: %lu total pages\n", total_pages);
 
 	/* Send userfaultfd back to CRIU before setting return status */
 	tsock = parasite_get_rpc_sock();
@@ -1001,7 +1002,7 @@ static int parasite_clone_dump_init(struct parasite_clone_dump_args *args)
 		return -1;
 	}
 
-	pr_info("Sent uffd=%d back to CRIU\n", uffd);
+	pr_debug("Sent uffd=%d back to CRIU\n", uffd);
 
 	/* Set success status after fd is sent */
 	args->total_pages = total_pages;

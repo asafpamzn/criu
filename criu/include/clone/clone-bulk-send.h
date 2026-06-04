@@ -116,11 +116,6 @@ bool clone_p3_had_error(void);
 void clone_p3_mark_had_error(void);
 
 /*
- * Check if any P3 thread is still running.
- */
-bool clone_p3_thread_running(void);
-
-/*
  * Get total number of pages sent by all P3 threads.
  */
 unsigned long clone_p3_pages_sent(void);
@@ -141,11 +136,6 @@ bool clone_all_threads_below_threshold(void);
  * Called by main thread after freezing the process.
  */
 void clone_signal_last_scan(void);
-
-/*
- * Check if last scan has been signaled.
- */
-bool clone_is_last_scan_signaled(void);
 
 /*
  * Set new VMA ranges detected in Phase 3 for P3 threads to send.

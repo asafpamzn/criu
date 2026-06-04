@@ -113,9 +113,6 @@ int __attribute__((weak)) arch_set_thread_regs(struct pstree_item *item, bool wi
 #define PERSONALITY_LENGTH 9
 static char loc_buf[PERSONALITY_LENGTH];
 
-/* Phase 3 freeze start time - set in cr_dump_tasks_clone_phased, used in cr_dump_finish */
-static struct timeval g_phase3_freeze_start;
-
 static int cr_dump_tasks_clone_phased(pid_t pid);
 
 void free_mappings(struct vm_area_list *vma_area_list)
@@ -1522,8 +1519,8 @@ static int pre_dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie
 	}
 
 	if (opts.clone_dump)
-		pr_err("CLONE PHASE 1: Collected %lu VMAs for pid %d\n",
-		       (unsigned long)vmas.nr, pid);
+		pr_debug("CLONE PHASE 1: Collected %lu VMAs for pid %d\n",
+			 (unsigned long)vmas.nr, pid);
 
 	ret = -1;
 	parasite_ctl = parasite_infect_seized(pid, item, &vmas);
@@ -1764,8 +1761,6 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	 *     clone_skeleton_non_lazy=true makes generate_iovs short-circuit
 	 *     lazy VMAs so we only write non-lazy ones to pagemap/pages images.
 	 */
-	pr_debug("VMA_TRACE: phase=PHASE3_SKELETON pid=%d clone_is_phased_skeleton_dump=%d will_dump_pages=1\n",
-	       pid, clone_is_phased_skeleton_dump() ? 1 : 0);
 	mdc.pre_dump = false;
 	mdc.lazy = clone_is_phased_skeleton_dump() ? false : opts.lazy_pages;
 	mdc.clone_lazy_build_only = false;
@@ -2118,7 +2113,6 @@ static int cr_dump_finish(int ret)
 			ret = -1;
 	}
 
-	pr_err("DEBUG: Closing glob_imgset\n");
 	close_cr_imgset(&glob_imgset);
 
 	if (bfd_flush_images())
@@ -2176,16 +2170,14 @@ static int cr_dump_finish(int ret)
 	 * Inventory was already written in cr_dump_tasks_clone_phased().
 	 */
 	if (opts.clone_dump && clone_get_phase() == CLONE_PHASE_DONE) {
-		struct timeval t_start, t_end, t_delta;
 		int sk = get_page_server_sk();
 
-		pr_err("CLONE: Signaling replica (ret=%d, sk=%d)\n", ret, sk);
+		pr_debug("CLONE: Signaling replica (ret=%d, sk=%d)\n", ret, sk);
 
 		/*
 		 * Send single completion signal while frozen (fast).
 		 * Replica waits for this before starting restore.
 		 */
-		gettimeofday(&t_start, NULL);
 		if (!ret && sk >= 0) {
 			if (clone_send_skeleton_files(sk) < 0) {
 				pr_err("CLONE: Failed to send skeleton files\n");
@@ -2196,71 +2188,47 @@ static int cr_dump_finish(int ret)
 				ret = -1;
 			}
 		}
-		gettimeofday(&t_end, NULL);
-		timersub(&t_end, &t_start, &t_delta);
-		pr_debug("TIMING: send_completion_signal took %ld.%06ld seconds\n",
-		       t_delta.tv_sec, t_delta.tv_usec);
-
-		/* Unfreeze IMMEDIATELY - don't wait for ACK while frozen */
-		{
-			struct timeval freeze_end, freeze_delta;
-			gettimeofday(&freeze_end, NULL);
-			timersub(&freeze_end, &g_phase3_freeze_start, &freeze_delta);
-			pr_debug("TIMING: Phase 3 total freeze time: %ld.%06ld seconds\n",
-			       freeze_delta.tv_sec, freeze_delta.tv_usec);
-		}
-
 
 #ifdef CONFIG_CLONE_COMPARE
 		/*
 		 * When comparing, wait for ACK before compare starts.
 		 * Replica sends ACK after it's ready for comparison.
 		 */
-		gettimeofday(&t_start, NULL);
 		if (!ret && sk >= 0) {
 			if (wait_for_all_pages_sent_ack(sk) < 0) {
 				pr_err("CLONE: Failed to receive completion ACK\n");
 				ret = -1;
 			}
 		}
-		gettimeofday(&t_end, NULL);
-		timersub(&t_end, &t_start, &t_delta);
-		pr_debug("TIMING: wait_for_completion_ack took %ld.%06ld seconds (before compare)\n",
-		       t_delta.tv_sec, t_delta.tv_usec);
 
 		/* Process comparison with replica (source already unfrozen) */
 		{
 			int compare_sk;
 			pid_t target_pid = root_item->pid->real;
 
-			pr_err("COMPARE: PRIMARY waiting for replica connection (PID %d running)\n",
-			       target_pid);
+			pr_debug("COMPARE: PRIMARY waiting for replica connection (PID %d running)\n",
+				 target_pid);
 
 			if (clone_compare_listen(&compare_sk) == 0) {
 				clone_compare_send_state(compare_sk, target_pid);
 				close(compare_sk);
 			}
-			pr_err("COMPARE: PRIMARY comparison done\n");
+			pr_debug("COMPARE: PRIMARY comparison done\n");
 		}
 
-		pr_err("CLONE: Unfreezing process\n");
+		pr_debug("CLONE: Unfreezing process\n");
 		pstree_switch_state(root_item, TASK_ALIVE);
 #else
 
-		pr_err("CLONE: Unfreezing process\n");
+		pr_debug("CLONE: Unfreezing process\n");
 		pstree_switch_state(root_item, TASK_ALIVE);
 		/* Wait for ACK AFTER unfreeze - not on critical path */
-		gettimeofday(&t_start, NULL);
 		if (!ret && sk >= 0) {
 			if (wait_for_all_pages_sent_ack(sk) < 0) {
 				pr_err("CLONE: Failed to receive completion ACK\n");
 				ret = -1;
 			}
 		}
-		gettimeofday(&t_end, NULL);
-		timersub(&t_end, &t_start, &t_delta);
-		pr_debug("TIMING: wait_for_completion_ack took %ld.%06ld seconds (after unfreeze)\n",
-		       t_delta.tv_sec, t_delta.tv_usec);
 #endif
 
 		/* Cleanup after unfreeze - not on critical path */
@@ -2273,10 +2241,8 @@ static int cr_dump_finish(int ret)
 	}
 
 	/* Standard path: transfer pages then resume */
-	if (!ret && opts.lazy_pages) {
-		pr_debug("DEBUG_SOCKET: About to call cr_lazy_mem_dump (standard path)\n");
+	if (!ret && opts.lazy_pages)
 		ret = cr_lazy_mem_dump();
-	}
 
 	if (arch_set_thread_regs(root_item, true) < 0)
 		ret = -1;
@@ -2386,18 +2352,13 @@ int cr_dump_tasks(pid_t pid)
 	int ret;
 	int exit_code = -1;
 
-	pr_debug("DEBUG_SOCKET: cr_dump_tasks ENTRY clone_dump=%d lazy_pages=%d\n",
-	       opts.clone_dump, opts.lazy_pages);
-
 	/*
 	 * CLONE phased migration: when both --clone-dump and --lazy-pages are
 	 * enabled, use the phased WP_ASYNC → WP_SYNC flow for minimal
 	 * source downtime.
 	 */
-	if (opts.clone_dump && opts.lazy_pages) {
-		pr_debug("DEBUG_SOCKET: Redirecting to cr_dump_tasks_clone_phased\n");
+	if (opts.clone_dump && opts.lazy_pages)
 		return cr_dump_tasks_clone_phased(pid);
-	}
 
 	kerndat_warn_about_madv_guards();
 
@@ -2490,7 +2451,6 @@ int cr_dump_tasks(pid_t pid)
 	glob_imgset = cr_glob_imgset_open(O_DUMP);
 	if (!glob_imgset)
 		goto err;
-	pr_err("DEBUG: glob_imgset opened for dump (standard path)\n");
 
 	if (seccomp_collect_dump_filters() < 0)
 		goto err;
@@ -2547,7 +2507,6 @@ static int cr_dump_tasks_clone_phased(pid_t pid)
 	InventoryEntry he = INVENTORY_ENTRY__INIT;
 	InventoryEntry *parent_ie = NULL;
 	struct pstree_item *item;
-	struct timeval freeze_start, freeze_end, freeze_delta;
 	int ret;
 	int exit_code = -1;
 
@@ -2611,10 +2570,7 @@ static int cr_dump_tasks_clone_phased(pid_t pid)
 		goto err;
 
 	/* === PHASE 1: Seize + Pre-dump + WP_ASYNC === */
-	pr_err("=== PHASE 1: Seize + Pre-dump + WP_ASYNC ===\n");
-
-	gettimeofday(&freeze_start, NULL);
-	pr_debug("TIMING: Phase 1 freeze started\n");
+	pr_debug("PHASE 1: Seize + Pre-dump + WP_ASYNC\n");
 
 	if (collect_pstree())
 		goto err;
@@ -2647,7 +2603,7 @@ static int cr_dump_tasks_clone_phased(pid_t pid)
 	 */
 #ifdef CONFIG_HAS_LIBBPF
 	if (clone_bpf_start(root_item->pid->real) == 0)
-		pr_err("BPF dirty tracker started (before unfreeze)\n");
+		pr_debug("BPF dirty tracker started (before unfreeze)\n");
 	else
 		pr_info("BPF dirty tracker not available, using PAGEMAP_SCAN\n");
 #endif
@@ -2659,13 +2615,8 @@ static int cr_dump_tasks_clone_phased(pid_t pid)
 
 	pstree_switch_state(root_item, TASK_ALIVE);
 
-	gettimeofday(&freeze_end, NULL);
-	timersub(&freeze_end, &freeze_start, &freeze_delta);
-	pr_debug("TIMING: Phase 1 freeze ended - process frozen for %ld.%06ld seconds\n",
-	       freeze_delta.tv_sec, freeze_delta.tv_usec);
-
 	/* === PHASE 2: Bulk page transfer + iterative dirty scan === */
-	pr_err("=== PHASE 2: Bulk page transfer + dirty scan convergence ===\n");
+	pr_debug("PHASE 2: Bulk page transfer + dirty scan convergence\n");
 
 	/*
 	 * Start the page server which starts P3 threads.
@@ -2701,36 +2652,21 @@ static int cr_dump_tasks_clone_phased(pid_t pid)
 	 * Wait for P3 threads to converge (all below dirty page threshold).
 	 * Threads are running iterative dirty scan loop.
 	 */
-	pr_err("=== Waiting for dirty page convergence ===\n");
+	pr_debug("Waiting for dirty page convergence\n");
 	while (!clone_all_threads_below_threshold()) {
 		usleep(10000);  /* 10ms poll */
 	}
-	pr_err("=== CONVERGENCE: All threads below threshold ===\n");
+	pr_debug("CONVERGENCE: All threads below threshold\n");
 
 	/* === PHASE 3: Freeze + skeleton dump === */
-	pr_err("=== PHASE 3: Freeze + skeleton dump ===\n");
-
-	gettimeofday(&freeze_start, NULL);
-	g_phase3_freeze_start = freeze_start;  /* Save for cr_dump_finish */
-	pr_debug("TIMING: Phase 3 freeze started\n");
+	pr_debug("PHASE 3: Freeze + skeleton dump\n");
 
 	/*
 	 * Re-seize all tasks. After Phase 1, tasks were released via
 	 * pstree_switch_state(TASK_ALIVE) which detached from ptrace.
 	 * We need to re-attach to perform the skeleton dump.
 	 */
-	{
-		struct timeval t_start, t_end, t_delta, t_elapsed;
-		gettimeofday(&t_start, NULL);
-		timersub(&t_start, &freeze_start, &t_elapsed);
-		pr_debug("TIMING @%ld.%06ld: reseize_pstree starting\n",
-		       t_elapsed.tv_sec, t_elapsed.tv_usec);
-		ret = reseize_pstree();
-		gettimeofday(&t_end, NULL);
-		timersub(&t_end, &t_start, &t_delta);
-		pr_debug("TIMING: reseize_pstree took %ld.%06ld seconds\n",
-		       t_delta.tv_sec, t_delta.tv_usec);
-	}
+	ret = reseize_pstree();
 	if (ret) {
 		pr_err("Failed to re-seize tasks\n");
 		goto err;
@@ -2745,16 +2681,8 @@ static int cr_dump_tasks_clone_phased(pid_t pid)
 	 * Collect pstree IDs now so vpid(item) is valid for the VMA detection.
 	 * This must happen before clone_detect_new_vmas() which uses dst_id.
 	 */
-	{
-		struct timeval t_start, t_end, t_delta;
-		gettimeofday(&t_start, NULL);
-		if (collect_pstree_ids())
-			goto err;
-		gettimeofday(&t_end, NULL);
-		timersub(&t_end, &t_start, &t_delta);
-		pr_debug("TIMING: collect_pstree_ids took %ld.%06ld seconds\n",
-		       t_delta.tv_sec, t_delta.tv_usec);
-	}
+	if (collect_pstree_ids())
+		goto err;
 
 	/* Update CLONE dst_id now that collect_pstree_ids() has populated vpid */
 	clone_set_dst_id(vpid(root_item));
@@ -2769,30 +2697,19 @@ static int cr_dump_tasks_clone_phased(pid_t pid)
 		struct vm_area_list phase3_vmas;
 		unsigned long *new_vma_ranges = NULL;
 		unsigned int nr_new_vma_ranges = 0;
-		struct timeval t_start, t_end, t_delta;
 
 		vm_area_list_init(&phase3_vmas);
 
-		gettimeofday(&t_start, NULL);
 		ret = collect_mappings(root_item->pid->real, &phase3_vmas, NULL);
-		gettimeofday(&t_end, NULL);
-		timersub(&t_end, &t_start, &t_delta);
-		pr_debug("TIMING: Phase3 collect_mappings took %ld.%06ld seconds\n",
-		       t_delta.tv_sec, t_delta.tv_usec);
 		if (ret) {
 			pr_err("Failed to collect Phase 3 VMAs\n");
 			goto err;
 		}
 
-		pr_err("CLONE PHASE 3: Collected %lu VMAs for pid %d (compare with Phase 1 count)\n",
-		       (unsigned long)phase3_vmas.nr, root_item->pid->real);
+		pr_debug("CLONE PHASE 3: Collected %lu VMAs for pid %d (compare with Phase 1 count)\n",
+			 (unsigned long)phase3_vmas.nr, root_item->pid->real);
 
-		gettimeofday(&t_start, NULL);
 		ret = clone_detect_new_vmas(&phase3_vmas, &new_vma_ranges, &nr_new_vma_ranges);
-		gettimeofday(&t_end, NULL);
-		timersub(&t_end, &t_start, &t_delta);
-		pr_debug("TIMING: clone_detect_new_vmas took %ld.%06ld seconds\n",
-		       t_delta.tv_sec, t_delta.tv_usec);
 		free_mappings(&phase3_vmas);
 
 		if (ret) {
@@ -2801,17 +2718,17 @@ static int cr_dump_tasks_clone_phased(pid_t pid)
 		}
 
 		if (nr_new_vma_ranges > 0) {
-			pr_err("CLONE PHASE 3: Found %u new VMA regions since Phase 1!\n",
-				nr_new_vma_ranges);
-			pr_err("CLONE PHASE 3: These VMAs were created while process ran during Phase 2.\n");
-			pr_err("CLONE PHASE 3: Their PAGE DATA will be sent, but VMA METADATA is missing from dump.\n");
-			pr_err("CLONE PHASE 3: REPLICA will NOT have these VMAs - expect comparison differences!\n");
+			pr_debug("CLONE PHASE 3: Found %u new VMA regions since Phase 1!\n",
+				 nr_new_vma_ranges);
+			pr_debug("CLONE PHASE 3: These VMAs were created while process ran during Phase 2.\n");
+			pr_debug("CLONE PHASE 3: Their PAGE DATA will be sent, but VMA METADATA is missing from dump.\n");
+			pr_debug("CLONE PHASE 3: REPLICA will NOT have these VMAs - expect comparison differences!\n");
 
 			/* Pass new VMA ranges to P3 threads for sending during final scan */
 			clone_set_new_vma_ranges(new_vma_ranges, nr_new_vma_ranges);
 			/* Don't free - P3 threads will use it */
 		} else {
-			pr_err("CLONE PHASE 3: No new VMAs detected - VMA count unchanged since Phase 1.\n");
+			pr_debug("CLONE PHASE 3: No new VMAs detected - VMA count unchanged since Phase 1.\n");
 			xfree(new_vma_ranges);
 		}
 	}
@@ -2822,92 +2739,32 @@ static int cr_dump_tasks_clone_phased(pid_t pid)
 	 */
 	clone_signal_last_scan();
 
-	{
-		struct timeval t_start, t_end, t_delta;
-		gettimeofday(&t_start, NULL);
-		if (network_lock())
-			goto err;
-		gettimeofday(&t_end, NULL);
-		timersub(&t_end, &t_start, &t_delta);
-		pr_debug("TIMING: network_lock took %ld.%06ld seconds\n",
-		       t_delta.tv_sec, t_delta.tv_usec);
-	}
+	if (network_lock())
+		goto err;
 
-	{
-		struct timeval t_start, t_end, t_delta;
-		gettimeofday(&t_start, NULL);
-		if (rpc_query_external_files())
-			goto err;
-		gettimeofday(&t_end, NULL);
-		timersub(&t_end, &t_start, &t_delta);
-		pr_debug("TIMING: rpc_query_external_files took %ld.%06ld seconds\n",
-		       t_delta.tv_sec, t_delta.tv_usec);
-	}
+	if (rpc_query_external_files())
+		goto err;
 
-	{
-		struct timeval t_start, t_end, t_delta;
-		gettimeofday(&t_start, NULL);
-		if (collect_file_locks())
-			goto err;
-		gettimeofday(&t_end, NULL);
-		timersub(&t_end, &t_start, &t_delta);
-		pr_debug("TIMING: collect_file_locks took %ld.%06ld seconds\n",
-		       t_delta.tv_sec, t_delta.tv_usec);
-	}
+	if (collect_file_locks())
+		goto err;
 
-	{
-		struct timeval t_start, t_end, t_delta;
-		gettimeofday(&t_start, NULL);
-		if (collect_namespaces(true) < 0)
-			goto err;
-		gettimeofday(&t_end, NULL);
-		timersub(&t_end, &t_start, &t_delta);
-		pr_debug("TIMING: collect_namespaces took %ld.%06ld seconds\n",
-		       t_delta.tv_sec, t_delta.tv_usec);
-	}
+	if (collect_namespaces(true) < 0)
+		goto err;
 
-	{
-		struct timeval t_start, t_end, t_delta;
-		gettimeofday(&t_start, NULL);
-		glob_imgset = cr_glob_imgset_open(O_DUMP);
-		if (!glob_imgset)
-			goto err;
-		gettimeofday(&t_end, NULL);
-		timersub(&t_end, &t_start, &t_delta);
-		pr_debug("TIMING: cr_glob_imgset_open took %ld.%06ld seconds\n",
-		       t_delta.tv_sec, t_delta.tv_usec);
-	}
-	pr_err("DEBUG: glob_imgset opened for skeleton dump (CLONE path)\n");
+	glob_imgset = cr_glob_imgset_open(O_DUMP);
+	if (!glob_imgset)
+		goto err;
 
-	{
-		struct timeval t_start, t_end, t_delta;
-		gettimeofday(&t_start, NULL);
-		if (seccomp_collect_dump_filters() < 0)
-			goto err;
-		gettimeofday(&t_end, NULL);
-		timersub(&t_end, &t_start, &t_delta);
-		pr_debug("TIMING: seccomp_collect_dump_filters took %ld.%06ld seconds\n",
-		       t_delta.tv_sec, t_delta.tv_usec);
-	}
+	if (seccomp_collect_dump_filters() < 0)
+		goto err;
 
 	/* Set phase to SCAN so clone_is_phased_skeleton_dump() returns true */
 	clone_set_phase(CLONE_PHASE_SCAN);
 
 	/* Dump skeleton (everything except pages) */
-	{
-		struct timeval t_start, t_end, t_delta, t_elapsed;
-		gettimeofday(&t_start, NULL);
-		timersub(&t_start, &freeze_start, &t_elapsed);
-		pr_debug("TIMING @%ld.%06ld: skeleton dump loop starting\n",
-		       t_elapsed.tv_sec, t_elapsed.tv_usec);
-		for_each_pstree_item(item) {
-			if (dump_one_task(item, parent_ie))
-				goto err;
-		}
-		gettimeofday(&t_end, NULL);
-		timersub(&t_end, &t_start, &t_delta);
-		pr_debug("TIMING: skeleton dump loop took %ld.%06ld seconds\n",
-		       t_delta.tv_sec, t_delta.tv_usec);
+	for_each_pstree_item(item) {
+		if (dump_one_task(item, parent_ie))
+			goto err;
 	}
 
 	if (parent_ie) {
@@ -2916,19 +2773,8 @@ static int cr_dump_tasks_clone_phased(pid_t pid)
 	}
 
 	/* Standard post-task dump operations */
-	{
-		struct timeval t_start, t_end, t_delta, t_elapsed;
-		gettimeofday(&t_start, NULL);
-		timersub(&t_start, &freeze_start, &t_elapsed);
-		pr_debug("TIMING @%ld.%06ld: cr_dump_post_task_operations starting\n",
-		       t_elapsed.tv_sec, t_elapsed.tv_usec);
-		if (cr_dump_post_task_operations(&he))
-			goto err;
-		gettimeofday(&t_end, NULL);
-		timersub(&t_end, &t_start, &t_delta);
-		pr_debug("TIMING: cr_dump_post_task_operations took %ld.%06ld seconds\n",
-		       t_delta.tv_sec, t_delta.tv_usec);
-	}
+	if (cr_dump_post_task_operations(&he))
+		goto err;
 
 	pr_info("Skeleton dump complete\n");
 
@@ -2939,20 +2785,9 @@ static int cr_dump_tasks_clone_phased(pid_t pid)
 	 * NOTE: Inventory write and signal moved to cr_dump_finish() - they happen
 	 * AFTER all data is collected and flushed, right before unfreeze.
 	 */
-	pr_err("=== Waiting for P3 threads final scan ===\n");
-	{
-		struct timeval t_start, t_end, t_delta, t_elapsed;
-		gettimeofday(&t_start, NULL);
-		timersub(&t_start, &freeze_start, &t_elapsed);
-		pr_debug("TIMING @%ld.%06ld: clone_wait_p3_threads starting\n",
-		       t_elapsed.tv_sec, t_elapsed.tv_usec);
-		clone_wait_p3_threads();
-		gettimeofday(&t_end, NULL);
-		timersub(&t_end, &t_start, &t_delta);
-		pr_debug("TIMING: clone_wait_p3_threads took %ld.%06ld seconds\n",
-		       t_delta.tv_sec, t_delta.tv_usec);
-	}
-	pr_err("P3 threads completed: %lu total pages sent\n", clone_p3_pages_sent());
+	pr_debug("Waiting for P3 threads final scan\n");
+	clone_wait_p3_threads();
+	pr_debug("P3 threads completed: %lu total pages sent\n", clone_p3_pages_sent());
 
 	if (clone_p3_had_error()) {
 		pr_err("clone-dump: P3 bulk transfer reported errors — failing "

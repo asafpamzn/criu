@@ -350,7 +350,6 @@ static struct page_pipe_buf *get_ppb(struct page_pipe *pp, unsigned long addr, s
 			/* got iov that contains the addr */
 			*len += (addr - base);
 			*iov_ret = iov;
-			//pr_warn("DEBUG file =%s, line = %d\n", __FILE__, __LINE__);
 			//list_move(&ppb->l, &pp->bufs); TODO ADD BACK
 			return ppb;
 		}

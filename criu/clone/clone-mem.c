@@ -36,27 +36,6 @@ struct list_head *get_global_lazy_vmas(void)
 }
 
 
-/* Find lazy VMA entry by address only (no dst_id filter) */
-struct lazy_vma_entry *find_lazy_vma_by_addr(unsigned long vaddr)
-{
-	struct lazy_vma_entry *lve;
-
-	/* Ensure lock is initialized (pthread_once guarantees single init) */
-	clone_mem_init_lazy_vmas();
-
-	pthread_spin_lock(&lazy_vmas_lock);
-
-	list_for_each_entry(lve, &global_lazy_vmas, list) {
-		if (vaddr >= lve->start && vaddr < lve->end) {
-			pthread_spin_unlock(&lazy_vmas_lock);
-			return lve;
-		}
-	}
-	pthread_spin_unlock(&lazy_vmas_lock);
-
-	return NULL;
-}
-
 /*
  * add_lazy_vma_for_new_region - Add a new VMA to global_lazy_vmas
  *

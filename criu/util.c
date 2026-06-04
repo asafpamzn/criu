@@ -1220,7 +1220,6 @@ int setup_tcp_server(char *type, char *addr, unsigned short *port)
 		return -1;
 	}
 
-	pr_debug("DEBUG_SOCKET: setup_tcp_server type=%s port=%u\n", type, *port);
 	pr_info("Starting %s server on port %u\n", type, *port);
 
 	sk = socket(saddr.ss_family, SOCK_STREAM, IPPROTO_TCP);
@@ -1239,8 +1238,6 @@ int setup_tcp_server(char *type, char *addr, unsigned short *port)
 		pr_perror("Can't bind %s server", type);
 		goto out;
 	}
-
-	pr_debug("DEBUG_SOCKET: Bound socket fd=%d to port %u\n", sk, *port);
 
 	if (listen(sk, 32)) {
 		pr_perror("Can't listen on %s server socket", type);
@@ -1279,7 +1276,6 @@ int get_listen_socket(void)
 
 void close_listen_socket(void)
 {
-	pr_debug("DEBUG_SOCKET: close_listen_socket called fd=%d\n", g_listen_sk);
 	if (g_listen_sk >= 0) {
 		close(g_listen_sk);
 		g_listen_sk = -1;
@@ -1407,9 +1403,6 @@ int epoll_add_rfd(int epfd, struct epoll_rfd *rfd)
 {
 	struct epoll_event ev;
 
-	pr_err("DEBUG_FD: epoll_add_rfd fd=%d read_event=%p hangup_event=%p\n",
-	       rfd->fd, rfd->read_event, rfd->hangup_event);
-
 	ev.events = EPOLLIN | EPOLLRDHUP;
 	ev.data.ptr = rfd;
 	if (epoll_ctl(epfd, EPOLL_CTL_ADD, rfd->fd, &ev) == -1) {
@@ -1422,8 +1415,6 @@ int epoll_add_rfd(int epfd, struct epoll_rfd *rfd)
 
 int epoll_del_rfd(int epfd, struct epoll_rfd *rfd)
 {
-	pr_err("DEBUG_FD: epoll_del_rfd fd=%d\n", rfd->fd);
-
 	if (epoll_ctl(epfd, EPOLL_CTL_DEL, rfd->fd, NULL) == -1) {
 		pr_perror("epoll_ctl DEL failed for fd=%d", rfd->fd);
 		return -1;
@@ -1436,11 +1427,8 @@ static int epoll_hangup_event(int epollfd, struct epoll_rfd *rfd)
 {
 	int ret = 0;
 
-	pr_err("DEBUG_CALLBACK: epoll_hangup_event called fd=%d\n", rfd->fd);
-
 	if (rfd->hangup_event) {
 		ret = rfd->hangup_event(rfd);
-		pr_err("DEBUG_CALLBACK: hangup_event returned %d, will remove fd=%d from epoll\n", ret, rfd->fd);
 		if (ret < 0)
 			return ret;
 	}
@@ -1448,7 +1436,6 @@ static int epoll_hangup_event(int epollfd, struct epoll_rfd *rfd)
 	if (epoll_del_rfd(epollfd, rfd))
 		return -1;
 
-	pr_err("DEBUG_CALLBACK: closing fd=%d after hangup\n", rfd->fd);
 	close_safe(&rfd->fd);
 
 	return ret;
@@ -1473,7 +1460,7 @@ static void check_and_print_epoll_stats(void)
 			struct tm *tm;
 			clock_gettime(CLOCK_REALTIME, &ts);
 			tm = localtime(&ts.tv_sec);
-			pr_info("[EPOLL_STATS] [%02d:%02d:%02d.%03ld] read_calls=%lu read_success=%lu epoll_wait_calls=%lu epoll_wait_ns=%lu\n",
+			pr_debug("[%02d:%02d:%02d.%03ld] read_calls=%lu read_success=%lu epoll_wait_calls=%lu epoll_wait_ns=%lu\n",
 				tm->tm_hour, tm->tm_min, tm->tm_sec, ts.tv_nsec / 1000000,
 				epoll_stats.total_read_calls,
 				epoll_stats.total_read_success,
@@ -1508,7 +1495,6 @@ int epoll_run_rfds(int epollfd, struct epoll_event *evs, int nr_fds, int timeout
 		if (opts.clone_dump) {
 			ret = clone_process_eagain_requests();
 			if (ret < 0) {
-				pr_err("DEBUG_EPOLL: clone_process_eagain_requests returned %d\n", ret);
 				goto out;
 			}
 		}
@@ -1544,7 +1530,6 @@ int epoll_run_rfds(int epollfd, struct epoll_event *evs, int nr_fds, int timeout
 				ret = rfd->read_event(rfd);
 
 				if (ret < 0) {
-					pr_err("DEBUG_EPOLL: read_event failed fd=%d ret=%d\n", rfd->fd, ret);
 					goto out;
 				}
 				if (ret > 0) {
@@ -1554,7 +1539,6 @@ int epoll_run_rfds(int epollfd, struct epoll_event *evs, int nr_fds, int timeout
 			}
 
 			if (events & (EPOLLHUP | EPOLLRDHUP)) {
-				pr_err("DEBUG_CALLBACK: EPOLLHUP/EPOLLRDHUP detected fd=%d events=0x%x\n", rfd->fd, events);
 				ret = epoll_hangup_event(epollfd, rfd);
 				if (ret < 0)
 					goto out;

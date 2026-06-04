@@ -43,11 +43,6 @@ void set_all_pages_sent_ack_received(void)
 	all_pages_sent_ack_received = true;
 }
 
-bool is_all_pages_sent_ack_received(void)
-{
-	return all_pages_sent_ack_received;
-}
-
 /*
  * Wait for all_pages_sent ACK from replica.
  * Called by primary after sending PS_IOV_ALL_PAGES_SENT.

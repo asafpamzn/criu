@@ -24,7 +24,6 @@ extern unsigned long g_compress_compressed_bytes;
 
 /* CLONE all-pages-sent ACK state */
 extern void set_all_pages_sent_ack_received(void);
-extern bool is_all_pages_sent_ack_received(void);
 
 /* Wait for all_pages_sent ACK (called from page-xfer.c) */
 extern int wait_for_all_pages_sent_ack(int sk);

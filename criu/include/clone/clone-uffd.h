@@ -50,18 +50,8 @@ void *clone_page_buffer_get_data_ptr(unsigned long base_vaddr,
 void clone_page_buffer_mark_pages(unsigned long base_vaddr,
 				int page_offset, int nr_pages);
 
-/*
- * Add a single page to the buffer (legacy per-page path).
- * Groups the page into its 256KB-aligned batch automatically.
- * Used by Phase 4 dirty page overwrites.
- */
-int clone_page_buffer_add(unsigned long vaddr, void *data, int thread_id, bool nocopy);
-
 /* Get current page count */
 unsigned long clone_page_buffer_count(void);
-
-/* Destroy CLONE page buffer and free all resources */
-void clone_page_buffer_destroy(void);
 
 
 /* Start background drain thread (lpis needed for EAGAIN handling) */
@@ -83,11 +73,8 @@ void clone_page_buffer_readd(unsigned long vaddr, void *data);
  * UFFD Statistics (CLONE mode)
  */
 extern void check_and_print_uffd_stats(void);
-extern int clone_get_histogram_bucket(unsigned long nr_pages);
 extern void clone_uffd_stats_add_io_bulk(unsigned long ns);
 extern void clone_uffd_stats_inc_io_bulk_start(void);
-extern void clone_uffd_stats_add_copy(unsigned long ns);
-extern void clone_uffd_stats_add_drop(unsigned long ns);
 
 /*
  * EAGAIN Request Handling (CLONE mode)
@@ -133,9 +120,8 @@ extern int clone_handle_lazy_accept(struct list_head *lpis, int epollfd,
 				  int client, bool phase3_active);
 
 
-/* Set/get phase3_active flag */
+/* Set phase3_active flag */
 extern void clone_set_phase3_active(bool active);
-extern bool clone_is_phase3_active(void);
 
 
 /*

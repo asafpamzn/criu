@@ -2407,11 +2407,6 @@ bool clone_p3_had_error(void)
 	return __atomic_load_n(&g_p3_had_error, __ATOMIC_ACQUIRE) != 0;
 }
 
-bool clone_p3_thread_running(void)
-{
-	return p3_threads_active > 0;
-}
-
 unsigned long clone_p3_pages_sent(void)
 {
 	return p3_total_pages_sent;
@@ -2482,12 +2477,4 @@ void clone_signal_last_scan(void)
 
 	clone_signal_scanner_freeze();  /* Signal scanner to do final scan */
 	__sync_synchronize();  /* Memory barrier */
-}
-
-/*
- * Check if last scan has been signaled.
- */
-bool clone_is_last_scan_signaled(void)
-{
-	return g_last_scan_flag;
 }

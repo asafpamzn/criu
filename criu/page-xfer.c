@@ -42,7 +42,6 @@
 #include "dump.h"
 #include "mem.h"
 #include "atomic-bitmap.h"
-#include "clone/clone-bitmap.h"
 #include "clone/clone-bulk-send.h"
 #include "clone/spsc-queue.h"
 #include "xmalloc.h"
@@ -310,9 +309,6 @@ static int write_pages_to_server(struct page_xfer *xfer, int p, unsigned long le
 {
 	ssize_t ret, left = len;
 
-	pr_debug("VMA_TRACE: phase=PS_WRITE_PAGES dst_id=0x%lx len=%lu\n",
-	       (unsigned long)xfer->dst_id, len);
-
 	if (opts.tls) {
 		pr_debug("Sending %lx bytes\n", len);
 
@@ -344,11 +340,6 @@ static int write_pagemap_to_server(struct page_xfer *xfer, struct iovec *iov, u3
 		.vaddr = encode_pointer(iov->iov_base),
 		.dst_id = xfer->dst_id,
 	};
-
-	pr_debug("VMA_TRACE: phase=PS_WRITE_PAGEMAP dst_id=0x%lx vaddr=0x%lx nr_pages=%u flags=0x%x\n",
-	       (unsigned long)xfer->dst_id,
-	       (unsigned long)iov->iov_base,
-	       (unsigned int)pi.nr_pages, flags);
 
 	return send_psi(xfer->sk, &pi);
 }
@@ -397,9 +388,6 @@ static int write_pages_loc(struct page_xfer *xfer, int p, unsigned long len)
 {
 	ssize_t ret;
 	ssize_t curr = 0;
-
-	pr_debug("VMA_TRACE: phase=LOC_WRITE_PAGES pi_fd=%d len=%lu\n",
-	       xfer->pi ? img_raw_fd(xfer->pi) : -1, len);
 
 	while (1) {
 		ret = splice(p, NULL, img_raw_fd(xfer->pi), NULL, len - curr, SPLICE_F_MOVE);
@@ -472,12 +460,6 @@ static int write_pagemap_loc(struct page_xfer *xfer, struct iovec *iov, u32 flag
 	pe.has_flags = true;
 	pe.flags = flags;
 	pe.has_nr_pages = true;
-
-	pr_debug("VMA_TRACE: phase=LOC_WRITE_PAGEMAP pi_fd=%d vaddr=0x%lx nr_pages=%u flags=0x%x has_parent=%d\n",
-	       xfer->pi ? img_raw_fd(xfer->pi) : -1,
-	       (unsigned long)iov->iov_base,
-	       (unsigned int)pe.nr_pages, flags,
-	       xfer->parent ? 1 : 0);
 
 	if (flags & PE_PRESENT) {
 		if (opts.auto_dedup && xfer->parent != NULL) {
@@ -571,14 +553,6 @@ out:
 	xfer->write_pages = write_pages_loc;
 	xfer->close = close_page_xfer;
 
-	/*
-	 * Do not call img_raw_fd() on the pagemap image — it's protobuf-buffered
-	 * and BUG_ON's there. Only the pages image (xfer->pi) is raw/splice-ok.
-	 */
-	pr_debug("VMA_TRACE: phase=LOC_XFER_OPEN fd_type=%d img_id=%lu pi_fd=%d has_parent=%d\n",
-	       fd_type, img_id,
-	       xfer->pi ? img_raw_fd(xfer->pi) : -1,
-	       xfer->parent ? 1 : 0);
 	return 0;
 
 err_pi:
@@ -593,10 +567,6 @@ int open_page_xfer(struct page_xfer *xfer, int fd_type, unsigned long img_id)
 	xfer->offset = 0;
 	xfer->transfer_lazy = true;
 
-	pr_debug("VMA_TRACE: phase=OPEN_PAGE_XFER fd_type=%d img_id=%lu use_page_server=%d clone_dump=%d\n",
-	       fd_type, img_id, opts.use_page_server ? 1 : 0,
-	       opts.clone_dump ? 1 : 0);
-
 	if (opts.use_page_server)
 		return open_page_server_xfer(xfer, fd_type, img_id);
 	else
@@ -609,7 +579,7 @@ static int page_xfer_dump_hole(struct page_xfer *xfer, struct iovec *hole, u32 f
 	hole->iov_base -= xfer->offset;
 	pr_debug("\th %p [%u]\n", hole->iov_base, (unsigned int)(hole->iov_len / PAGE_SIZE));
 
-	pr_info("  Writing hole pagemap: 0x%lx-0x%lx (%lu pages)\n",
+	pr_debug("  Writing hole pagemap: 0x%lx-0x%lx (%lu pages)\n",
 		(unsigned long)hole->iov_base,
 		(unsigned long)(hole->iov_base + hole->iov_len),
 		(unsigned long)(hole->iov_len / PAGE_SIZE));
@@ -1057,7 +1027,7 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 
 	/* In CLONE dump mode, we need to interleave lazy VMA entries with pipe entries */
 	if (opts.clone_dump) {
-		pr_info("Writing pagemap entries (interleaved mode) for dst_id=%lu\n", 
+		pr_debug("Writing pagemap entries (interleaved mode) for dst_id=%lu\n",
 			(unsigned long)xfer->dst_id);
 	}
 
@@ -1282,10 +1252,6 @@ static int page_server_add(int sk, struct page_server_iov *pi, u32 flags)
 	struct page_xfer *lxfer = &cxfer.loc_xfer;
 	struct iovec iov;
 
-	pr_debug("VMA_TRACE: phase=PS_RECV_ADD dst_id=0x%lx vaddr=0x%lx nr_pages=%u flags=0x%x\n",
-	       (unsigned long)pi->dst_id, (unsigned long)pi->vaddr,
-	       (unsigned int)pi->nr_pages, flags);
-
 	if (prep_loc_xfer(pi))
 		return -1;
 
@@ -1481,7 +1447,7 @@ static int page_server_serve(int sk)
 			 * An answer must be sent back to inform another side,
 			 * that all data were received
 			 */
-			pr_err("Got close; sending completion status\n");
+			pr_debug("Got close; sending completion status\n");
 			if (__send(sk, &status, sizeof(status), 0) != sizeof(status)) {
 				pr_perror("Can't send the final package");
 				ret = -1;
@@ -1538,16 +1504,16 @@ static int page_server_serve(int sk)
 	 * No need to wait for ACK - main socket only carries control signals.
 	 */
 	if (opts.clone_dump && last_cmd == PS_IOV_GET_ALL) {
-		pr_err("CLONE mode: storing socket (sk=%d) after PS_IOV_GET_ALL\n", sk);
+		pr_debug("CLONE mode: storing socket (sk=%d) after PS_IOV_GET_ALL\n", sk);
 		page_server_sk = sk;
 		return 0;
 	}
 
 	/* Legacy path: wait for bulk ACK (kept for backwards compatibility) */
 	if (opts.clone_dump && bulk_ack_received) {
-		pr_info("Bulk ACK received, storing socket (sk=%d) for dirty bitmap\n", sk);
+		pr_debug("Bulk ACK received, storing socket (sk=%d) for dirty bitmap\n", sk);
 		page_server_sk = sk;
-		pr_info("page_server_sk now set to %d\n", page_server_sk);
+		pr_debug("page_server_sk now set to %d\n", page_server_sk);
 		return 0;
 	}
 
@@ -1687,9 +1653,6 @@ int cr_page_server(bool daemon_mode, bool lazy_dump, int cfd)
 	int sk = -1;
 	int ret;
 
-	pr_debug("DEBUG_SOCKET: cr_page_server ENTRY daemon=%d lazy=%d\n",
-	       daemon_mode, lazy_dump);
-
 	/*
 	 * When running inside the dump process (lazy_dump=true), stats are
 	 * already initialized by cr_dump_tasks(). Re-initializing them here
@@ -1811,7 +1774,7 @@ int disconnect_from_page_server(void)
 	if (page_server_sk == -1)
 		return 0;
 
-	pr_err("Disconnect from the page server\n");
+	pr_debug("Disconnect from the page server\n");
 
 	if (opts.ps_socket != -1)
 		/*
@@ -1953,11 +1916,8 @@ static int page_server_async_read(struct epoll_rfd *f)
 
 static int page_server_hangup_event(struct epoll_rfd *rfd)
 {
-	pr_err("DEBUG_CALLBACK: page_server_hangup_event called fd=%d clone_dump=%d all_pages_sent=%d\n",
-	       rfd->fd, opts.clone_dump, clone_is_all_pages_sent_received());
-
 	if (opts.clone_dump && clone_is_all_pages_sent_received()) {
-		pr_err("Page server closed connection after all pages sent\n");
+		pr_debug("Page server closed connection after all pages sent\n");
 		return 1;
 	}
 
@@ -1976,10 +1936,8 @@ int connect_to_page_server_to_recv(int epfd)
 	/* Use bulk stream reader in bulk mode, regular reader in on-demand mode */
 	if (opts.clone_dump) {
 		ps_rfd.read_event = page_server_async_read_bulk;
-		pr_err("DEBUG_CALLBACK: set read_event=page_server_async_read_bulk fd=%d\n", page_server_sk);
 	} else {
 		ps_rfd.read_event = page_server_async_read;
-		pr_err("DEBUG_CALLBACK: set read_event=page_server_async_read fd=%d\n", page_server_sk);
 	}
 	ps_rfd.hangup_event = page_server_hangup_event;
 
@@ -1995,7 +1953,7 @@ int remove_page_server_from_epoll(int epfd)
 	if (page_server_sk < 0)
 		return 0;
 
-	pr_info("Removing page server fd=%d from epoll\n", page_server_sk);
+	pr_debug("Removing page server fd=%d from epoll\n", page_server_sk);
 	epoll_del_rfd(epfd, &ps_rfd);
 	close(page_server_sk);
 	page_server_sk = -1;

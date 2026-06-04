@@ -81,7 +81,6 @@ static LIST_HEAD(exiting_lpis);
 static LIST_HEAD(pending_lpis);
 static int epollfd;
 static bool restore_finished;
-/* phase3_active is now in clone-uffd.c: clone_is_phase3_active() / clone_set_phase3_active() */
 static struct epoll_rfd lazy_sk_rfd;
 /* socket for communication with lazy-pages daemon */
 static int lazy_pages_sk_id = -1;
@@ -1416,7 +1415,7 @@ int lazy_pages_finish_restore(void)
 		uint32_t tasks_frozen = LAZY_PAGES_TASKS_FROZEN;
 		uint32_t drain_signal;
 
-		pr_info("CLONE mode: Sending TASKS_FROZEN signal to lazy-pages\n");
+		pr_debug("CLONE mode: Sending TASKS_FROZEN signal to lazy-pages\n");
 		ret = send(fd, &tasks_frozen, sizeof(tasks_frozen), 0);
 		if (ret != sizeof(tasks_frozen)) {
 			pr_perror("Failed sending TASKS_FROZEN signal");
@@ -1424,7 +1423,7 @@ int lazy_pages_finish_restore(void)
 			return -1;
 		}
 
-		pr_info("CLONE mode: Waiting for drain complete signal...\n");
+		pr_debug("CLONE mode: Waiting for drain complete signal...\n");
 		ret = recv(fd, &drain_signal, sizeof(drain_signal), MSG_WAITALL);
 		if (ret != sizeof(drain_signal)) {
 			pr_perror("Failed receiving drain complete signal");
@@ -1436,7 +1435,7 @@ int lazy_pages_finish_restore(void)
 			close(fd);
 			return -1;
 		}
-		pr_info("CLONE mode: Drain complete, proceeding to unfreeze\n");
+		pr_debug("CLONE mode: Drain complete, proceeding to unfreeze\n");
 	}
 
 	ret = send(fd, &fin, sizeof(fin), 0);
@@ -1493,7 +1492,7 @@ static int lazy_sk_read_event(struct epoll_rfd *rfd)
 	 * via PTRACE_INTERRUPT. Now it's safe to start drain - tasks are frozen.
 	 */
 	if (fin == LAZY_PAGES_TASKS_FROZEN && opts.clone_dump) {
-		pr_info("CLONE: Received TASKS_FROZEN signal, starting drain\n");
+		pr_debug("CLONE: Received TASKS_FROZEN signal, starting drain\n");
 		if (clone_handle_lazy_accept_post_connect(&lpis) < 0) {
 			pr_err("Failed to start drain after TASKS_FROZEN\n");
 			return -1;
@@ -1671,7 +1670,7 @@ static void clone_unregister_all_uffds(void)
 		}
 	}
 
-	pr_info("All UFFD regions unregistered\n");
+	pr_debug("All UFFD regions unregistered\n");
 }
 
 /*
@@ -1709,7 +1708,7 @@ int clone_phase3_restore_loop(int ep_fd, struct epoll_event **events, int nr_fds
 		return -1;
 	}
 
-	pr_info("Phase 3: listening for restore connection\n");
+	pr_debug("Phase 3: listening for restore connection\n");
 
 	/*
 	 * Simplified flow for CLONE bulk transfer:
@@ -1732,8 +1731,8 @@ int clone_phase3_restore_loop(int ep_fd, struct epoll_event **events, int nr_fds
 		}
 	}
 
-	pr_info("Restore connected, waiting for drain to complete (%lu pages)\n",
-		clone_page_buffer_count());
+	pr_debug("Restore connected, waiting for drain to complete (%lu pages)\n",
+		 clone_page_buffer_count());
 
 	/*
 	 * Wait for drain thread to finish copying all pages.
@@ -1758,7 +1757,7 @@ int clone_phase3_restore_loop(int ep_fd, struct epoll_event **events, int nr_fds
 		}
 	}
 
-	pr_info("Drain complete, buffer empty\n");
+	pr_debug("Drain complete, buffer empty\n");
 
 	/* Debug: show page pool utilization */
 	page_pool_dump_utilization();
@@ -1777,28 +1776,28 @@ int clone_phase3_restore_loop(int ep_fd, struct epoll_event **events, int nr_fds
 		}
 
 		if (target_pid > 0) {
-			pr_err("COMPARE: REPLICA connecting to primary for comparison (PID %d)\n",
-			       target_pid);
+			pr_debug("COMPARE: REPLICA connecting to primary for comparison (PID %d)\n",
+				 target_pid);
 
 			if (clone_compare_connect(opts.addr, &compare_sk) == 0) {
 				int result = clone_compare_receive_and_verify(compare_sk, target_pid);
 				close(compare_sk);
 
 				if (result != 0) {
-					pr_err("COMPARE: DIFFERENCES FOUND - see logs above\n");
+					pr_debug("COMPARE: DIFFERENCES FOUND - see logs above\n");
 #ifdef CONFIG_CLONE_WAIT_REPLICA_TOUCH
 					/* Pause for investigation */
-					pr_err("COMPARE: Touch /tmp/continue_replica to proceed\n");
+					pr_debug("COMPARE: Touch /tmp/continue_replica to proceed\n");
 					while (access("/tmp/continue_replica", F_OK) != 0)
 						sleep(1);
 					unlink("/tmp/continue_replica");
 #endif
 				} else {
-					pr_err("COMPARE: Processes are IDENTICAL - proceeding\n");
+					pr_debug("COMPARE: Processes are IDENTICAL - proceeding\n");
 				}
 			}
 		} else {
-			pr_warn("COMPARE: No LPI found, skipping comparison\n");
+			pr_debug("COMPARE: No LPI found, skipping comparison\n");
 		}
 	}
 #endif //CONFIG_CLONE_COMPARE
@@ -1814,7 +1813,7 @@ int clone_phase3_restore_loop(int ep_fd, struct epoll_event **events, int nr_fds
 		if (send(lazy_sk_rfd.fd, &drain_complete, sizeof(drain_complete), 0) != sizeof(drain_complete))
 			pr_perror("Failed to send drain complete signal");
 		else
-			pr_info("CLONE Phase 3: Sent drain complete signal to restore\n");
+			pr_debug("CLONE Phase 3: Sent drain complete signal to restore\n");
 	}
 	return 0;
 }

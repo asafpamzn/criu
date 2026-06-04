@@ -206,7 +206,7 @@ int collect_image(struct collect_image_info *cinfo)
 	pr_info("Collecting %d/%d (flags %x)\n", cinfo->fd_type, cinfo->pb_type, cinfo->flags);
 
 	if (cinfo->pb_type == PB_FILE) {
-		pr_err("DEBUG: collect_image opening files.img for restore\n");
+		pr_debug("DEBUG: collect_image opening files.img for restore\n");
 	}
 
 	img = open_image(cinfo->fd_type, O_RSTR);
@@ -214,7 +214,7 @@ int collect_image(struct collect_image_info *cinfo)
 		return -1;
 
 	if (cinfo->pb_type == PB_FILE) {
-		pr_err("DEBUG: files.img opened successfully for restore\n");
+		pr_debug("DEBUG: files.img opened successfully for restore\n");
 	}
 
 	if (cinfo->flags & COLLECT_SHARED) {

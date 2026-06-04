@@ -567,104 +567,6 @@ void clone_page_buffer_mark_pages(unsigned long base_vaddr,
 }
 
 /*
- * Legacy per-page add wrapper.
- * Groups the page into its 256KB-aligned batch.
- * Used by Phase 4 dirty page path which overwrites individual pages.
- */
-int clone_page_buffer_add(unsigned long vaddr, void *data, int thread_id, bool nocopy)
-{
-	unsigned long base = batch_align(vaddr);
-	int page_idx = batch_page_index(vaddr);
-	struct batch_buffer_entry *entry;
-	unsigned int hash;
-	int lock_idx;
-	void *batch_data;
-
-	BUG_ON(!clone_buffer.initialized);
-
-	hash = batch_buffer_hash(base);
-	lock_idx = lock_index(hash);
-
-	pthread_spin_lock(&hash_locks[lock_idx]);
-
-	/* Look for existing batch */
-	hlist_for_each_entry(entry, &clone_buffer.hash_table[hash], hash) {
-		if (entry->base_vaddr == base) {
-			/* Copy page into existing batch */
-			memcpy((char *)entry->data + page_idx * PAGE_SIZE,
-			       data, PAGE_SIZE);
-
-			if (!clone_batch_bitmap_test(&entry->page_bitmap, page_idx)) {
-				clone_batch_bitmap_set(&entry->page_bitmap, page_idx);
-				clone_batch_bitmap_set(&entry->initial_bitmap, page_idx);
-				entry->nr_pages++;
-				__sync_fetch_and_add(&clone_buffer.nr_pages, 1);
-			}
-			page_state_set_with_crc(vaddr, PAGE_STATE_IN_BUFFER,
-						(char *)entry->data + page_idx * PAGE_SIZE);
-			pthread_spin_unlock(&hash_locks[lock_idx]);
-
-			if (nocopy)
-				page_pool_put(data);
-			return 0;
-		}
-	}
-
-	/* New batch - allocate full CLONE_BATCH_PAGES buffer */
-	BUG_ON(thread_id < 0);
-	batch_data = page_pool_get_pages(thread_id, CLONE_BATCH_PAGES);
-	BUG_ON(!batch_data);
-	memcpy((char *)batch_data + page_idx * PAGE_SIZE, data, PAGE_SIZE);
-
-	if (nocopy)
-		page_pool_put(data);
-
-	entry = xmalloc(sizeof(*entry));
-	BUG_ON(!entry);
-
-	entry->magic = BATCH_ENTRY_MAGIC;
-	entry->base_vaddr = base;
-	entry->data = batch_data;
-	clone_batch_bitmap_zero(&entry->page_bitmap);
-	clone_batch_bitmap_set(&entry->page_bitmap, page_idx);
-	clone_batch_bitmap_zero(&entry->initial_bitmap);
-	clone_batch_bitmap_set(&entry->initial_bitmap, page_idx);
-	entry->nr_pages = 1;
-	INIT_HLIST_NODE(&entry->hash);
-	INIT_LIST_HEAD(&entry->chunk_list);
-	entry->chunk_id = page_pool_get_chunk_id(batch_data);
-
-	/*
-	 * Publish to both indices under the hash lock (see add_batch).
-	 * Lock order: hash_lock -> chunk_index.lock.
-	 */
-	if (entry->chunk_id >= 0 && entry->chunk_id < CLONE_MAX_POOL_CHUNKS) {
-		pthread_spin_lock(&chunk_index[entry->chunk_id].lock);
-		list_add_tail(&entry->chunk_list, &chunk_index[entry->chunk_id].batches);
-		atomic_fetch_add(&chunk_index[entry->chunk_id].batch_count, 1);
-		pthread_spin_unlock(&chunk_index[entry->chunk_id].lock);
-	}
-
-	hlist_add_head(&entry->hash, &clone_buffer.hash_table[hash]);
-	page_state_set_with_crc(vaddr, PAGE_STATE_IN_BUFFER,
-				(char *)batch_data + page_idx * PAGE_SIZE);
-	pthread_spin_unlock(&hash_locks[lock_idx]);
-
-	if (entry->chunk_id >= 0 && entry->chunk_id < CLONE_MAX_POOL_CHUNKS) {
-		int cur_max = atomic_load(&nr_active_chunks);
-
-		while (entry->chunk_id >= cur_max) {
-			if (atomic_compare_exchange_weak(&nr_active_chunks, &cur_max, entry->chunk_id + 1))
-				break;
-		}
-	}
-
-	__sync_fetch_and_add(&clone_buffer.nr_batches, 1);
-	__sync_fetch_and_add(&clone_buffer.nr_pages, 1);
-	return 0;
-}
-
-/*
  * Look up a single page in the batch buffer.
  * Returns a pointer to a PAGE_SIZE buffer that the caller must free
  * via page_pool_put(), or NULL if the page is not in the buffer.
@@ -758,63 +660,6 @@ void *clone_page_buffer_lookup_and_remove(unsigned long vaddr)
 unsigned long clone_page_buffer_count(void)
 {
 	return clone_buffer.nr_pages;
-}
-
-void clone_page_buffer_destroy(void)
-{
-	struct batch_buffer_entry *entry;
-	struct hlist_node *tmp;
-	int i, j;
-
-	if (!clone_buffer.initialized)
-		return;
-
-	/* Stop drain thread first */
-	clone_stop_drain_thread();
-
-	/* Walk all buckets and free batch entries */
-	for (i = 0; i < CLONE_BATCH_BUFFER_HASH_SIZE; i++) {
-		int lock_idx = lock_index(i);
-
-		pthread_spin_lock(&hash_locks[lock_idx]);
-		hlist_for_each_entry_safe(entry, tmp,
-					  &clone_buffer.hash_table[i], hash) {
-			/* Free pages still owned (bitmap) + unused slots (~initial) */
-			clone_batch_bitmap_t free_bm;
-			clone_batch_bitmap_not(&free_bm, &entry->initial_bitmap);
-			clone_batch_bitmap_mask(&free_bm, CLONE_BATCH_PAGES);
-			clone_batch_bitmap_or(&free_bm, &free_bm, &entry->page_bitmap);
-			CLONE_BATCH_BITMAP_FOR_EACH_SET(&free_bm, j) {
-				page_pool_put((char *)entry->data + j * PAGE_SIZE);
-			}
-			hlist_del(&entry->hash);
-			xfree(entry);
-		}
-		pthread_spin_unlock(&hash_locks[lock_idx]);
-	}
-
-	xfree(clone_buffer.hash_table);
-	clone_buffer.hash_table = NULL;
-	clone_buffer.initialized = false;
-
-	for (i = 0; i < CLONE_BATCH_NUM_HASH_LOCKS; i++)
-		pthread_spin_destroy(&hash_locks[i]);
-
-	/* Clean up chunk index */
-	for (i = 0; i < CLONE_MAX_POOL_CHUNKS; i++) {
-		pthread_spin_destroy(&chunk_index[i].lock);
-		INIT_LIST_HEAD(&chunk_index[i].batches);
-	}
-	atomic_store(&chunk_index_initialized, false);
-	atomic_store(&nr_active_chunks, 0);
-
-	pr_info("CLONE batch buffer destroyed: batches=%lu pages=%lu applied=%lu discarded=%lu\n",
-		clone_buffer.nr_batches, clone_buffer.nr_pages,
-		clone_buffer.nr_applied, clone_buffer.nr_discarded);
-
-	/* Destroy all page pools last */
-	page_pool_destroy_all();
-
 }
 
 /*
@@ -1270,27 +1115,6 @@ static struct {
 	time_t last_print_time;
 } uffd_stats = {0};
 
-int clone_get_histogram_bucket(unsigned long nr_pages)
-{
-	if (nr_pages == 1)
-		return 0; /* 4KB */
-	if (nr_pages <= 16)
-		return 1; /* 64KB */
-	if (nr_pages <= 32)
-		return 2; /* 128KB */
-	if (nr_pages <= 64)
-		return 3; /* 256KB */
-	if (nr_pages <= 128)
-		return 4; /* 512KB */
-	if (nr_pages <= 256)
-		return 5; /* 1MB */
-	if (nr_pages <= 512)
-		return 6; /* 2MB */
-	if (nr_pages <= 1024)
-		return 7; /* 4MB */
-	return 8;	  /* >4MB */
-}
-
 static const char *get_bucket_label(int bucket)
 {
 	switch (bucket) {
@@ -1318,18 +1142,6 @@ static const char *get_bucket_label(int bucket)
 }
 
 
-
-void clone_uffd_stats_add_copy(unsigned long ns)
-{
-	uffd_stats.uffd_copy_total_ns += ns;
-	uffd_stats.uffd_copy_count++;
-}
-
-void clone_uffd_stats_add_drop(unsigned long ns)
-{
-	uffd_stats.drop_iovs_total_ns += ns;
-	uffd_stats.drop_iovs_count++;
-}
 
 void check_and_print_uffd_stats(void)
 {
@@ -1697,11 +1509,6 @@ static bool phase3_active_flag = false;
 void clone_set_phase3_active(bool active)
 {
 	phase3_active_flag = active;
-}
-
-bool clone_is_phase3_active(void)
-{
-	return phase3_active_flag;
 }
 
 /*
