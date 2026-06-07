@@ -61,11 +61,11 @@ struct vma_metadata {
 
 static LIST_HEAD(update_vma_info_list);
 
-size_t kfd_max_buffer_size;
+static size_t kfd_max_buffer_size;
 
-bool plugin_added_to_inventory = false;
+static bool plugin_added_to_inventory = false;
 
-bool plugin_disabled = false;
+static bool plugin_disabled = false;
 
 struct handle_id {
 	int handle;
@@ -75,7 +75,7 @@ struct shared_handle_ids {
 	int num_handles;
 	struct handle_id *handles;
 };
-struct shared_handle_ids *shared_memory = NULL;
+static struct shared_handle_ids *shared_memory = NULL;
 
 static mutex_t *shared_memory_mutex;
 
@@ -87,10 +87,10 @@ static mutex_t *shared_memory_mutex;
  * in this case. The flag, parallel_disabled, is used to control whether the
  * optimization is enabled or disabled.
  */
-bool parallel_disabled = false;
+static bool parallel_disabled = false;
 
-pthread_t parallel_thread = 0;
-int parallel_thread_result = 0;
+static pthread_t parallel_thread = 0;
+static int parallel_thread_result = 0;
 /**************************************************************************************************/
 
 /* Call ioctl, restarting if it is interrupted */
@@ -308,33 +308,37 @@ int devinfo_to_topology(KfdDeviceEntry *devinfos[], uint32_t num_devices, struct
 	return 0;
 }
 
-void getenv_bool(const char *var, bool *value)
+static bool getenv_bool(const char *var, bool defvalue)
 {
 	char *value_str = getenv(var);
+	bool val = defvalue;
 
 	if (value_str) {
 		if (!strcmp(value_str, "0") || !strcasecmp(value_str, "NO"))
-			*value = false;
+			val = false;
 		else if (!strcmp(value_str, "1") || !strcasecmp(value_str, "YES"))
-			*value = true;
+			val = true;
 		else
-			pr_err("Ignoring invalid value for %s=%s, expecting (YES/NO)\n", var, value_str);
+			pr_warn("Ignoring invalid value for %s=%s, expecting (0/1 or YES/NO)\n", var, value_str);
 	}
-	pr_info("param: %s:%s\n", var, *value ? "Y" : "N");
+
+	pr_info("param: %s:%d\n", var, val);
+	return val;
 }
 
-void getenv_size_t(const char *var, size_t *value)
+static size_t getenv_size_t(const char *var, size_t defvalue)
 {
 	char *value_str = getenv(var);
 	char *endp = value_str;
+	size_t val = defvalue;
 	int sh = 0;
-	size_t size;
 
 	if (value_str) {
-		size = (size_t)strtoul(value_str, &endp, 0);
+		errno = 0;
+		val = (size_t)strtoul(value_str, &endp, 0);
 		if (errno || value_str == endp) {
-			pr_err("Ignoring invalid value for %s=%s, expecting a positive integer\n", var, value_str);
-			return;
+			pr_warn("Ignoring invalid value for %s=%s, expecting a positive integer\n", var, value_str);
+			goto out;
 		}
 		switch (*endp) {
 		case 'k':
@@ -351,16 +355,19 @@ void getenv_size_t(const char *var, size_t *value)
 			sh = 0;
 			break;
 		default:
-			pr_err("Ignoring invalid size suffix for %s=%s, expecting 'K'/k', 'M', or 'G'\n", var, value_str);
-			return;
+			pr_warn("Ignoring invalid size suffix for %s=%s, expecting 'K'/'k', 'M', or 'G'\n", var, value_str);
+			goto out;
 		}
-		if (SIZE_MAX >> sh < size) {
-			pr_err("Ignoring invalid value for %s=%s, exceeds SIZE_MAX\n", var, value_str);
-			return;
+		if (SIZE_MAX >> sh < val) {
+			pr_warn("Ignoring invalid value for %s=%s, exceeds SIZE_MAX\n", var, value_str);
+			goto out;
 		}
-		*value = size << sh;
+		val <<= sh;
 	}
-	pr_info("param: %s:0x%lx\n", var, *value);
+
+out:
+	pr_info("param: %s:0x%zx\n", var, val);
+	return val;
 }
 
 int amdgpu_plugin_init(int stage)
@@ -389,25 +396,17 @@ int amdgpu_plugin_init(int stage)
 				return -1;
 			}
 		}
-		/* Default Values */
-		kfd_fw_version_check = true;
-		kfd_sdma_fw_version_check = true;
-		kfd_caches_count_check = true;
-		kfd_num_gws_check = true;
-		kfd_vram_size_check = true;
-		kfd_numa_check = true;
-		kfd_capability_check = true;
 
-		getenv_bool("KFD_FW_VER_CHECK", &kfd_fw_version_check);
-		getenv_bool("KFD_SDMA_FW_VER_CHECK", &kfd_sdma_fw_version_check);
-		getenv_bool("KFD_CACHES_COUNT_CHECK", &kfd_caches_count_check);
-		getenv_bool("KFD_NUM_GWS_CHECK", &kfd_num_gws_check);
-		getenv_bool("KFD_VRAM_SIZE_CHECK", &kfd_vram_size_check);
-		getenv_bool("KFD_NUMA_CHECK", &kfd_numa_check);
-		getenv_bool("KFD_CAPABILITY_CHECK", &kfd_capability_check);
+		kfd_fw_version_check = getenv_bool("KFD_FW_VER_CHECK", true);
+		kfd_sdma_fw_version_check = getenv_bool("KFD_SDMA_FW_VER_CHECK", true);
+		kfd_caches_count_check = getenv_bool("KFD_CACHES_COUNT_CHECK", true);
+		kfd_num_gws_check = getenv_bool("KFD_NUM_GWS_CHECK", true);
+		kfd_vram_size_check = getenv_bool("KFD_VRAM_SIZE_CHECK", true);
+		kfd_numa_check = getenv_bool("KFD_NUMA_CHECK", true);
+		kfd_capability_check = getenv_bool("KFD_CAPABILITY_CHECK", true);
 	}
-	kfd_max_buffer_size = 0;
-	getenv_size_t("KFD_MAX_BUFFER_SIZE", &kfd_max_buffer_size);
+
+	kfd_max_buffer_size = getenv_size_t("KFD_MAX_BUFFER_SIZE", 0);
 
 	return 0;
 }

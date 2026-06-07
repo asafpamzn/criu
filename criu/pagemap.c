@@ -1,6 +1,8 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <errno.h>
+#include <string.h>
 #include <linux/falloc.h>
 #include <sys/uio.h>
 #include <limits.h>
@@ -25,6 +27,9 @@
 #endif
 
 #define MAX_BUNCH_SIZE 256
+
+#define OFF_MAX (sizeof(off_t) == sizeof(long long) ? LLONG_MAX : sizeof(off_t) == sizeof(int) ? INT_MAX : -999999)
+#define OFF_MIN (sizeof(off_t) == sizeof(long long) ? LLONG_MIN : sizeof(off_t) == sizeof(int) ? INT_MIN : -999999)
 
 /*
  * One "job" for the preadv() syscall in pagemap.c
@@ -528,12 +533,42 @@ static void advance_piov(struct page_read_iov *piov, ssize_t len)
 	pr_debug("Advanced iov %zu bytes, %d->%d iovs, %zu tail\n", olen, onr, piov->nr, len);
 }
 
+/*
+ * Drain (free without reading) all async entries in pr and its parent chain.
+ * Called on error paths to satisfy BUG_ON(!list_empty(&pr->async)) in
+ * close_page_read().
+ */
+static void drain_async_queue(struct page_read *pr)
+{
+	struct page_read_iov *piov, *n;
+
+	list_for_each_entry_safe(piov, n, &pr->async, l) {
+		list_del(&piov->l);
+		xfree(piov->to);
+		xfree(piov);
+	}
+	if (pr->parent)
+		drain_async_queue(pr->parent);
+}
+
 static int process_async_reads(struct page_read *pr)
 {
 	int fd, ret = 0;
 	struct page_read_iov *piov, *n;
+	off_t first_off = OFF_MAX, last_end = OFF_MIN;
 
 	fd = img_raw_fd(pr->pi);
+	if (!pr->use_direct) {
+		list_for_each_entry(piov, &pr->async, l) {
+			first_off = min(piov->from, first_off);
+			last_end = max(piov->end, last_end);
+		}
+		if (last_end > first_off) {
+			if (posix_fadvise(fd, first_off, (off_t)(last_end - first_off), POSIX_FADV_WILLNEED) != 0)
+				pr_debug("posix_fadvise(WILLNEED) failed for async range\n");
+		}
+	}
+
 	list_for_each_entry_safe(piov, n, &pr->async, l) {
 		ssize_t ret;
 		struct iovec *iovs = piov->to;
@@ -548,9 +583,10 @@ static int process_async_reads(struct page_read *pr)
 			 * purposes let's try to force the advance_piov()
 			 * and re-read tail.
 			 */
-			if (ret > 0 && piov->nr >= 2) {
+			if (ret >= 2 * PAGE_SIZE) {
 				pr_debug("`- trim preadv %zu\n", ret);
 				ret /= 2;
+				ret &= PAGE_MASK;
 			}
 		}
 
@@ -558,25 +594,24 @@ static int process_async_reads(struct page_read *pr)
 			int i;
 			pr_err("Can't read async pr bytes (%zd / %ju read, %ju off, %d iovs)\n", ret,
 			       piov->end - piov->from, piov->from, piov->nr);
-			
 			/* Print all target addresses that failed */
 			pr_err("Failed to read for virtual addresses:\n");
 			for (i = 0; i < piov->nr; i++) {
 				unsigned long vaddr = (unsigned long)piov->to[i].iov_base;
 				size_t len = piov->to[i].iov_len;
 				off_t file_off = piov->from;
-				
+
 				/* Calculate file offset for this specific iovec */
 				if (i > 0) {
 					int j;
 					for (j = 0; j < i; j++)
 						file_off += piov->to[j].iov_len;
 				}
-				
+
 				pr_err("  [%d] vaddr=0x%lx len=%zu (file_off=%ju)\n",
 				       i, vaddr, len, (uintmax_t)file_off);
 			}
-			
+
 			/* If we have pagemap context, print it */
 			if (pr->pe) {
 				pr_err("Current pagemap entry: vaddr=0x%lx nr_pages=%lu flags=0x%x (PE_PRESENT=%d PE_LAZY=%d)\n",
@@ -585,18 +620,18 @@ static int process_async_reads(struct page_read *pr)
 				       !!(pr->pe->flags & PE_PRESENT),
 				       !!(pr->pe->flags & PE_LAZY));
 			}
-			
-			return -1;
+
+			goto err;
 		}
 
 		if (ret == 0 && piov->end != piov->from) {
 			pr_err("Unexpected EOF reading pages: expected %ju more bytes at offset %ju\n",
 			       piov->end - piov->from, piov->from);
-			return -1;
+			goto err;
 		}
 
 		if (opts.auto_dedup && punch_hole(pr, piov->from, ret, false))
-			return -1;
+			goto err;
 
 		if (ret != piov->end - piov->from) {
 			/*
@@ -613,7 +648,6 @@ static int process_async_reads(struct page_read *pr)
 		}
 
 		BUG_ON(pr->io_complete); /* FIXME -- implement once needed */
-
 		list_del(&piov->l);
 		xfree(iovs);
 		xfree(piov);
@@ -623,6 +657,9 @@ static int process_async_reads(struct page_read *pr)
 		ret = process_async_reads(pr->parent);
 
 	return ret;
+err:
+	drain_async_queue(pr);
+	return -1;
 }
 
 static void close_page_read(struct page_read *pr)
@@ -792,6 +829,60 @@ free_pagemaps:
 	return -1;
 }
 
+int probe_pages_o_direct(int fd)
+{
+	int fl, ret, memerr;
+	void *probe = NULL;
+	ssize_t probe_ret;
+
+	fl = fcntl(fd, F_GETFL);
+	if (fl < 0)
+		return 0;
+
+	ret = fcntl(fd, F_SETFL, fl | O_DIRECT);
+	if (ret < 0) {
+		pr_warn("Failed to set O_DIRECT on pages fd %d: %s\n", fd, strerror(errno));
+		return 0;
+	}
+
+	/*
+	 * PAGE_SIZE is not a compile-time constant on aarch64, so the
+	 * probe buffer is allocated via posix_memalign() instead of a
+	 * stack array with __attribute__((aligned)).
+	 */
+	memerr = posix_memalign(&probe, PAGE_SIZE, PAGE_SIZE);
+	if (memerr) {
+		pr_err("O_DIRECT probe alloc failed on pages fd %d: %s\n", fd, strerror(memerr));
+		return -1;
+	}
+
+	probe_ret = pread(fd, probe, PAGE_SIZE, 0);
+	xfree(probe);
+
+	if (probe_ret >= 0) {
+		pr_debug("O_DIRECT enabled on pages fd %d\n", fd);
+		return 1;
+	}
+
+	if (errno != EINVAL) {
+		pr_perror("O_DIRECT probe failed on pages fd %d", fd);
+		return -1;
+	}
+
+	pr_info("O_DIRECT rejected at read time on pages fd %d, using buffered I/O\n", fd);
+	if (fcntl(fd, F_SETFL, fl) < 0) {
+		pr_perror("Failed to clear O_DIRECT on pages fd %d", fd);
+		return -1;
+	}
+
+	/*
+	 * Hint the kernel that fallback buffered reads will mostly
+	 * advance through the pages file in offset order.
+	 */
+	posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+	return 0;
+}
+
 int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int pr_flags)
 {
 	int flags, i_typ;
@@ -832,6 +923,7 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 	pr->pmes = NULL;
 	pr->pieok = false;
 	pr->disable_dedup = false;
+	pr->use_direct = false;
 
 	pr->pmi = open_image_at(dfd, i_typ, O_RSTR, img_id);
 	if (!pr->pmi)
@@ -851,6 +943,20 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 	if (!pr->pi) {
 		close_page_read(pr);
 		return -1;
+	}
+
+	{
+		int pfd = img_raw_fd(pr->pi);
+
+		if (pfd >= 0 && !opts.stream) {
+			int direct = probe_pages_o_direct(pfd);
+
+			if (direct < 0) {
+				close_page_read(pr);
+				return -1;
+			}
+			pr->use_direct = (direct == 1);
+		}
 	}
 
 	if (init_pagemaps(pr)) {

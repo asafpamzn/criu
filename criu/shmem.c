@@ -17,6 +17,7 @@
 #include "rst-malloc.h"
 #include "vma.h"
 #include "mem.h"
+#include "pagemap.h"
 #include <compel/plugins/std/syscall-codes.h>
 #include "bitops.h"
 #include "log.h"
@@ -491,11 +492,18 @@ static int do_restore_shmem_content(void *addr, unsigned long size, unsigned lon
 		if (vaddr + nr_pages * PAGE_SIZE > size)
 			break;
 
-		pr.read_pages(&pr, vaddr, nr_pages, addr + vaddr, 0);
+		ret = pr.read_pages(&pr, vaddr, nr_pages, addr + vaddr, PR_ASYNC);
+		if (ret < 0)
+			goto err;
 	}
 
+	ret = pr.sync(&pr);
 	pr.close(&pr);
 	return ret;
+err:
+	pr.sync(&pr); /* drain async queue before close */
+	pr.close(&pr);
+	return -1;
 }
 
 int restore_shmem_content(void *addr, struct shmem_info *si)
