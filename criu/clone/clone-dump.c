@@ -616,11 +616,10 @@ bool clone_is_phased_skeleton_dump(void)
 	/*
 	 * In CLONE phased migration, Phase 3 (SCAN) dumps everything except
 	 * memory pages. This is detected by checking:
-	 * 1. CLONE dump mode is enabled
-	 * 2. Lazy pages is enabled (required for phased migration)
-	 * 3. We're at or past the SCAN phase (pages already sent in Phase 2)
+	 * 1. CLONE dump mode is enabled (which implies the lazy-pages transport)
+	 * 2. We're at or past the SCAN phase (pages already sent in Phase 2)
 	 */
-	if (!opts.clone_dump || !opts.lazy_pages)
+	if (!opts.clone_dump)
 		return false;
 	if (!g_clone_info)
 		return false;

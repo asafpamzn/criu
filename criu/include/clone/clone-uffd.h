@@ -57,9 +57,6 @@ unsigned long clone_page_buffer_count(void);
 /* Start background drain thread (lpis needed for EAGAIN handling) */
 int clone_start_drain_thread(struct list_head *lpis);
 
-/* Stop background drain thread */
-void clone_stop_drain_thread(void);
-
 /* Check if drain thread is running */
 bool clone_drain_thread_running(void);
 

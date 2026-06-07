@@ -1014,27 +1014,6 @@ int clone_start_drain_thread(struct list_head *lpis)
 	return 0;
 }
 
-void clone_stop_drain_thread(void)
-{
-	int i;
-
-	if (atomic_load(&drain_threads_active) == 0)
-		return;
-
-	atomic_store(&drain_thread_stop, true);
-
-	/* Join all threads */
-	for (i = 0; i < clone_cfg.num_drain_threads; i++) {
-		if (drain_threads[i]) {
-			pthread_join(drain_threads[i], NULL);
-			drain_threads[i] = 0;
-		}
-	}
-
-	/* Reset state for potential restart */
-	atomic_store(&drain_threads_active, 0);
-}
-
 bool clone_drain_thread_running(void)
 {
 	return atomic_load(&drain_threads_active) > 0;

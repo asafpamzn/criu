@@ -393,20 +393,6 @@ int clone_bpf_drain(struct clone_bpf_region *out_regions, int max_regions,
 	return nr_regions;
 }
 
-u64 clone_bpf_event_count(void)
-{
-	u32 zero = 0;
-	u64 count = 0;
-
-	if (!g_skel)
-		return 0;
-
-	bpf_map__lookup_elem(g_skel->maps.event_count,
-			     &zero, sizeof(zero),
-			     &count, sizeof(count), 0);
-	return count;
-}
-
 u64 clone_bpf_drop_count(void)
 {
 	u32 zero = 0;

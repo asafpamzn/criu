@@ -1447,13 +1447,6 @@ void clone_debug_scan_compare(void)
 }
 #endif /* SCAN_COMPARE */
 
-/*
- * Check if using BPF mode (no scanner threads).
- */
-bool clone_using_bpf_mode(void)
-{
-	return g_using_bpf_mode;
-}
 #endif /* CONFIG_HAS_LIBBPF */
 
 void clone_set_new_vma_ranges(unsigned long *ranges, unsigned int nr_ranges)

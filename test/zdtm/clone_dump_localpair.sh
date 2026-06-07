@@ -190,7 +190,7 @@ echo "=== Victim daemonized: pidns-pid=$VPID ==="
 # Kick off dump in the primary worker. Because send_and_wait is
 # synchronous we fire it into the background here.
 DUMP_CMD="$CRIU_BIN dump --tree $VPID --images-dir '$IMAGES_DIR' \
-	--clone-dump --lazy-pages \
+	--clone-dump \
 	--address $PRIMARY_IP --port $PORT \
 	--leave-running --shell-job \
 	-v4 -o dump.log"

@@ -133,22 +133,22 @@ static pid_t clone_start_restore(void)
 
 	snprintf(log_path, sizeof(log_path), "%s/lazy-restore.log", opts.imgs_dir);
 
+	/* --clone-dump enables the lazy-pages transport internally (check_options). */
 	argv[0] = opts.argv_0;
 	argv[1] = "restore";
 	argv[2] = "--images-dir";
 	argv[3] = opts.imgs_dir;
-	argv[4] = "--lazy-pages";
-	argv[5] = "--tcp-close";
-	argv[6] = "--clone-dump";
-	argv[7] = "--restore-detached";
-	argv[8] = "--skip-file-rwx-check";
-	argv[9] = "--skip-file-size-check";
-	argv[10] = "--file-validation";
-	argv[11] = "filesize";
-	argv[12] = "-v1";
-	argv[13] = "-o";
-	argv[14] = log_path;
-	argv[15] = NULL;
+	argv[4] = "--tcp-close";
+	argv[5] = "--clone-dump";
+	argv[6] = "--restore-detached";
+	argv[7] = "--skip-file-rwx-check";
+	argv[8] = "--skip-file-size-check";
+	argv[9] = "--file-validation";
+	argv[10] = "filesize";
+	argv[11] = "-v1";
+	argv[12] = "-o";
+	argv[13] = log_path;
+	argv[14] = NULL;
 
 	ret = posix_spawn(&pid, opts.argv_0, NULL, NULL, argv, environ);
 	if (ret != 0) {

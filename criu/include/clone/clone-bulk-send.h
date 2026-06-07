@@ -157,11 +157,6 @@ void clone_free_new_vma_ranges(void);
  * BUG() if ring buffer overflow detected.
  */
 int clone_bpf_drain_to_queues(void);
-
-/*
- * Check if using BPF mode (no scanner threads).
- */
-bool clone_using_bpf_mode(void);
 #endif /* CONFIG_HAS_LIBBPF */
 
 #ifdef SCAN_COMPARE

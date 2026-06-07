@@ -1104,6 +1104,17 @@ bad_arg:
 
 int check_options(void)
 {
+	/*
+	 * CLONE phased migration is built on top of the lazy-pages page
+	 * transport. Enable it internally so the user does not have to pass
+	 * --lazy-pages alongside --clone-dump. Pre-dump does not support lazy
+	 * pages, so leave that mode untouched.
+	 */
+	if (opts.clone_dump && !opts.lazy_pages && opts.mode != CR_PRE_DUMP) {
+		opts.lazy_pages = true;
+		pr_info("--clone-dump enables lazy-pages transport internally\n");
+	}
+
 	if (opts.tcp_established_ok)
 		pr_info("Will dump/restore TCP connections\n");
 	if (opts.tcp_skip_in_flight)

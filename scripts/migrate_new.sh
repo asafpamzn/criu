@@ -123,7 +123,6 @@ sudo "$CRIU_BIN" dump \
   --clone-pre-scanners "$CLONE_PRE_SCANNERS" \
   --clone-drain-threads "$CLONE_DRAIN_THREADS" \
   $CLONE_PRE_SCAN_FLAG \
-  --lazy-pages \
   --address "$PRIMARY_IP" \
   --port "$CRIU_PORT" \
   --tcp-close \
