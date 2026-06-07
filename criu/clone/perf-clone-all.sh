@@ -87,7 +87,7 @@ if [ "$SIDE" = "dump" ]; then
     END_RE='Dump finished|clone_dump_finish|Phase 4 complete|TIMING: total dump'
 else
     # Restore side: profile from connection to drain completion
-    START_RE='P3 receiver|clone-lazy-pages.*started|Starting lazy-pages|REPLICA PHASE'
+    START_RE='P3 receiver|clone-phase2.*started|REPLICA PHASE'
     END_RE='TIMING: drain took|Restore complete|lazy-pages completed|All pages drained'
 fi
 

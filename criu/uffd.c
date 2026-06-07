@@ -45,7 +45,7 @@
 #include "pagemap.h"
 #include "clone/clone-conf.h"
 #include "clone/pf-tracker.h"
-#include "clone/clone-lazy-pages.h"
+#include "clone/clone-phase2.h"
 #include "clone/clone-uffd.h"
 #include "uffd-internal.h"
 #include "clone/unmapped-tracker.h"
@@ -217,8 +217,11 @@ out:
 
 int lazy_pages_setup_zombie(int pid)
 {
-	if (!opts.lazy_pages)
+	if (!(opts.lazy_pages || opts.clone_dump))
 		return 0;
+
+	if (opts.clone_dump && !opts.lazy_pages)
+		pr_warn("CLONE_GATE_PROBE: uffd.c lazy_pages_setup_zombie clone-only\n");
 
 	if (send_uffd(0, -pid))
 		return -1;
@@ -282,10 +285,13 @@ int setup_uffd(int pid, struct task_restore_args *task_args)
 {
 	unsigned long features = kdat.uffd_features & NEED_UFFD_API_FEATURES;
 
-	if (!opts.lazy_pages) {
+	if (!(opts.lazy_pages || opts.clone_dump)) {
 		task_args->uffd = -1;
 		return 0;
 	}
+
+	if (opts.clone_dump && !opts.lazy_pages)
+		pr_warn("CLONE_GATE_PROBE: uffd.c setup_uffd clone-only\n");
 
 	/*
 	 * Open userfaulfd FD which is passed to the restorer blob and
@@ -311,8 +317,11 @@ int prepare_lazy_pages_socket(void)
 	int fd, len, ret = -1;
 	struct sockaddr_un sun;
 
-	if (!opts.lazy_pages)
+	if (!(opts.lazy_pages || opts.clone_dump))
 		return 0;
+
+	if (opts.clone_dump && !opts.lazy_pages)
+		pr_warn("CLONE_GATE_PROBE: uffd.c prepare_lazy_pages_socket clone-only\n");
 
 	if (prepare_sock_addr(&sun))
 		return -1;
@@ -1349,7 +1358,7 @@ static int handle_requests(int epollfd, struct epoll_event **events, int nr_fds)
 	int ret;
 
 	if (opts.clone_dump) {
-		pr_err("CLONE should not reach handle_requests (use cr_lazy_pages_clone_phase2)\n");
+		pr_err("CLONE should not reach handle_requests (use cr_clone_phase2)\n");
 		BUG();
 	}
 
@@ -1398,8 +1407,11 @@ int lazy_pages_finish_restore(void)
 	uint32_t fin = LAZY_PAGES_RESTORE_FINISHED;
 	int fd, ret;
 
-	if (!opts.lazy_pages)
+	if (!(opts.lazy_pages || opts.clone_dump))
 		return 0;
+
+	if (opts.clone_dump && !opts.lazy_pages)
+		pr_warn("CLONE_GATE_PROBE: uffd.c lazy_pages_finish_restore clone-only\n");
 
 	fd = fdstore_get(lazy_pages_sk_id);
 	if (fd < 0) {
@@ -1675,7 +1687,7 @@ static void clone_unregister_all_uffds(void)
 
 /*
  * CLONE Phase 3: Enter restore loop after pages are buffered and pstree loaded.
- * Called from clone-lazy-pages.c after Phase 2 completes.
+ * Called from clone-phase2.c after Phase 2 completes.
  *
  * This sets up the lazy socket for restore to connect and enters the
  * main event loop to handle page faults (WP_SYNC convergence).
@@ -1833,7 +1845,7 @@ int cr_lazy_pages(bool daemon)
 	 * Use separate code path with minimal dependencies.
 	 */
 	if (opts.clone_dump && opts.use_page_server)
-		return cr_lazy_pages_clone_phase2(daemon);
+		return cr_clone_phase2(daemon);
 
 	if (prepare_dummy_pstree())
 		return -1;

@@ -316,9 +316,11 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 			st = 0;
 		} else {
 			ret = page_pipe_add_page(pp, vaddr, ppb_flags);
-			if (ppb_flags & PPB_LAZY && opts.lazy_pages)
+			if (ppb_flags & PPB_LAZY && (opts.lazy_pages || opts.clone_dump)) {
+				if (opts.clone_dump && !opts.lazy_pages)
+					pr_warn("CLONE_GATE_PROBE: mem.c generate_iovs lazy-class clone-only\n");
 				st = 1;
-			else
+			} else
 				st = 2;
 		}
 
@@ -711,7 +713,7 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	if (mdc->clone_lazy_build_only) {
 		/*
 		 * Create an empty pagemap image so the replica's
-		 * discover_tasks_from_pagemaps() (clone-lazy-pages.c) can find
+		 * discover_tasks_from_pagemaps() (clone-phase2.c) can find
 		 * this task at Phase-2 startup. No page entries are written
 		 * here — Phase-3 skeleton reopens with O_DUMP|O_TRUNC and
 		 * fills in the real content.
@@ -1320,7 +1322,9 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 		 * This means that userfaultfd is used to load the pages
 		 * on demand.
 		 */
-		if (opts.lazy_pages && pagemap_lazy(pr->pe)) {
+		if ((opts.lazy_pages || opts.clone_dump) && pagemap_lazy(pr->pe)) {
+			if (opts.clone_dump && !opts.lazy_pages)
+				pr_warn("CLONE_GATE_PROBE: mem.c restore_priv_vma_content lazy-skip clone-only\n");
 			pr_debug("Lazy restore skips %ld pages at %lx\n", nr_pages, va);
 			pr->skip_pages(pr, nr_pages * PAGE_SIZE);
 			nr_lazy += nr_pages;
@@ -1492,8 +1496,11 @@ static int maybe_disable_thp(struct pstree_item *t, struct page_read *pr)
 	 * collapse. And, once we register the VMA with uffd,
 	 * khugepaged will skip it.
 	 */
-	if (!(opts.lazy_pages && page_read_has_parent(pr)))
+	if (!((opts.lazy_pages || opts.clone_dump) && page_read_has_parent(pr)))
 		return 0;
+
+	if (opts.clone_dump && !opts.lazy_pages)
+		pr_warn("CLONE_GATE_PROBE: mem.c THP-disable clone-only\n");
 
 	if (!kdat.has_thp_disable)
 		pr_warn("Disabling transparent huge pages. "

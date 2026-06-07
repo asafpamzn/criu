@@ -1,5 +1,5 @@
 /*
- * CLONE Phase 2/3 Lazy Pages - Phased migration page handling
+ * CLONE Phase 2/3 - Phased migration page handling
  *
  * Phase 2: Buffer pages from primary before skeleton dump exists
  * Phase 3: After dirty bitmap arrives, start restore with buffered pages
@@ -33,12 +33,12 @@
 #include "clone/pf-tracker.h"
 #include "clone/unmapped-tracker.h"
 #include "rst_info.h"
-#include "clone/clone-lazy-pages.h"
+#include "clone/clone-phase2.h"
 #include "clone/clone-conf.h"
 #include "common/bug.h"
 
 #undef LOG_PREFIX
-#define LOG_PREFIX "clone-lazy: "
+#define LOG_PREFIX "clone-phase2: "
 
 /* List of discovered task PIDs from pagemap files */
 struct clone_task {
@@ -131,9 +131,8 @@ static pid_t clone_start_restore(void)
 	int ret;
 	char *argv[16];
 
-	snprintf(log_path, sizeof(log_path), "%s/lazy-restore.log", opts.imgs_dir);
+	snprintf(log_path, sizeof(log_path), "%s/clone-restore.log", opts.imgs_dir);
 
-	/* --clone-dump enables the lazy-pages transport internally (check_options). */
 	argv[0] = opts.argv_0;
 	argv[1] = "restore";
 	argv[2] = "--images-dir";
@@ -161,7 +160,7 @@ static pid_t clone_start_restore(void)
 }
 
 /*
- * CLONE Phase 2/3 lazy-pages entry point.
+ * CLONE Phase 2/3 entry point.
  *
  * Phase 2:
  *   1. Discovers tasks from pagemap files (no pstree needed)
@@ -173,7 +172,7 @@ static pid_t clone_start_restore(void)
  *   5. Start restore with buffered pages
  *   6. Handle page faults (WP_SYNC convergence)
  */
-int cr_lazy_pages_clone_phase2(bool daemon)
+int cr_clone_phase2(bool daemon)
 {
 	struct epoll_event *events = NULL;
 	struct clone_task *ct;
@@ -297,7 +296,7 @@ int cr_lazy_pages_clone_phase2(bool daemon)
 
 	/*
 	 * Verify nr_fds fits in our fixed buffer.
-	 * Fds: task uffd (nr_tasks) + lazy_listen + lazy_client = nr_tasks + 2
+	 * Fds: task uffd (nr_tasks) + restore listen + restore client = nr_tasks + 2
 	 */
 	BUG_ON(task_entries->nr_tasks + 2 > CLONE_MAX_EPOLL_FDS);
 

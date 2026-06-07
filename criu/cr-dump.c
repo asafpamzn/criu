@@ -137,7 +137,7 @@ int collect_mappings(pid_t pid, struct vm_area_list *vma_area_list, dump_filemap
 	pr_info("Collecting mappings (pid: %d)\n", pid);
 	pr_info("----------------------------------------\n");
 
-	use_maps = opts.clone_dump && opts.lazy_pages;
+	use_maps = opts.clone_dump;
 	ret = use_maps ? parse_maps(pid, vma_area_list, dump_file) : parse_smaps(pid, vma_area_list, dump_file);
 	if (ret < 0)
 		goto err;
@@ -2353,11 +2353,10 @@ int cr_dump_tasks(pid_t pid)
 	int exit_code = -1;
 
 	/*
-	 * CLONE phased migration: when both --clone-dump and --lazy-pages are
-	 * enabled, use the phased WP_ASYNC → WP_SYNC flow for minimal
-	 * source downtime.
+	 * CLONE phased migration: --clone-dump uses the phased
+	 * WP_ASYNC -> WP_SYNC flow for minimal source downtime.
 	 */
-	if (opts.clone_dump && opts.lazy_pages)
+	if (opts.clone_dump)
 		return cr_dump_tasks_clone_phased(pid);
 
 	kerndat_warn_about_madv_guards();

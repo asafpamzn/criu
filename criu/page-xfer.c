@@ -1365,8 +1365,11 @@ static int page_server_serve(int sk)
 	int ret = -1;
 	bool flushed = false;
 	bool bulk_ack_received = false;
-	bool receiving_pages = !opts.lazy_pages;
+	bool receiving_pages = !(opts.lazy_pages || opts.clone_dump);
 	u32 last_cmd = 0;
+
+	if (opts.clone_dump && !opts.lazy_pages)
+		pr_warn("CLONE_GATE_PROBE: page-xfer page_server_serve receiving_pages=%d (clone-only)\n", receiving_pages);
 
 	if (receiving_pages) {
 		/*
@@ -1661,7 +1664,10 @@ int cr_page_server(bool daemon_mode, bool lazy_dump, int cfd)
 	if (!lazy_dump && init_stats(DUMP_STATS))
 		return -1;
 
-	if (!opts.lazy_pages)
+	if (opts.clone_dump && !opts.lazy_pages)
+		pr_warn("CLONE_GATE_PROBE: page-xfer cr_page_server up_page_ids_base gate (clone-only, lazy_dump=%d)\n", lazy_dump);
+
+	if (!(opts.lazy_pages || opts.clone_dump))
 		up_page_ids_base();
 	else if (!lazy_dump)
 		if (page_server_init_send())

@@ -252,7 +252,7 @@ done
 # We launch criu restore in the replica worker (backgrounded) so it connects
 # to the lazy-pages daemon and restores the process tree.
 RESTORE_CMD="$CRIU_BIN restore --images-dir '$IMAGES_DIR' \
-	--lazy-pages --clone-dump \
+	--clone-dump \
 	--shell-job \
 	-v4 -o restore.log &"
 send_and_wait replica "$RESTORE_CMD" || die "restore dispatch timed out"
