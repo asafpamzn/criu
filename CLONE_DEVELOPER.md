@@ -1,6 +1,6 @@
 # CLONE Dump Developer Setup Guide
 
-Complete setup guide for CRIU CLONE (Copy-on-Write) dump development and testing
+Complete setup guide for CRIU CLONE dump development and testing
 with Valkey live migration.
 
 ## Prerequisites
@@ -521,12 +521,12 @@ make -j$(nproc)
 ### Run ZDTM Tests
 
 ```bash
-# Single test
+# Single (standard) zdtm test
 sudo ./test/zdtm.py run -t zdtm/static/env00
 
-# CLONE-related tests
-sudo ./test/zdtm.py run -t zdtm/static/cow00
-sudo ./test/zdtm.py run -t zdtm/static/cow01
+# CLONE dump system tests (two-netns localpair harness)
+sudo bash test/zdtm/run_clone_tests.sh                 # all clone_dump_* tests
+sudo bash test/zdtm/run_clone_tests.sh clone_dump_basic # a single one
 ```
 
 ### Debug Logging

@@ -1,10 +1,15 @@
 # CLONE Dump - Minimized Downtime Live Migration
 
-```echo 1 | sudo tee /proc/sys/vm/unprivileged_userfaultfd
-```
 ## What is CLONE Dump?
 
-CLONE (Copy-on-Write) dump is an experimental CRIU feature that minimizes source process downtime during live migration. Traditional CRIU dump freezes the process for the entire duration while saving memory to disk. CLONE dump uses Linux's userfaultfd write-protect mechanism to track memory writes while the process continues running.
+CLONE dump is an experimental CRIU feature that minimizes source process downtime during live migration. Traditional CRIU dump freezes the process for the entire duration while saving memory to disk. CLONE dump uses Linux's userfaultfd write-protect mechanism to track memory writes while the process continues running.
+
+> **Prerequisite:** unprivileged userfaultfd must be enabled on both source and
+> destination hosts:
+>
+> ```sh
+> echo 1 | sudo tee /proc/sys/vm/unprivileged_userfaultfd
+> ```
 
 ## How It Works
 

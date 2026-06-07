@@ -1518,10 +1518,6 @@ static int pre_dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie
 		goto err;
 	}
 
-	if (opts.clone_dump)
-		pr_debug("CLONE PHASE 1: Collected %lu VMAs for pid %d\n",
-			 (unsigned long)vmas.nr, pid);
-
 	ret = -1;
 	parasite_ctl = parasite_infect_seized(pid, item, &vmas);
 	if (!parasite_ctl) {
@@ -1802,7 +1798,6 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 		goto err_cure;
 	}
 
-
 	ret = compel_stop_daemon(parasite_ctl);
 	if (ret) {
 		pr_err("Can't stop daemon in parasite (pid: %d)\n", pid);
@@ -1982,7 +1977,7 @@ err:
 		pr_err("Pre-dumping FAILED.\n");
 	else {
 		write_stats(DUMP_STATS);
-		pr_warn("Pre-dumping finished successfully\n");
+		pr_info("Pre-dumping finished successfully\n");
 	}
 	return ret;
 }
