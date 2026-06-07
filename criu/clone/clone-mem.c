@@ -12,7 +12,7 @@
 #include "clone/clone-mem.h"
 #include "log.h"
 #include "xmalloc.h"
-#include "atomic-bitmap.h"
+#include "clone/atomic-bitmap.h"
 #include "page-xfer.h"
 
 /* Global lazy VMA list for CLONE dump */

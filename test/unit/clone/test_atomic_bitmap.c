@@ -3,7 +3,7 @@
 #include <stdlib.h>
 
 #include "test_harness.h"
-#include "atomic-bitmap.h"
+#include "clone/atomic-bitmap.h"
 
 static void test_set_and_test(void)
 {

@@ -41,7 +41,6 @@
 #include "plugin.h"
 #include "dump.h"
 #include "mem.h"
-#include "atomic-bitmap.h"
 #include "clone/clone-bulk-send.h"
 #include "clone/spsc-queue.h"
 #include "xmalloc.h"
@@ -257,12 +256,6 @@ int page_server_send_raw(int sk, const void *buf, size_t sz, int fl)
 int page_server_recv_raw(int sk, void *buf, size_t sz, int fl)
 {
 	return recv(sk, buf, sz, fl);
-}
-
-/* Exported wrapper for encode_pm */
-u64 encode_pm_id(int type, unsigned long id)
-{
-	return encode_pm(type, id);
 }
 
 /*
@@ -1368,9 +1361,6 @@ static int page_server_serve(int sk)
 	bool receiving_pages = !(opts.lazy_pages || opts.clone_dump);
 	u32 last_cmd = 0;
 
-	if (opts.clone_dump && !opts.lazy_pages)
-		pr_warn("CLONE_GATE_PROBE: page-xfer page_server_serve receiving_pages=%d (clone-only)\n", receiving_pages);
-
 	if (receiving_pages) {
 		/*
 		 * This socket only accepts data except one thing -- it
@@ -1663,9 +1653,6 @@ int cr_page_server(bool daemon_mode, bool lazy_dump, int cfd)
 	 */
 	if (!lazy_dump && init_stats(DUMP_STATS))
 		return -1;
-
-	if (opts.clone_dump && !opts.lazy_pages)
-		pr_warn("CLONE_GATE_PROBE: page-xfer cr_page_server up_page_ids_base gate (clone-only, lazy_dump=%d)\n", lazy_dump);
 
 	if (!(opts.lazy_pages || opts.clone_dump))
 		up_page_ids_base();

@@ -54,9 +54,6 @@ extern int page_server_recv_raw(int sk, void *buf, size_t sz, int fl);
 extern int send_psi(int sk, struct page_server_iov *pi);
 extern void page_server_tcp_nodelay(int sk, bool on);
 
-/* Pagemap encoding for dst_id */
-extern u64 encode_pm_id(int type, unsigned long id);
-
 extern int cr_page_server(bool daemon_mode, bool lazy_dump, int cfd);
 
 /* User buffer for read-mode pre-dump*/

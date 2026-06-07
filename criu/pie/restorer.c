@@ -2237,8 +2237,7 @@ __visible long __export_restore_task(struct task_restore_args *args)
 						     args->clone_restore_fn);
 			}
 			if (ret != thread_args[i].pid) {
-				pr_err("Unable to create a thread: %ld (wanted pid %d, clone_flags=0x%lx)\n",
-				       ret, thread_args[i].pid, (unsigned long)clone_flags);
+				pr_err("Unable to create a thread: %ld\n", ret);
 				sys_close(fd);
 				mutex_unlock(&task_entries_local->last_pid_mutex);
 				goto core_restore_end;

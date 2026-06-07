@@ -26,7 +26,6 @@
 
 #include "../soccr/soccr.h"
 #include "compel/log.h"
-#include <time.h>
 
 #define DEFAULT_LOGFD STDERR_FILENO
 /* Enable timestamps if verbosity is increased from default */
@@ -38,6 +37,11 @@ static unsigned int current_loglevel = DEFAULT_LOGLEVEL;
 static void vprint_on_level(unsigned int, const char *, va_list);
 
 static char buffer[LOG_BUF_LEN];
+/*
+ * CLONE dump runs many worker threads that all call pr_*(); serialize access
+ * to the shared static buffer (and the write()/timestamp) so their output is
+ * not interleaved or corrupted.
+ */
 static spinlock_t log_lock = SPINLOCK_INIT;
 static char buf_off = 0;
 /*
@@ -55,8 +59,8 @@ static struct timeval start;
  * Manual buf len as sprintf will _always_ put '\0' at the end,
  * but we want a "constant" pid to be there on restore
  */
-#define TS_BUF_OFF 18
-#if 0
+#define TS_BUF_OFF 12
+
 static void timediff(struct timeval *from, struct timeval *to)
 {
 	to->tv_sec -= from->tv_sec;
@@ -67,18 +71,16 @@ static void timediff(struct timeval *from, struct timeval *to)
 		to->tv_usec += USEC_PER_SEC - from->tv_usec;
 	}
 }
-#endif
+
 static void print_ts(void)
 {
 	struct timeval t;
-	struct tm *tm;
 
 	gettimeofday(&t, NULL);
-	tm = localtime(&t.tv_sec);
-	snprintf(buffer, TS_BUF_OFF, "(%02d:%02d:%02d.%06u",
-		 tm->tm_hour, tm->tm_min, tm->tm_sec, (unsigned)t.tv_usec);
-	buffer[TS_BUF_OFF - 2] = ')';
-	buffer[TS_BUF_OFF - 1] = ' ';
+	timediff(&start, &t);
+	snprintf(buffer, TS_BUF_OFF, "(%02u.%06u", (unsigned)t.tv_sec, (unsigned)t.tv_usec);
+	buffer[TS_BUF_OFF - 2] = ')'; /* this will overwrite the last digit if tv_sec>=100 */
+	buffer[TS_BUF_OFF - 1] = ' '; /* kill the '\0' produced by snprintf */
 }
 
 int log_get_fd(void)
@@ -345,7 +347,7 @@ static void early_vprint(const char *format, unsigned int loglevel, va_list para
 		 * log levels with timestamps (>=LOG_TIMESTAMP).
 		 */
 		log_size = snprintf(early_log_buffer + early_log_buf_off, log_space,
-				    "(00:00:00.000000) ");
+				    "(00.000000) ");
 	}
 
 	if (log_size < log_space)
@@ -384,9 +386,8 @@ static void vprint_on_level(unsigned int loglevel, const char *format, va_list p
 	}
 
 	/*
-	 * Protect the shared buffer from concurrent access by multiple
-	 * threads. Lock covers: print_ts(), vsnprintf(), write(), and
-	 * log_note_err() which all use the shared buffer.
+	 * Serialize the shared-buffer region (timestamp, vsnprintf, write,
+	 * log_note_err) against concurrent CLONE worker threads.
 	 */
 	spin_lock(&log_lock);
 

@@ -149,6 +149,4 @@ static inline bool pagemap_present(PagemapEntry *pe)
 	return !!(pe->flags & PE_PRESENT);
 }
 
-int bulk_page_complete(unsigned long img_id, unsigned long vaddr, unsigned long int nr_pages, void *priv);
-
 #endif /* __CR_PAGE_READ_H__ */

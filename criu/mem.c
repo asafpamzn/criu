@@ -316,11 +316,9 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 			st = 0;
 		} else {
 			ret = page_pipe_add_page(pp, vaddr, ppb_flags);
-			if (ppb_flags & PPB_LAZY && (opts.lazy_pages || opts.clone_dump)) {
-				if (opts.clone_dump && !opts.lazy_pages)
-					pr_warn("CLONE_GATE_PROBE: mem.c generate_iovs lazy-class clone-only\n");
+			if (ppb_flags & PPB_LAZY && (opts.lazy_pages || opts.clone_dump))
 				st = 1;
-			} else
+			else
 				st = 2;
 		}
 
@@ -1323,8 +1321,6 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 		 * on demand.
 		 */
 		if ((opts.lazy_pages || opts.clone_dump) && pagemap_lazy(pr->pe)) {
-			if (opts.clone_dump && !opts.lazy_pages)
-				pr_warn("CLONE_GATE_PROBE: mem.c restore_priv_vma_content lazy-skip clone-only\n");
 			pr_debug("Lazy restore skips %ld pages at %lx\n", nr_pages, va);
 			pr->skip_pages(pr, nr_pages * PAGE_SIZE);
 			nr_lazy += nr_pages;
@@ -1498,9 +1494,6 @@ static int maybe_disable_thp(struct pstree_item *t, struct page_read *pr)
 	 */
 	if (!((opts.lazy_pages || opts.clone_dump) && page_read_has_parent(pr)))
 		return 0;
-
-	if (opts.clone_dump && !opts.lazy_pages)
-		pr_warn("CLONE_GATE_PROBE: mem.c THP-disable clone-only\n");
 
 	if (!kdat.has_thp_disable)
 		pr_warn("Disabling transparent huge pages. "

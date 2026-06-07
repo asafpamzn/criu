@@ -9,7 +9,7 @@
 #include "clone/spsc-queue.h"
 #include "clone/mpsc-queue.h"
 #include "clone/spmc-queue.h"
-#include "atomic-bitmap.h"
+#include "clone/atomic-bitmap.h"
 
 /*
  * Stress tests for lock-free CLONE data structures.

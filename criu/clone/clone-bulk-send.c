@@ -35,7 +35,7 @@
 #include "clone/clone-bulk-send.h"
 #include "page-xfer.h"
 #include "clone/clone-page-xfer.h"
-#include "atomic-bitmap.h"
+#include "clone/atomic-bitmap.h"
 #include "cr_options.h"
 #include "tls.h"
 #include "clone/tls-conn.h"

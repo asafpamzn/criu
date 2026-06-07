@@ -220,9 +220,6 @@ int lazy_pages_setup_zombie(int pid)
 	if (!(opts.lazy_pages || opts.clone_dump))
 		return 0;
 
-	if (opts.clone_dump && !opts.lazy_pages)
-		pr_warn("CLONE_GATE_PROBE: uffd.c lazy_pages_setup_zombie clone-only\n");
-
 	if (send_uffd(0, -pid))
 		return -1;
 
@@ -290,9 +287,6 @@ int setup_uffd(int pid, struct task_restore_args *task_args)
 		return 0;
 	}
 
-	if (opts.clone_dump && !opts.lazy_pages)
-		pr_warn("CLONE_GATE_PROBE: uffd.c setup_uffd clone-only\n");
-
 	/*
 	 * Open userfaulfd FD which is passed to the restorer blob and
 	 * to a second process handling the userfaultfd page faults.
@@ -319,9 +313,6 @@ int prepare_lazy_pages_socket(void)
 
 	if (!(opts.lazy_pages || opts.clone_dump))
 		return 0;
-
-	if (opts.clone_dump && !opts.lazy_pages)
-		pr_warn("CLONE_GATE_PROBE: uffd.c prepare_lazy_pages_socket clone-only\n");
 
 	if (prepare_sock_addr(&sun))
 		return -1;
@@ -1409,9 +1400,6 @@ int lazy_pages_finish_restore(void)
 
 	if (!(opts.lazy_pages || opts.clone_dump))
 		return 0;
-
-	if (opts.clone_dump && !opts.lazy_pages)
-		pr_warn("CLONE_GATE_PROBE: uffd.c lazy_pages_finish_restore clone-only\n");
 
 	fd = fdstore_get(lazy_pages_sk_id);
 	if (fd < 0) {
