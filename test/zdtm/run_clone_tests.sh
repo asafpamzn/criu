@@ -31,6 +31,7 @@ TESTS_ALL=(
 	clone_dump_munmap_reuse
 	clone_dump_mremap
 	clone_dump_wp_unpopulated
+	clone_dump_reseize
 )
 
 usage() { sed -n '3,17p' "$0"; }

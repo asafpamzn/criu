@@ -204,6 +204,7 @@ TST_NOFILE	:=				\
 		clone_dump_munmap_reuse_unwritten	\
 		clone_dump_mremap			\
 		clone_dump_wp_unpopulated		\
+		clone_dump_reseize		\
 		child_opened_proc		\
 		posix_timers			\
 		sigpending			\
@@ -634,6 +635,7 @@ clone_dump_munmap_reuse:	LDLIBS += -pthread
 clone_dump_munmap_reuse_unwritten:	LDLIBS += -pthread
 clone_dump_mremap:	LDLIBS += -pthread
 clone_dump_wp_unpopulated:	LDLIBS += -pthread
+clone_dump_reseize:	LDLIBS += -pthread
 pthread00:		LDLIBS += -pthread
 pthread00-pac:		CFLAGS += ${PAC_CFLAGS}
 pthread00-pac:		LDLIBS += -pthread

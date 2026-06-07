@@ -461,8 +461,16 @@ void clone_record_unmapped_range(unsigned long start, unsigned long len)
 	if (cdi->nr_unmapped_ranges >= cdi->unmapped_capacity) {
 		unsigned int new_cap = cdi->unmapped_capacity ?
 				       cdi->unmapped_capacity * 2 : 16;
-		cdi->unmapped_ranges = xrealloc(cdi->unmapped_ranges,
-						new_cap * sizeof(*cdi->unmapped_ranges));
+		/*
+		 * Grow via a temp: xrealloc() is realloc() that only logs on
+		 * failure (it does not abort), so on NULL we must not bump
+		 * capacity (the writes below would NULL-deref) or leak the old
+		 * buffer. Allocation failure here is not expected.
+		 */
+		void *grown = xrealloc(cdi->unmapped_ranges,
+				       new_cap * sizeof(*cdi->unmapped_ranges));
+		BUG_ON(!grown);
+		cdi->unmapped_ranges = grown;
 		cdi->unmapped_capacity = new_cap;
 	}
 

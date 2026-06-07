@@ -247,6 +247,25 @@ for i in $(seq 1 ${SEND_AND_WAIT_TIMEOUT:-900}); do
 	sleep 1
 done
 
+# --- Regression gate: Phase-3 re-infect / any dump failure ---
+# Defense-in-depth on top of the dump-rc check above. The clone phased
+# dump RE-INFECTS the same pid in Phase 3 (cr-dump.c reseize_pstree),
+# reusing the parasite's abstract transport socket name. If accept_tsock()
+# (compel/src/lib/infect.c) fails to close() the listening socket after
+# accept(), Phase 3 infect dies with "Can't bind socket: Address already
+# in use" -> "Can't infect" -> "Dumping FAILED.". We FAIL the test if any
+# of those signatures appear in the dump log even if the rc check above
+# somehow passed, so this whole class of dump failure can never be masked.
+DUMP_FAIL_PAT='Address already in use|Can.t bind socket|Can.t infect|Dumping FAILED'
+for _logf in "$PRIMARY_LOG" "$IMAGES_DIR/lazy-pages.log" "$IMAGES_DIR/lazy-primary.log"; do
+	[ -s "$_logf" ] || continue
+	if grep -qE "$DUMP_FAIL_PAT" "$_logf" 2>/dev/null; then
+		echo "=== dump-failure signature found in $_logf: ==="
+		grep -nE "$DUMP_FAIL_PAT" "$_logf" 2>/dev/null | head -10
+		die "dump failure signature in $(basename "$_logf") (Phase-3 re-infect / dump failed)"
+	fi
+done
+
 # --- Start criu restore on replica ---
 # lazy-pages is waiting for restore to connect via the lazy-pages socket.
 # We launch criu restore in the replica worker (backgrounded) so it connects

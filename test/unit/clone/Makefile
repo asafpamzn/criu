@@ -11,7 +11,8 @@ LDFLAGS := -pthread
 
 # Header-only tests (portable, work on macOS + Linux)
 TESTS_PORTABLE := test_batch_bitmap test_spsc_queue test_mpsc_queue \
-		  test_spmc_queue test_atomic_bitmap test_stress
+		  test_spmc_queue test_atomic_bitmap test_stress \
+		  test_remove_range_leak
 
 # Tests linking real CLONE .c files (Linux-only: need pthread_spinlock_t, mmap alignment)
 TESTS_LINUX := test_unmapped_tracker test_page_pool test_page_state_tracker \
@@ -37,6 +38,9 @@ test_mpsc_queue: test_mpsc_queue.c test_harness.h shims/page.h shims/criu-log.h 
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
 test_spmc_queue: test_spmc_queue.c test_harness.h shims/page.h shims/criu-log.h shims/xmalloc.h
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
+test_remove_range_leak: test_remove_range_leak.c test_harness.h
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
 test_atomic_bitmap: test_atomic_bitmap.c test_harness.h

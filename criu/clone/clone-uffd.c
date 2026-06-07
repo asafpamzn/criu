@@ -227,26 +227,40 @@ int clone_uffd_copy(int uffd, unsigned long vaddr, void *data,
 		  const char *caller)
 {
 	enum clone_copy_result res;
+	unsigned long copied = 0;
 
-	res = clone_uffd_copy_pages(uffd, vaddr, data, nr_pages, NULL);
+	res = clone_uffd_copy_pages(uffd, vaddr, data, nr_pages, &copied);
 
 	switch (res) {
 	case CLONE_COPY_OK: {
 		unsigned long i;
 
+		/*
+		 * UFFDIO_COPY may install FEWER than nr_pages (short copy):
+		 * the kernel returns success with uffd_copy.copy < len (e.g. it
+		 * hit an already-present page mid-range). Only the first
+		 * `copied` pages actually have data — mark exactly those COPIED,
+		 * then re-issue for the uncopied remainder so it is not silently
+		 * left missing (SIGBUS/zero on restore).
+		 */
+		if (copied == 0)
+			copied = nr_pages; /* defensive: shouldn't happen on OK */
+
 		if (!(flags & CLONE_TRACK_RETRY))
 			__sync_fetch_and_add(&clone_buffer.nr_applied, 1);
 		pf_tracker_set_state(vaddr, PF_STATE_COMPLETED);
-		/*
-		 * UFFDIO_COPY installed all nr_pages; transition every page in
-		 * the range so the tracker reflects reality (drain fast path
-		 * copies 64 pages in one call — marking only the base leaves
-		 * the other 63 stuck at DRAIN_PENDING).
-		 */
-		for (i = 0; i < nr_pages; i++)
+		for (i = 0; i < copied; i++)
 			page_state_set(vaddr + i * PAGE_SIZE, PAGE_STATE_COPIED);
 		if (lpi)
-			lpi->copied_pages += nr_pages;
+			lpi->copied_pages += copied;
+
+		if (copied < nr_pages) {
+			/* Handle the uncopied tail with the same tracking. */
+			return clone_uffd_copy(uffd, vaddr + copied * PAGE_SIZE,
+					       (char *)data + copied * PAGE_SIZE,
+					       nr_pages - copied, lpi, lpis,
+					       flags, caller);
+		}
 		return 1;
 	}
 
@@ -567,6 +581,50 @@ void clone_page_buffer_mark_pages(unsigned long base_vaddr,
 }
 
 /*
+ * Tear down an emptied batch entry.
+ *
+ * Unlinks the entry from both indices it lives in (the hash table and its
+ * per-chunk drain list), returns the pool pages selected by @free_bm to the
+ * pool, poisons the entry and frees it, and updates nr_batches.
+ *
+ * Contract: caller holds hash_locks[@lock_idx] and has ALREADY decided the
+ * batch is empty. This function performs the hlist_del and DROPS that lock
+ * (matching the original inline order, which releases the hash lock before
+ * taking the per-chunk lock). @free_bm is the set of slot indices to free;
+ * each caller computes it differently (lookup_and_remove excludes the page
+ * it hands back to its caller; remove_range includes the pages it discards).
+ *
+ * NOTE: this does not address the drain-vs-fault use-after-free race in the
+ * window after the hash lock is dropped — it only factors out the shared
+ * teardown; the locking is identical to the previous inline code.
+ */
+static void clone_batch_destroy_locked(struct batch_buffer_entry *entry,
+				       int lock_idx,
+				       const clone_batch_bitmap_t *free_bm)
+{
+	int chunk_id = entry->chunk_id;
+	int j;
+
+	hlist_del(&entry->hash);
+	pthread_spin_unlock(&hash_locks[lock_idx]);
+
+	if (chunk_id >= 0 && chunk_id < CLONE_MAX_POOL_CHUNKS) {
+		pthread_spin_lock(&chunk_index[chunk_id].lock);
+		list_del(&entry->chunk_list);
+		atomic_fetch_sub(&chunk_index[chunk_id].batch_count, 1);
+		pthread_spin_unlock(&chunk_index[chunk_id].lock);
+	}
+
+	CLONE_BATCH_BITMAP_FOR_EACH_SET(free_bm, j) {
+		page_pool_put((char *)entry->data + j * PAGE_SIZE);
+	}
+
+	entry->magic = BATCH_ENTRY_DEAD;
+	xfree(entry);
+	__sync_fetch_and_sub(&clone_buffer.nr_batches, 1);
+}
+
+/*
  * Look up a single page in the batch buffer.
  * Returns a pointer to a PAGE_SIZE buffer that the caller must free
  * via page_pool_put(), or NULL if the page is not in the buffer.
@@ -613,39 +671,20 @@ void *clone_page_buffer_lookup_and_remove(unsigned long vaddr)
 		__sync_fetch_and_sub(&clone_buffer.nr_pages, 1);
 
 		if (entry->nr_pages == 0) {
-			/* Batch empty — remove entirely */
-			int chunk_id = entry->chunk_id;
-			clone_batch_bitmap_t free_bm;
-			int j;
-
-			hlist_del(&entry->hash);
-			pthread_spin_unlock(&hash_locks[lock_idx]);
-
-			if (chunk_id >= 0 && chunk_id < CLONE_MAX_POOL_CHUNKS) {
-				pthread_spin_lock(&chunk_index[chunk_id].lock);
-				list_del(&entry->chunk_list);
-				atomic_fetch_sub(&chunk_index[chunk_id].batch_count, 1);
-				pthread_spin_unlock(&chunk_index[chunk_id].lock);
-			}
 			/*
-			 * Free pages we still own. Skip page_idx (caller frees)
-			 * and pages already freed by earlier page faults
-			 * (initial_bitmap bit set, page_bitmap bit clear).
-			 * page_bitmap is 0 here (entry empty), so freed_by_pf =
-			 * initial_bitmap minus the current page_idx bit.
+			 * Batch empty — free every slot we still own. page_bitmap
+			 * is 0 here, so the owned set is just the unused slots
+			 * (~initial_bitmap); exclude page_idx, which we hand back
+			 * to the caller to free. clone_batch_destroy_locked()
+			 * drops the hash lock.
 			 */
-			/* Also free unused slots (never had data) */
-			/* free_bm has bits set for unused slots */
-			/* Don't free page_idx — caller will */
+			clone_batch_bitmap_t free_bm;
+
 			clone_batch_bitmap_not(&free_bm, &entry->initial_bitmap);
 			clone_batch_bitmap_mask(&free_bm, CLONE_BATCH_PAGES);
 			clone_batch_bitmap_clear(&free_bm, page_idx);
-			CLONE_BATCH_BITMAP_FOR_EACH_SET(&free_bm, j) {
-				page_pool_put((char *)entry->data + j * PAGE_SIZE);
-			}
-			entry->magic = BATCH_ENTRY_DEAD;
-			xfree(entry);
-			__sync_fetch_and_sub(&clone_buffer.nr_batches, 1);
+
+			clone_batch_destroy_locked(entry, lock_idx, &free_bm);
 			return page_ptr;
 		}
 
@@ -685,6 +724,7 @@ void clone_page_buffer_remove_range(unsigned long start, unsigned long len)
 		int first_page, last_page;
 		clone_batch_bitmap_t clear_mask;
 		clone_batch_bitmap_t masked;
+		clone_batch_bitmap_t page_bitmap_pre_clear;
 		int cleared;
 
 		/* Which pages within this batch overlap [start, end)? */
@@ -708,34 +748,38 @@ void clone_page_buffer_remove_range(unsigned long start, unsigned long len)
 				goto next_batch;
 			}
 
+			/*
+			 * Snapshot the still-buffered pages BEFORE clearing the
+			 * unmapped bits. The free mask below must include the
+			 * pages we are about to discard (they are owned pool
+			 * slots that nobody else will copy), so it has to be
+			 * computed from the pre-clear bitmap — mirroring
+			 * drain_apply_batch(). Computing it after clear_range
+			 * leaks exactly the discarded pages.
+			 */
+			clone_batch_bitmap_copy(&page_bitmap_pre_clear, &entry->page_bitmap);
+
 			clone_batch_bitmap_clear_range(&entry->page_bitmap, first_page,
 						     last_page - first_page + 1);
 			entry->nr_pages -= cleared;
 			removed += cleared;
 
 			if (entry->nr_pages == 0) {
-				int chunk_id = entry->chunk_id;
+				/*
+				 * Batch empty — free unused slots (~initial_bitmap)
+				 * plus the still-buffered pages we are discarding
+				 * (page_bitmap_pre_clear, snapshotted before the
+				 * clear above); page-fault-served slots are absent
+				 * from both and stay freed. clone_batch_destroy_locked()
+				 * drops the hash lock.
+				 */
 				clone_batch_bitmap_t free_bm;
-				int j;
 
-				hlist_del(&entry->hash);
-				pthread_spin_unlock(&hash_locks[lock_idx]);
-
-				if (chunk_id >= 0 && chunk_id < CLONE_MAX_POOL_CHUNKS) {
-					pthread_spin_lock(&chunk_index[chunk_id].lock);
-					list_del(&entry->chunk_list);
-					atomic_fetch_sub(&chunk_index[chunk_id].batch_count, 1);
-					pthread_spin_unlock(&chunk_index[chunk_id].lock);
-				}
-				/* Free owned + unused, skip page-fault-served */
 				clone_batch_bitmap_not(&free_bm, &entry->initial_bitmap);
 				clone_batch_bitmap_mask(&free_bm, CLONE_BATCH_PAGES);
-				clone_batch_bitmap_or(&free_bm, &free_bm, &entry->page_bitmap);
-				CLONE_BATCH_BITMAP_FOR_EACH_SET(&free_bm, j) {
-					page_pool_put((char *)entry->data + j * PAGE_SIZE);
-				}
-				xfree(entry);
-				__sync_fetch_and_sub(&clone_buffer.nr_batches, 1);
+				clone_batch_bitmap_or(&free_bm, &free_bm, &page_bitmap_pre_clear);
+
+				clone_batch_destroy_locked(entry, lock_idx, &free_bm);
 				goto next_batch;
 			}
 
