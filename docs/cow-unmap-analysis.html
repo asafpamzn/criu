@@ -1,0 +1,617 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>COW Dump — Primary-Side Unmap Handling Analysis</title>
+<style>
+  :root {
+    --fg: #1f2328;
+    --muted: #656d76;
+    --bg: #ffffff;
+    --panel: #f6f8fa;
+    --panel-border: #d0d7de;
+    --accent: #0969da;
+    --accent-soft: #ddf4ff;
+    --success: #1a7f37;
+    --success-soft: #dafbe1;
+    --warn: #9a6700;
+    --warn-bg: #fff8c5;
+    --danger: #cf222e;
+    --danger-soft: #ffebe9;
+    --code-fg: #24292f;
+    --code-bg: #f6f8fa;
+    --table-border: #d0d7de;
+    --table-row-alt: #f6f8fa;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fg: #e6edf3;
+      --muted: #8b949e;
+      --bg: #0d1117;
+      --panel: #161b22;
+      --panel-border: #30363d;
+      --accent: #58a6ff;
+      --accent-soft: #0c2d6b;
+      --success: #3fb950;
+      --success-soft: #033a16;
+      --warn: #d4a72c;
+      --warn-bg: #3b2e04;
+      --danger: #f85149;
+      --danger-soft: #490202;
+      --code-fg: #e6edf3;
+      --code-bg: #161b22;
+      --table-border: #30363d;
+      --table-row-alt: #161b22;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans",
+                 Helvetica, Arial, sans-serif;
+    font-size: 16px;
+    line-height: 1.65;
+  }
+  .wrap {
+    max-width: 1000px;
+    margin: 0 auto;
+    padding: 28px 32px 80px 32px;
+  }
+  h1 {
+    margin-top: 0;
+    font-size: 2em;
+    padding-bottom: 0.3em;
+    border-bottom: 1px solid var(--panel-border);
+    line-height: 1.2;
+  }
+  h2 {
+    margin-top: 2em;
+    font-size: 1.4em;
+    padding-bottom: 0.3em;
+    border-bottom: 1px solid var(--panel-border);
+  }
+  h3 { margin-top: 1.5em; font-size: 1.15em; }
+  .subtitle { color: var(--muted); font-size: 1em; margin: -0.5em 0 2em 0; }
+  p { margin: 0 0 1em 0; }
+  ul, ol { margin: 0 0 1em 0; padding-left: 1.6em; }
+  li { margin: 0.3em 0; }
+  code {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.875em;
+    background: var(--code-bg);
+    color: var(--code-fg);
+    padding: 2px 6px;
+    border-radius: 4px;
+  }
+  pre {
+    background: var(--code-bg);
+    color: var(--code-fg);
+    border: 1px solid var(--panel-border);
+    border-radius: 6px;
+    padding: 14px 16px;
+    overflow-x: auto;
+    font-size: 13px;
+    line-height: 1.5;
+    margin: 0 0 1.2em 0;
+  }
+  pre code { background: none; padding: 0; font-size: inherit; }
+  table {
+    border-collapse: collapse;
+    margin: 0 0 1.5em 0;
+    width: 100%;
+    font-size: 0.92em;
+  }
+  th, td {
+    border: 1px solid var(--table-border);
+    padding: 8px 12px;
+    text-align: left;
+    vertical-align: top;
+  }
+  th { background: var(--panel); font-weight: 600; }
+  tr:nth-child(even) td { background: var(--table-row-alt); }
+
+  .verdict {
+    border-radius: 8px;
+    padding: 16px 20px;
+    margin: 1.5em 0;
+    border: 1.5px solid;
+  }
+  .verdict.ok {
+    background: var(--success-soft);
+    border-color: var(--success);
+  }
+  .verdict.warn {
+    background: var(--warn-bg);
+    border-color: var(--warn);
+  }
+  .verdict.danger {
+    background: var(--danger-soft);
+    border-color: var(--danger);
+  }
+  .verdict strong { display: block; margin-bottom: 4px; }
+
+  .flow {
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 8px;
+    padding: 16px 20px;
+    margin: 1em 0 1.5em 0;
+    font-size: 0.9em;
+  }
+  .flow h4 { margin: 0 0 8px 0; font-size: 0.95em; color: var(--accent); }
+  .flow ol { margin: 0; padding-left: 1.4em; }
+  .flow li { margin: 0.4em 0; }
+
+  .option-card {
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-left: 4px solid var(--accent);
+    border-radius: 6px;
+    padding: 14px 18px;
+    margin: 1em 0;
+  }
+  .option-card h4 { margin: 0 0 6px 0; color: var(--accent); }
+  .option-card p { margin: 0 0 0.5em 0; font-size: 0.92em; }
+  .option-card .pros { color: var(--success); }
+  .option-card .cons { color: var(--danger); }
+
+  .recommended {
+    border-left-color: var(--success);
+    background: var(--success-soft);
+  }
+  .recommended h4 { color: var(--success); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>COW Dump: Primary-Side Unmap Handling</h1>
+<p class="subtitle">Analysis of correctness when the source process unmaps memory during Phase 2, and whether the primary should listen for UFFD_EVENT_REMOVE.</p>
+
+<h2>Current Design</h2>
+
+<p>The primary requests <code>UFFD_FEATURE_WP_ASYNC</code> plus <code>UFFD_FEATURE_EVENT_UNMAP</code> and <code>UFFD_FEATURE_EVENT_REMOVE</code>. Detection of unmapped regions uses <strong>two complementary mechanisms</strong>:</p>
+
+<ol>
+  <li><strong>UFFD events:</strong> A background thread reads <code>UFFD_EVENT_UNMAP</code> and <code>UFFD_EVENT_REMOVE</code> during Phase 2</li>
+  <li><strong>EFAULT fallback:</strong> <code>process_vm_readv</code> returns EFAULT when bulk transfer hits an unmapped range</li>
+</ol>
+
+<p>Both mechanisms record unmapped ranges for Phase 3 remap detection:</p>
+
+<table>
+<thead><tr><th>Mechanism</th><th>What it does</th><th>Where</th></tr></thead>
+<tbody>
+<tr>
+  <td><code>UFFD_EVENT_UNMAP/REMOVE</code></td>
+  <td>Background thread reads events, records unmapped ranges immediately</td>
+  <td><code>cow-dump.c:cow_uffd_event_reader()</code></td>
+</tr>
+<tr>
+  <td><code>process_vm_readv</code> → EFAULT</td>
+  <td>Fallback: sender detects via <code>cow_errno_is_vma_gone()</code>, records unmapped range</td>
+  <td><code>cow-bulk-send.c:164-178, 1599-1633, 1681-1784</code></td>
+</tr>
+<tr>
+  <td><code>cow_record_unmapped_range()</code></td>
+  <td>Thread-safe recording of unmapped ranges (from events or EFAULT)</td>
+  <td><code>cow-dump.c</code></td>
+</tr>
+<tr>
+  <td>Phase 3: unmapped range check</td>
+  <td>Checks if new VMA exists at previously-unmapped address → remap detected</td>
+  <td><code>cow-dump.c:cow_detect_new_vmas()</code></td>
+</tr>
+<tr>
+  <td><code>PS_IOV_UNMAP_NOTIFY</code></td>
+  <td>Notifies replica of unmapped ranges (for buffer/RSS cleanup)</td>
+  <td><code>cow-page-xfer.c</code></td>
+</tr>
+<tr>
+  <td>Replica: <code>UFFD_EVENT_REMOVE</code></td>
+  <td>Clears stale bulk-transfer pages from the batch buffer</td>
+  <td><code>cow-uffd.c:1730-1740</code></td>
+</tr>
+</tbody>
+</table>
+
+<div class="verdict ok">
+  <strong>Simple munmap (no reuse): CORRECT</strong>
+  Pages are skipped on primary (EFAULT), cleared on replica (REMOVE event). No stale data reaches the restored process.
+</div>
+
+<h2>The Breaking Scenario: Address Reuse</h2>
+
+<p>The design breaks when the source process does <code>munmap</code> followed by <code>mmap</code> at the <strong>same address</strong> with <strong>unwritten pages</strong>:</p>
+
+<pre><code>// During Phase 2 (process running with WP_ASYNC tracking)
+munmap(addr, len);                         // removes tracked VMA
+mmap(addr, len, PROT_READ|PROT_WRITE,      // new VMA at same address
+     MAP_PRIVATE|MAP_ANON|MAP_FIXED, -1, 0);
+// Some pages written, some left as zero-fill-on-demand
+</code></pre>
+
+<div class="flow">
+<h4>Data flow showing the bug</h4>
+<ol>
+  <li><strong>Phase 1:</strong> VMA [A, B) tracked, all pages sent during bulk (content = C1)</li>
+  <li><strong>Phase 2:</strong> Process does <code>munmap([A, B))</code> then <code>mmap([A, B), MAP_FIXED)</code> — new content C2, but some pages never written (zero-fill-on-demand, no PTE)</li>
+  <li><strong>Replica:</strong> Receives <code>UFFD_EVENT_REMOVE</code> for [A, B) → clears stale C1 from batch buffer</li>
+  <li><strong>Phase 3:</strong> <code>cow_detect_new_vmas()</code> calls <code>cow_region_subtract([A, B))</code>
+    <ul>
+      <li>[A, B) is in <code>tracked_vmas</code> from Phase 1 → <strong>no gap detected</strong></li>
+      <li>New VMA NOT flagged as new, NOT added to new-VMA send path</li>
+    </ul>
+  </li>
+  <li><strong>Frozen scan:</strong> <code>PAGEMAP_SCAN</code> with <code>PAGE_IS_WRITTEN</code> on original lazy VMA range
+    <ul>
+      <li>Written pages → found, sent to replica (correct)</li>
+      <li>Unwritten zero-fill pages → <strong>no PTE, not found, not sent</strong></li>
+    </ul>
+  </li>
+  <li><strong>Result:</strong> Replica has no data for unwritten pages in [A, B). Batch buffer was cleared by REMOVE event. Drain installs nothing for those pages. Restored process accesses them → <strong>SIGBUS</strong></li>
+</ol>
+</div>
+
+<div class="verdict danger">
+  <strong>munmap + mmap at same address with unwritten pages: DATA LOSS / SIGBUS</strong>
+  <code>cow_region_subtract()</code> compares address ranges only — it cannot distinguish "same VMA still here" from "different VMA at same address." Zero-fill-on-demand pages in the new mapping are invisible to <code>PAGEMAP_SCAN</code>.
+</div>
+
+<h3>Root Cause</h3>
+
+<p><code>cow_region_subtract()</code> (<code>cow-dump.c:570-652</code>) uses <strong>address-only comparison</strong>. It walks <code>tracked_vmas</code> from Phase 1 and reports gaps. If a new VMA occupies the same address range as an old tracked VMA, there is no gap, and it is not detected as new.</p>
+
+<h3>Why the existing test passes</h3>
+
+<p><code>cow_dump_munmap_reuse.c</code> fills <strong>every page</strong> of the remapped region with 0xBB immediately after remapping. Every page gets a PTE + <code>PAGE_IS_WRITTEN</code> flag. The frozen scan finds them all. The bug only manifests when pages are <strong>not written</strong> before freeze.</p>
+
+<h2>Should the Primary Listen to REMOVE/UNMAP Events?</h2>
+
+<div class="verdict ok">
+  <strong>Yes — events + EFAULT fallback + Phase 3 check together solve the problem</strong>
+  While a single REMOVE/UNMAP event doesn't tell us about subsequent <code>mmap</code> at the same address, recording all unmapped ranges allows Phase 3 to detect remaps by checking if a VMA now exists at a previously-unmapped address.
+</div>
+
+<p>Why this approach works:</p>
+<ul>
+  <li><strong>Immediate detection:</strong> UFFD events arrive as soon as unmap happens — no waiting for bulk transfer to reach that range</li>
+  <li><strong>Fallback coverage:</strong> EFAULT from <code>process_vm_readv</code> catches any unmaps missed by events</li>
+  <li><strong>Remap detection:</strong> Phase 3 checks recorded unmapped ranges against current VMA list — if VMA exists at unmapped address, it's a remap</li>
+  <li><strong>No freeze overhead:</strong> Events are processed during Phase 2 — no extra scanning during Phase 3 freeze</li>
+</ul>
+
+<h3>Kernel Requirements for UFFD Events</h3>
+
+<p>To receive <code>UFFD_EVENT_UNMAP</code> and <code>UFFD_EVENT_REMOVE</code>, the following must be true:</p>
+<ol>
+  <li>VMA must be registered with uffd (<code>vm_userfaultfd_ctx.ctx != NULL</code>) — ✓ We do this in Phase 1</li>
+  <li><code>UFFD_FEATURE_EVENT_UNMAP</code> must be requested at <code>UFFDIO_API</code> time</li>
+  <li><code>UFFD_FEATURE_EVENT_REMOVE</code> must be requested for <code>MADV_DONTNEED</code> events</li>
+</ol>
+
+<pre><code>/* cow-dump.c: Enable event features alongside WP_ASYNC */
+args->uffd_features = UFFD_FEATURE_WP_ASYNC |
+                      UFFD_FEATURE_EVENT_UNMAP |
+                      UFFD_FEATURE_EVENT_REMOVE;
+</code></pre>
+
+<h2>Why Traditional VMA Attributes Fail</h2>
+
+<p>The initial instinct is to compare VMA metadata (flags, inode, dev, pgoff) between Phase 1 and Phase 3. This works for some cases but <strong>completely fails</strong> for the hardest scenario:</p>
+
+<table>
+<thead><tr><th>Attribute</th><th>Original (Phase 1)</th><th>Remapped (Phase 3)</th><th>Distinguishable?</th></tr></thead>
+<tbody>
+<tr><td><code>flags</code></td><td><code>MAP_PRIVATE|MAP_ANONYMOUS</code></td><td><code>MAP_PRIVATE|MAP_ANONYMOUS</code></td><td class="cons">NO</td></tr>
+<tr><td><code>prot</code></td><td><code>PROT_READ|PROT_WRITE</code></td><td><code>PROT_READ|PROT_WRITE</code></td><td class="cons">NO</td></tr>
+<tr><td><code>dev</code></td><td>0 (anon)</td><td>0 (anon)</td><td class="cons">NO</td></tr>
+<tr><td><code>ino</code></td><td>0 (anon)</td><td>0 (anon)</td><td class="cons">NO</td></tr>
+<tr><td><code>pgoff</code></td><td>0</td><td>0</td><td class="cons">NO</td></tr>
+</tbody>
+</table>
+
+<div class="verdict danger">
+  <strong>Anon-to-anon remap at same address: ALL traditional attributes are identical</strong>
+  There is no "VMA generation number" or unique ID exposed by the kernel in <code>/proc/pid/maps</code>. A purely attribute-based comparison would <strong>miss</strong> this scenario entirely.
+</div>
+
+<h2>Chosen Approach: UFFD Events + EFAULT Fallback</h2>
+
+<h3>Why PAGE_IS_WPALLOWED Was Rejected</h3>
+
+<p>An alternative approach using <code>PAGE_IS_WPALLOWED</code> (PAGEMAP_SCAN probe to detect VMA registration loss) was considered but rejected:</p>
+
+<ul>
+  <li><strong>Adds freeze overhead:</strong> Requires extra PAGEMAP_SCAN during Phase 3 freeze — increases downtime</li>
+  <li><strong>Kernel reliability issues:</strong> Testing on kernel 6.17 showed unexpected behavior with the probe</li>
+  <li><strong>Feature dependency:</strong> For anonymous VMAs, <code>PAGE_IS_WPALLOWED</code> requires <code>WP_UNPOPULATED</code> feature to be reliable</li>
+</ul>
+
+<div class="flow">
+<h4>How the UFFD Events + EFAULT approach works</h4>
+<ol>
+  <li><strong>Phase 1:</strong> Enable <code>UFFD_FEATURE_EVENT_UNMAP | EVENT_REMOVE</code> alongside <code>WP_ASYNC</code></li>
+  <li><strong>Phase 2 (background):</strong> Event reader thread polls uffd fd, records unmapped ranges from <code>UFFD_EVENT_UNMAP/REMOVE</code></li>
+  <li><strong>Phase 2 (bulk transfer):</strong> If <code>process_vm_readv</code> returns EFAULT, record unmapped range (fallback)</li>
+  <li><strong>Phase 3:</strong> For each recorded unmapped range, check if a VMA now exists at that address</li>
+  <li><strong>Remap detected:</strong> If VMA exists → treat as "new" → full <code>process_vm_readv</code> of all pages</li>
+  <li><strong>Truly unmapped:</strong> If no VMA → send <code>PS_IOV_UNMAP_NOTIFY</code> to replica for cleanup</li>
+</ol>
+</div>
+
+<table>
+<thead><tr><th>Scenario</th><th>Detection Method</th><th>Result</th></tr></thead>
+<tbody>
+<tr><td>anon → anon (same flags, same addr)</td><td>UFFD_EVENT_UNMAP + Phase 3 VMA check</td><td class="pros">DETECTED</td></tr>
+<tr><td>anon → file-backed</td><td>UFFD_EVENT_UNMAP + Phase 3 VMA check</td><td class="pros">DETECTED</td></tr>
+<tr><td>file-backed → anon</td><td>UFFD_EVENT_UNMAP + Phase 3 VMA check</td><td class="pros">DETECTED</td></tr>
+<tr><td>partial remap (subset of range)</td><td>UFFD_EVENT_UNMAP covers exact unmapped range</td><td class="pros">DETECTED</td></tr>
+<tr><td>same VMA, never remapped</td><td>No event, no EFAULT</td><td class="pros">no false positive</td></tr>
+<tr><td>munmap only (no remap)</td><td>UFFD_EVENT_UNMAP, no VMA in Phase 3</td><td class="pros">DETECTED (notifies replica)</td></tr>
+</tbody>
+</table>
+
+<div class="verdict ok">
+  <strong>UFFD Events + EFAULT is 100% correct for all scenarios with no freeze overhead</strong>
+  Events arrive during Phase 2 while the process runs. Phase 3 only does a simple VMA list check — no extra PAGEMAP_SCAN. EFAULT fallback ensures coverage even if events are delayed or missed.
+</div>
+
+<h3>Key Advantage: No Freeze Overhead</h3>
+
+<p>Unlike the WPALLOWED probe approach, UFFD events are processed <strong>during Phase 2</strong> while the process continues running. Phase 3 only needs to:</p>
+<ol>
+  <li>Stop the event reader thread (set <code>phase3_started</code> flag)</li>
+  <li>Walk the recorded unmapped ranges array</li>
+  <li>For each range, check if VMA exists in the current VMA list (already parsed for other reasons)</li>
+</ol>
+<p>This is O(unmapped_ranges × VMAs), with both counts typically small. No extra kernel calls during the critical freeze window.</p>
+
+<h2>Implementation Design</h2>
+
+<div class="option-card recommended">
+  <h4>Chosen Approach: UFFD Events + EFAULT Fallback</h4>
+  <p>During Phase 2, a background thread reads UFFD events while bulk transfer uses EFAULT as fallback. Phase 3 checks recorded unmapped ranges against current VMAs to detect remaps.</p>
+  <p class="pros">+ 100% correct for ALL scenarios including anon-to-anon</p>
+  <p class="pros">+ Zero freeze overhead (events processed during Phase 2)</p>
+  <p class="pros">+ Immediate detection (events arrive when unmap happens)</p>
+  <p class="pros">+ EFAULT fallback ensures coverage if events delayed</p>
+  <p class="pros">+ Notifies replica to clean up buffer/RSS for unmapped ranges</p>
+</div>
+
+<h3>1. Enable UFFD Event Features</h3>
+
+<pre><code>/* cow-dump.c: Request event features at UFFDIO_API time */
+args-&gt;uffd_features = UFFD_FEATURE_WP_ASYNC |
+                      UFFD_FEATURE_EVENT_UNMAP |
+                      UFFD_FEATURE_EVENT_REMOVE;
+</code></pre>
+
+<h3>2. UFFD Event Reader Thread</h3>
+
+<pre><code>/*
+ * cow_uffd_event_reader - Read UFFD events during Phase 2
+ *
+ * Runs in background while bulk transfer is active. Reads UFFD_EVENT_UNMAP
+ * and UFFD_EVENT_REMOVE events, recording unmapped ranges.
+ *
+ * Thread exits when Phase 3 starts (signaled via atomic flag).
+ */
+static void *cow_uffd_event_reader(void *arg)
+{
+    struct cow_dump_info *cdi = arg;
+    struct uffd_msg msg;
+    ssize_t n;
+
+    while (!atomic_load(&amp;cdi-&gt;phase3_started)) {
+        struct pollfd pfd = { .fd = cdi-&gt;uffd, .events = POLLIN };
+        int ret = poll(&amp;pfd, 1, 100 /* ms */);
+
+        if (ret &lt;= 0)
+            continue;
+
+        n = read(cdi-&gt;uffd, &amp;msg, sizeof(msg));
+        if (n != sizeof(msg))
+            continue;
+
+        if (msg.event == UFFD_EVENT_UNMAP ||
+            msg.event == UFFD_EVENT_REMOVE) {
+            unsigned long start = msg.arg.remove.start;
+            unsigned long end = msg.arg.remove.end;
+
+            pr_info("UFFD EVENT: %s 0x%lx-0x%lx\n",
+                    msg.event == UFFD_EVENT_UNMAP ? "UNMAP" : "REMOVE",
+                    start, end);
+
+            cow_record_unmapped_range(start, end - start);
+        }
+    }
+
+    return NULL;
+}
+</code></pre>
+
+<h3>3. Unmapped Range Recording (Thread-Safe)</h3>
+
+<pre><code>/*
+ * cow_record_unmapped_range - Record a range that was unmapped
+ *
+ * Called from event reader thread OR bulk sender (on EFAULT).
+ * Thread-safe (multiple callers may run in parallel).
+ */
+void cow_record_unmapped_range(unsigned long start, unsigned long len)
+{
+    struct cow_dump_info *cdi = g_cow_info;
+
+    pthread_mutex_lock(&amp;cdi-&gt;unmapped_lock);
+
+    /* Grow array if needed */
+    if (cdi-&gt;nr_unmapped_ranges &gt;= cdi-&gt;unmapped_capacity) {
+        unsigned int new_cap = cdi-&gt;unmapped_capacity ?
+                               cdi-&gt;unmapped_capacity * 2 : 16;
+        cdi-&gt;unmapped_ranges = xrealloc(cdi-&gt;unmapped_ranges,
+                                        new_cap * sizeof(*cdi-&gt;unmapped_ranges));
+        cdi-&gt;unmapped_capacity = new_cap;
+    }
+
+    cdi-&gt;unmapped_ranges[cdi-&gt;nr_unmapped_ranges].start = start;
+    cdi-&gt;unmapped_ranges[cdi-&gt;nr_unmapped_ranges].end = start + len;
+    cdi-&gt;nr_unmapped_ranges++;
+
+    pthread_mutex_unlock(&amp;cdi-&gt;unmapped_lock);
+}
+</code></pre>
+
+<h3>4. Phase 3: Check Unmapped Ranges for Remaps</h3>
+
+<pre><code>/* In cow_detect_new_vmas(), after existing gap detection: */
+for (i = 0; i &lt; cdi-&gt;nr_unmapped_ranges; i++) {
+    unsigned long u_start = cdi-&gt;unmapped_ranges[i].start;
+    unsigned long u_end = cdi-&gt;unmapped_ranges[i].end;
+    bool has_new_vma = false;
+
+    /* Check if any current VMA overlaps this unmapped range */
+    list_for_each_entry(vma, &amp;vmas-&gt;h, list) {
+        if (!cow_is_vma_trackable(vma))
+            continue;
+        if (vma-&gt;e-&gt;start &lt; u_end &amp;&amp; vma-&gt;e-&gt;end &gt; u_start) {
+            has_new_vma = true;
+            break;
+        }
+    }
+
+    if (has_new_vma) {
+        /* Remap detected - add to new_ranges for full resend */
+        add_range(&amp;ranges, &amp;nr_ranges, &amp;capacity, u_start, u_end - u_start);
+        pr_err("COW REMAP: 0x%lx-0x%lx unmapped then new VMA appeared\n",
+               u_start, u_end);
+    } else {
+        /* Truly unmapped - notify replica to clean up */
+        cow_send_unmap_notification(u_start, u_end - u_start, false);
+    }
+}
+</code></pre>
+
+<h3>5. Replica Notification Protocol</h3>
+
+<pre><code>/* page-xfer.h: New message type */
+#define PS_IOV_UNMAP_NOTIFY  11  /* Range was unmapped on primary */
+
+/* cow_send_unmap_notification - Tell replica a range was unmapped
+ *
+ * Replica will:
+ * - Remove pages from buffer
+ * - MADV_DONTNEED if pages were already applied
+ * - Update lazy IOV list
+ */
+void cow_send_unmap_notification(unsigned long start, unsigned long len,
+                                 bool has_new_vma);
+</code></pre>
+
+<h3>What Happens to Detected Remapped Ranges</h3>
+
+<p>Ranges flagged as remapped enter the existing "new VMA" path:</p>
+<ol>
+  <li><code>cow_extend_tracked_vmas()</code> adds them to the tracked list</li>
+  <li><code>add_lazy_vma_for_new_region()</code> adds them to <code>global_lazy_vmas</code></li>
+  <li>The sender does a <strong>full</strong> <code>process_vm_readv</code> of all pages — not relying on <code>PAGE_IS_WRITTEN</code></li>
+  <li>Zero-fill pages are read as zeros and sent to the replica</li>
+  <li>Replica receives correct content for the entire remapped range</li>
+</ol>
+
+<h3>Replica Handling of PS_IOV_UNMAP_NOTIFY</h3>
+
+<pre><code>/*
+ * cow_handle_unmap_notification - Handle unmap notification from primary
+ *
+ * Reuses existing infrastructure for cleanup.
+ */
+void cow_handle_unmap_notification(unsigned long start, unsigned long len,
+                                   bool has_new_vma)
+{
+    /* Remove from buffer if pages were received */
+    cow_page_buffer_remove_range(start, len);
+
+    /* Mark as unmapped in state tracker */
+    page_state_mark_range_unmapped(start, len);
+
+    /* Release RSS if pages were already applied */
+    if (pages_were_applied(start, len)) {
+        cow_release_unmapped_pages(restored_pid, start, len);
+    }
+
+    /* Remove from lazy IOV list */
+    cow_remove_lazy_iov_range(start, len);
+
+    if (has_new_vma) {
+        /* Re-add to IOV list - will receive new content */
+        cow_add_lazy_iov_range(start, len);
+    }
+
+    /*
+     * TODO: Ask CRIU maintainers if VMA mismatch is acceptable.
+     *
+     * When primary unmaps without remapping, the replica's restored
+     * process still has the VMA (from Phase 1 dump). We release pages
+     * via MADV_DONTNEED but don't remove the VMA itself.
+     *
+     * Options if this is problematic:
+     * 1. Inject munmap via ptrace/compel after restore unfreezes
+     * 2. Update image files before restore to remove VMA entry
+     * 3. Accept the mismatch (current approach)
+     */
+}
+</code></pre>
+
+<h2>Practical Risk Assessment</h2>
+
+<table>
+<thead><tr><th>Factor</th><th>Assessment</th></tr></thead>
+<tbody>
+<tr>
+  <td>How common is munmap+mmap at same address?</td>
+  <td>Rare in most workloads. Happens in custom allocators (jemalloc arena recycling), JIT compilers, and some database engines.</td>
+</tr>
+<tr>
+  <td>How common are unwritten pages after remap?</td>
+  <td>Common if the allocator reserves large regions but fills lazily (e.g., arena-based allocators that <code>mmap</code> large then write incrementally).</td>
+</tr>
+<tr>
+  <td>Existing test coverage</td>
+  <td><code>cow_dump_munmap_reuse.c</code> covers the written case. No test for unwritten pages after reuse.</td>
+</tr>
+<tr>
+  <td>Failure mode without fix</td>
+  <td>SIGBUS on restored process when accessing the missing pages — hard crash, not silent corruption.</td>
+</tr>
+<tr>
+  <td>Mitigation by replica</td>
+  <td>UFFD_EVENT_REMOVE clears stale data, preventing wrong-content-served. But doesn't provide new content either.</td>
+</tr>
+<tr>
+  <td>Performance impact of fix</td>
+  <td>One PAGEMAP_SCAN ioctl per tracked VMA during Phase 3 (frozen). Each probe walks ≤1 PTE. For 1000 VMAs → ~1000 ioctls → sub-millisecond total.</td>
+</tr>
+</tbody>
+</table>
+
+<h2>Files Involved</h2>
+
+<table>
+<thead><tr><th>File</th><th>Change</th></tr></thead>
+<tbody>
+<tr><td><code>criu/cow/cow-dump.c</code></td><td>Add <code>UFFD_FEATURE_EVENT_UNMAP | EVENT_REMOVE</code> to uffd_features. Add <code>unmapped_ranges</code> tracker. Add <code>cow_record_unmapped_range()</code>. Add <code>cow_uffd_event_reader()</code> thread. Extend <code>cow_detect_new_vmas()</code> to check unmapped ranges for remaps.</td></tr>
+<tr><td><code>criu/cow/cow-bulk-send.c</code></td><td>On EFAULT from <code>process_vm_readv</code>: call <code>cow_record_unmapped_range()</code> as fallback.</td></tr>
+<tr><td><code>criu/include/page-xfer.h</code></td><td>Add <code>PS_IOV_UNMAP_NOTIFY</code> (11) message type.</td></tr>
+<tr><td><code>criu/cow/cow-page-xfer.c</code></td><td>Send <code>PS_IOV_UNMAP_NOTIFY</code> to replica for unmapped ranges.</td></tr>
+<tr><td><code>criu/cow/cow-uffd.c</code></td><td>Handle <code>PS_IOV_UNMAP_NOTIFY</code> — reuse existing <code>cow_page_buffer_remove_range()</code> etc.</td></tr>
+<tr><td><code>test/zdtm/static/cow_dump_munmap_reuse_unwritten.c</code></td><td>New test: munmap+mmap at same address with only partial writes — verifies unwritten pages restore as zeros (not SIGBUS).</td></tr>
+<tr><td><code>test/zdtm/static/Makefile</code></td><td>Add new test to build.</td></tr>
+</tbody>
+</table>
+
+</div>
+</body>
+</html>

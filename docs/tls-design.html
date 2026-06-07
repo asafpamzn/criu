@@ -1,0 +1,952 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TLS Design for CRIU COW Migration</title>
+<style>
+:root {
+    --bg: #1a1a2e;
+    --surface: #16213e;
+    --primary: #0f3460;
+    --accent: #e94560;
+    --text: #eaeaea;
+    --muted: #a0a0a0;
+    --success: #4ecdc4;
+    --warning: #f39c12;
+    --code-bg: #0d1b2a;
+    --border: #2a4a7f;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.7;
+    padding: 2rem;
+}
+.container { max-width: 1200px; margin: 0 auto; }
+h1 {
+    font-size: 2.4rem;
+    margin-bottom: 0.5rem;
+    background: linear-gradient(135deg, var(--accent), #ff6b6b);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+}
+.subtitle {
+    color: var(--muted);
+    font-size: 1.1rem;
+    margin-bottom: 2rem;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 1rem;
+}
+h2 {
+    font-size: 1.6rem;
+    color: var(--success);
+    margin-top: 2.5rem;
+    margin-bottom: 1rem;
+    padding-left: 0.8rem;
+    border-left: 4px solid var(--accent);
+}
+h3 {
+    font-size: 1.2rem;
+    color: #7ec8e3;
+    margin-top: 1.5rem;
+    margin-bottom: 0.7rem;
+}
+p { margin-bottom: 1rem; }
+code {
+    font-family: 'JetBrains Mono', 'Fira Code', monospace;
+    background: var(--code-bg);
+    padding: 0.15rem 0.4rem;
+    border-radius: 4px;
+    font-size: 0.9em;
+    color: #ff9f43;
+}
+pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1.2rem;
+    overflow-x: auto;
+    margin: 1rem 0;
+    font-size: 0.85rem;
+    line-height: 1.5;
+}
+pre code {
+    background: none;
+    padding: 0;
+    color: var(--text);
+}
+.card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.5rem;
+    margin: 1.5rem 0;
+}
+.card-title {
+    color: var(--accent);
+    font-weight: 700;
+    margin-bottom: 0.8rem;
+    font-size: 1.1rem;
+}
+table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 1rem 0;
+    font-size: 0.9rem;
+}
+th, td {
+    padding: 0.8rem 1rem;
+    border: 1px solid var(--border);
+    text-align: left;
+}
+th {
+    background: var(--primary);
+    color: var(--success);
+    font-weight: 600;
+}
+tr:nth-child(even) { background: rgba(15, 52, 96, 0.3); }
+.diagram {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1.5rem;
+    margin: 1.5rem 0;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.82rem;
+    line-height: 1.4;
+    white-space: pre;
+    overflow-x: auto;
+}
+.highlight { color: var(--accent); font-weight: bold; }
+.green { color: var(--success); }
+.yellow { color: var(--warning); }
+.blue { color: #7ec8e3; }
+ul, ol { margin-left: 1.5rem; margin-bottom: 1rem; }
+li { margin-bottom: 0.4rem; }
+.badge {
+    display: inline-block;
+    padding: 0.2rem 0.6rem;
+    border-radius: 4px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    margin-right: 0.3rem;
+}
+.badge-existing { background: var(--success); color: #000; }
+.badge-new { background: var(--accent); color: #fff; }
+.badge-change { background: var(--warning); color: #000; }
+.toc {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.5rem;
+    margin: 1.5rem 0;
+}
+.toc a { color: #7ec8e3; text-decoration: none; }
+.toc a:hover { text-decoration: underline; }
+.toc ul { list-style: none; margin-left: 0; }
+.toc li { margin-bottom: 0.3rem; padding-left: 1rem; }
+.toc li::before { content: ""; margin-right: 0.5rem; color: var(--accent); }
+.phase-indicator {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    margin-right: 0.4rem;
+    vertical-align: middle;
+}
+.phase-existing { background: var(--success); }
+.phase-new { background: var(--accent); }
+</style>
+</head>
+<body>
+<div class="container">
+
+<h1>TLS Design for CRIU COW Migration</h1>
+<p class="subtitle">Securing all network connections between Source (PRIMARY) and Target (REPLICA) during live migration &mdash; modeled after Valkey's TLS architecture</p>
+
+<div class="toc">
+<h3 style="margin-top:0">Contents</h3>
+<ul>
+<li><a href="#motivation">1. Motivation &amp; Goals</a></li>
+<li><a href="#current-state">2. Current State Analysis</a></li>
+<li><a href="#valkey-model">3. Valkey TLS Model (Reference)</a></li>
+<li><a href="#connection-map">4. CRIU COW Connection Map</a></li>
+<li><a href="#architecture">5. Proposed TLS Architecture</a></li>
+<li><a href="#per-connection-tls">6. Per-Connection TLS (Thread-Safe)</a></li>
+<li><a href="#config">7. Configuration &amp; CLI Options</a></li>
+<li><a href="#implementation">8. Implementation Plan</a></li>
+<li><a href="#api">9. New TLS API</a></li>
+<li><a href="#files">10. Files to Modify</a></li>
+<li><a href="#security">11. Security Considerations</a></li>
+</ul>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="motivation">1. Motivation &amp; Goals</h2>
+
+<p>When migrating a Valkey process via CRIU COW dump, all page data (hundreds of GBs) flows over the network between the source and target machines. This data includes the full memory contents of Valkey &mdash; including encryption keys, user data, authentication tokens, and in-flight queries.</p>
+
+<div class="card">
+<div class="card-title">Requirements</div>
+<ul>
+<li><strong>Encryption:</strong> All data in transit must be encrypted (TLS 1.2+)</li>
+<li><strong>Mutual Authentication:</strong> Both source and target must present valid X.509 certificates</li>
+<li><strong>Multi-connection support:</strong> P3 parallel connections (up to 15 threads) must each have independent TLS sessions</li>
+<li><strong>Performance:</strong> TLS overhead must not become the bottleneck (currently LZ4 compression + tcp_sendmsg dominate)</li>
+<li><strong>Consistency with Valkey:</strong> Use the same certificate infrastructure that Valkey itself uses</li>
+</ul>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="current-state">2. Current State Analysis</h2>
+
+<h3>Existing TLS Implementation (Upstream CRIU)</h3>
+<p>CRIU already has basic TLS support using <strong>GnuTLS</strong>, but it has a critical limitation for COW mode:</p>
+
+<div class="card">
+<div class="card-title">Current Implementation: <code>criu/tls.c</code></div>
+<pre><code>/* PROBLEM: Global singleton state - NOT thread-safe */
+static gnutls_session_t session;              /* Single global session */
+static gnutls_certificate_credentials_t x509_cred;
+static int tls_sk = -1;                       /* Single socket */
+static int tls_sk_flags = 0;
+
+/* Only one TLS session can exist at a time */
+int tls_x509_init(int sockfd, bool is_server) { ... }
+ssize_t tls_send(const void *buf, size_t len, int flags) { ... }
+ssize_t tls_recv(void *buf, size_t len, int flags) { ... }</code></pre>
+</div>
+
+<h3>The Problem</h3>
+<table>
+<tr><th>Issue</th><th>Impact</th><th>Severity</th></tr>
+<tr><td>Global singleton TLS session</td><td>Only one connection can use TLS at a time</td><td><span class="badge badge-new">CRITICAL</span></td></tr>
+<tr><td><code>tls_x509_init()</code> called from P3 threads</td><td>Race condition: overwrites global session</td><td><span class="badge badge-new">CRITICAL</span></td></tr>
+<tr><td><code>page_server_send/recv</code> use global <code>opts.tls</code> flag</td><td>Can't mix TLS and non-TLS connections</td><td><span class="badge badge-change">HIGH</span></td></tr>
+<tr><td>No per-socket TLS context</td><td>P3 threads (15 sockets) share one session object</td><td><span class="badge badge-new">CRITICAL</span></td></tr>
+</table>
+
+<p>The current <code>tls_x509_init()</code> calls in <code>cow-p3-receiver.c</code> (lines 251, 306, 336) appear to be placeholders &mdash; they will <strong>crash or corrupt</strong> in multi-threaded COW mode because they overwrite the global session.</p>
+
+<!-- ============================================================ -->
+<h2 id="valkey-model">3. Valkey TLS Model (Reference)</h2>
+
+<p>Valkey (and Redis 6+) implements TLS using <strong>OpenSSL</strong> with a per-connection architecture. Key design patterns to replicate:</p>
+
+<div class="card">
+<div class="card-title">Valkey TLS Architecture</div>
+<table>
+<tr><th>Aspect</th><th>Valkey Approach</th></tr>
+<tr><td>Library</td><td>OpenSSL (libssl/libcrypto)</td></tr>
+<tr><td>Context</td><td>Shared <code>SSL_CTX</code> (certificate config), per-connection <code>SSL</code> objects</td></tr>
+<tr><td>Configuration</td><td><code>tls-port</code>, <code>tls-cert-file</code>, <code>tls-key-file</code>, <code>tls-ca-cert-file</code>, <code>tls-ca-cert-dir</code>, <code>tls-auth-clients</code>, <code>tls-replication</code></td></tr>
+<tr><td>Replication</td><td>Replicas connect to primary over TLS; same certs; mutual auth configurable</td></tr>
+<tr><td>Thread Safety</td><td>Each connection has its own <code>SSL</code> session; <code>SSL_CTX</code> is thread-safe for reads</td></tr>
+<tr><td>Handshake</td><td>Non-blocking handshake integrated into event loop (we can use blocking for CRIU)</td></tr>
+<tr><td>Client Auth</td><td><code>tls-auth-clients yes|no|optional</code> &mdash; mutual TLS when required</td></tr>
+<tr><td>Session Cache</td><td>Server-side session caching for resumed connections (reduces handshake cost)</td></tr>
+<tr><td>Min Protocol</td><td><code>tls-protocols "TLSv1.2 TLSv1.3"</code></td></tr>
+<tr><td>Cipher Config</td><td><code>tls-ciphersuites</code> for TLS 1.3, <code>tls-ciphers</code> for TLS 1.2</td></tr>
+</table>
+</div>
+
+<h3>Key Valkey Pattern: Shared Context, Per-Connection Sessions</h3>
+<pre><code>/* Valkey: one SSL_CTX shared across all connections */
+SSL_CTX *ctx = SSL_CTX_new(TLS_method());
+SSL_CTX_use_certificate_file(ctx, cert_file, SSL_FILETYPE_PEM);
+SSL_CTX_use_PrivateKey_file(ctx, key_file, SSL_FILETYPE_PEM);
+SSL_CTX_load_verify_locations(ctx, ca_cert_file, ca_cert_dir);
+
+/* Per-connection: each socket gets its own SSL object */
+SSL *ssl = SSL_new(ctx);      /* Lightweight - shares ctx config */
+SSL_set_fd(ssl, socket_fd);
+SSL_connect(ssl);             /* or SSL_accept() on server side */
+
+/* I/O is per-connection - thread-safe */
+SSL_write(ssl, data, len);
+SSL_read(ssl, buf, len);</code></pre>
+
+<p>This is exactly the model we need for CRIU COW: one shared credential context, but 15+ independent TLS sessions for parallel P3 threads.</p>
+
+<!-- ============================================================ -->
+<h2 id="connection-map">4. CRIU COW Connection Map</h2>
+
+<p>During a COW migration, the following network connections exist between source and target:</p>
+
+<div class="diagram">
+<span class="highlight">SOURCE (PRIMARY)</span>                                        <span class="green">TARGET (REPLICA)</span>
+
+ criu dump --cow-dump                              criu lazy-pages
+ ┌─────────────────────┐                          ┌──────────────────────┐
+ │                     │                          │                      │
+ │  Page Server        │◄────── <span class="yellow">Connection 1</span> ────►│  Page Client          │
+ │  (accept on port)   │     Control + P1/P2      │  (connect_to_page_   │
+ │                     │     pages + signals      │   server_to_recv)    │
+ │                     │                          │                      │
+ │  P3 Accept (same    │◄────── <span class="yellow">Connection 2..N</span> ──►│  P3 Receiver Threads  │
+ │  listen socket)     │     Parallel page data   │  (connect_p3_sockets)│
+ │  cow-unified-thread │     (LZ4 compressed)     │  cow-p3-receiver.c   │
+ │                     │                          │                      │
+ │  File Transfer      │◄────── <span class="yellow">Connection N+1</span> ──►│  Skeleton File Recv   │
+ │  (cow-bulk-recv.c)  │     Image files/metadata │  (cow-bulk-recv.c)   │
+ │                     │                          │                      │
+ └─────────────────────┘                          └──────────────────────┘
+
+ Port: opts.port (single listen socket, multiple accept())
+
+ <span class="blue">Connection Types:</span>
+ 1. <span class="yellow">Main Control Channel</span> - page requests, ACKs, signals (PS_IOV_*)
+ 2. <span class="yellow">P3 Data Channels</span> - 15 parallel connections for bulk page transfer
+ 3. <span class="yellow">File Transfer</span> - skeleton image files (uses same page server socket)
+</div>
+
+<div class="card">
+<div class="card-title">Connection Details</div>
+<table>
+<tr><th>Connection</th><th>Direction</th><th>Purpose</th><th>Count</th><th>Current TLS</th></tr>
+<tr>
+    <td>Main Page Server</td>
+    <td>Replica &rarr; Primary</td>
+    <td>Control messages, page requests, ACKs, skeleton files</td>
+    <td>1</td>
+    <td><span class="badge badge-existing">Works (singleton)</span></td>
+</tr>
+<tr>
+    <td>P3 Data Channels</td>
+    <td>Replica &rarr; Primary</td>
+    <td>Parallel bulk page transfer (LZ4 compressed batches)</td>
+    <td>4-15</td>
+    <td><span class="badge badge-new">BROKEN (global state)</span></td>
+</tr>
+</table>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="architecture">5. Proposed TLS Architecture</h2>
+
+<p>Following Valkey's model, we separate TLS into two layers:</p>
+
+<div class="diagram">
+┌─────────────────────────────────────────────────────────────────────┐
+│                     <span class="highlight">TLS Architecture (New)</span>                          │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  <span class="green">Layer 1: Shared Credential Context</span> (process-wide, init once)       │
+│  ┌───────────────────────────────────────────────────────────────┐  │
+│  │  struct tls_context {                                         │  │
+│  │      gnutls_certificate_credentials_t x509_cred;             │  │
+│  │      /* Loaded once: CA cert, server cert, private key */     │  │
+│  │      /* Thread-safe for reads after initialization */         │  │
+│  │  };                                                           │  │
+│  └───────────────────────────────────────────────────────────────┘  │
+│                              │                                       │
+│              ┌───────────────┼───────────────────┐                   │
+│              ▼               ▼                   ▼                   │
+│  <span class="yellow">Layer 2: Per-Connection Sessions</span> (one per socket)                  │
+│  ┌──────────────┐  ┌──────────────┐    ┌──────────────┐            │
+│  │ tls_conn #1  │  │ tls_conn #2  │    │ tls_conn #N  │            │
+│  │  session     │  │  session     │    │  session     │            │
+│  │  socket_fd   │  │  socket_fd   │    │  socket_fd   │            │
+│  │  send/recv   │  │  send/recv   │    │  send/recv   │            │
+│  └──────────────┘  └──────────────┘    └──────────────┘            │
+│   Main control       P3 thread 0         P3 thread N-1              │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+</div>
+
+<!-- ============================================================ -->
+<h2 id="per-connection-tls">6. Per-Connection TLS (Thread-Safe)</h2>
+
+<h3>Core Design: <code>struct tls_conn</code></h3>
+
+<pre><code>/* New: Per-connection TLS state (replaces global singleton) */
+struct tls_conn {
+    gnutls_session_t session;
+    int socket_fd;
+    int flags;             /* For push/pull callbacks */
+    bool is_server;
+};
+
+/* Shared credential context (init once, use by all connections) */
+struct tls_context {
+    gnutls_certificate_credentials_t x509_cred;
+    bool initialized;
+    pthread_mutex_t init_lock;  /* Protects one-time init */
+};
+
+/* Global shared context */
+static struct tls_context g_tls_ctx;
+
+/* API */
+int tls_global_init(void);                           /* Load certs once */
+struct tls_conn *tls_conn_new(int sockfd, bool is_server);  /* Per-socket */
+void tls_conn_free(struct tls_conn *conn);
+ssize_t tls_conn_send(struct tls_conn *conn, const void *buf, size_t len, int flags);
+ssize_t tls_conn_recv(struct tls_conn *conn, void *buf, size_t len, int flags);
+</code></pre>
+
+<h3>Thread Safety Model</h3>
+
+<div class="card">
+<div class="card-title">Concurrency Guarantees</div>
+<ul>
+<li><strong>Credential loading:</strong> Done once during startup via <code>tls_global_init()</code>. Protected by mutex for lazy init.</li>
+<li><strong>Session creation:</strong> <code>tls_conn_new()</code> creates independent GnuTLS sessions. Each session has its own state.</li>
+<li><strong>I/O operations:</strong> Each P3 thread owns its <code>tls_conn</code> exclusively &mdash; no locking needed for send/recv.</li>
+<li><strong>GnuTLS thread safety:</strong> GnuTLS is thread-safe when sessions are not shared. <code>gnutls_global_init()</code> called once.</li>
+</ul>
+</div>
+
+<h3>Integration with Existing Code</h3>
+
+<pre><code>/* page-xfer.c: Main page server connection (backward compatible) */
+static struct tls_conn *g_page_server_tls = NULL;
+
+static inline int __send(int sk, const void *buf, size_t sz, int fl)
+{
+    if (g_page_server_tls)
+        return tls_conn_send(g_page_server_tls, buf, sz, fl);
+    return send(sk, buf, sz, fl);
+}
+
+/* cow-p3-receiver.c: Each P3 thread gets its own tls_conn */
+struct p3_receiver_ctx {
+    ...
+    struct tls_conn *tls;     /* Per-thread TLS connection */
+};
+
+/* cow-bulk-send.c: Each P3 sender thread gets its own tls_conn */
+struct p3_thread_ctx {
+    ...
+    struct tls_conn *tls;     /* Per-thread TLS connection */
+};</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="config">7. Configuration &amp; CLI Options</h2>
+
+<h3>Existing Options (Keep)</h3>
+<table>
+<tr><th>Option</th><th>Current</th><th>Note</th></tr>
+<tr><td><code>--tls</code></td><td>Boolean flag to enable TLS</td><td>Keep as master switch</td></tr>
+<tr><td><code>--tls-cacert</code></td><td>CA certificate file path</td><td>Keep</td></tr>
+<tr><td><code>--tls-cacrl</code></td><td>Certificate revocation list</td><td>Keep</td></tr>
+<tr><td><code>--tls-cert</code></td><td>Server/client certificate</td><td>Keep</td></tr>
+<tr><td><code>--tls-key</code></td><td>Private key file</td><td>Keep</td></tr>
+<tr><td><code>--tls-no-cn-verify</code></td><td>Skip CN verification</td><td>Keep</td></tr>
+</table>
+
+<h3>New Options (Valkey-Inspired)</h3>
+<table>
+<tr><th>Option</th><th>Description</th><th>Default</th><th>Valkey Equivalent</th></tr>
+<tr><td><code>--tls-priority</code></td><td>GnuTLS priority string (cipher/protocol selection)</td><td><code>NORMAL</code></td><td><code>tls-ciphers</code> / <code>tls-protocols</code></td></tr>
+<tr><td><code>--tls-mutual-auth</code></td><td>Require client certificate (mutual TLS)</td><td><code>yes</code></td><td><code>tls-auth-clients</code></td></tr>
+</table>
+
+<h3>Valkey Reuse: Same Certificates</h3>
+<p>When migrating a Valkey process, use the <strong>same certificate files</strong> that Valkey itself is configured with. Example deployment:</p>
+
+<pre><code># Both CRIU source and target use Valkey's existing PKI:
+criu dump --cow-dump \
+    --tls \
+    --tls-cert /etc/valkey/tls/server.crt \
+    --tls-key /etc/valkey/tls/server.key \
+    --tls-cacert /etc/valkey/tls/ca.crt \
+    --address target-host \
+    --port 27182
+
+criu lazy-pages \
+    --tls \
+    --tls-cert /etc/valkey/tls/server.crt \
+    --tls-key /etc/valkey/tls/server.key \
+    --tls-cacert /etc/valkey/tls/ca.crt \
+    --address source-host \
+    --port 27182</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="implementation">8. Implementation Plan</h2>
+
+<h3>Phase 1: Per-Connection TLS Core (Replace Singleton)</h3>
+
+<div class="card">
+<div class="card-title">Step 1: New <code>tls_conn</code> API</div>
+<p>Create <code>criu/tls-conn.c</code> and <code>criu/include/tls-conn.h</code> with the per-connection TLS implementation. Keep the old <code>tls.c</code> as a thin wrapper for backward compatibility with non-COW code paths.</p>
+<pre><code>/* criu/include/tls-conn.h */
+#ifndef __CR_TLS_CONN_H__
+#define __CR_TLS_CONN_H__
+
+#include &lt;stdbool.h&gt;
+#include &lt;sys/types.h&gt;
+
+struct tls_conn;
+
+/* Initialize global TLS context (load certificates). Call once. */
+int tls_global_init(void);
+
+/* Shutdown global TLS context. Call at exit. */
+void tls_global_deinit(void);
+
+/* Create a new TLS connection on an existing socket.
+ * Performs handshake and certificate verification.
+ * Returns NULL on failure. */
+struct tls_conn *tls_conn_new(int sockfd, bool is_server);
+
+/* Close TLS session and free resources. Does NOT close the socket. */
+void tls_conn_free(struct tls_conn *conn);
+
+/* Send data over TLS connection. Same semantics as send(). */
+ssize_t tls_conn_send(struct tls_conn *conn, const void *buf,
+                      size_t len, int flags);
+
+/* Receive data over TLS connection. Same semantics as recv(). */
+ssize_t tls_conn_recv(struct tls_conn *conn, void *buf,
+                      size_t len, int flags);
+
+/* Blocking send-all: retries short writes until all bytes sent. */
+ssize_t tls_conn_send_all(struct tls_conn *conn, const void *buf,
+                          size_t len, int flags);
+
+/* Blocking recv-all: retries until all bytes received. */
+ssize_t tls_conn_recv_all(struct tls_conn *conn, void *buf,
+                          size_t len, int flags);
+
+#endif /* __CR_TLS_CONN_H__ */</code></pre>
+</div>
+
+<h3>Phase 2: Integrate into Page Transfer</h3>
+
+<div class="card">
+<div class="card-title">Step 2: Per-Socket TLS in <code>page_server_send/recv</code></div>
+<p>Modify the send/recv wrappers to accept an optional <code>tls_conn</code> parameter, or look up the TLS connection from a socket-to-TLS map.</p>
+<pre><code>/* Option A: Pass tls_conn explicitly (cleanest, minimal refactor) */
+int page_server_send_tls(struct tls_conn *tls, int sk,
+                         const void *buf, size_t sz, int fl)
+{
+    if (tls)
+        return tls_conn_send_all(tls, buf, sz, fl);
+    return __send_all(sk, buf, sz, fl);
+}
+
+/* Option B: Thread-local TLS connection (matches current pattern) */
+static __thread struct tls_conn *tl_tls_conn = NULL;
+
+int page_server_send(int sk, const void *buf, size_t sz, int fl)
+{
+    if (tl_tls_conn)
+        return tls_conn_send_all(tl_tls_conn, buf, sz, fl);
+    return __send_all_plain(sk, buf, sz, fl);
+}
+
+/* Each P3 thread sets its thread-local before starting work */
+void page_server_set_thread_tls(struct tls_conn *conn)
+{
+    tl_tls_conn = conn;
+}</code></pre>
+</div>
+
+<h3>Phase 3: P3 Thread Integration</h3>
+
+<div class="card">
+<div class="card-title">Step 3: TLS in Sender Threads (<code>cow-bulk-send.c</code>)</div>
+<pre><code>/* cow-bulk-send.c: p3_bulk_sender_thread */
+static void *p3_bulk_sender_thread(void *arg)
+{
+    struct p3_thread_ctx *ctx = (struct p3_thread_ctx *)arg;
+
+    /* Initialize per-thread TLS session (if TLS enabled) */
+    if (opts.tls) {
+        ctx->tls = tls_conn_new(ctx->socket, false);  /* client side */
+        if (!ctx->tls) {
+            pr_err("P3[%d]: TLS handshake failed\n", ctx->thread_id);
+            ctx->error = true;
+            return NULL;
+        }
+        page_server_set_thread_tls(ctx->tls);
+    }
+
+    /* ... existing bulk send logic (page_server_send already TLS-aware) ... */
+
+    /* Cleanup */
+    if (ctx->tls) {
+        tls_conn_free(ctx->tls);
+        ctx->tls = NULL;
+        page_server_set_thread_tls(NULL);
+    }
+    return NULL;
+}</code></pre>
+</div>
+
+<div class="card">
+<div class="card-title">Step 4: TLS in Receiver Threads (<code>cow-p3-receiver.c</code>)</div>
+<pre><code>/* cow-p3-receiver.c: p3_receiver_thread_func */
+static void *p3_receiver_thread_func(void *arg)
+{
+    struct p3_receiver_ctx *ctx = (struct p3_receiver_ctx *)arg;
+
+    /* Initialize per-thread TLS session (server side) */
+    if (opts.tls) {
+        ctx->tls = tls_conn_new(ctx->socket, true);  /* server side */
+        BUG_ON(!ctx->tls);
+        page_server_set_thread_tls(ctx->tls);
+    }
+
+    /* ... existing receive logic ... */
+
+    if (ctx->tls) {
+        tls_conn_free(ctx->tls);
+        ctx->tls = NULL;
+    }
+    return NULL;
+}
+
+/* accept_p3_connections: TLS handshake on accept (server side) */
+int accept_p3_connections(int *sockets, struct tls_conn **tls_conns,
+                          int max_connections, int timeout_ms)
+{
+    /* ... accept loop ... */
+    if (opts.tls) {
+        tls_conns[num_accepted] = tls_conn_new(sk, true);
+        if (!tls_conns[num_accepted]) {
+            close(sk);
+            continue;  /* Skip failed handshakes */
+        }
+    }
+    /* ... */
+}</code></pre>
+</div>
+
+<h3>Phase 4: Main Connection (Backward Compat)</h3>
+
+<div class="card">
+<div class="card-title">Step 5: Migrate Main Page Server Connection</div>
+<pre><code>/* page-xfer.c: connect_to_page_server */
+static struct tls_conn *g_page_server_tls = NULL;
+
+static int connect_to_page_server(void)
+{
+    /* ... existing connect logic ... */
+
+    if (opts.tls) {
+        /* Use new per-connection API */
+        if (!tls_global_ctx_ready())
+            tls_global_init();
+
+        g_page_server_tls = tls_conn_new(page_server_sk, false);
+        if (!g_page_server_tls) {
+            close(page_server_sk);
+            return -1;
+        }
+        /* Set as the "main thread" TLS connection */
+        page_server_set_thread_tls(g_page_server_tls);
+    }
+    /* ... */
+}
+
+/* Page server accept side */
+static int page_server_start(...)
+{
+    /* ... accept ... */
+    if (opts.tls) {
+        tls_global_init();
+        g_page_server_tls = tls_conn_new(ask, true);
+        if (!g_page_server_tls)
+            return -1;
+        page_server_set_thread_tls(g_page_server_tls);
+    }
+    /* ... */
+}</code></pre>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="api">9. New TLS API</h2>
+
+<h3>Full Implementation: <code>criu/tls-conn.c</code></h3>
+
+<pre><code>#include &lt;gnutls/gnutls.h&gt;
+#include &lt;pthread.h&gt;
+#include "cr_options.h"
+#include "tls-conn.h"
+#include "criu-log.h"
+
+struct tls_conn {
+    gnutls_session_t session;
+    int socket_fd;
+    int io_flags;
+};
+
+static struct {
+    gnutls_certificate_credentials_t x509_cred;
+    bool initialized;
+    pthread_once_t once;
+} g_tls_ctx = { .once = PTHREAD_ONCE_INIT };
+
+static void _tls_global_init_once(void)
+{
+    gnutls_global_init();
+
+    gnutls_certificate_allocate_credentials(&g_tls_ctx.x509_cred);
+
+    /* Load CA trust */
+    if (opts.tls_cacert)
+        gnutls_certificate_set_x509_trust_file(
+            g_tls_ctx.x509_cred, opts.tls_cacert, GNUTLS_X509_FMT_PEM);
+    else
+        gnutls_certificate_set_x509_system_trust(g_tls_ctx.x509_cred);
+
+    /* Load CRL if provided */
+    if (opts.tls_cacrl)
+        gnutls_certificate_set_x509_crl_file(
+            g_tls_ctx.x509_cred, opts.tls_cacrl, GNUTLS_X509_FMT_PEM);
+
+    /* Load our cert + key */
+    gnutls_certificate_set_x509_key_file(
+        g_tls_ctx.x509_cred,
+        opts.tls_cert ? opts.tls_cert : CRIU_CERT,
+        opts.tls_key ? opts.tls_key : CRIU_KEY,
+        GNUTLS_X509_FMT_PEM);
+
+    g_tls_ctx.initialized = true;
+}
+
+int tls_global_init(void)
+{
+    pthread_once(&g_tls_ctx.once, _tls_global_init_once);
+    return g_tls_ctx.initialized ? 0 : -1;
+}
+
+/* Push/pull callbacks - use conn->socket_fd */
+static ssize_t _conn_push(gnutls_transport_ptr_t ptr,
+                           const void *data, size_t sz)
+{
+    struct tls_conn *conn = (struct tls_conn *)ptr;
+    return send(conn->socket_fd, data, sz, conn->io_flags);
+}
+
+static ssize_t _conn_pull(gnutls_transport_ptr_t ptr,
+                           void *data, size_t sz)
+{
+    struct tls_conn *conn = (struct tls_conn *)ptr;
+    return recv(conn->socket_fd, data, sz, conn->io_flags);
+}
+
+struct tls_conn *tls_conn_new(int sockfd, bool is_server)
+{
+    struct tls_conn *conn;
+    unsigned int flags;
+    int ret;
+
+    if (!g_tls_ctx.initialized)
+        tls_global_init();
+
+    conn = xmalloc(sizeof(*conn));
+    if (!conn)
+        return NULL;
+
+    conn->socket_fd = sockfd;
+    conn->io_flags = 0;
+
+    flags = is_server ? GNUTLS_SERVER : GNUTLS_CLIENT;
+    ret = gnutls_init(&conn->session, flags);
+    if (ret != GNUTLS_E_SUCCESS)
+        goto err_free;
+
+    gnutls_credentials_set(conn->session,
+                           GNUTLS_CRD_CERTIFICATE, g_tls_ctx.x509_cred);
+    gnutls_set_default_priority(conn->session);
+
+    /* Transport callbacks use conn pointer */
+    gnutls_transport_set_ptr(conn->session, conn);
+    gnutls_transport_set_push_function(conn->session, _conn_push);
+    gnutls_transport_set_pull_function(conn->session, _conn_pull);
+
+    if (is_server) {
+        gnutls_certificate_server_set_request(
+            conn->session, GNUTLS_CERT_REQUIRE);
+        gnutls_certificate_send_x509_rdn_sequence(conn->session, 1);
+    }
+
+    /* Perform handshake */
+    do {
+        ret = gnutls_handshake(conn->session);
+    } while (ret == GNUTLS_E_AGAIN || ret == GNUTLS_E_INTERRUPTED);
+
+    if (ret != GNUTLS_E_SUCCESS)
+        goto err_session;
+
+    /* Verify peer certificate */
+    if (!is_server || opts.tls_mutual_auth) {
+        unsigned status;
+        const char *hostname = opts.tls_no_cn_verify ? NULL : opts.addr;
+        ret = gnutls_certificate_verify_peers3(
+            conn->session, hostname, &status);
+        if (ret != GNUTLS_E_SUCCESS || status != 0)
+            goto err_session;
+    }
+
+    return conn;
+
+err_session:
+    gnutls_deinit(conn->session);
+err_free:
+    xfree(conn);
+    return NULL;
+}
+
+ssize_t tls_conn_send(struct tls_conn *conn,
+                       const void *buf, size_t len, int flags)
+{
+    conn->io_flags = flags;
+    ssize_t ret = gnutls_record_send(conn->session, buf, len);
+    conn->io_flags = 0;
+    if (ret < 0) {
+        errno = (ret == GNUTLS_E_AGAIN) ? EAGAIN : EIO;
+        return -1;
+    }
+    return ret;
+}
+
+ssize_t tls_conn_recv(struct tls_conn *conn,
+                       void *buf, size_t len, int flags)
+{
+    conn->io_flags = flags;
+    ssize_t ret = gnutls_record_recv(conn->session, buf, len);
+    conn->io_flags = 0;
+    if (ret < 0) {
+        errno = (ret == GNUTLS_E_AGAIN) ? EAGAIN : EIO;
+        return -1;
+    }
+    return ret;
+}
+
+ssize_t tls_conn_send_all(struct tls_conn *conn,
+                           const void *buf, size_t len, int flags)
+{
+    const char *cursor = buf;
+    size_t remaining = len;
+
+    while (remaining > 0) {
+        ssize_t ret = tls_conn_send(conn, cursor, remaining, flags);
+        if (ret < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (ret == 0) return len - remaining;
+        cursor += ret;
+        remaining -= ret;
+    }
+    return len;
+}
+
+void tls_conn_free(struct tls_conn *conn)
+{
+    if (!conn) return;
+    gnutls_bye(conn->session, GNUTLS_SHUT_WR);
+    gnutls_deinit(conn->session);
+    xfree(conn);
+}
+
+void tls_global_deinit(void)
+{
+    if (g_tls_ctx.initialized) {
+        gnutls_certificate_free_credentials(g_tls_ctx.x509_cred);
+        gnutls_global_deinit();
+        g_tls_ctx.initialized = false;
+    }
+}</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="files">10. Files to Modify</h2>
+
+<table>
+<tr><th>File</th><th>Action</th><th>Description</th></tr>
+<tr><td><code>criu/tls-conn.c</code></td><td><span class="badge badge-new">NEW</span></td><td>Per-connection TLS implementation</td></tr>
+<tr><td><code>criu/include/tls-conn.h</code></td><td><span class="badge badge-new">NEW</span></td><td>Per-connection TLS API header</td></tr>
+<tr><td><code>criu/tls.c</code></td><td><span class="badge badge-change">MODIFY</span></td><td>Thin wrapper: delegate to tls-conn for COW mode, keep singleton for legacy</td></tr>
+<tr><td><code>criu/include/tls.h</code></td><td><span class="badge badge-change">MODIFY</span></td><td>Add <code>#include "tls-conn.h"</code> for COW code</td></tr>
+<tr><td><code>criu/page-xfer.c</code></td><td><span class="badge badge-change">MODIFY</span></td><td>Use thread-local <code>tls_conn</code> in send/recv wrappers</td></tr>
+<tr><td><code>criu/cow/cow-p3-receiver.c</code></td><td><span class="badge badge-change">MODIFY</span></td><td>Create per-thread <code>tls_conn</code> on accept and in receiver threads</td></tr>
+<tr><td><code>criu/cow/cow-bulk-send.c</code></td><td><span class="badge badge-change">MODIFY</span></td><td>Create per-thread <code>tls_conn</code> in P3 sender threads</td></tr>
+<tr><td><code>criu/cow/cow-unified-thread.c</code></td><td><span class="badge badge-change">MODIFY</span></td><td>Initialize TLS context before accepting P3 connections</td></tr>
+<tr><td><code>criu/include/cr_options.h</code></td><td><span class="badge badge-change">MODIFY</span></td><td>Add <code>tls_priority</code>, <code>tls_mutual_auth</code> options</td></tr>
+<tr><td><code>criu/config.c</code></td><td><span class="badge badge-change">MODIFY</span></td><td>Parse new TLS options</td></tr>
+<tr><td><code>Makefile.criu</code></td><td><span class="badge badge-change">MODIFY</span></td><td>Add <code>tls-conn.o</code> to build</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="security">11. Security Considerations</h2>
+
+<div class="card">
+<div class="card-title">Certificate Deployment Model</div>
+<p>Recommended: Use the same PKI infrastructure as Valkey itself.</p>
+<pre><code>/etc/valkey/tls/
+├── ca.crt           # Trusted CA certificate
+├── server.crt       # Machine certificate (unique per host)
+├── server.key       # Machine private key (mode 0600)
+└── ca.crl           # Certificate revocation list (optional)
+
+# Both CRIU source and target reference these files
+# Mutual TLS ensures both sides are authorized migration peers</code></pre>
+</div>
+
+<div class="card">
+<div class="card-title">Threat Model</div>
+<table>
+<tr><th>Threat</th><th>Mitigation</th></tr>
+<tr><td>Network eavesdropping on page data</td><td>TLS encryption on all connections</td></tr>
+<tr><td>Rogue target stealing process memory</td><td>Mutual TLS: target must present valid cert</td></tr>
+<tr><td>Rogue source injecting malicious pages</td><td>Mutual TLS: source must present valid cert</td></tr>
+<tr><td>Downgrade attacks</td><td><code>--tls-priority</code> enforces minimum TLS 1.2</td></tr>
+<tr><td>Compromised certificate</td><td>CRL support via <code>--tls-cacrl</code></td></tr>
+<tr><td>Replay attacks</td><td>TLS session keys are ephemeral (PFS with DHE/ECDHE)</td></tr>
+</table>
+</div>
+
+<div class="card">
+<div class="card-title">Performance Considerations</div>
+<ul>
+<li><strong>Handshake overhead:</strong> ~2-5ms per connection. With 15 P3 threads connecting in parallel, total is still ~5ms (parallel handshakes).</li>
+<li><strong>Encryption throughput:</strong> AES-256-GCM on modern CPUs (AES-NI): ~5-10 GB/s per core. The bottleneck remains tcp_sendmsg and LZ4 compression, not TLS.</li>
+<li><strong>Record overhead:</strong> ~29 bytes per TLS record. With batch sizes of 256KB+, this is negligible (&lt;0.01%).</li>
+<li><strong>Memory:</strong> ~100KB per GnuTLS session. 15 P3 threads = ~1.5MB total &mdash; trivial vs the GB of page data.</li>
+<li><strong>Session resumption:</strong> Not needed; connections are long-lived (entire migration duration).</li>
+</ul>
+</div>
+
+<div class="card">
+<div class="card-title">Migration Timeline with TLS</div>
+<div class="diagram">
+Time ──────────────────────────────────────────────────────────────────►
+
+<span class="green">Startup</span>          <span class="yellow">Phase 2 (Process Running)</span>         <span class="highlight">Phase 3 (Frozen)</span>
+│                │                                  │
+├─ tls_global_init()                               │
+├─ Main conn: tls_conn_new() [5ms]                 │
+│                │                                  │
+│                ├─ P3 conns: 15x tls_conn_new()    │
+│                │  [parallel, ~5ms total]          │
+│                │                                  │
+│                ├─ Bulk transfer over TLS ─────────┤─ Final dirty pages
+│                │  (~10 GB/s per thread)           │  over TLS
+│                │                                  │
+│                                                   ├─ Close TLS sessions
+│                                                   │  [~1ms each]
+</div>
+</div>
+
+<h3>Comparison: Valkey TLS vs CRIU COW TLS</h3>
+<table>
+<tr><th>Aspect</th><th>Valkey</th><th>CRIU COW (Proposed)</th></tr>
+<tr><td>Library</td><td>OpenSSL</td><td>GnuTLS (existing dependency)</td></tr>
+<tr><td>Context sharing</td><td><code>SSL_CTX</code> shared, <code>SSL</code> per-conn</td><td><code>x509_cred</code> shared, <code>session</code> per-conn</td></tr>
+<tr><td>Thread model</td><td>Single-threaded event loop + I/O threads</td><td>Multi-threaded (15+ P3 threads)</td></tr>
+<tr><td>Connection lifetime</td><td>Long (client sessions, replication)</td><td>Medium (duration of migration)</td></tr>
+<tr><td>Mutual auth</td><td>Optional (<code>tls-auth-clients</code>)</td><td>Required by default (migration is trusted)</td></tr>
+<tr><td>Certificate config</td><td>Per Valkey instance</td><td>Same certs, shared PKI infrastructure</td></tr>
+<tr><td>Handshake</td><td>Non-blocking (event loop)</td><td>Blocking (acceptable: one-time at migration start)</td></tr>
+</table>
+
+</div>
+</body>
+</html>

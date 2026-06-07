@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BgIteration / Forkless Snapshot Analysis</title>
+<style>
+:root { --bg: #1a1a2e; --card: #16213e; --accent: #0f3460; --highlight: #e94560; --text: #eaeaea; --muted: #a0a0b0; --green: #4ecca3; --yellow: #f0c040; --orange: #ff8c42; --red: #e94560; }
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); line-height: 1.6; padding: 2rem; }
+h1 { text-align: center; margin-bottom: 0.5rem; font-size: 2rem; background: linear-gradient(90deg, var(--green), var(--highlight)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+.subtitle { text-align: center; color: var(--muted); margin-bottom: 2rem; }
+.section { background: var(--card); border-radius: 12px; padding: 1.5rem; margin-bottom: 1.5rem; border-left: 4px solid var(--accent); }
+.section h2 { color: var(--green); margin-bottom: 1rem; font-size: 1.3rem; }
+.section h3 { color: var(--yellow); margin: 1rem 0 0.5rem; font-size: 1.1rem; }
+table { width: 100%; border-collapse: collapse; margin: 1rem 0; }
+th, td { padding: 0.6rem 0.8rem; text-align: left; border-bottom: 1px solid #2a2a4a; }
+th { background: var(--accent); color: var(--green); font-weight: 600; }
+tr:hover { background: #1a1a3e; }
+.tag { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 0.8rem; font-weight: 600; }
+.tag-safe { background: #1a4a3a; color: var(--green); }
+.tag-warn { background: #4a3a1a; color: var(--yellow); }
+.tag-danger { background: #4a1a2a; color: var(--red); }
+.tag-info { background: #1a2a4a; color: #60a0ff; }
+code { background: #0a0a1e; padding: 2px 6px; border-radius: 4px; font-size: 0.9em; color: var(--yellow); }
+.finding { background: #0f0f2e; border-radius: 8px; padding: 1rem; margin: 0.8rem 0; border-left: 3px solid var(--highlight); }
+.finding.critical { border-left-color: var(--red); }
+.finding.warning { border-left-color: var(--yellow); }
+.finding.info { border-left-color: var(--green); }
+.finding-title { font-weight: 600; margin-bottom: 0.3rem; }
+.severity { float: right; }
+ul { padding-left: 1.5rem; margin: 0.5rem 0; }
+li { margin: 0.3rem 0; }
+.diagram { background: #0a0a1e; border-radius: 8px; padding: 1rem; margin: 1rem 0; font-family: monospace; font-size: 0.85rem; white-space: pre; overflow-x: auto; color: var(--muted); }
+.summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 1rem; margin: 1rem 0; }
+.summary-card { background: #0f0f2e; border-radius: 8px; padding: 1rem; text-align: center; }
+.summary-card .number { font-size: 2rem; font-weight: 700; color: var(--highlight); }
+.summary-card .label { color: var(--muted); font-size: 0.9rem; }
+</style>
+</head>
+<body>
+<h1>BgIteration / Forkless Snapshot Analysis</h1>
+<p class="subtitle">Correctness, Performance &amp; Edge Case Review &mdash; May 2026</p>
+
+<div class="summary-grid">
+<div class="summary-card"><div class="number">6</div><div class="label">Critical Issues</div></div>
+<div class="summary-card"><div class="number">4</div><div class="label">Warning Issues</div></div>
+<div class="summary-card"><div class="number">~2800</div><div class="label">Lines in bgiteration.c</div></div>
+<div class="summary-card"><div class="number">2</div><div class="label">Iterator Types (FullScan / Slots)</div></div>
+</div>
+
+<!-- Section 1: Consistency Model -->
+<div class="section">
+<h2>1. Consistency Model</h2>
+
+<h3>Epoch/Version Mechanism</h3>
+<div class="diagram">
+Iterator Creation:
+  server.amz.iterator_epoch++  →  it->consistent_modification_id = epoch_at_creation
+
+Key Modification (amzSignalModifiedKey):
+  de->metadata->iterator_epoch = server.amz.iterator_epoch  (current global epoch)
+
+During Iteration (feedIterator):
+  if (de->metadata->iterator_epoch > it->consistent_modification_id) → SKIP
+  (key was modified AFTER snapshot started)
+</div>
+
+<div class="finding info">
+<div class="finding-title">Point-in-Time Without Fork</div>
+<p>Uses a monotonically increasing <code>uint32_t</code> epoch. Each key is stamped on modification. The iterator skips any key whose epoch exceeds the snapshot's creation epoch. This provides a logical point-in-time view without physical memory isolation.</p>
+</div>
+
+<div class="finding warning">
+<div class="finding-title"><span class="severity"><span class="tag tag-warn">WARNING</span></span>Epoch Wraparound Risk</div>
+<p>The epoch is <code>uint32_t</code> (4 billion values). At 1M writes/sec, wraps in ~72 minutes. A long-running snapshot under extreme write load could theoretically see a wrapped epoch and include post-snapshot keys. Unlikely in practice but not impossible.</p>
+</div>
+
+<table>
+<tr><th>Mode</th><th>Consistency</th><th>Use Case</th></tr>
+<tr><td><code>CONSISTENT</code></td><td>True point-in-time (no fuzzy state)</td><td>File-based backup (BGSAVE)</td></tr>
+<tr><td><code>REPLICATION</code> only</td><td>Fuzzy base + replication stream</td><td>Replica sync (eventual consistency)</td></tr>
+<tr><td><code>CONSISTENT | REPLICATION</code></td><td>Point-in-time base + stream</td><td>Cluster mode only (no SWAPDB)</td></tr>
+</table>
+</div>
+
+<!-- Section 2: Client Blocking -->
+<div class="section">
+<h2>2. Client Blocking / Write Handling</h2>
+
+<h3>Code Path by Scenario</h3>
+<table>
+<tr><th>Scenario</th><th>Consistent Mode</th><th>Non-Consistent + Repl</th><th>Non-Consistent, No Repl</th></tr>
+<tr><td><strong>Write to FUTURE key</strong> (not yet reached)</td><td>Key expedited → blocked if not cloneable</td><td>Only if some keys already iterated</td><td>No block</td></tr>
+<tr><td><strong>Write to IN-USE key</strong> (BG thread processing)</td><td>Blocked (in <code>inUseEntries</code>)</td><td>Blocked</td><td>Blocked</td></tr>
+<tr><td><strong>Write to PAST key</strong> (already returned)</td><td>No block</td><td>No block (cmd replicated)</td><td>No block</td></tr>
+</table>
+
+<h3>Clone Optimization</h3>
+<div class="finding info">
+<div class="finding-title">Small String Cloning Avoids Blocking</div>
+<p><code>tryCloneDbEntry()</code> clones small strings (RAW/EMBSTR encoding, not spilled to flash) if:</p>
+<ul>
+<li>Item size ≤ <code>bgiteration_max_item_clone_size</code></li>
+<li>Total clone pool ≤ <code>bgiteration_max_clone_pool_size</code></li>
+</ul>
+<p>When cloned, the client is <strong>NOT blocked</strong> — the BG thread works on the copy.</p>
+</div>
+
+<div class="finding critical">
+<div class="finding-title"><span class="severity"><span class="tag tag-danger">CRITICAL</span></span>Clone Limited to Strings Only</div>
+<p>Only <code>OBJ_STRING</code> with RAW/EMBSTR encoding can be cloned. Hashes, Sets, Sorted Sets, Lists, and Streams <strong>always block</strong>. A TODO in the code acknowledges this gap. Large collections (e.g., a 1M-member sorted set) will block the client for the entire serialization duration.</p>
+</div>
+
+<h3>Worst-Case Block Duration</h3>
+<table>
+<tr><th>Scenario</th><th>Duration</th><th>Mechanism</th></tr>
+<tr><td>Small string (cloneable)</td><td>~0 (no block)</td><td>Clone created, client proceeds</td></tr>
+<tr><td>Large string (not cloneable)</td><td>Microseconds–low ms</td><td>BG thread serializes string</td></tr>
+<tr><td>Large hash/set/zset</td><td>Milliseconds–seconds</td><td>BG thread serializes entire collection</td></tr>
+<tr><td>Lua script with undeclared keys</td><td><strong>Unbounded busy-wait</strong></td><td>Synchronous <code>receiveItemsBackFromIterators(true)</code></td></tr>
+</table>
+
+<div class="finding critical">
+<div class="finding-title"><span class="severity"><span class="tag tag-danger">CRITICAL</span></span>Synchronous Busy-Wait for Scripts</div>
+<p>When a Lua script accesses undeclared keys that are in-use, the main thread enters a <code>while(mustBlock)</code> loop calling <code>receiveItemsBackFromIterators(true)</code> with <code>usleep(100)</code>. This blocks the <strong>entire event loop</strong> until the BG thread finishes processing the key.</p>
+</div>
+</div>
+
+<!-- Section 3: Multi-Key Commands -->
+<div class="section">
+<h2>3. Multi-Key Commands (MSET, SUNIONSTORE, etc.)</h2>
+
+<h3>FIRSTKEY_MOD Optimization</h3>
+<p>Commands flagged with <code>REDIS_AMZ_CMD_FIRSTKEY_MOD</code> (flag <code>'1'</code>) indicate that <strong>only the first key is modified</strong>; remaining keys are read-only sources. This allows the system to skip expediting read-only keys when replication is disabled.</p>
+
+<table>
+<tr><th>Command</th><th>FIRSTKEY_MOD?</th><th>Blocking Behavior</th></tr>
+<tr><td><code>MSET key1 v1 key2 v2 ...</code></td><td><span class="tag tag-danger">NO</span></td><td>ALL keys treated as write keys → all may block</td></tr>
+<tr><td><code>MSETNX key1 v1 key2 v2 ...</code></td><td><span class="tag tag-danger">NO</span></td><td>ALL keys treated as write keys → all may block</td></tr>
+<tr><td><code>SUNIONSTORE dest src1 src2</code></td><td><span class="tag tag-safe">YES</span></td><td>Only <code>dest</code> blocks (without repl); with repl, all keys may block</td></tr>
+<tr><td><code>SINTERSTORE dest src1 src2</code></td><td><span class="tag tag-safe">YES</span></td><td>Only <code>dest</code> blocks (without repl); with repl, all keys may block</td></tr>
+<tr><td><code>SDIFFSTORE dest src1 src2</code></td><td><span class="tag tag-safe">YES</span></td><td>Only <code>dest</code> blocks (without repl); with repl, all keys may block</td></tr>
+<tr><td><code>ZUNIONSTORE dest ... src1 src2</code></td><td><span class="tag tag-safe">YES</span></td><td>Only <code>dest</code> blocks (without repl); with repl, all keys may block</td></tr>
+<tr><td><code>ZINTERSTORE dest ... src1 src2</code></td><td><span class="tag tag-safe">YES</span></td><td>Only <code>dest</code> blocks (without repl); with repl, all keys may block</td></tr>
+<tr><td><code>BITOP op dest src1 src2</code></td><td><span class="tag tag-safe">YES</span></td><td>Only <code>dest</code> blocks (without repl); with repl, all keys may block</td></tr>
+<tr><td><code>RENAME src dest</code></td><td><span class="tag tag-danger">NO</span></td><td>Both keys treated as write → both may block</td></tr>
+<tr><td><code>COPY src dest</code></td><td><span class="tag tag-warn">SPECIAL</span></td><td>Special-cased in <code>expediteKeysForCopy()</code></td></tr>
+<tr><td><code>MOVE key db</code></td><td><span class="tag tag-warn">SPECIAL</span></td><td>Special-cased in <code>expediteKeysForMove()</code></td></tr>
+<tr><td><code>SMOVE src dest member</code></td><td><span class="tag tag-danger">NO</span></td><td>Both keys treated as write → both may block</td></tr>
+</table>
+
+<h3>MSET Deep Dive</h3>
+<div class="finding warning">
+<div class="finding-title"><span class="severity"><span class="tag tag-warn">PERF CONCERN</span></span>MSET Blocks on ALL Keys</div>
+<p><code>MSET</code> does NOT have <code>FIRSTKEY_MOD</code> because it modifies ALL keys. With N keys:</p>
+<ul>
+<li><strong>Consistent mode:</strong> All N keys that haven't been iterated are expedited. Client blocked until BG thread processes all non-cloneable ones.</li>
+<li><strong>Non-consistent + repl:</strong> If ANY of the N keys has been iterated, ALL remaining keys are expedited.</li>
+<li><strong>Non-consistent, no repl:</strong> Only blocks on keys currently in-use by BG thread.</li>
+</ul>
+<p>A <code>MSET</code> with 100 keys where 50 are in-use could block for 50× single-key serialization time.</p>
+</div>
+
+<h3>SUNIONSTORE Deep Dive</h3>
+<div class="finding info">
+<div class="finding-title"><span class="severity"><span class="tag tag-safe">OPTIMIZED</span></span>SUNIONSTORE Only Blocks on Destination (Without Replication)</div>
+<p><code>SUNIONSTORE</code> has <code>FIRSTKEY_MOD</code>. The optimization at line 1115:</p>
+<ul>
+<li>When <code>BGITERATOR_FLAG_REPLICATION</code> is <strong>NOT</strong> set: <code>numKeys = 1</code> — only the destination key is checked for blocking.</li>
+<li>When <code>BGITERATOR_FLAG_REPLICATION</code> IS set: ALL keys (dest + sources) are checked because the replica needs source values to replay the command.</li>
+</ul>
+</div>
+
+<div class="finding warning">
+<div class="finding-title"><span class="severity"><span class="tag tag-warn">WARNING</span></span>SUNIONSTORE with Replication: Source Keys May Block Unnecessarily</div>
+<p>With replication enabled, if the destination key has already been iterated but source keys haven't, ALL source keys are expedited and the client blocks. This is <strong>correct for replication consistency</strong> (the replica needs the source values) but creates potentially large blocking windows when source sets are large collections.</p>
+</div>
+
+<h3>Boundary Spanning Logic</h3>
+<div class="diagram">
+Command: SUNIONSTORE dest src1 src2
+
+Case A: All keys FUTURE (not yet iterated)
+  → No expedite, no block, no replication
+  → Iterator will naturally encounter all keys
+
+Case B: dest=PAST, src1=FUTURE, src2=FUTURE (with REPL)
+  → src1 and src2 are expedited (sent to BG thread now)
+  → Client blocked until BG processes src1 & src2
+  → Command IS replicated to stream
+
+Case C: dest=FUTURE, src1=PAST (with REPL)
+  → dest is expedited
+  → Client blocked until BG processes dest
+  → Command IS replicated
+
+Case D: All keys PAST
+  → No block needed
+  → Command IS replicated
+</div>
+</div>
