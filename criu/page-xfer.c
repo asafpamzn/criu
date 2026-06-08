@@ -1016,7 +1016,7 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 	if (ret)
 		return ret;
 
-	/* CLONE: Write any remaining lazy VMAs after all pipe entries */
+	/* CLONE: Write remaining lazy VMAs that come after all pipe segments */
 	if (opts.clone_dump && xfer->offset == 0) {
 		ret = clone_write_lazy_vmas_to_pagemap(xfer, ULONG_MAX, &cur_lve);
 		if (ret)
