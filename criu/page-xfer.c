@@ -63,9 +63,6 @@ void wait_for_page_server_thread(void)
 }
 
 
-/* Compression statistics are in clone-page-xfer.c */
-
-/* struct page_server_iov is now in page-xfer.h */
 
 static void psi2iovec(struct page_server_iov *ps, struct iovec *iov)
 {
@@ -73,9 +70,6 @@ static void psi2iovec(struct page_server_iov *ps, struct iovec *iov)
 	iov->iov_len = ps->nr_pages * PAGE_SIZE;
 }
 
-/* PS_IOV_* protocol commands (1-7), PS_IOV_CLOSE, PS_IOV_FORCE_CLOSE are now in page-xfer.h */
-/* CLONE-specific PS_IOV_* defines (8-17) are in clone-page-xfer.h */
-/* PS_CMD_BITS, PS_CMD_MASK, encode_ps_cmd, decode_ps_cmd are now in page-xfer.h */
 
 #define PS_TYPE_BITS 8
 #define PS_TYPE_MASK ((1 << PS_TYPE_BITS) - 1)
@@ -139,7 +133,6 @@ static int decode_pm(u64 dst_id, unsigned long *id)
 	return type;
 }
 
-/* encode_ps_cmd and decode_ps_cmd are now in page-xfer.h */
 
 static inline u32 decode_ps_flags(u32 cmd)
 {
@@ -239,7 +232,6 @@ static inline int send_psi_flags(int sk, struct page_server_iov *pi, int flags)
 	return 0;
 }
 
-/* Non-static so clone-page-xfer.c can use it */
 int send_psi(int sk, struct page_server_iov *pi)
 {
 	return send_psi_flags(sk, pi, 0);

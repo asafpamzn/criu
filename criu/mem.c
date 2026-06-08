@@ -1253,7 +1253,7 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 		 * on demand.
 		 */
 		if ((opts.lazy_pages || opts.clone_dump) && pagemap_lazy(pr->pe)) {
-			pr_debug("Lazy restore skips %ld pages at %lx\n", nr_pages, va);
+			pr_err("DEBUG: restore_priv_vma_content: skipping lazy pages at %lx, nr_pages=%ld\n", va, nr_pages);
 			pr->skip_pages(pr, nr_pages * PAGE_SIZE);
 			nr_lazy += nr_pages;
 			continue;
