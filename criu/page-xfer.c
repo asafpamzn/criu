@@ -1300,9 +1300,7 @@ static int page_server_serve(int sk)
 {
 	int ret = -1;
 	bool flushed = false;
-	bool bulk_ack_received = false;
 	bool receiving_pages = !(opts.lazy_pages || opts.clone_dump);
-	u32 last_cmd = 0;
 
 	if (receiving_pages) {
 		/*
@@ -1377,7 +1375,6 @@ static int page_server_serve(int sk)
 			 * An answer must be sent back to inform another side,
 			 * that all data were received
 			 */
-			pr_debug("Got close; sending completion status\n");
 			if (__send(sk, &status, sizeof(status), 0) != sizeof(status)) {
 				pr_perror("Can't send the final package");
 				ret = -1;
@@ -1390,18 +1387,20 @@ static int page_server_serve(int sk)
 			ret = page_server_get_pages(sk, &pi);
 			break;
 		case PS_IOV_GET_ALL:
-		case PS_IOV_START_RESTORE:
-		case PS_IOV_ALL_PAGES_SENT_ACK:
-			/* CLONE-specific commands handled in clone-page-xfer.c */
+			/*
+			 * CLONE mode: replica requests all pages. Hand off to
+			 * clone_page_server_get_all_pages() which starts P3 senders.
+			 * Store socket and return - main dump loop continues.
+			 */
 			if (!opts.clone_dump) {
-				pr_err("CLONE command %u requires CLONE mode\n", cmd);
+				pr_err("PS_IOV_GET_ALL requires CLONE mode\n");
 				ret = -1;
 				break;
 			}
-			ret = clone_handle_protocol_cmd(cmd, &pi, sk, &ret, &flushed, &bulk_ack_received);
-			if (ret == 1) {
-				pr_err("Unknown CLONE command %u\n", cmd);
-				ret = -1;
+			ret = clone_page_server_get_all_pages(sk, pi.dst_id);
+			if (!ret) {
+				page_server_sk = sk;
+				return 0;
 			}
 			break;
 		default:
@@ -1412,39 +1411,13 @@ static int page_server_serve(int sk)
 
 		if (ret)
 			break;
-		last_cmd = cmd;
 		if (pi.cmd == PS_IOV_CLOSE || pi.cmd == PS_IOV_FORCE_CLOSE)
-			break;
-		/*
-		 * CLONE mode: break immediately after PS_IOV_GET_ALL.
-		 * Unified thread starts P3 senders, we store socket and return.
-		 * Main dump loop will send PS_IOV_ALL_PAGES_SENT later.
-		 */
-		if (opts.clone_dump && cmd == PS_IOV_GET_ALL)
 			break;
 	}
 
 	if (receiving_pages && !ret && !flushed) {
 		pr_err("The data were not flushed\n");
 		ret = -1;
-	}
-
-	/*
-	 * CLONE mode: store socket after PS_IOV_GET_ALL and return.
-	 * No need to wait for ACK - main socket only carries control signals.
-	 */
-	if (opts.clone_dump && last_cmd == PS_IOV_GET_ALL) {
-		pr_debug("CLONE mode: storing socket (sk=%d) after PS_IOV_GET_ALL\n", sk);
-		page_server_sk = sk;
-		return 0;
-	}
-
-	/* Legacy path: wait for bulk ACK (kept for backwards compatibility) */
-	if (opts.clone_dump && bulk_ack_received) {
-		pr_debug("Bulk ACK received, storing socket (sk=%d) for dirty bitmap\n", sk);
-		page_server_sk = sk;
-		pr_debug("page_server_sk now set to %d\n", page_server_sk);
-		return 0;
 	}
 
 	tls_terminate_session(ret != 0);

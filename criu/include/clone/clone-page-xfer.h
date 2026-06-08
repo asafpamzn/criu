@@ -8,9 +8,8 @@
  * CLONE-specific page server protocol commands.
  * These extend the base PS_IOV_* protocol for CLONE migration.
  */
-#define PS_IOV_GET_ALL            8
-#define PS_IOV_ADD_F_COMPRESS     10
-#define PS_IOV_START_RESTORE      12  /* Signal replica to start process */
+#define PS_IOV_GET_ALL            8   /* Replica -> Primary: request all pages */
+#define PS_IOV_ADD_F_COMPRESS     10  /* Primary -> Replica: compressed page data */
 #define PS_IOV_ALL_PAGES_SENT     16  /* Primary -> Replica: all pages sent, zero-fill rest */
 #define PS_IOV_ALL_PAGES_SENT_ACK 17  /* Replica -> Primary: ACK, safe to close connection */
 #define PS_IOV_SKELETON_FILE      20  /* Primary -> Replica: skeleton image file transfer */
@@ -55,13 +54,7 @@ extern int clone_send_skeleton_files(int sk);
  */
 struct page_xfer;
 struct lazy_vma_entry;
-struct page_server_iov;
 extern int clone_write_lazy_vmas_to_pagemap(struct page_xfer *xfer, unsigned long before_vaddr,
 					    struct lazy_vma_entry **cur_lve);
-
-/* CLONE protocol command handler (returns 0=handled, 1=not CLONE cmd, -1=error) */
-extern int clone_handle_protocol_cmd(u32 cmd, struct page_server_iov *pi, int sk,
-				   int *ret_val, bool *flushed, bool *bulk_ack);
-
 
 #endif /* __CR_CLONE_PAGE_XFER_H__ */

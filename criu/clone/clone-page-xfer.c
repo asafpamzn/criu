@@ -293,24 +293,6 @@ int clone_write_lazy_vmas_to_pagemap(struct page_xfer *xfer, unsigned long befor
 }
 
 /*
- * Handle CLONE-specific protocol commands in page_server_serve().
- * Returns: 0 = handled, 1 = not a CLONE command, -1 = error
- * Sets *ret_val, *flushed, *bulk_ack on success.
- */
-int clone_handle_protocol_cmd(u32 cmd, struct page_server_iov *pi, int sk,
-			    int *ret_val, bool *flushed, bool *bulk_ack)
-{
-	switch (cmd) {
-	case PS_IOV_GET_ALL:		
-		*ret_val = clone_page_server_get_all_pages(sk, pi->dst_id);
-		return 0;
-
-	default:
-		return 1;  /* Not a CLONE command */
-	}
-}
-
-/*
  * Raw send/recv wrappers for P3 parallel sockets.
  * These bypass TLS and use plain TCP for performance.
  * Used by clone-bulk-send.c and clone-p3-receiver.c.
