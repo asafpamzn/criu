@@ -8,6 +8,7 @@
 
 #include <stdbool.h>
 #include <unistd.h>
+#include <errno.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <string.h>
@@ -286,5 +287,39 @@ int clone_handle_protocol_cmd(u32 cmd, struct page_server_iov *pi, int sk,
 	default:
 		return 1;  /* Not a CLONE command */
 	}
+}
+
+/*
+ * Raw send/recv wrappers for P3 parallel sockets.
+ * These bypass TLS and use plain TCP for performance.
+ * Used by clone-bulk-send.c and clone-p3-receiver.c.
+ */
+int page_server_send_raw(int sk, const void *buf, size_t sz, int fl)
+{
+	const char *cursor = buf;
+	size_t remaining = sz;
+
+	if (fl & MSG_DONTWAIT)
+		return send(sk, buf, sz, fl);
+
+	while (remaining > 0) {
+		int ret = send(sk, cursor, remaining, fl);
+
+		if (ret < 0) {
+			if (errno == EINTR)
+				continue;
+			return -1;
+		}
+		if (ret == 0)
+			return 0;
+		cursor += ret;
+		remaining -= ret;
+	}
+	return sz;
+}
+
+int page_server_recv_raw(int sk, void *buf, size_t sz, int fl)
+{
+	return recv(sk, buf, sz, fl);
 }
 

@@ -1307,7 +1307,7 @@ int cr_dump_clone_finish(int ret)
 	clone_cleanup_async_uffd();
 
 	/* Close page server socket AFTER unfreeze */
-	close_page_server_socket();
+	clone_close_page_server_socket();
 
 	return ret;
 }

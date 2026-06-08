@@ -103,7 +103,6 @@ extern int connect_to_page_server_to_send(void);
 extern int connect_to_page_server_to_recv(int epfd);
 extern int remove_page_server_from_epoll(int epfd);
 extern int disconnect_from_page_server(void);
-extern void close_page_server_socket(void);
 extern int get_page_server_sk(void);
 extern void wait_for_page_server_thread(void);
 
@@ -121,7 +120,6 @@ extern int check_parent_page_xfer(int fd_type, unsigned long id);
 
 /* async request/receive of remote pages */
 extern int request_remote_pages(unsigned long img_id, unsigned long addr, unsigned long nr_pages);
-extern int request_all_remote_pages(unsigned long img_id);
 
 typedef int (*ps_async_read_complete)(unsigned long img_id, unsigned long vaddr, unsigned long nr_pages, void *);
 extern int page_server_start_read(void *buf, unsigned long nr_pages, ps_async_read_complete complete, void *priv, unsigned flags);

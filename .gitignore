@@ -37,4 +37,6 @@ build/**
 scripts/.env
 artifacts/
 coverage-report/
+clone-coverage-report/
+coverage_html/
 docs/

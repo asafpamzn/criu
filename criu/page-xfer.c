@@ -228,39 +228,7 @@ int page_server_recv(int sk, void *buf, size_t sz, int fl)
 	return __recv(sk, buf, sz, fl);
 }
 
-/* Raw wrappers for P3 parallel sockets — always use plain TCP */
-int page_server_send_raw(int sk, const void *buf, size_t sz, int fl)
-{
-	const char *cursor = buf;
-	size_t remaining = sz;
-
-	if (fl & MSG_DONTWAIT)
-		return send(sk, buf, sz, fl);
-
-	while (remaining > 0) {
-		int ret = send(sk, cursor, remaining, fl);
-
-		if (ret < 0) {
-			if (errno == EINTR)
-				continue;
-			return -1;
-		}
-		if (ret == 0)
-			return 0;
-		cursor += ret;
-		remaining -= ret;
-	}
-	return sz;
-}
-
-int page_server_recv_raw(int sk, void *buf, size_t sz, int fl)
-{
-	return recv(sk, buf, sz, fl);
-}
-
-/*
- * P3 parallel receiver code is now in clone-p3-receiver.c
- */
+/* Raw wrappers for P3 parallel sockets are in clone-page-xfer.c */
 
 static inline int send_psi_flags(int sk, struct page_server_iov *pi, int flags)
 {
@@ -284,17 +252,11 @@ static void tcp_cork(int sk, bool on)
 		pr_pwarn("Unable to set TCP_CORK=%d", val);
 }
 
-static void tcp_nodelay(int sk, bool on)
+void page_server_page_server_tcp_nodelay(int sk, bool on)
 {
 	int val = on ? 1 : 0;
 	if (setsockopt(sk, SOL_TCP, TCP_NODELAY, &val, sizeof(val)))
 		pr_pwarn("Unable to set TCP_NODELAY=%d", val);
-}
-
-/* Exported wrapper for clone-bulk-recv.c */
-void page_server_tcp_nodelay(int sk, bool on)
-{
-	tcp_nodelay(sk, on);
 }
 
 /* page-server xfer */
@@ -363,7 +325,7 @@ static int open_page_server_xfer(struct page_xfer *xfer, int fd_type, unsigned l
 	}
 
 	/* Push the command NOW */
-	tcp_nodelay(xfer->sk, true);
+	page_server_tcp_nodelay(xfer->sk, true);
 
 	if (__recv(xfer->sk, &has_parent, 1, 0) != 1) {
 		pr_perror("The page server doesn't answer");
@@ -1137,7 +1099,7 @@ static int check_parent_server_xfer(int fd_type, unsigned long img_id)
 	if (send_psi(page_server_sk, &pi))
 		return -1;
 
-	tcp_nodelay(page_server_sk, true);
+	page_server_tcp_nodelay(page_server_sk, true);
 
 	if (__recv(page_server_sk, &has_parent, sizeof(int), 0) != sizeof(int)) {
 		pr_perror("The page server doesn't answer");
@@ -1334,7 +1296,7 @@ static int page_server_get_pages(int sk, struct page_server_iov *pi)
 			return -1;
 	}
 
-	tcp_nodelay(sk, true);
+	page_server_tcp_nodelay(sk, true);
 
 	return 0;
 }
@@ -1353,7 +1315,7 @@ static int page_server_serve(int sk)
 		 * writes back the has_parent bit from time to time, so
 		 * make it NODELAY all the time.
 		 */
-		tcp_nodelay(sk, true);
+		page_server_tcp_nodelay(sk, true);
 
 		if (pipe(cxfer.p)) {
 			pr_perror("Can't make pipe for xfer");
@@ -1727,16 +1689,6 @@ int connect_to_page_server_to_send(void)
 	return connect_to_page_server();
 }
 
-/*
- * Close the page server socket (server-side).
- * Used after sending dirty bitmap in CLONE phased migration.
- * Wrapper for clone_close_page_server_socket().
- */
-void close_page_server_socket(void)
-{
-	clone_close_page_server_socket();
-}
-
 int disconnect_from_page_server(void)
 {
 	struct page_server_iov pi = {};
@@ -1948,14 +1900,8 @@ int request_remote_pages(unsigned long img_id, unsigned long addr, unsigned long
 	if (send_psi_flags(page_server_sk, &pi, MSG_DONTWAIT))
 		return -1;
 
-	tcp_nodelay(page_server_sk, true);
+	page_server_tcp_nodelay(page_server_sk, true);
 	return 0;
-}
-
-/* CLONE batch mode request - wrapper for clone_request_all_remote_pages */
-int request_all_remote_pages(unsigned long img_id)
-{
-	return clone_request_all_remote_pages(img_id);
 }
 
 static int page_server_start_sync_read(void *buf, unsigned long nr, ps_async_read_complete complete, void *priv)

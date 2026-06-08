@@ -29,6 +29,7 @@
 #include "clone/clone-uffd.h"
 #include "clone/clone-bulk-send.h"
 #include "clone/clone-bulk-recv.h"
+#include "clone/clone-page-xfer.h"
 #include "pstree.h"
 #include "clone/pf-tracker.h"
 #include "clone/unmapped-tracker.h"
@@ -244,7 +245,7 @@ int cr_clone_phase2(bool daemon)
 	/* 7. Request all pages for each discovered task */
 	list_for_each_entry(ct, &clone_tasks, l) {
 		pr_info("Requesting all pages for pid=%d\n", ct->pid);
-		if (request_all_remote_pages(ct->pid) < 0) {
+		if (clone_request_all_remote_pages(ct->pid) < 0) {
 			pr_err("Failed to request pages for pid=%d\n", ct->pid);
 			goto err_disconnect;
 		}
