@@ -629,7 +629,17 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	if (!pp)
 		goto out;
 
-	if (!mdc->pre_dump && !mdc->clone_pre_dump) {
+	/*
+	 * CLONE Phase 1: create empty pagemap so target's
+	 * discover_tasks_from_pagemaps() can find this task.
+	 */
+	if (mdc->clone_pre_dump) {
+		ret = open_page_xfer(&xfer, CR_FD_PAGEMAP, vpid(item));
+		if (ret < 0)
+			goto out_pp;
+		xfer.close(&xfer);
+		memset(&xfer, 0, sizeof(xfer));
+	} else if (!mdc->pre_dump) {
 		/*
 		 * Regular dump -- create xfer object and send pages to it
 		 * right here. For pre-dumps the pp will be taken by the
