@@ -1248,6 +1248,10 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 		va = (unsigned long)decode_pointer(pr->pe->vaddr);
 		nr_pages = pr->pe->nr_pages;
 
+		pr_err("DEBUG: pagemap entry: va=%lx nr_pages=%ld lazy=%d current_vma=%lx-%lx\n",
+		       va, nr_pages, pagemap_lazy(pr->pe),
+		       (unsigned long)vma->e->start, (unsigned long)vma->e->end);
+
 		/*
 		 * This means that userfaultfd is used to load the pages
 		 * on demand.
@@ -1269,6 +1273,8 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 			while (va >= vma->e->end) {
 				if (vma->list.next == vmas)
 					goto err_addr;
+				pr_err("DEBUG: advancing VMA from %lx-%lx to next\n",
+				       (unsigned long)vma->e->start, (unsigned long)vma->e->end);
 				vma = vma_next(vma);
 			}
 
@@ -1278,8 +1284,11 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 			 * there is no guarantee that the data from pagemap is
 			 * valid.
 			 */
-			if (va < vma->e->start)
+			if (va < vma->e->start) {
+				pr_err("DEBUG: va %lx < vma->e->start %lx, going to err_addr\n",
+				       va, (unsigned long)vma->e->start);
 				goto err_addr;
+			}
 			else if (unlikely(!vma_area_is_private(vma, kdat.task_size))) {
 				pr_err("Trying to restore page for non-private VMA\n");
 				goto err_addr;

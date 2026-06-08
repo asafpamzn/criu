@@ -136,6 +136,9 @@ static pid_t clone_start_restore(void)
 	snprintf(log_path, sizeof(log_path), "%s/clone-restore.log", opts.imgs_dir);
 	snprintf(log_level, sizeof(log_level), "-v%d", opts.log_level);
 
+	pr_info("Starting restore: log_level=%d, log_level_str=%s, log_path=%s\n",
+		opts.log_level, log_level, log_path);
+
 	argv[0] = opts.argv_0;
 	argv[1] = "restore";
 	argv[2] = "--images-dir";
