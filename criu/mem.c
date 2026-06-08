@@ -216,6 +216,40 @@ static bool is_stack(struct pstree_item *item, unsigned long vaddr)
 }
 
 /*
+ * Check if a VMA can use CLONE lazy transfer.
+ *
+ * CLONE lazy VMAs are transferred asynchronously via bulk page transfer
+ * while the process runs. Non-lazy VMAs must be dumped immediately while
+ * frozen (Phase 3).
+ *
+ * Criteria for lazy transfer:
+ *   - VMA is eligible for lazy pages (anonymous, private, not locked, etc.)
+ *   - Not a guard page
+ *   - Readable and writable (so write faults can be tracked)
+ *   - Not droppable
+ *   - Not a stack page (stack changes too rapidly)
+ *   - VMA is tracked by CLONE userfaultfd
+ */
+static bool clone_vma_can_be_lazy(struct pstree_item *item, struct vma_area *vma)
+{
+	if (!vma_entry_can_be_lazy(vma->e))
+		return false;
+	if (vma_area_is(vma, VMA_AREA_GUARD))
+		return false;
+	if ((vma->e->prot & (PROT_READ | PROT_WRITE)) != (PROT_READ | PROT_WRITE))
+		return false;
+	if (vma->e->flags & MAP_DROPPABLE)
+		return false;
+	if (!vma_area_is_private(vma, kdat.task_size) && !vma_area_is(vma, VMA_ANON_SHARED))
+		return false;
+	if (is_stack(item, vma->e->start))
+		return false;
+	if (!clone_dump_is_vma_tracked(item->pid->real, vma->e->start, vma->e->end))
+		return false;
+	return true;
+}
+
+/*
  * This routine finds out what memory regions to grab from the
  * dumpee. The iovs generated are then fed into vmsplice to
  * put the memory into the page-pipe's pipe.
@@ -223,71 +257,28 @@ static bool is_stack(struct pstree_item *item, unsigned long vaddr)
  * "Holes" in page-pipe are regions, that should be dumped, but
  * the memory contents is present in the parent image set.
  */
-
 static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct page_pipe *pp, pmc_t *pmc, u64 *pvaddr,
-			 bool has_parent, struct page_xfer *xfer, bool clone_skeleton_non_lazy)
+			 bool has_parent, bool clone_skip_lazy)
 {
 	unsigned long nr_scanned;
 	unsigned long pages[3] = {};
 	unsigned long vaddr;
 	bool dump_all_pages;
 	int ret = 0;
-	unsigned long vma_start = *pvaddr;
-	bool clone_tracked = !opts.clone_dump ||
-			   clone_dump_is_vma_tracked(item->pid->real,
-						   vma->e->start,
-						   vma->e->end);
-
-	int lazy_capable = vma_entry_can_be_lazy(vma->e) &&
-	    !vma_area_is(vma, VMA_AREA_GUARD) &&
-		(vma->e->prot & PROT_WRITE) &&
-		!(!vma_area_is_private(vma, kdat.task_size) && !vma_area_is(vma, VMA_ANON_SHARED)) &&
-		!(vma->e->flags & MAP_DROPPABLE) &&
-		(vma->e->prot & PROT_READ) &&
-		!is_stack(item, vma_start) &&
-		clone_tracked;
-
 
 	dump_all_pages = should_dump_entire_vma(vma->e);
 
 	/*
-	 * CLONE-dump optimization: Skip expensive per-page pagemap scanning.
-	 * Create one iov for entire VMA and detect holes lazily on-demand
-	 * when trying to read pages via process_vm_readv.
-	 * 
-	 * Note: We don't use pipes in CLONE mode - pages are read directly
-	 * via process_vm_readv on-demand, so ppb->pages_in stays 0.
-	 *
-	 * IMPORTANT: VMAs marked with dump_all_pages (VDSO, AIORING) must use
-	 * traditional dump because they're read-only and won't generate write
-	 * faults for CLONE tracking. Their content must be captured immediately.
+	 * CLONE-dump: lazy VMAs are handled via bulk transfer, not page pipe.
+	 * Phase 1: register VMA in global_lazy_vmas for async transfer.
+	 * Phase 3: skip - already transferred by P3 sender threads.
 	 */
-
-	if (opts.clone_dump && lazy_capable) {
-		unsigned long nr_pages = vma_entry_len(vma->e) / PAGE_SIZE;
-
-		/*
-		 * Phase-3 skeleton dump (clone_skeleton_non_lazy): the lazy VMAs
-		 * have already been streamed by the P3 sender threads, so we
-		 * must not push their pages into the pipe again. Also do not
-		 * re-add to global_lazy_vmas — the list was built at pre-dump.
-		 */
-		if (clone_skeleton_non_lazy) {
+	if (opts.clone_dump && clone_vma_can_be_lazy(item, vma)) {
+		if (clone_skip_lazy)
 			return 0;
-		}
 
-		/*
-		 * CLONE pre-dump: Add this VMA to the global lazy VMA list.
-		 * The dst_id is vpid(item) to match what the REPLICA sends
-		 * in request_all_remote_pages(img_id).
-		 *
-		 * NOTE: do NOT use xfer->dst_id here.  In local mode
-		 * (no --page-server) the page_xfer union overlaps
-		 * dst_id with the pmi/pi pointers, so xfer->dst_id
-		 * contains a raw pointer value — garbage.
-		 */
-		return clone_mem_add_lazy_vma(vma, nr_pages, vpid(item),
-					    item->pid->real);
+		return clone_mem_add_lazy_vma(vma, vma_entry_len(vma->e) / PAGE_SIZE,
+					      vpid(item), item->pid->real);
 	}
 
 	nr_scanned = 0;
@@ -296,6 +287,7 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 		struct page_info page_info = {};
 		int st;
 
+		/* If dump_all_pages is true, should_dump_page is called to get pme. */
 		if (should_dump_page(pmc, vma->e, vaddr, &page_info))
 			return -1;
 
@@ -474,11 +466,10 @@ static int detect_pid_reuse(struct pstree_item *item, struct proc_pid_stat *pps,
 static int generate_vma_iovs(struct pstree_item *item, struct vma_area *vma, struct page_pipe *pp,
 			     struct page_xfer *xfer, struct parasite_dump_pages_args *args, struct parasite_ctl *ctl,
 			     pmc_t *pmc, bool has_parent, bool pre_dump, int parent_predump_mode,
-			     bool clone_skeleton_non_lazy)
+			     bool clone_skip_lazy)
 {
 	u64 vaddr;
 	int ret;
-	bool clone_lazy_opt;
 
 	if (!vma_area_is_private(vma, kdat.task_size) && !vma_area_is(vma, VMA_ANON_SHARED))
 		return 0;
@@ -561,26 +552,15 @@ static int generate_vma_iovs(struct pstree_item *item, struct vma_area *vma, str
 		has_parent = false;
 	}
 
-	clone_lazy_opt = opts.clone_dump &&
-		       vma_area_is_private(vma, kdat.task_size) &&
-		       vma_entry_can_be_lazy(vma->e) &&
-		       !vma_area_is(vma, VMA_AREA_GUARD) &&
-		       ((vma->e->prot & (PROT_READ | PROT_WRITE)) ==
-			(PROT_READ | PROT_WRITE)) &&
-		       !is_stack(item, vma->e->start) &&
-		       clone_dump_is_vma_tracked(item->pid->real,
-					       vma->e->start,
-					       vma->e->end);
-
 	/*
 	 * CLONE dump can skip expensive per-page pagemap scanning for VMAs that
 	 * are tracked and lazy-capable. Let generate_iovs() take the fast-path
 	 * without touching pagemap at all (avoids PAGEMAP_SCAN for large VMAs).
 	 */
-	if (clone_lazy_opt) {
+	if (opts.clone_dump && clone_vma_can_be_lazy(item, vma)) {
 		vaddr = vma->e->start;
 		return generate_iovs(item, vma, pp, pmc, &vaddr, has_parent,
-				     xfer, clone_skeleton_non_lazy);
+				     clone_skip_lazy);
 	}
 
 	if (pmc_get_map(pmc, vma))
@@ -590,8 +570,8 @@ static int generate_vma_iovs(struct pstree_item *item, struct vma_area *vma, str
 		return add_shmem_area(item->pid->real, vma->e, pmc);
 	vaddr = vma->e->start;
 again:
-	ret = generate_iovs(item, vma, pp, pmc, &vaddr, has_parent, xfer,
-			    clone_skeleton_non_lazy);
+	ret = generate_iovs(item, vma, pp, pmc, &vaddr, has_parent,
+			    clone_skip_lazy);
 	if (ret == -EAGAIN) {
 		BUG_ON(!(pp->flags & PP_CHUNK_MODE));
 
@@ -621,7 +601,6 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	int possible_pid_reuse = 0;
 	bool has_parent;
 	int parent_predump_mode = -1;
-	unsigned int nr_segs;
 
 	pr_info("\n");
 	pr_info("Dumping pages (type: %d pid: %d)\n", CR_FD_PAGES, item->pid->real);
@@ -646,86 +625,11 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 		 * use, i.e. on non-lazy non-predump.
 		 */
 		cpp_flags |= PP_CHUNK_MODE;
-	
-	nr_segs = vma_area_list->nr_priv_pages;
-	if (opts.clone_dump && mdc->lazy) {
-		unsigned long pages = 0;
-
-		list_for_each_entry(vma_area, &vma_area_list->h, list) {
-			unsigned long vma_pages;
-			bool clone_tracked;
-			bool lazy_capable;
-
-			if (vma_area_is(vma_area, VMA_AREA_GUARD))
-				continue;
-			if (!vma_area_is_private(vma_area, kdat.task_size) &&
-			    !vma_area_is(vma_area, VMA_ANON_SHARED))
-				continue;
-			if (vma_entry_is(vma_area->e, VMA_AREA_VVAR))
-				continue;
-			if (vma_area->e->flags & MAP_DROPPABLE)
-				continue;
-			if (vma_area_is(vma_area, VMA_ANON_SHARED))
-				continue;
-
-			vma_pages = vma_area_len(vma_area) / PAGE_SIZE;
-
-			clone_tracked = clone_dump_is_vma_tracked(item->pid->real,
-							      vma_area->e->start,
-							      vma_area->e->end);
-			lazy_capable = vma_entry_can_be_lazy(vma_area->e) &&
-				       !vma_area_is(vma_area, VMA_AREA_GUARD) &&
-				       (vma_area->e->prot & PROT_WRITE) &&
-				       !(vma_area->e->flags & MAP_DROPPABLE) &&
-				       (vma_area->e->prot & PROT_READ) &&
-				       !is_stack(item, vma_area->e->start) &&
-				       clone_tracked;
-
-			if (lazy_capable)
-				continue;
-
-			pages += vma_pages;
-		}
-
-		/*
-		 * Keep at least one iov slot to satisfy create_page_pipe()
-		 * internal bookkeeping.
-		 */
-		if (pages == 0)
-			pages = 1;
-		if (pages < UINT_MAX)
-			nr_segs = pages;
-	}
-
-	pp = create_page_pipe(nr_segs, mdc->lazy ? NULL : pargs_iovs(args), cpp_flags);
+	pp = create_page_pipe(vma_area_list->nr_priv_pages, mdc->lazy ? NULL : pargs_iovs(args), cpp_flags);
 	if (!pp)
 		goto out;
 
-	/*
-	 * CLONE pre-dump (clone_lazy_build_only): do not open any xfer.
-	 * The VMA walk below still runs generate_vma_iovs so lazy VMAs get
-	 * registered in global_lazy_vmas (via generate_iovs -> clone_mem_add_lazy_vma).
-	 * Non-lazy VMAs that push iovs into the page pipe are discarded at
-	 * out_pp — we skip drain_pages and xfer_pages below so no pages are
-	 * read from the target process and nothing is written to disk.
-	 * All on-disk images for non-lazy VMAs are produced in Phase-3
-	 * skeleton (while frozen).
-	 */
-	if (mdc->clone_lazy_build_only) {
-		/*
-		 * Create an empty pagemap image so the replica's
-		 * discover_tasks_from_pagemaps() (clone-phase2.c) can find
-		 * this task at Phase-2 startup. No page entries are written
-		 * here — Phase-3 skeleton reopens with O_DUMP|O_TRUNC and
-		 * fills in the real content.
-		 */
-		ret = open_page_xfer(&xfer, CR_FD_PAGEMAP, vpid(item));
-		if (ret < 0)
-			goto out_pp;
-		xfer.close(&xfer);
-		/* Reset xfer so later code knows it's not open */
-		memset(&xfer, 0, sizeof(xfer));
-	} else if (!mdc->pre_dump) {
+	if (!mdc->pre_dump && !mdc->clone_pre_dump) {
 		/*
 		 * Regular dump -- create xfer object and send pages to it
 		 * right here. For pre-dumps the pp will be taken by the
@@ -764,20 +668,15 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 			continue;
 
 		ret = generate_vma_iovs(item, vma_area, pp, &xfer, args, ctl, &pmc, has_parent, mdc->pre_dump,
-					parent_predump_mode, mdc->clone_skeleton_non_lazy);
+					parent_predump_mode, mdc->clone_skip_lazy);
 		if (ret < 0)
 			goto out_xfer;
 	}
 	if (mdc->lazy)
 		memcpy(pargs_iovs(args), pp->iovs, sizeof(struct iovec) * pp->free_iov);
 
-	/*
-	 * CLONE pre-dump (clone_lazy_build_only): bail out early. global_lazy_vmas
-	 * has been populated by generate_iovs for lazy VMAs. Non-lazy VMAs
-	 * pushed iovs into pp but we discard them — their pages will be
-	 * dumped in Phase-3 skeleton while frozen.
-	 */
-	if (mdc->clone_lazy_build_only) {
+	/* CLONE Phase 1: lazy VMA list built, bail out (no page transfer) */
+	if (mdc->clone_pre_dump) {
 		exit_code = 0;
 		ret = 0;
 		goto out_pp;
@@ -1343,7 +1242,7 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 		 * This means that userfaultfd is used to load the pages
 		 * on demand.
 		 */
-		if ((opts.lazy_pages || opts.clone_dump) && pagemap_lazy(pr->pe)) {
+		if (opts.lazy_pages && pagemap_lazy(pr->pe)) {
 			pr_debug("Lazy restore skips %ld pages at %lx\n", nr_pages, va);
 			pr->skip_pages(pr, nr_pages * PAGE_SIZE);
 			nr_lazy += nr_pages;
@@ -1519,7 +1418,7 @@ static int maybe_disable_thp(struct pstree_item *t, struct page_read *pr)
 	 * collapse. And, once we register the VMA with uffd,
 	 * khugepaged will skip it.
 	 */
-	if (!((opts.lazy_pages || opts.clone_dump) && page_read_has_parent(pr)))
+	if (!(opts.lazy_pages && page_read_has_parent(pr)))
 		return 0;
 
 	if (!kdat.has_thp_disable)

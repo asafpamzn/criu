@@ -1559,19 +1559,13 @@ int pre_dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	item->pid->ns[0].virt = misc.pid;
 
 	/*
-	 * CLONE phased migration:
-	 *   pre_dump = false: treat as real dump for page collection
-	 *   lazy = true: use lazy VMA path in generate_iovs() to mark pages
-	 *                for deferred transfer instead of immediate dump
-	 *   clone_lazy_build_only = true: populate global_lazy_vmas only,
-	 *                do NOT write any pagemap/pages image. All disk
-	 *                writes for CLONE mode happen in Phase-3 skeleton
-	 *                (while frozen). Pre-dump is planning-only.
+	 * CLONE Phase 1: Build lazy VMA list only, no disk writes.
+	 * Pages will be transferred asynchronously via P3 bulk sender.
 	 */
 	mdc.pre_dump = !opts.clone_dump;
 	mdc.lazy = opts.clone_dump;
-	mdc.clone_lazy_build_only = opts.clone_dump;
-	mdc.clone_skeleton_non_lazy = false;
+	mdc.clone_pre_dump = opts.clone_dump;
+	mdc.clone_skip_lazy = false;
 	mdc.stat = NULL;
 	mdc.parent_ie = parent_ie;
 
@@ -1749,16 +1743,13 @@ int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	 * Phase-3 skeleton dump:
 	 *   - Non-CLONE: standard dump — run parasite_dump_pages_seized to dump
 	 *     all page data.
-	 *   - CLONE: pre-dump was planning-only; lazy VMAs have already streamed
-	 *     via P3 sender threads; we still need to dump *non-lazy* VMAs
-	 *     (file-backed private writable, etc.) now, while frozen.
-	 *     clone_skeleton_non_lazy=true makes generate_iovs short-circuit
-	 *     lazy VMAs so we only write non-lazy ones to pagemap/pages images.
+	 *   - CLONE Phase 3: skip lazy VMAs (already transferred via P3 bulk
+	 *     sender), dump only non-lazy VMAs (stack, VDSO, etc.).
 	 */
 	mdc.pre_dump = false;
 	mdc.lazy = clone_is_phased_skeleton_dump() ? false : opts.lazy_pages;
-	mdc.clone_lazy_build_only = false;
-	mdc.clone_skeleton_non_lazy = clone_is_phased_skeleton_dump();
+	mdc.clone_pre_dump = false;
+	mdc.clone_skip_lazy = clone_is_phased_skeleton_dump();
 	mdc.stat = &pps_buf;
 	mdc.parent_ie = parent_ie;
 

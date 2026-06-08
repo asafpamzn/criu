@@ -19,18 +19,16 @@ struct mem_dump_ctl {
 	bool pre_dump;
 	bool lazy;
 	/*
-	 * CLONE pre-dump: populate global_lazy_vmas only. No page pipe,
+	 * CLONE Phase 1 pre-dump: populate global_lazy_vmas only. No page pipe,
 	 * no xfer, no pagemap/pages file is written. Disk writes for CLONE
 	 * mode happen only in Phase-3 skeleton dump (while frozen).
 	 */
-	bool clone_lazy_build_only;
+	bool clone_pre_dump;
 	/*
-	 * CLONE Phase-3 skeleton dump: write non-lazy VMAs only. Lazy VMAs
-	 * have already streamed via the P3 sender threads, so generate_iovs
-	 * short-circuits them without pushing into the page pipe and
-	 * without re-adding them to global_lazy_vmas.
+	 * CLONE Phase 3 skeleton dump: skip lazy VMAs (already transferred
+	 * via P3 bulk sender), dump only non-lazy VMAs (stack, VDSO, etc.).
 	 */
-	bool clone_skeleton_non_lazy;
+	bool clone_skip_lazy;
 	struct proc_pid_stat *stat;
 	InventoryEntry *parent_ie;
 };
