@@ -252,7 +252,7 @@ static void tcp_cork(int sk, bool on)
 		pr_pwarn("Unable to set TCP_CORK=%d", val);
 }
 
-void page_server_page_server_tcp_nodelay(int sk, bool on)
+void page_server_tcp_nodelay(int sk, bool on)
 {
 	int val = on ? 1 : 0;
 	if (setsockopt(sk, SOL_TCP, TCP_NODELAY, &val, sizeof(val)))
