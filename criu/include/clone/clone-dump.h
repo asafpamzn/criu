@@ -154,4 +154,18 @@ extern void clone_record_unmapped_range(unsigned long start, unsigned long len);
  */
 extern int cr_dump_clone_finish(int ret);
 
+/**
+ * cr_dump_tasks_clone_phased - CLONE phased migration orchestration
+ * @pid: Target process ID
+ *
+ * Implements the WP_ASYNC → WP_SYNC phased migration flow:
+ *   Phase 1: pre_dump → WP_ASYNC all VMAs → resume immediately
+ *   Phase 2: bulk page transfer (process running, writes tracked async)
+ *   Phase 3: freeze → dump skeleton (no pages) → PAGEMAP_SCAN dirty pages
+ *   Phase 4: WP_SYNC on dirty pages → resume → convergence
+ *
+ * Returns: 0 on success, -1 on failure
+ */
+extern int cr_dump_tasks_clone_phased(pid_t pid);
+
 #endif /* __CR_CLONE_DUMP_H_ */

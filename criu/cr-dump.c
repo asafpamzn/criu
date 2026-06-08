@@ -113,8 +113,6 @@ int __attribute__((weak)) arch_set_thread_regs(struct pstree_item *item, bool wi
 #define PERSONALITY_LENGTH 9
 static char loc_buf[PERSONALITY_LENGTH];
 
-static int cr_dump_tasks_clone_phased(pid_t pid);
-
 void free_mappings(struct vm_area_list *vma_area_list)
 {
 	struct vma_area *vma_area, *p;
@@ -869,7 +867,7 @@ err:
 	return ret;
 }
 
-static int collect_pstree_ids_predump(void)
+int collect_pstree_ids_predump(void)
 {
 	struct pstree_item *item;
 	struct pid pid;
@@ -913,7 +911,7 @@ int collect_pstree_ids(void)
 	return 0;
 }
 
-static int collect_file_locks(void)
+int collect_file_locks(void)
 {
 	return parse_file_locks();
 }
@@ -1480,7 +1478,7 @@ static int dump_task_cgroup(struct parasite_ctl *parasite_ctl, const struct pstr
 	return 0;
 }
 
-static int pre_dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
+int pre_dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 {
 	pid_t pid = item->pid->real;
 	struct vm_area_list vmas;
@@ -1594,7 +1592,7 @@ err_cure:
 	goto err_free;
 }
 
-static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
+int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 {
 	pid_t pid = item->pid->real;
 	struct vm_area_list vmas;
@@ -2095,7 +2093,7 @@ static int cr_lazy_mem_dump(void)
 	return ret;
 }
 
-static int cr_dump_finish(int ret)
+int cr_dump_finish(int ret)
 {
 	int post_dump_ret = 0;
 
@@ -2220,7 +2218,7 @@ out_release_clone:
  *
  * Returns: 0 on success, -1 on error
  */
-static int cr_dump_post_task_operations(InventoryEntry *he)
+int cr_dump_post_task_operations(InventoryEntry *he)
 {
 	if (dead_pid_conflict())
 		return -1;
@@ -2283,7 +2281,7 @@ static int cr_dump_post_task_operations(InventoryEntry *he)
  * @banner is the descriptive label for the "Dumping ..." log line.
  * Returns 0 on success, -1 on error (the caller's err: path runs cr_dump_finish).
  */
-static int cr_dump_init(pid_t pid, InventoryEntry *he, const char *banner)
+int cr_dump_init(pid_t pid, InventoryEntry *he, const char *banner)
 {
 	int ret;
 
@@ -2435,288 +2433,6 @@ int cr_dump_tasks(pid_t pid)
 	}
 
 	exit_code = write_img_inventory(&he);
-err:
-	if (parent_ie)
-		inventory_entry__free_unpacked(parent_ie, NULL);
-
-	return cr_dump_finish(exit_code);
-}
-
-/*
- * cr_dump_tasks_clone_phased - CLONE phased migration orchestration
- *
- * Implements the WP_ASYNC → WP_SYNC phased migration flow:
- *   Phase 1: pre_dump → WP_ASYNC all VMAs → resume immediately
- *   Phase 2: bulk page transfer (process running, writes tracked async)
- *   Phase 3: freeze → dump skeleton (no pages) → PAGEMAP_SCAN dirty pages
- *   Phase 4: WP_SYNC on dirty pages → resume → convergence
- */
-static int cr_dump_tasks_clone_phased(pid_t pid)
-{
-	InventoryEntry he = INVENTORY_ENTRY__INIT;
-	InventoryEntry *parent_ie = NULL;
-	struct pstree_item *item;
-	int ret;
-	int exit_code = -1;
-
-	if (cr_dump_init(pid, &he, "CLONE Phased dump"))
-		goto err;
-
-	/* === PHASE 1: Seize + Pre-dump + WP_ASYNC === */
-	pr_debug("PHASE 1: Seize + Pre-dump + WP_ASYNC\n");
-
-	if (collect_pstree())
-		goto err;
-
-	if (checkpoint_devices())
-		goto err;
-
-	if (collect_pstree_ids_predump())
-		goto err;
-
-	if (collect_namespaces(false) < 0)
-		goto err;
-
-	/* Errors handled later in detect_pid_reuse */
-	parent_ie = get_parent_inventory();
-
-	if (collect_and_suspend_lsm() < 0)
-		goto err;
-
-	for_each_pstree_item(item) {
-		if (pre_dump_one_task(item, parent_ie))
-			goto err;
-	}
-
-	/*
-	 * Start BPF dirty page tracker BEFORE unfreezing the process.
-	 * This ensures we capture all page faults from the moment the
-	 * process resumes. Starting after unfreeze creates a race window
-	 * where faults could be missed.
-	 */
-#ifdef CONFIG_HAS_LIBBPF
-	if (clone_bpf_start(root_item->pid->real) == 0)
-		pr_debug("BPF dirty tracker started (before unfreeze)\n");
-	else
-		pr_info("BPF dirty tracker not available, using PAGEMAP_SCAN\n");
-#endif
-
-	/* Unfreeze — process runs with WP_ASYNC, BPF captures all faults */
-	ret = arch_set_thread_regs(root_item, false);
-	if (ret)
-		goto err;
-
-	pstree_switch_state(root_item, TASK_ALIVE);
-
-	/* === PHASE 2: Bulk page transfer + iterative dirty scan === */
-	pr_debug("PHASE 2: Bulk page transfer + dirty scan convergence\n");
-
-	/*
-	 * Start the page server which starts P3 threads.
-	 * P3 threads do bulk transfer then iterative dirty scanning.
-	 * WP_ASYNC tracks writes without generating faults.
-	 */
-	ret = cr_page_server(false, true, -1);
-	if (ret) {
-		pr_err("Bulk page transfer failed\n");
-		goto err_refreeze;
-	}
-
-	wait_for_page_server_thread();
-
-	/*
-	 * Clean up page_pipes and local parasite mappings from Phase 1.
-	 * The bulk transfer is complete, so we no longer need these.
-	 */
-	for_each_pstree_item(item) {
-		if (item->pid->state != TASK_DEAD && dmpi(item)->mem_pp) {
-			destroy_page_pipe(dmpi(item)->mem_pp);
-			dmpi(item)->mem_pp = NULL;
-			if (dmpi(item)->parasite_ctl) {
-				if (compel_cure_local(dmpi(item)->parasite_ctl))
-					pr_err("Can't cure local (pid: %d)\n",
-					       item->pid->real);
-				dmpi(item)->parasite_ctl = NULL;
-			}
-		}
-	}
-
-	/*
-	 * Wait for P3 threads to converge (all below dirty page threshold).
-	 * Threads are running iterative dirty scan loop.
-	 */
-	pr_debug("Waiting for dirty page convergence\n");
-	while (!clone_all_threads_below_threshold()) {
-		usleep(10000);  /* 10ms poll */
-	}
-	pr_debug("CONVERGENCE: All threads below threshold\n");
-
-	/* === PHASE 3: Freeze + skeleton dump === */
-	pr_debug("PHASE 3: Freeze + skeleton dump\n");
-
-	/*
-	 * Re-seize all tasks. After Phase 1, tasks were released via
-	 * pstree_switch_state(TASK_ALIVE) which detached from ptrace.
-	 * We need to re-attach to perform the skeleton dump.
-	 */
-	ret = reseize_pstree();
-	if (ret) {
-		pr_err("Failed to re-seize tasks\n");
-		goto err;
-	}
-
-#ifdef SCAN_COMPARE
-	/* DEBUG: Compare BPF vs PAGEMAP_SCAN and exit */
-	clone_debug_scan_compare();	
-#endif
-
-	/*
-	 * Collect pstree IDs now so vpid(item) is valid for the VMA detection.
-	 * This must happen before clone_detect_new_vmas() which uses dst_id.
-	 */
-	if (collect_pstree_ids())
-		goto err;
-
-	/* Update CLONE dst_id now that collect_pstree_ids() has populated vpid */
-	clone_set_dst_id(vpid(root_item));
-
-	/*
-	 * Detect VMAs that were created between Phase 1 and Phase 3.
-	 * New VMAs weren't tracked during Phase 2, so their pages weren't
-	 * sent. We mark them as dirty to ensure they get transferred
-	 * and protected with WP_SYNC for convergence.
-	 */
-	{
-		struct vm_area_list phase3_vmas;
-		unsigned long *new_vma_ranges = NULL;
-		unsigned int nr_new_vma_ranges = 0;
-
-		vm_area_list_init(&phase3_vmas);
-
-		ret = collect_mappings(root_item->pid->real, &phase3_vmas, NULL);
-		if (ret) {
-			pr_err("Failed to collect Phase 3 VMAs\n");
-			goto err;
-		}
-
-		pr_debug("CLONE PHASE 3: Collected %lu VMAs for pid %d (compare with Phase 1 count)\n",
-			 (unsigned long)phase3_vmas.nr, root_item->pid->real);
-
-		ret = clone_detect_new_vmas(&phase3_vmas, &new_vma_ranges, &nr_new_vma_ranges);
-		free_mappings(&phase3_vmas);
-
-		if (ret) {
-			pr_err("Failed to detect new VMAs\n");
-			goto err;
-		}
-
-		if (nr_new_vma_ranges > 0) {
-			pr_debug("CLONE PHASE 3: Found %u new VMA regions since Phase 1!\n",
-				 nr_new_vma_ranges);
-			pr_debug("CLONE PHASE 3: These VMAs were created while process ran during Phase 2.\n");
-			pr_debug("CLONE PHASE 3: Their PAGE DATA will be sent, but VMA METADATA is missing from dump.\n");
-			pr_debug("CLONE PHASE 3: REPLICA will NOT have these VMAs - expect comparison differences!\n");
-
-			/* Pass new VMA ranges to P3 threads for sending during final scan */
-			clone_set_new_vma_ranges(new_vma_ranges, nr_new_vma_ranges);
-			/* Don't free - P3 threads will use it */
-		} else {
-			pr_debug("CLONE PHASE 3: No new VMAs detected - VMA count unchanged since Phase 1.\n");
-			xfree(new_vma_ranges);
-		}
-	}
-
-	/*
-	 * Signal P3 threads to do final scan (process is frozen, new VMA ranges set).
-	 * Must be after clone_set_new_vma_ranges() so threads can send new VMA pages.
-	 */
-	clone_signal_last_scan();
-
-	if (network_lock())
-		goto err;
-
-	if (rpc_query_external_files())
-		goto err;
-
-	if (collect_file_locks())
-		goto err;
-
-	if (collect_namespaces(true) < 0)
-		goto err;
-
-	glob_imgset = cr_glob_imgset_open(O_DUMP);
-	if (!glob_imgset)
-		goto err;
-
-	if (seccomp_collect_dump_filters() < 0)
-		goto err;
-
-	/* Set phase to SCAN so clone_is_phased_skeleton_dump() returns true */
-	clone_set_phase(CLONE_PHASE_SCAN);
-
-	/* Dump skeleton (everything except pages) */
-	for_each_pstree_item(item) {
-		if (dump_one_task(item, parent_ie))
-			goto err;
-	}
-
-	if (parent_ie) {
-		inventory_entry__free_unpacked(parent_ie, NULL);
-		parent_ie = NULL;
-	}
-
-	/* Standard post-task dump operations */
-	if (cr_dump_post_task_operations(&he))
-		goto err;
-
-	pr_info("Skeleton dump complete\n");
-
-	/*
-	 * Wait for P3 threads to complete their final scan (process is frozen,
-	 * last_scan flag was set above). Threads will send any remaining dirty pages.
-	 *
-	 * NOTE: Inventory write and signal moved to cr_dump_finish() - they happen
-	 * AFTER all data is collected and flushed, right before unfreeze.
-	 */
-	pr_debug("Waiting for P3 threads final scan\n");
-	clone_wait_p3_threads();
-	pr_debug("P3 threads completed: %lu total pages sent\n", clone_p3_pages_sent());
-
-	if (clone_p3_had_error()) {
-		pr_err("clone-dump: P3 bulk transfer reported errors — failing "
-		       "the dump rather than producing a torn image\n");
-		goto err_refreeze;
-	}
-
-	/* Free new VMA ranges after P3 threads are done using them */
-	clone_free_new_vma_ranges();
-
-	/*
-	 * all_pages_sent signal is sent in cr_dump_finish() after unfreeze.
-	 */
-
-	clone_set_phase(CLONE_PHASE_DONE);
-
-	/* NOTE: clone_cleanup_async_uffd() moved to cr_dump_finish() after unfreeze */
-
-	/* Set up inventory fields and write - like standard path */
-	he.has_pre_dump_mode = false;
-	if (found_uprobes_vma()) {
-		he.has_allow_uprobes = true;
-		he.allow_uprobes = true;
-	}
-
-	exit_code = write_img_inventory(&he);
-	goto err;
-
-err_refreeze:
-	/*
-	 * If we failed during bulk transfer, try to re-seize tasks before
-	 * cleanup. Tasks were detached in Phase 1, so pstree_switch_state
-	 * alone won't work.
-	 */
-	if (reseize_pstree())
-		pr_warn("Failed to re-seize tasks during error cleanup\n");
 err:
 	if (parent_ie)
 		inventory_entry__free_unpacked(parent_ie, NULL);
