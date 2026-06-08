@@ -674,7 +674,8 @@ static int remap_iovs(struct lazy_pages_info *lpi, unsigned long from, unsigned 
 static int collect_iovs(struct lazy_pages_info *lpi)
 {
 	unsigned long start, end, len, nr_pages = 0;
-	int n_vma = 0, max_iov_len = 0, ret = -1;
+	unsigned long max_iov_len = 0;
+	int n_vma = 0, ret = -1;
 	struct page_read *pr = &lpi->pr;
 	struct lazy_iov *iov;
 	MmEntry *mm;
