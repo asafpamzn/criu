@@ -1531,6 +1531,7 @@ int epoll_run_rfds(int epollfd, struct epoll_event *evs, int nr_fds, int timeout
 				ret = rfd->read_event(rfd);
 
 				if (ret < 0) {
+					pr_err("DEBUG: read_event returned %d for fd=%d\n", ret, rfd->fd);
 					goto out;
 				}
 				if (ret > 0) {
@@ -1541,8 +1542,10 @@ int epoll_run_rfds(int epollfd, struct epoll_event *evs, int nr_fds, int timeout
 
 			if (events & (EPOLLHUP | EPOLLRDHUP)) {
 				ret = epoll_hangup_event(epollfd, rfd);
-				if (ret < 0)
+				if (ret < 0) {
+					pr_err("DEBUG: hangup_event returned %d for fd=%d events=0x%x\n", ret, rfd->fd, events);
 					goto out;
+				}
 				if (ret > 0)
 					have_a_break = true;
 			}
