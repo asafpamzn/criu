@@ -1329,25 +1329,20 @@ static int retry_uffd_copy(struct uffd_eagain_request *req)
 {
 	int ret;
 
-	pr_err("DEBUG: retry_uffd_copy addr=0x%llx nr_pages=%lu lpi=%p fd=%d\n",
-	       req->address, req->nr_pages, req->lpi, req->lpi ? req->lpi->lpfd.fd : -1);
-
 	ret = clone_uffd_copy(req->lpi->lpfd.fd, req->address,
 			    req->buf, req->nr_pages,
 			    req->lpi, NULL,
 			    CLONE_TRACK_RETRY | CLONE_TRACK_STRICT,
 			    "EAGAIN_RETRY");
-	pr_err("DEBUG: retry_uffd_copy returned %d for addr=0x%llx\n", ret, req->address);
-
 	if (ret == 1) {
-		pr_err("DEBUG: EAGAIN copy retry succeeded for 0x%llx\n", req->address);
+		lp_debug(req->lpi, "EAGAIN copy retry succeeded for 0x%llx\n", req->address);
 		return 0;
 	}
 	if (ret == -EAGAIN)
 		return -EAGAIN;
 
 	/* ENOENT or ERROR - unified handler already set page state */
-	pr_err("DEBUG: EAGAIN copy retry failed ret=%d for 0x%llx (expected 1 or -EAGAIN)\n", ret, req->address);
+	lp_err(req->lpi, "EAGAIN copy retry failed for 0x%llx\n", req->address);
 	return -1;
 }
 
@@ -1446,8 +1441,8 @@ int clone_process_eagain_requests(void)
 		} else if (ret < 0) {
 			/* Error - remove from queue (state already set by retry func) */
 			uffd_stats.eagain_errors++;
-			pr_err("DEBUG: EAGAIN retry error ret=%d for addr=0x%llx nr_pages=%lu op=%s\n",
-			       ret, req->address, req->nr_pages, req->buf ? "copy" : "zero");
+			pr_err("EAGAIN retry error for 0x%llx, removing from queue\n",
+			       req->address);
 			BUG();
 			list_del(&req->l);
 			if (req->buf)

@@ -1495,7 +1495,6 @@ int epoll_run_rfds(int epollfd, struct epoll_event *evs, int nr_fds, int timeout
 		if (opts.clone_dump) {
 			ret = clone_process_eagain_requests();
 			if (ret < 0) {
-				pr_err("DEBUG: clone_process_eagain_requests failed with %d\n", ret);
 				goto out;
 			}
 		}
@@ -1510,7 +1509,7 @@ int epoll_run_rfds(int epollfd, struct epoll_event *evs, int nr_fds, int timeout
 
 		if (ret <= 0) {
 			if (ret < 0) {
-				pr_perror("polling failed (epoll_wait returned %d, errno=%d)", ret, errno);
+				pr_perror("polling failed");
 				break;
 			}
 			/* Timeout - return 0 so caller can check exit conditions */
@@ -1531,7 +1530,6 @@ int epoll_run_rfds(int epollfd, struct epoll_event *evs, int nr_fds, int timeout
 				ret = rfd->read_event(rfd);
 
 				if (ret < 0) {
-					pr_err("DEBUG: read_event returned %d for fd=%d\n", ret, rfd->fd);
 					goto out;
 				}
 				if (ret > 0) {
@@ -1542,10 +1540,8 @@ int epoll_run_rfds(int epollfd, struct epoll_event *evs, int nr_fds, int timeout
 
 			if (events & (EPOLLHUP | EPOLLRDHUP)) {
 				ret = epoll_hangup_event(epollfd, rfd);
-				if (ret < 0) {
-					pr_err("DEBUG: hangup_event returned %d for fd=%d events=0x%x\n", ret, rfd->fd, events);
+				if (ret < 0)
 					goto out;
-				}
 				if (ret > 0)
 					have_a_break = true;
 			}

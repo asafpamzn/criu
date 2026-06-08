@@ -1696,11 +1696,9 @@ int clone_phase3_restore_loop(int ep_fd, struct epoll_event **events, int nr_fds
 	 */
 
 	/* Wait for restore to connect - single epoll iteration */
-	pr_err("DEBUG: Phase3 waiting for restore connection (epollfd=%d nr_fds=%d)\n", epollfd, nr_fds);
 	while (!clone_is_restore_connected()) {
 		ret = epoll_run_rfds(epollfd, *events, nr_fds, 1000);
 		if (ret < 0) {
-			pr_err("DEBUG: epoll_run_rfds returned %d, errno=%d\n", ret, errno);
 			pr_err("epoll failed waiting for restore\n");
 			close(lazy_sk);
 			return -1;
