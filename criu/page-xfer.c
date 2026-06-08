@@ -960,7 +960,6 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 {
 	struct page_pipe_buf *ppb;
 	unsigned int cur_hole = 0;
-	struct lazy_vma_entry *cur_lve = NULL;
 	int ret;
 
 	pr_debug("Transferring pages:\n");
@@ -973,24 +972,10 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 		for (i = 0; i < ppb->nr_segs; i++) {
 			struct iovec iov = ppb->iov[i];
 			u32 flags;
-			unsigned long seg_vaddr = (unsigned long)iov.iov_base + xfer->offset;
 
 			ret = dump_holes(xfer, pp, &cur_hole, iov.iov_base);
 			if (ret)
 				return ret;
-
-			/*
-			 * Write any lazy VMAs that should come before this segment.
-			 * Only applies to the task pagemap (xfer->offset == 0).
-			 * Shmem pagemap xfer sets xfer->offset to the shmem VMA's
-			 * vaddr (shmem.c: do_dump_one_shmem), and shmem pagemap
-			 * entries must not be interleaved with lazy-VMA metadata.
-			 */
-			if (opts.clone_dump && xfer->offset == 0) {
-				ret = clone_write_lazy_vmas_before(xfer, seg_vaddr, &cur_lve);
-				if (ret)
-					return ret;
-			}
 
 			BUG_ON(iov.iov_base < (void *)xfer->offset);
 			iov.iov_base -= xfer->offset;
@@ -1005,22 +990,7 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 		}
 	}
 
-	ret = dump_holes(xfer, pp, &cur_hole, NULL);
-	if (ret)
-		return ret;
-
-	/*
-	 * Write any remaining lazy VMAs after all pipe entries.
-	 * Task pagemap only — see comment on the first clone_write_lazy_vmas_before
-	 * call above. Shmem pagemap must not carry lazy-VMA metadata.
-	 */
-	if (opts.clone_dump && xfer->offset == 0) {
-		ret = clone_write_lazy_vmas_before(xfer, ULONG_MAX, &cur_lve);
-		if (ret)
-			return ret;
-	}
-
-	return 0;
+	return dump_holes(xfer, pp, &cur_hole, NULL);
 }
 
 /*
