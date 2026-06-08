@@ -1252,7 +1252,7 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 		 * This means that userfaultfd is used to load the pages
 		 * on demand.
 		 */
-		if (opts.lazy_pages && pagemap_lazy(pr->pe)) {
+		if ((opts.lazy_pages || opts.clone_dump) && pagemap_lazy(pr->pe)) {
 			pr_debug("Lazy restore skips %ld pages at %lx\n", nr_pages, va);
 			pr->skip_pages(pr, nr_pages * PAGE_SIZE);
 			nr_lazy += nr_pages;
@@ -1428,7 +1428,7 @@ static int maybe_disable_thp(struct pstree_item *t, struct page_read *pr)
 	 * collapse. And, once we register the VMA with uffd,
 	 * khugepaged will skip it.
 	 */
-	if (!(opts.lazy_pages && page_read_has_parent(pr)))
+	if (!((opts.lazy_pages || opts.clone_dump) && page_read_has_parent(pr)))
 		return 0;
 
 	if (!kdat.has_thp_disable)
