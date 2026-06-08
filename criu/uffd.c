@@ -747,12 +747,14 @@ static int ud_open(int client, struct lazy_pages_info **_lpi)
 
 	/* The "transfer protocol" is first the pid as int and then
 	 * the FD for UFFD */
+	pr_err("DEBUG: ud_open waiting for PID on client fd=%d\n", client);
 	ret = recv(client, &lpi->pid, sizeof(lpi->pid), 0);
+	pr_err("DEBUG: ud_open recv returned %d (expected %zu)\n", ret, sizeof(lpi->pid));
 	if (ret != sizeof(lpi->pid)) {
 		if (ret < 0)
 			pr_perror("PID recv error");
 		else
-			pr_err("PID recv: short read\n");
+			pr_err("PID recv: short read (got %d bytes)\n", ret);
 		goto out;
 	}
 

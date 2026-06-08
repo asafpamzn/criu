@@ -236,26 +236,33 @@ static int restore_finish_ns_stage(int from, int to)
 
 static int crtools_prepare_shared(void)
 {
+	pr_err("DEBUG: crtools_prepare_shared: calling prepare_memfd_inodes\n");
 	if (prepare_memfd_inodes())
 		return -1;
 
+	pr_err("DEBUG: crtools_prepare_shared: calling prepare_files\n");
 	if (prepare_files())
 		return -1;
 
+	pr_err("DEBUG: crtools_prepare_shared: calling collect_remaps_and_regfiles\n");
 	/* We might want to remove ghost files on failed restore */
 	if (collect_remaps_and_regfiles())
 		return -1;
 
+	pr_err("DEBUG: crtools_prepare_shared: calling collect_image inet_sk_cinfo\n");
 	/* Connections are unlocked from criu */
 	if (!files_collected() && collect_image(&inet_sk_cinfo))
 		return -1;
 
+	pr_err("DEBUG: crtools_prepare_shared: calling tty_prep_fds\n");
 	if (tty_prep_fds())
 		return -1;
 
+	pr_err("DEBUG: crtools_prepare_shared: calling prepare_apparmor_namespaces\n");
 	if (prepare_apparmor_namespaces())
 		return -1;
 
+	pr_err("DEBUG: crtools_prepare_shared: done\n");
 	return 0;
 }
 
@@ -2435,12 +2442,15 @@ int cr_restore_tasks(void)
 			return -1;
 	}
 
+	pr_err("DEBUG: cr_restore_tasks: calling prepare_task_entries\n");
 	if (prepare_task_entries() < 0)
 		return -1;
 
+	pr_err("DEBUG: cr_restore_tasks: calling prepare_pstree\n");
 	if (prepare_pstree() < 0)
 		return -1;
 
+	pr_err("DEBUG: cr_restore_tasks: calling fdstore_init\n");
 	if (fdstore_init())
 		return -1;
 
@@ -2456,15 +2466,19 @@ int cr_restore_tasks(void)
 	if (inherit_fd_move_to_fdstore())
 		goto err;
 
+	pr_err("DEBUG: cr_restore_tasks: calling crtools_prepare_shared\n");
 	if (crtools_prepare_shared() < 0)
 		goto err;
 
+	pr_err("DEBUG: cr_restore_tasks: calling prepare_cgroup\n");
 	if (prepare_cgroup())
 		goto clean_cgroup;
 
+	pr_err("DEBUG: cr_restore_tasks: calling criu_signals_setup\n");
 	if (criu_signals_setup() < 0)
 		goto clean_cgroup;
 
+	pr_err("DEBUG: cr_restore_tasks: calling prepare_lazy_pages_socket\n");
 	if (prepare_lazy_pages_socket() < 0)
 		goto clean_cgroup;
 
