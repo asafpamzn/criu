@@ -1617,7 +1617,19 @@ static int connect_to_page_server(void)
 		goto out;
 	}
 
-	page_server_sk = setup_tcp_client(opts.addr);
+	if (opts.clone_dump) {
+		int retries = 300;
+
+		while (retries-- > 0) {
+			page_server_sk = setup_tcp_client(opts.addr);
+			if (page_server_sk >= 0)
+				break;
+			usleep(100000);
+		}
+	} else {
+		page_server_sk = setup_tcp_client(opts.addr);
+	}
+
 	if (page_server_sk == -1)
 		return -1;
 
@@ -1869,6 +1881,16 @@ static int page_server_start_sync_read(void *buf, unsigned long nr, ps_async_rea
 int page_server_start_read(void *buf, unsigned long nr, ps_async_read_complete complete, void *priv, unsigned flags)
 {
 	pr_err("page_server_start_read\n");
+
+	if (opts.clone_dump) {
+		/*
+		 * CLONE mode: reader is already initialized by
+		 * clone_setup_prebuffer_reader(). Pages come via P3 threads,
+		 * not through this path.
+		 */
+		return 0;
+	}
+
 	if (flags & PR_ASYNC)
 		return page_server_start_async_read(buf, nr, complete, priv);
 	else
