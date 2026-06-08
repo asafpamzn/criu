@@ -72,7 +72,7 @@ struct vma_area {
 	};
 };
 
-#define VMA_CLONE_ROOT ((struct vma_area *)1)
+#define VMA_COW_ROOT ((struct vma_area *)1)
 
 typedef int (*dump_filemap_t)(struct vma_area *vma_area, int fd);
 

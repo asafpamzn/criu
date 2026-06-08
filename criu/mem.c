@@ -163,7 +163,7 @@ int should_dump_page(pmc_t *pmc, VmaEntry *vmae, u64 vaddr, struct page_info *pa
 
 		/*
 		 * Optimisation for private mapping pages, that haven't
-		 * yet being CLONE-ed
+		 * yet being COW-ed
 		 */
 		if (vma_entry_is(vmae, VMA_FILE_PRIVATE) && (pme & PME_FILE)) {
 			page_info->next = vaddr + PAGE_SIZE;
@@ -870,7 +870,7 @@ int parasite_dump_pages_seized(struct pstree_item *item, struct vm_area_list *vm
 	 * 9. syscall fails to copy
 	 *    data from M
 	 */
-	// TODO AVI - we do not need to skip PARASITE_CMD_MPROTECT_VMAS as we skip this function entirely.
+
 	if (!mdc->pre_dump || opts.pre_dump_mode == PRE_DUMP_SPLICE) {
 		pargs->add_prot = PROT_READ;
 		ret = compel_rpc_call_sync(PARASITE_CMD_MPROTECT_VMAS, ctl);
@@ -980,13 +980,13 @@ int prepare_mm_pid(struct pstree_item *i)
 	return ret;
 }
 
-static inline bool check_clone_vmas(struct vma_area *vma, struct vma_area *pvma)
+static inline bool check_cow_vmas(struct vma_area *vma, struct vma_area *pvma)
 {
 	/*
-	 * VMAs that _may_[1] have CLONE-ed pages should ...
+	 * VMAs that _may_[1] have COW-ed pages should ...
 	 *
 	 * [1] I say "may" because whether or not particular pages are
-	 * CLONE-ed is determined later in restore_priv_vma_content() by
+	 * COW-ed is determined later in restore_priv_vma_content() by
 	 * memcmp'aring the contents.
 	 */
 
@@ -1008,16 +1008,16 @@ static inline bool check_clone_vmas(struct vma_area *vma, struct vma_area *pvma)
 	if (!(vma->e->flags & MAP_ANONYMOUS) && vma->e->shmid != pvma->e->shmid)
 		return false;
 
-	pr_debug("Found two CLONE VMAs @0x%" PRIx64 "-0x%" PRIx64 "\n", vma->e->start, pvma->e->end);
+	pr_debug("Found two COW VMAs @0x%" PRIx64 "-0x%" PRIx64 "\n", vma->e->start, pvma->e->end);
 	return true;
 }
 
 static inline bool vma_inherited(struct vma_area *vma)
 {
-	return (vma->pvma != NULL && vma->pvma != VMA_CLONE_ROOT);
+	return (vma->pvma != NULL && vma->pvma != VMA_COW_ROOT);
 }
 
-static void prepare_clone_vmas_for(struct vm_area_list *vmas, struct vm_area_list *pvmas)
+static void prepare_cow_vmas_for(struct vm_area_list *vmas, struct vm_area_list *pvmas)
 {
 	struct vma_area *vma, *pvma;
 
@@ -1025,10 +1025,10 @@ static void prepare_clone_vmas_for(struct vm_area_list *vmas, struct vm_area_lis
 	pvma = list_first_entry(&pvmas->h, struct vma_area, list);
 
 	while (1) {
-		if ((vma->e->start == pvma->e->start) && check_clone_vmas(vma, pvma)) {
+		if ((vma->e->start == pvma->e->start) && check_cow_vmas(vma, pvma)) {
 			vma->pvma = pvma;
 			if (pvma->pvma == NULL)
-				pvma->pvma = VMA_CLONE_ROOT;
+				pvma->pvma = VMA_COW_ROOT;
 		}
 
 		/* <= here to shift from matching VMAs and ... */
@@ -1047,7 +1047,7 @@ static void prepare_clone_vmas_for(struct vm_area_list *vmas, struct vm_area_lis
 	}
 }
 
-void prepare_clone_vmas(void)
+void prepare_cow_vmas(void)
 {
 	struct pstree_item *pi;
 
@@ -1071,12 +1071,12 @@ void prepare_clone_vmas(void)
 		if (rsti(pi)->mm->exe_file_id != rsti(ppi)->mm->exe_file_id)
 			/*
 			 * Tasks running different executables have
-			 * close to zero chance of having clone-ed areas
+			 * close to zero chance of having cow-ed areas
 			 * and actually kernel never creates such.
 			 */
 			continue;
 
-		prepare_clone_vmas_for(vmas, pvmas);
+		prepare_cow_vmas_for(vmas, pvmas);
 	}
 }
 
@@ -1400,7 +1400,7 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 			}
 
 			/*
-			 * Otherwise to the CLONE restore
+			 * Otherwise to the COW restore
 			 */
 
 			off = (va - vma->e->start) / PAGE_SIZE;
@@ -1617,7 +1617,7 @@ bool vma_has_guard_gap_hidden(struct vma_area *vma)
 
 /*
  * A guard page must be unmapped after restoring content and
- * forking children to restore CLONE memory.
+ * forking children to restore COW memory.
  */
 int unmap_guard_pages(struct pstree_item *t)
 {

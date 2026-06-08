@@ -9,7 +9,6 @@
  * These extend the base PS_IOV_* protocol for CLONE migration.
  */
 #define PS_IOV_GET_ALL            8
-#define PS_IOV_ADD_F_PF           9
 #define PS_IOV_ADD_F_COMPRESS     10
 #define PS_IOV_START_RESTORE      12  /* Signal replica to start process */
 #define PS_IOV_ALL_PAGES_SENT     16  /* Primary -> Replica: all pages sent, zero-fill rest */

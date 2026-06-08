@@ -2339,6 +2339,85 @@ static int cr_dump_post_task_operations(InventoryEntry *he)
 
 
 
+/*
+ * Common dump initialization shared by cr_dump_tasks() and the CLONE phased
+ * dump. Performs everything from the process-limit bump through arming the
+ * alarm handler: allocates the pstree root for @pid, runs the pre-dump
+ * scripts, initializes stats/plugins/LSM/irmap/cpu/vdso/cgroups, prepares the
+ * inventory @he, connects to the page server and sets up the alarm handler.
+ *
+ * @banner is the descriptive label for the "Dumping ..." log line.
+ * Returns 0 on success, -1 on error (the caller's err: path runs cr_dump_finish).
+ */
+static int cr_dump_init(pid_t pid, InventoryEntry *he, const char *banner)
+{
+	int ret;
+
+	kerndat_warn_about_madv_guards();
+
+	pr_info("========================================\n");
+	pr_info("%s (pid: %d comm: %s)\n", banner, pid, __task_comm_info(pid));
+	pr_info("========================================\n");
+
+	/*
+	 *  We will fetch all file descriptors for each task, their number can
+	 *  be bigger than a default file limit, so we need to raise it to the
+	 *  maximum.
+	 */
+	rlimit_unlimit_nofile();
+
+	root_item = alloc_pstree_item();
+	if (!root_item)
+		return -1;
+	root_item->pid->real = pid;
+
+	ret = run_scripts(ACT_PRE_DUMP);
+	if (ret != 0) {
+		pr_err("Pre dump script failed with %d!\n", ret);
+		return -1;
+	}
+
+	if (init_stats(DUMP_STATS))
+		return -1;
+
+	if (cr_plugin_init(CR_PLUGIN_STAGE__DUMP))
+		return -1;
+
+	if (lsm_check_opts())
+		return -1;
+
+	if (irmap_load_cache())
+		return -1;
+
+	if (cpu_init())
+		return -1;
+
+	if (vdso_init_dump())
+		return -1;
+
+	if (cgp_init(opts.cgroup_props, opts.cgroup_props ? strlen(opts.cgroup_props) : 0, opts.cgroup_props_file))
+		return -1;
+
+	if (parse_cg_info())
+		return -1;
+
+	if (prepare_inventory(he))
+		return -1;
+
+	if (opts.cpu_cap & CPU_CAP_IMAGE) {
+		if (cpu_dump_cpuinfo())
+			return -1;
+	}
+
+	if (connect_to_page_server_to_send() < 0)
+		return -1;
+
+	if (setup_alarm_handler())
+		return -1;
+
+	return 0;
+}
+
 int cr_dump_tasks(pid_t pid)
 {
 	InventoryEntry he = INVENTORY_ENTRY__INIT;
@@ -2354,65 +2433,7 @@ int cr_dump_tasks(pid_t pid)
 	if (opts.clone_dump)
 		return cr_dump_tasks_clone_phased(pid);
 
-	kerndat_warn_about_madv_guards();
-
-	pr_info("========================================\n");
-	pr_info("Dumping processes (pid: %d comm: %s)\n", pid, __task_comm_info(pid));
-	pr_info("========================================\n");
-
-	/*
-	 *  We will fetch all file descriptors for each task, their number can
-	 *  be bigger than a default file limit, so we need to raise it to the
-	 *  maximum.
-	 */
-	rlimit_unlimit_nofile();
-
-	root_item = alloc_pstree_item();
-	if (!root_item)
-		goto err;
-	root_item->pid->real = pid;
-
-	ret = run_scripts(ACT_PRE_DUMP);
-	if (ret != 0) {
-		pr_err("Pre dump script failed with %d!\n", ret);
-		goto err;
-	}
-	if (init_stats(DUMP_STATS))
-		goto err;
-
-	if (cr_plugin_init(CR_PLUGIN_STAGE__DUMP))
-		goto err;
-
-	if (lsm_check_opts())
-		goto err;
-
-	if (irmap_load_cache())
-		goto err;
-
-	if (cpu_init())
-		goto err;
-
-	if (vdso_init_dump())
-		goto err;
-
-	if (cgp_init(opts.cgroup_props, opts.cgroup_props ? strlen(opts.cgroup_props) : 0, opts.cgroup_props_file))
-		goto err;
-
-	if (parse_cg_info())
-		goto err;
-
-	if (prepare_inventory(&he))
-		goto err;
-
-	if (opts.cpu_cap & CPU_CAP_IMAGE) {
-		if (cpu_dump_cpuinfo())
-			goto err;
-	}
-
-	if (connect_to_page_server_to_send() < 0)
-		goto err;
-
-	if (setup_alarm_handler())
+	if (cr_dump_init(pid, &he, "Dumping processes"))
 		goto err;
 
 	/*
@@ -2504,63 +2525,7 @@ static int cr_dump_tasks_clone_phased(pid_t pid)
 	int ret;
 	int exit_code = -1;
 
-	kerndat_warn_about_madv_guards();
-
-	pr_info("========================================\n");
-	pr_info("CLONE Phased dump (pid: %d comm: %s)\n", pid, __task_comm_info(pid));
-	pr_info("========================================\n");
-
-	rlimit_unlimit_nofile();
-
-	root_item = alloc_pstree_item();
-	if (!root_item)
-		goto err;
-	root_item->pid->real = pid;
-
-	ret = run_scripts(ACT_PRE_DUMP);
-	if (ret != 0) {
-		pr_err("Pre dump script failed with %d!\n", ret);
-		goto err;
-	}
-
-	if (init_stats(DUMP_STATS))
-		goto err;
-
-	if (cr_plugin_init(CR_PLUGIN_STAGE__DUMP))
-		goto err;
-
-	if (lsm_check_opts())
-		goto err;
-
-	if (irmap_load_cache())
-		goto err;
-
-	if (cpu_init())
-		goto err;
-
-	if (vdso_init_dump())
-		goto err;
-
-	if (cgp_init(opts.cgroup_props,
-		     opts.cgroup_props ? strlen(opts.cgroup_props) : 0,
-		     opts.cgroup_props_file))
-		goto err;
-
-	if (parse_cg_info())
-		goto err;
-
-	if (prepare_inventory(&he))
-		goto err;
-
-	if (opts.cpu_cap & CPU_CAP_IMAGE) {
-		if (cpu_dump_cpuinfo())
-			goto err;
-	}
-
-	if (connect_to_page_server_to_send() < 0)
-		goto err;
-
-	if (setup_alarm_handler())
+	if (cr_dump_init(pid, &he, "CLONE Phased dump"))
 		goto err;
 
 	/* === PHASE 1: Seize + Pre-dump + WP_ASYNC === */

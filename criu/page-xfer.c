@@ -545,7 +545,6 @@ out:
 	xfer->write_pagemap = write_pagemap_loc;
 	xfer->write_pages = write_pages_loc;
 	xfer->close = close_page_xfer;
-
 	return 0;
 
 err_pi:
@@ -572,10 +571,6 @@ static int page_xfer_dump_hole(struct page_xfer *xfer, struct iovec *hole, u32 f
 	hole->iov_base -= xfer->offset;
 	pr_debug("\th %p [%u]\n", hole->iov_base, (unsigned int)(hole->iov_len / PAGE_SIZE));
 
-	pr_debug("  Writing hole pagemap: 0x%lx-0x%lx (%lu pages)\n",
-		(unsigned long)hole->iov_base,
-		(unsigned long)(hole->iov_base + hole->iov_len),
-		(unsigned long)(hole->iov_len / PAGE_SIZE));
 	if (xfer->write_pagemap(xfer, hole, flags))
 		return -1;
 
@@ -1007,8 +1002,6 @@ err:
 	return -1;
 }
 
-/* write_lazy_vmas_before is now in clone-page-xfer.c (clone_write_lazy_vmas_before) */
-
 int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 {
 	struct page_pipe_buf *ppb;
@@ -1017,12 +1010,6 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 	int ret;
 
 	pr_debug("Transferring pages:\n");
-
-	/* In CLONE dump mode, we need to interleave lazy VMA entries with pipe entries */
-	if (opts.clone_dump) {
-		pr_debug("Writing pagemap entries (interleaved mode) for dst_id=%lu\n",
-			(unsigned long)xfer->dst_id);
-	}
 
 	list_for_each_entry(ppb, &pp->bufs, l) {
 		unsigned int i;
@@ -1056,10 +1043,6 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 			pr_debug("\tp %p - %p\n", iov.iov_base, iov.iov_base + iov.iov_len);
 
 			flags = ppb_xfer_flags(xfer, ppb);
-
-			pr_debug("Writing pagemap segment: 0x%lx-0x%lx (%lu pages)\n",
-				 (unsigned long)iov.iov_base, (unsigned long)(iov.iov_base + iov.iov_len),
-				 (unsigned long)(iov.iov_len / PAGE_SIZE));
 
 			if (xfer->write_pagemap(xfer, &iov, flags))
 				return -1;
@@ -1245,6 +1228,9 @@ static int page_server_add(int sk, struct page_server_iov *pi, u32 flags)
 	struct page_xfer *lxfer = &cxfer.loc_xfer;
 	struct iovec iov;
 
+	pr_debug("Adding %" PRIx64 " - %" PRIx64 "\n",
+		 pi->vaddr, pi->vaddr + pi->nr_pages * PAGE_SIZE);
+
 	if (prep_loc_xfer(pi))
 		return -1;
 
@@ -1254,6 +1240,7 @@ static int page_server_add(int sk, struct page_server_iov *pi, u32 flags)
 
 	if (!(flags & PE_PRESENT))
 		return 0;
+
 	len = iov.iov_len;
 	while (len > 0) {
 		ssize_t chunk;
@@ -1302,7 +1289,6 @@ static int page_server_add(int sk, struct page_server_iov *pi, u32 flags)
 
 	return 0;
 }
-
 
 static int page_server_get_pages(int sk, struct page_server_iov *pi)
 {
@@ -1409,27 +1395,21 @@ static int page_server_serve(int sk)
 		case PS_IOV_PARENT:
 			ret = page_server_check_parent(sk, &pi);
 			break;
-		case PS_IOV_ADD_F_COMPRESS:
-			/* Compressed pages go through clone-bulk-recv.c */
-			BUG();
 		case PS_IOV_ADD_F:
-		case PS_IOV_ADD_F_PF:
 		case PS_IOV_ADD:
 		case PS_IOV_HOLE: {
 			u32 flags;
-			if (cmd == PS_IOV_ADD_F_PF)
-				cmd = PS_IOV_ADD_F;
-			if (likely(cmd == PS_IOV_ADD_F)) {
+
+			if (likely(cmd == PS_IOV_ADD_F))
 				flags = decode_ps_flags(pi.cmd);
-			} else if (cmd == PS_IOV_ADD) {
+			else if (cmd == PS_IOV_ADD)
 				flags = PE_PRESENT;
-			} else /* PS_IOV_HOLE */ {
+			else /* PS_IOV_HOLE */
 				flags = PE_PARENT;
-			}
 
 			ret = page_server_add(sk, &pi, flags);
 			break;
-			}
+		}
 		case PS_IOV_CLOSE:
 		case PS_IOV_FORCE_CLOSE: {
 			int32_t status = 0;
@@ -1669,10 +1649,6 @@ int cr_page_server(bool daemon_mode, bool lazy_dump, int cfd)
 	sk = setup_tcp_server("page", opts.addr, &opts.port);
 	if (sk == -1)
 		return -1;
-
-	if (opts.clone_dump && lazy_dump)
-		pr_info("Page server ready, replica will connect with retry\n");
-
 no_server:
 
 	if (!daemon_mode && cfd >= 0) {
@@ -1712,6 +1688,7 @@ static int connect_to_page_server(void)
 
 	if (opts.ps_socket != -1) {
 		page_server_sk = opts.ps_socket;
+		pr_info("Reusing ps socket %d\n", page_server_sk);
 		goto out;
 	}
 
@@ -1736,6 +1713,11 @@ static int connect_to_page_server(void)
 		return -1;
 	}
 out:
+	/*
+	 * CORK the socket at the very beginning. As per ANK
+	 * the corked by default socket with sporadic NODELAY-s
+	 * on urgent data is the smartest mode ever.
+	 */
 	tcp_cork(page_server_sk, true);
 	return 0;
 }
@@ -1767,7 +1749,7 @@ int disconnect_from_page_server(void)
 	if (page_server_sk == -1)
 		return 0;
 
-	pr_debug("Disconnect from the page server\n");
+	pr_info("Disconnect from the page server\n");
 
 	if (opts.ps_socket != -1)
 		/*

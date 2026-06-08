@@ -129,7 +129,6 @@ static void free_iovs(struct lazy_pages_info *lpi)
 
 static void lpi_fini(struct lazy_pages_info *lpi);
 
-/* Non-static for use by uffd_clone.c */
 void lpi_put(struct lazy_pages_info *lpi)
 {
 	lpi->ref_cnt--;
@@ -526,11 +525,6 @@ static int __drop_iovs(struct list_head *iovs, unsigned long addr, int len)
 {
 	struct lazy_iov *iov, *n;
 
-	if (opts.clone_dump) {
-		pr_err("CLONE should not reach __drop_iovs (addr=0x%lx len=%d)\n", addr, len);
-		BUG();
-	}
-
 	list_for_each_entry_safe(iov, n, iovs, l) {
 		unsigned long start = iov->start;
 		unsigned long end = iov->end;
@@ -587,11 +581,6 @@ static int __drop_iovs(struct list_head *iovs, unsigned long addr, int len)
 
 static int drop_iovs(struct lazy_pages_info *lpi, unsigned long addr, int len)
 {
-	if (opts.clone_dump) {
-		pr_err("CLONE should not reach drop_iovs (addr=0x%lx len=%d)\n", addr, len);
-		BUG();
-	}
-
 	if (__drop_iovs(&lpi->iovs, addr, len))
 		return -1;
 
@@ -685,8 +674,7 @@ static int remap_iovs(struct lazy_pages_info *lpi, unsigned long from, unsigned 
 static int collect_iovs(struct lazy_pages_info *lpi)
 {
 	unsigned long start, end, len, nr_pages = 0;
-	unsigned long max_iov_len = 0;
-	int n_vma = 0, ret = -1;
+	int n_vma = 0, max_iov_len = 0, ret = -1;
 	struct page_read *pr = &lpi->pr;
 	struct lazy_iov *iov;
 	MmEntry *mm;
@@ -813,6 +801,7 @@ out:
 
 static int handle_exit(struct lazy_pages_info *lpi)
 {
+	lp_debug(lpi, "EXIT\n");
 	if (epoll_del_rfd(epollfd, &lpi->lpfd))
 		return -1;
 	free_iovs(lpi);
@@ -912,11 +901,6 @@ static int uffd_io_complete(struct page_read *pr, unsigned long img_addr, unsign
 	unsigned long addr = 0, req_pages;
 	struct lazy_iov *req;
 	int ret;
-
-	if (opts.clone_dump) {
-		pr_err("CLONE should not reach uffd_io_complete (img_addr=0x%lx nr=%lu)\n", img_addr, nr);
-		BUG();
-	}
 
 	lpi = container_of(pr, struct lazy_pages_info, pr);
 
@@ -1052,11 +1036,6 @@ static int xfer_pages(struct lazy_pages_info *lpi)
 	unsigned long nr_pages;
 	unsigned long len;
 	int err;
-
-	if (opts.clone_dump) {
-		pr_err("CLONE should not reach xfer_pages\n");
-		BUG();
-	}
 
 	iov = pick_next_range(lpi);
 	if (!iov)
@@ -1327,7 +1306,6 @@ static int handle_uffd_event(struct epoll_rfd *lpfd)
 	return 0;
 }
 
-/* Non-static for use by uffd_clone.c */
 void lazy_pages_summary(struct lazy_pages_info *lpi)
 {
 	lp_debug(lpi, "UFFD transferred pages: (%ld/%ld)\n", lpi->copied_pages, lpi->total_pages);
@@ -1347,11 +1325,6 @@ static int handle_requests(int epollfd, struct epoll_event **events, int nr_fds)
 	struct lazy_pages_info *lpi, *n;
 	int poll_timeout = -1;
 	int ret;
-
-	if (opts.clone_dump) {
-		pr_err("CLONE should not reach handle_requests (use cr_clone_phase2)\n");
-		BUG();
-	}
 
 	for (;;) {
 		ret = epoll_run_rfds(epollfd, *events, nr_fds, poll_timeout);
