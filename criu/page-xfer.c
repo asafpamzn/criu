@@ -980,12 +980,21 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 				return ret;
 
 			/*
-			 * CLONE: Write lazy VMA pagemap entries before this segment.
-			 * These are needed by uffd handler to serve page faults from
-			 * the bulk transfer buffer. Only for task pagemap (offset==0).
+			 * CLONE mode: Write lazy VMA entries to pagemap.
+			 *
+			 * The uffd page fault handler (collect_iovs in uffd.c) reads
+			 * pagemap to build its list of servable address ranges. Without
+			 * these PE_LAZY entries, it won't know about lazy VMAs and the
+			 * process will crash on page faults.
+			 *
+			 * In regular lazy-pages, lazy pages go through generate_iovs()
+			 * into page_pipe. In CLONE mode, lazy VMAs skip that path and
+			 * are collected separately, so we write them here.
+			 *
+			 * Only for task pagemap (offset==0), not shmem pagemap.
 			 */
 			if (opts.clone_dump && xfer->offset == 0) {
-				ret = clone_write_lazy_vmas_before(xfer, seg_vaddr, &cur_lve);
+				ret = clone_write_lazy_vmas_to_pagemap(xfer, seg_vaddr, &cur_lve);
 				if (ret)
 					return ret;
 			}
@@ -1009,7 +1018,7 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 
 	/* CLONE: Write any remaining lazy VMAs after all pipe entries */
 	if (opts.clone_dump && xfer->offset == 0) {
-		ret = clone_write_lazy_vmas_before(xfer, ULONG_MAX, &cur_lve);
+		ret = clone_write_lazy_vmas_to_pagemap(xfer, ULONG_MAX, &cur_lve);
 		if (ret)
 			return ret;
 	}

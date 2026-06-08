@@ -216,11 +216,31 @@ void clone_close_page_server_socket(void)
 }
 
 /*
- * Helper to write lazy VMA pagemap entries that come before a given vaddr.
- * CLONE-specific: used to interleave lazy VMA entries with pipe entries.
+ * clone_write_lazy_vmas_to_pagemap - Write lazy VMA entries to pagemap file
+ *
+ * Why this is needed:
+ *   The uffd page fault handler (collect_iovs in uffd.c) reads the pagemap file
+ *   to build a list of address ranges it can serve via userfaultfd. It looks for
+ *   entries with the PE_LAZY flag to know which addresses should be handled.
+ *
+ *   In regular lazy-pages mode, lazy pages go through generate_iovs() and into
+ *   the page_pipe, then page_xfer_dump_pages() writes them to pagemap.
+ *
+ *   In CLONE mode, lazy VMAs skip the page-by-page scan entirely (optimization).
+ *   They're collected in global_lazy_vmas list instead. This function writes
+ *   those VMAs to the pagemap so collect_iovs() can find them.
+ *
+ * How it works:
+ *   Called from page_xfer_dump_pages() to interleave lazy VMA entries with
+ *   regular page entries, maintaining address order in the pagemap file.
+ *   Writes all lazy VMAs with start address < before_vaddr.
+ *
+ * @xfer: Page transfer context
+ * @before_vaddr: Write lazy VMAs starting before this address
+ * @cur_lve: Current position in lazy VMA list (for iterative calls)
  */
-int clone_write_lazy_vmas_before(struct page_xfer *xfer, unsigned long before_vaddr,
-			       struct lazy_vma_entry **cur_lve)
+int clone_write_lazy_vmas_to_pagemap(struct page_xfer *xfer, unsigned long before_vaddr,
+				     struct lazy_vma_entry **cur_lve)
 {
 	struct list_head *global_list = get_global_lazy_vmas();
 	struct lazy_vma_entry *lve = *cur_lve;
@@ -229,7 +249,8 @@ int clone_write_lazy_vmas_before(struct page_xfer *xfer, unsigned long before_va
 	if (!lve && !list_empty(global_list))
 		lve = list_first_entry(global_list, struct lazy_vma_entry, list);
 
-	/* Write all lazy VMAs that start before before_vaddr.
+	/*
+	 * Write all lazy VMAs that start before before_vaddr.
 	 * Use lve->start/end (not lve->vma->e) since vma structs
 	 * may be freed after the dump completes.
 	 */

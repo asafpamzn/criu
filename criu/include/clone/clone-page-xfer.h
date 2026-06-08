@@ -49,12 +49,15 @@ extern void clone_close_page_server_socket(void);
 /* CLONE skeleton file transfer: send all .img files over TCP */
 extern int clone_send_skeleton_files(int sk);
 
-/* CLONE lazy VMA pagemap writing */
+/*
+ * Write lazy VMA entries to pagemap for uffd handler (collect_iovs).
+ * See clone_write_lazy_vmas_to_pagemap() in clone-page-xfer.c for details.
+ */
 struct page_xfer;
 struct lazy_vma_entry;
 struct page_server_iov;
-extern int clone_write_lazy_vmas_before(struct page_xfer *xfer, unsigned long before_vaddr,
-				      struct lazy_vma_entry **cur_lve);
+extern int clone_write_lazy_vmas_to_pagemap(struct page_xfer *xfer, unsigned long before_vaddr,
+					    struct lazy_vma_entry **cur_lve);
 
 /* CLONE protocol command handler (returns 0=handled, 1=not CLONE cmd, -1=error) */
 extern int clone_handle_protocol_cmd(u32 cmd, struct page_server_iov *pi, int sk,
