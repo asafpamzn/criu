@@ -129,10 +129,12 @@ static pid_t clone_start_restore(void)
 {
 	pid_t pid;
 	char log_path[PATH_MAX];
+	char log_level[8];
 	int ret;
 	char *argv[16];
 
 	snprintf(log_path, sizeof(log_path), "%s/clone-restore.log", opts.imgs_dir);
+	snprintf(log_level, sizeof(log_level), "-v%d", opts.log_level);
 
 	argv[0] = opts.argv_0;
 	argv[1] = "restore";
@@ -145,7 +147,7 @@ static pid_t clone_start_restore(void)
 	argv[8] = "--skip-file-size-check";
 	argv[9] = "--file-validation";
 	argv[10] = "filesize";
-	argv[11] = "-v1";
+	argv[11] = log_level;
 	argv[12] = "-o";
 	argv[13] = log_path;
 	argv[14] = NULL;
