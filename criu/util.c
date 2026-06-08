@@ -1495,6 +1495,7 @@ int epoll_run_rfds(int epollfd, struct epoll_event *evs, int nr_fds, int timeout
 		if (opts.clone_dump) {
 			ret = clone_process_eagain_requests();
 			if (ret < 0) {
+				pr_err("DEBUG: clone_process_eagain_requests failed with %d\n", ret);
 				goto out;
 			}
 		}
@@ -1509,7 +1510,7 @@ int epoll_run_rfds(int epollfd, struct epoll_event *evs, int nr_fds, int timeout
 
 		if (ret <= 0) {
 			if (ret < 0) {
-				pr_perror("polling failed");
+				pr_perror("polling failed (epoll_wait returned %d, errno=%d)", ret, errno);
 				break;
 			}
 			/* Timeout - return 0 so caller can check exit conditions */
