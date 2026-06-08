@@ -143,4 +143,15 @@ extern void clone_cleanup_async_uffd(void);
  */
 extern void clone_record_unmapped_range(unsigned long start, unsigned long len);
 
+/**
+ * cr_dump_clone_finish - Clone-specific finish operations
+ * @ret: current return status (0 = success so far)
+ *
+ * Handles signaling replica, optional comparison, unfreezing the process,
+ * and cleanup. Called from cr_dump_finish() when clone dump is complete.
+ *
+ * Returns: updated return status
+ */
+extern int cr_dump_clone_finish(int ret);
+
 #endif /* __CR_CLONE_DUMP_H_ */

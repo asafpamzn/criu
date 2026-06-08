@@ -346,7 +346,7 @@ static int root_prepare_shared(void)
 	if (ret < 0)
 		goto err;
 
-	prepare_clone_vmas();
+	prepare_cow_vmas();
 
 	ret = prepare_restorer_blob();
 	if (ret)

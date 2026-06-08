@@ -29,8 +29,11 @@
 #include "kerndat.h"
 #include "criu-log.h"
 #include "parasite.h"
+#include "seize.h"
 #include "clone/clone-conf.h"
 #include "clone/clone-bulk-send.h"
+#include "clone/clone-page-xfer.h"
+#include "clone/clone-compare.h"
 #include "common/bug.h"
 
 #undef LOG_PREFIX
@@ -1210,4 +1213,83 @@ void clone_cleanup_async_uffd(void)
 
 }
 
+/*
+ * cr_dump_clone_finish - Clone-specific finish operations
+ *
+ * Handles signaling replica, optional comparison, unfreezing the process,
+ * and cleanup. Called from cr_dump_finish() when clone dump is complete.
+ *
+ * @ret: current return status (0 = success so far)
+ * Returns: updated return status
+ */
+int cr_dump_clone_finish(int ret)
+{
+	int sk = get_page_server_sk();
 
+	pr_debug("Signaling replica (ret=%d, sk=%d)\n", ret, sk);
+
+	/*
+	 * Send single completion signal while frozen (fast).
+	 * Replica waits for this before starting restore.
+	 */
+	if (!ret && sk >= 0) {
+		if (clone_send_skeleton_files(sk) < 0) {
+			pr_err("Failed to send skeleton files\n");
+			ret = -1;
+		}
+		if (!ret && send_all_pages_sent_signal(sk) < 0) {
+			pr_err("Failed to send completion signal\n");
+			ret = -1;
+		}
+	}
+
+#ifdef CONFIG_CLONE_COMPARE
+	/*
+	 * When comparing, wait for ACK before compare starts.
+	 * Replica sends ACK after it's ready for comparison.
+	 */
+	if (!ret && sk >= 0) {
+		if (wait_for_all_pages_sent_ack(sk) < 0) {
+			pr_err("Failed to receive completion ACK\n");
+			ret = -1;
+		}
+	}
+
+	/* Process comparison with replica (source already unfrozen) */
+	{
+		int compare_sk;
+		pid_t target_pid = root_item->pid->real;
+
+		pr_debug("COMPARE: PRIMARY waiting for replica connection (PID %d running)\n",
+			 target_pid);
+
+		if (clone_compare_listen(&compare_sk) == 0) {
+			clone_compare_send_state(compare_sk, target_pid);
+			close(compare_sk);
+		}
+		pr_debug("COMPARE: PRIMARY comparison done\n");
+	}
+
+	pr_debug("Unfreezing process\n");
+	pstree_switch_state(root_item, TASK_ALIVE);
+#else
+
+	pr_debug("Unfreezing process\n");
+	pstree_switch_state(root_item, TASK_ALIVE);
+	/* Wait for ACK AFTER unfreeze - not on critical path */
+	if (!ret && sk >= 0) {
+		if (wait_for_all_pages_sent_ack(sk) < 0) {
+			pr_err("Failed to receive completion ACK\n");
+			ret = -1;
+		}
+	}
+#endif
+
+	/* Cleanup after unfreeze - not on critical path */
+	clone_cleanup_async_uffd();
+
+	/* Close page server socket AFTER unfreeze */
+	close_page_server_socket();
+
+	return ret;
+}

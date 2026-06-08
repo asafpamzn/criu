@@ -39,7 +39,7 @@ extern bool vma_has_guard_gap_hidden(struct vma_area *vma);
 extern bool page_is_zero(u64 pme);
 extern bool page_in_parent(bool dirty);
 extern int prepare_mm_pid(struct pstree_item *i);
-extern void prepare_clone_vmas(void);
+extern void prepare_cow_vmas(void);
 extern int do_task_reset_dirty_track(int pid);
 extern unsigned long dump_pages_args_size(struct vm_area_list *vmas);
 extern int parasite_dump_pages_seized(struct pstree_item *item, struct vm_area_list *vma_area_list,

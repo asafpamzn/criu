@@ -61,7 +61,7 @@ struct vma_area {
 			 * Some notes about pvma, page_bitmap and premmaped_addr bits
 			 * above.
 			 *
-			 * The pvma is set in prepare_clone_vmas() when we resolve which
+			 * The pvma is set in prepare_cow_vmas() when we resolve which
 			 * VMAs _may_ inherit pages from each other.
 			 * The page_bitmap and premmaped_addr are set in prepare_mappings()
 			 * when the respective VMAs get mmap-ed or mremap-ed.
