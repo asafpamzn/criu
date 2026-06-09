@@ -169,12 +169,10 @@ static pid_t clone_start_restore(void)
 
 /*
  * criu clone-receive entry point.
- * Sets up clone mode and calls cr_clone_phase2().
  */
 int cr_clone_receive(bool daemon)
 {
-	/* clone-receive implies these options */
-	opts.clone_dump = true;
+	/* clone-receive implies page-server mode */
 	opts.use_page_server = true;
 
 	return cr_clone_phase2(daemon);

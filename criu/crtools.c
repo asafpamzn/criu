@@ -315,6 +315,9 @@ int main(int argc, char *argv[], char *envp[])
 	if (opts.img_parent)
 		pr_info("Will do snapshot from %s\n", opts.img_parent);
 
+	if (opts.mode == CR_CLONE_RECEIVE)
+		opts.clone_dump = true;
+
 	if (opts.clone_dump) {
 		if (clone_cfg_init_from_opts(opts.clone_num_p3_threads,
 					   opts.clone_num_p3_threads_bulk,
