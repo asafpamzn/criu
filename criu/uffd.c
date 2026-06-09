@@ -61,8 +61,7 @@
 #define LAZY_PAGES_SOCK_NAME "lazy-pages.socket"
 
 #define LAZY_PAGES_RESTORE_FINISHED 0x52535446 /* ReSTore Finished */
-#define LAZY_PAGES_DRAIN_COMPLETE   0x44524E43 /* DRaiN Complete (CLONE mode) */
-#define LAZY_PAGES_TASKS_FROZEN     0x54534B46 /* TaSKs Frozen (CLONE mode) */
+/* LAZY_PAGES_DRAIN_COMPLETE and LAZY_PAGES_TASKS_FROZEN are in uffd-internal.h */
 
 /*
  * Background transfer parameters.
@@ -72,6 +71,10 @@
  */
 #define DEFAULT_XFER_LEN (64 << 10)
 #define MAX_XFER_LEN	 (4 << 20)
+
+/* Connection retry parameters for lazy pages socket */
+#define LAZY_PAGES_CONN_RETRIES   1200	  /* ~2 minutes total */
+#define LAZY_PAGES_CONN_DELAY_US  100000  /* 100ms between retries */
 
 static mutex_t *lazy_sock_mutex;
 
@@ -85,11 +88,11 @@ static struct epoll_rfd lazy_sk_rfd;
 /* socket for communication with lazy-pages daemon */
 static int lazy_pages_sk_id = -1;
 
-/*
- * CLONE stats and EAGAIN handling functions are in clone-uffd.c:
- * - check_and_print_uffd_stats()
- * - clone_queue_eagain_request(), clone_process_eagain_requests()
- */
+/* Accessors for clone-uffd.c */
+struct list_head *uffd_get_lpis(void) { return &lpis; }
+struct epoll_rfd *uffd_get_lazy_sk_rfd(void) { return &lazy_sk_rfd; }
+void uffd_set_epollfd(int fd) { epollfd = fd; }
+int uffd_get_epollfd(void) { return epollfd; }
 
 static int handle_uffd_event(struct epoll_rfd *lpfd);
 
@@ -323,8 +326,15 @@ int prepare_lazy_pages_socket(void)
 	mutex_init(lazy_sock_mutex);
 
 	len = offsetof(struct sockaddr_un, sun_path) + strlen(sun.sun_path);
-	if (opts.clone_dump) {
-		int retries = 1200;
+
+	/*
+	 * Retry connecting - lazy-pages daemon may not be listening yet.
+	 * This is especially important in clone mode where restore starts
+	 * before lazy-pages is fully ready.
+	 */
+	{
+		int retries = LAZY_PAGES_CONN_RETRIES;
+		int delay_us = LAZY_PAGES_CONN_DELAY_US;
 
 		while (retries-- > 0) {
 			fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -334,18 +344,12 @@ int prepare_lazy_pages_socket(void)
 				break;
 			close(fd);
 			fd = -1;
-			usleep(100000);
+			if (retries > 0)
+				usleep(delay_us);
 		}
 		if (fd < 0) {
-			pr_perror("connect to %s failed after retries", sun.sun_path);
-			return -1;
-		}
-	} else {
-		if ((fd = socket(AF_UNIX, SOCK_STREAM, 0)) < 0)
-			return -1;
-		if (connect(fd, (struct sockaddr *)&sun, len) < 0) {
 			pr_perror("connect to %s failed", sun.sun_path);
-			goto out;
+			return -1;
 		}
 	}
 
@@ -418,7 +422,6 @@ static struct lazy_iov *find_iov(struct lazy_pages_info *lpi, unsigned long addr
 	return NULL;
 }
 
-/* Non-static wrapper for use by clone-uffd.c */
 struct lazy_iov *clone_find_iov(struct lazy_pages_info *lpi, unsigned long addr)
 {
 	return find_iov(lpi, addr);
@@ -735,7 +738,7 @@ free_mm:
 
 static int uffd_io_complete(struct page_read *pr, unsigned long vaddr, unsigned long nr);
 
-static int ud_open(int client, struct lazy_pages_info **_lpi)
+int uffd_open_task(int client, struct lazy_pages_info **_lpi)
 {
 	struct lazy_pages_info *lpi;
 	int ret = -1;
@@ -849,28 +852,11 @@ static int uffd_check_op_error(struct lazy_pages_info *lpi, const char *op, unsi
 	return 0;
 }
 
-static int xfer_pages(struct lazy_pages_info *lpi);
-
-/*
- * EAGAIN request handling is in clone-uffd.c:
- * - clone_queue_eagain_request()
- * - clone_queue_drain_eagain_request()
- */
-
 static int uffd_copy(struct lazy_pages_info *lpi, __u64 address, unsigned long *nr_pages)
 {
 	struct uffdio_copy uffdio_copy;
 	unsigned long len = *nr_pages * page_size();
 
-	/* CLONE mode: use unified copy with full tracking */
-	if (opts.clone_dump) {
-		int ret = clone_uffd_copy(lpi->lpfd.fd, address, lpi->buf, *nr_pages,
-					lpi, NULL, 0, "uffd_copy");
-		/* clone_uffd_copy returns 1=success, 0=soft-handled, -1=error */
-		return ret < 0 ? -1 : 0;
-	}
-
-	/* Non-CLONE mode: original implementation */
 	uffdio_copy.dst = address;
 	uffdio_copy.src = (unsigned long)lpi->buf;
 	uffdio_copy.len = len;
@@ -878,21 +864,12 @@ static int uffd_copy(struct lazy_pages_info *lpi, __u64 address, unsigned long *
 	uffdio_copy.copy = 0;
 
 	lp_debug(lpi, "uffd_copy: 0x%llx/%ld\n", uffdio_copy.dst, len);
-
-	if (ioctl(lpi->lpfd.fd, UFFDIO_COPY, &uffdio_copy) == -1) {
-		if (uffd_check_op_error(lpi, "copy", nr_pages, uffdio_copy.copy))
-			return -1;
-		return 0;
-	}
-
-	if (uffdio_copy.copy < 0) {
-		errno = -uffdio_copy.copy;
-		if (uffd_check_op_error(lpi, "copy", nr_pages, uffdio_copy.copy))
-			return -1;
-		return 0;
-	}
+	if (ioctl(lpi->lpfd.fd, UFFDIO_COPY, &uffdio_copy) &&
+	    uffd_check_op_error(lpi, "copy", nr_pages, uffdio_copy.copy))
+		return -1;
 
 	lpi->copied_pages += *nr_pages;
+
 	return 0;
 }
 
@@ -951,7 +928,7 @@ static int uffd_io_complete(struct page_read *pr, unsigned long img_addr, unsign
 	return drop_iovs(lpi, addr, nr * PAGE_SIZE);
 }
 
-static int uffd_zero(struct lazy_pages_info *lpi, __u64 address, unsigned long nr_pages)
+int uffd_zero(struct lazy_pages_info *lpi, __u64 address, unsigned long nr_pages)
 {
 	struct uffdio_zeropage uffdio_zeropage;
 	unsigned long len = page_size() * nr_pages;
@@ -1047,7 +1024,7 @@ static int xfer_pages(struct lazy_pages_info *lpi)
 	iov = extract_range(iov, iov->start, iov->start + len);
 	if (!iov)
 		return -1;
-	iov_list_insert(iov, &lpi->reqs);
+	list_move(&iov->l, &lpi->reqs);
 
 	nr_pages = (iov->end - iov->start) / PAGE_SIZE;
 
@@ -1093,7 +1070,7 @@ static int handle_remove(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 		pr_perror("Failed to unregister (%llx - %llx)", unreg.start, unreg.start + unreg.len);
 		return -1;
 	}
-	if (opts.clone_dump) return 0;//WE do not drop_iov since it is not thread safe
+	if (opts.clone_dump) return 0;//In clone mode do not remove iovs, as it impact performance and create many iovs onprocesses with high memory usage.
 	return drop_iovs(lpi, unreg.start, unreg.len);
 }
 
@@ -1188,54 +1165,15 @@ static bool is_page_queued(struct lazy_pages_info *lpi, unsigned long addr)
 static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 {
 	struct lazy_iov *iov;
-	unsigned long long address;
+	__u64 address;
 	int ret;
-	unsigned long nr_pages;
 
 	/* Align requested address to the next page boundary */
 	address = msg->arg.pagefault.address & ~(page_size() - 1);
-
 	lp_debug(lpi, "#PF at 0x%llx\n", address);
 
-	/*
-	 * CLONE mode: Serve page faults from the buffer.
-	 * This can happen during restorer execution (e.g., rseq setup) or after sigreturn.
-	 * We must resolve the fault or the process will block.
-	 */
-	if (opts.clone_dump) {
-		void *page_data;
-		int ret;
-
-		lp_debug(lpi, "CLONE #PF at 0x%llx drain_running=%d\n",
-			 address, clone_drain_thread_running());
-
-		/* Try to get page from buffer */
-		page_data = clone_page_buffer_lookup_and_remove(address);
-		if (page_data) {
-			/*
-			 * Route through clone_uffd_copy so page-state, pf_tracker,
-			 * and EEXIST/EAGAIN/ENOENT handling all go through the
-			 * unified path. Transition IN_BUFFER -> PF_PENDING first;
-			 * clone_uffd_copy will move it to COPIED / DISCARDED /
-			 * EAGAIN_QUEUED depending on UFFDIO_COPY result. On EAGAIN
-			 * clone_queue_eagain_request() copies the buffer, so we can
-			 * always return the page to the pool after the call.
-			 */
-			page_state_set(address, PAGE_STATE_PF_PENDING);
-			ret = clone_uffd_copy(lpi->lpfd.fd, address, page_data, 1,
-					    lpi, NULL, 0, "PAGE_FAULT");
-			page_pool_put(page_data);
-			if (ret < 0) {
-				lp_err(lpi, "PAGE_FAULT: clone_uffd_copy failed for 0x%llx\n", address);
-				return -1;
-			}
-			return 0;
-		}
-
-		/* Not in buffer - zero the page */
-		lp_debug(lpi, "PAGE_FAULT: 0x%llx not in buffer, zeroing\n", address);
-		return uffd_zero(lpi, address, 1);
-	}
+	if (opts.clone_dump)
+		return clone_handle_page_fault(lpi, address);
 
 	if (is_page_queued(lpi, address))
 		return 0;
@@ -1248,13 +1186,11 @@ static int handle_page_fault(struct lazy_pages_info *lpi, struct uffd_msg *msg)
 	if (!iov)
 		return -1;
 
-	iov_list_insert(iov, &lpi->reqs);
-
-	nr_pages = (iov->end - iov->start) / PAGE_SIZE;
+	list_move(&iov->l, &lpi->reqs);
 
 	update_xfer_len(lpi, true);
 
-	ret = uffd_handle_pages(lpi, iov->img_start, nr_pages, PR_ASYNC | PR_ASAP);
+	ret = uffd_handle_pages(lpi, iov->img_start, 1, PR_ASYNC | PR_ASAP);
 	if (ret < 0) {
 		lp_err(lpi, "Error during regular page copy\n");
 		return -1;
@@ -1381,35 +1317,9 @@ int lazy_pages_finish_restore(void)
 		return -1;
 	}
 
-	/*
-	 * CLONE mode: Signal lazy-pages that tasks are frozen (catch_tasks done),
-	 * then wait for drain to complete before unfreezing.
-	 */
-	if (opts.clone_dump) {
-		uint32_t tasks_frozen = LAZY_PAGES_TASKS_FROZEN;
-		uint32_t drain_signal;
-
-		pr_debug("CLONE mode: Sending TASKS_FROZEN signal to lazy-pages\n");
-		ret = send(fd, &tasks_frozen, sizeof(tasks_frozen), 0);
-		if (ret != sizeof(tasks_frozen)) {
-			pr_perror("Failed sending TASKS_FROZEN signal");
-			close(fd);
-			return -1;
-		}
-
-		pr_debug("CLONE mode: Waiting for drain complete signal...\n");
-		ret = recv(fd, &drain_signal, sizeof(drain_signal), MSG_WAITALL);
-		if (ret != sizeof(drain_signal)) {
-			pr_perror("Failed receiving drain complete signal");
-			close(fd);
-			return -1;
-		}
-		if (drain_signal != LAZY_PAGES_DRAIN_COMPLETE) {
-			pr_err("Unexpected signal: %x (expected drain complete)\n", drain_signal);
-			close(fd);
-			return -1;
-		}
-		pr_debug("CLONE mode: Drain complete, proceeding to unfreeze\n");
+	if (opts.clone_dump && clone_wait_for_drain(fd) < 0) {
+		close(fd);
+		return -1;
 	}
 
 	ret = send(fd, &fin, sizeof(fin), 0);
@@ -1421,7 +1331,7 @@ int lazy_pages_finish_restore(void)
 	return ret < 0 ? ret : 0;
 }
 
-static int prepare_lazy_socket(void)
+int uffd_prepare_listen_socket(void)
 {
 	int listen;
 	struct sockaddr_un saddr;
@@ -1438,7 +1348,7 @@ static int prepare_lazy_socket(void)
 	return listen;
 }
 
-static int lazy_sk_read_event(struct epoll_rfd *rfd)
+int uffd_lazy_sk_read_event(struct epoll_rfd *rfd)
 {
 	uint32_t fin;
 	int ret;
@@ -1478,7 +1388,7 @@ static int lazy_sk_read_event(struct epoll_rfd *rfd)
 	return -1;
 }
 
-static int lazy_sk_hangup_event(struct epoll_rfd *rfd)
+int uffd_lazy_sk_hangup_event(struct epoll_rfd *rfd)
 {
 	if (!restore_finished) {
 		pr_err("Restorer unexpectedly closed the connection\n");
@@ -1505,7 +1415,7 @@ static int prepare_uffds(int listen, int epollfd)
 
 	for (i = 0; i < task_entries->nr_tasks; i++) {
 		struct lazy_pages_info *lpi = NULL;
-		if (ud_open(client, &lpi))
+		if (uffd_open_task(client, &lpi))
 			goto close_uffd;
 		if (lpi == NULL)
 			continue;
@@ -1514,8 +1424,8 @@ static int prepare_uffds(int listen, int epollfd)
 	}
 
 	lazy_sk_rfd.fd = client;
-	lazy_sk_rfd.read_event = lazy_sk_read_event;
-	lazy_sk_rfd.hangup_event = lazy_sk_hangup_event;
+	lazy_sk_rfd.read_event = uffd_lazy_sk_read_event;
+	lazy_sk_rfd.hangup_event = uffd_lazy_sk_hangup_event;
 	if (epoll_add_rfd(epollfd, &lazy_sk_rfd))
 		goto close_uffd;
 
@@ -1526,270 +1436,6 @@ close_uffd:
 	close_safe(&client);
 	close(listen);
 	return -1;
-}
-
-/* Pre-buffer and convergence infrastructure is in clone-uffd.c */
-static struct epoll_rfd lazy_listen_rfd;
-
-
-/*
- * Non-blocking accept handler for when criu restore connects.
- * Called from epoll loop when restore connects on the Unix socket.
- */
-static int handle_lazy_accept(struct epoll_rfd *rfd)
-{
-	int client;
-	int i;
-	struct sockaddr_un saddr;
-	socklen_t len = sizeof(saddr);
-
-	client = accept(rfd->fd, (struct sockaddr *)&saddr, &len);
-	if (client < 0) {
-		if (errno == EAGAIN || errno == EWOULDBLOCK)
-			return 0;
-		pr_perror("accept failed");
-		return -1;
-	}
-
-	/* Set up lpi for each task (reads uffd from restore) */
-	{
-		int uffd_count = 0;
-		for (i = 0; i < task_entries->nr_tasks; i++) {
-			struct lazy_pages_info *lpi = NULL;
-
-			if (ud_open(client, &lpi))
-				goto err;
-			if (lpi == NULL)
-				continue;
-			/*
-			 * Always add UFFD to epoll, even in CLONE mode.
-			 * Page faults can still occur (e.g., during comparison)
-			 * and need to be handled by serving from buffer.
-			 */
-			if (epoll_add_rfd(epollfd, &lpi->lpfd))
-				goto err;
-
-			lp_debug(lpi, "registered UFFD handler (fd=%d)\n", lpi->lpfd.fd);
-			uffd_count++;
-		}
-		pr_info("Registered %d UFFD handlers for page faults\n", uffd_count);
-	}
-
-	/* Set up restore-finished notification socket */
-	lazy_sk_rfd.fd = client;
-	lazy_sk_rfd.read_event = lazy_sk_read_event;
-	lazy_sk_rfd.hangup_event = lazy_sk_hangup_event;
-	if (epoll_add_rfd(epollfd, &lazy_sk_rfd))
-		goto err;
-
-	/* Remove listen socket from epoll — only one connection needed */
-	epoll_del_rfd(epollfd, rfd);
-	close(rfd->fd);
-
-	/*
-	 * Keep buffering ON — handle_page_fault() will serve from buffer.
-	 * In CLONE mode, drain will start when we receive TASKS_FROZEN signal
-	 * from restore (after catch_tasks() completes).
-	 */
-	clone_set_restore_connected(true);
-
-	pr_info("criu restore setup complete, %lu pages buffered\n",
-		clone_page_buffer_count());
-
-	/*
-	 * CLONE mode: Don't start drain here - tasks are still running!
-	 * Drain will start when lazy_sk_read_event receives TASKS_FROZEN.
-	 */
-
-	return 0;
-
-err:
-	close(client);
-	return -1;
-}
-
-/*
- * Simple CLONE state accessors are in clone-uffd.c:
- * - clone_is_restore_connected(), clone_set_restore_connected()
- * - clone_is_all_pages_sent_received(), clone_set_all_pages_sent_received()
- */
-
-/*
- * Unregister all VMAs from UFFD before process unfreezes.
- * This ensures no page faults can occur after drain completes.
- */
-static void clone_unregister_all_uffds(void)
-{
-	struct lazy_pages_info *lpi;
-	struct lazy_iov *iov;
-
-	list_for_each_entry(lpi, &lpis, l) {
-		if (lpi->exited || lpi->lpfd.fd < 0)
-			continue;
-
-		list_for_each_entry(iov, &lpi->iovs, l) {
-			struct uffdio_range unreg = {
-				.start = iov->start,
-				.len = iov->end - iov->start,
-			};
-
-			if (ioctl(lpi->lpfd.fd, UFFDIO_UNREGISTER, &unreg)) {
-				if (errno != ENOMEM) /* ENOMEM = process already gone */
-					lp_perror(lpi, "UFFDIO_UNREGISTER 0x%lx-0x%lx",
-						  iov->start, iov->end);
-			} else {
-				lp_debug(lpi, "Unregistered UFFD 0x%lx-0x%lx\n",
-					 iov->start, iov->end);
-			}
-		}
-	}
-
-	pr_debug("All UFFD regions unregistered\n");
-}
-
-/*
- * CLONE Phase 3: Enter restore loop after pages are buffered and pstree loaded.
- * Called from clone-phase2.c after Phase 2 completes.
- *
- * This sets up the lazy socket for restore to connect and enters the
- * main event loop to handle page faults (WP_SYNC convergence).
- */
-int clone_phase3_restore_loop(int ep_fd, struct epoll_event **events, int nr_fds)
-{
-	int lazy_sk;
-	int flags;
-	int ret;
-
-	/* Set global epollfd for use by handle_lazy_accept() */
-	epollfd = ep_fd;
-	clone_set_phase3_active(true);
-
-	/* Create lazy socket for restore to connect */
-	lazy_sk = prepare_lazy_socket();
-	if (lazy_sk < 0) {
-		pr_err("Failed to create lazy socket for Phase 3\n");
-		return -1;
-	}
-
-	/* Make listen socket non-blocking and add to epoll */
-	flags = fcntl(lazy_sk, F_GETFL, 0);
-	fcntl(lazy_sk, F_SETFL, flags | O_NONBLOCK);
-
-	lazy_listen_rfd.fd = lazy_sk;
-	lazy_listen_rfd.read_event = handle_lazy_accept;
-	if (epoll_add_rfd(epollfd, &lazy_listen_rfd)) {
-		close(lazy_sk);
-		return -1;
-	}
-
-	pr_debug("Phase 3: listening for restore connection\n");
-
-	/*
-	 * Simplified flow for CLONE bulk transfer:
-	 * 1. Wait for restore to connect (accept via epoll)
-	 * 2. handle_lazy_accept() sets up LPIs and starts drain thread
-	 * 3. Wait for drain to complete (all pages UFFDIO_COPY'd)
-	 * 4. Return - process unfreezes with all pages in place
-	 *
-	 * No page fault handling needed since all pages are already buffered
-	 * and will be drained to process memory while frozen.
-	 */
-
-	/* Wait for restore to connect - single epoll iteration */
-	while (!clone_is_restore_connected()) {
-		ret = epoll_run_rfds(epollfd, *events, nr_fds, 1000);
-		if (ret < 0) {
-			pr_err("epoll failed waiting for restore\n");
-			close(lazy_sk);
-			return -1;
-		}
-	}
-
-	pr_debug("Restore connected, waiting for drain to complete (%lu pages)\n",
-		 clone_page_buffer_count());
-
-	/*
-	 * Wait for drain thread to finish copying all pages.
-	 * Poll epoll to handle any page faults that might occur.
-	 * Even though process is frozen, page faults can happen during
-	 * comparison or other operations.
-	 */
-	while (clone_drain_thread_running() || clone_page_buffer_count() > 0) {
-		/* Poll epoll with 10ms timeout to handle page faults */
-		ret = epoll_run_rfds(epollfd, *events, nr_fds, 10);
-		if (ret < 0) {
-			pr_err("epoll failed during drain wait\n");
-			return -1;
-		}
-
-		/* Handle any EAGAIN retries */
-		if (!clone_is_eagain_queue_empty()) {
-			if (clone_process_eagain_requests()) {
-				pr_err("EAGAIN processing failed during drain\n");
-				return -1;
-			}
-		}
-	}
-
-	pr_debug("Drain complete, buffer empty\n");
-
-	/* Debug: show page pool utilization */
-	page_pool_dump_utilization();
-
-	/* DEBUG: Process comparison with primary */
-#ifdef CONFIG_CLONE_COMPARE
-	if (opts.clone_dump && opts.addr) {
-		int compare_sk;
-		struct lazy_pages_info *first_lpi;
-		pid_t target_pid = 0;
-
-		/* Get the first LPI's PID as the target */
-		if (!list_empty(&lpis)) {
-			first_lpi = list_first_entry(&lpis, struct lazy_pages_info, l);
-			target_pid = first_lpi->pid;
-		}
-
-		if (target_pid > 0) {
-			pr_debug("COMPARE: REPLICA connecting to primary for comparison (PID %d)\n",
-				 target_pid);
-
-			if (clone_compare_connect(opts.addr, &compare_sk) == 0) {
-				int result = clone_compare_receive_and_verify(compare_sk, target_pid);
-				close(compare_sk);
-
-				if (result != 0) {
-					pr_debug("COMPARE: DIFFERENCES FOUND - see logs above\n");
-#ifdef CONFIG_CLONE_WAIT_REPLICA_TOUCH
-					/* Pause for investigation */
-					pr_debug("COMPARE: Touch /tmp/continue_replica to proceed\n");
-					while (access("/tmp/continue_replica", F_OK) != 0)
-						sleep(1);
-					unlink("/tmp/continue_replica");
-#endif
-				} else {
-					pr_debug("COMPARE: Processes are IDENTICAL - proceeding\n");
-				}
-			}
-		} else {
-			pr_debug("COMPARE: No LPI found, skipping comparison\n");
-		}
-	}
-#endif //CONFIG_CLONE_COMPARE
-	/* Unregister all UFFD regions before unfreezing process */
-	clone_unregister_all_uffds();
-
-	/*
-	 * Signal restore that drain is complete and it's safe to unfreeze.
-	 * Restore is waiting in lazy_pages_finish_restore() for this signal.
-	 */
-	if (opts.clone_dump) {
-		uint32_t drain_complete = LAZY_PAGES_DRAIN_COMPLETE;
-		if (send(lazy_sk_rfd.fd, &drain_complete, sizeof(drain_complete), 0) != sizeof(drain_complete))
-			pr_perror("Failed to send drain complete signal");
-		else
-			pr_debug("CLONE Phase 3: Sent drain complete signal to restore\n");
-	}
-	return 0;
 }
 
 int cr_lazy_pages(bool daemon)
@@ -1812,7 +1458,7 @@ int cr_lazy_pages(bool daemon)
 	if (prepare_dummy_pstree())
 		return -1;
 
-	lazy_sk = prepare_lazy_socket();
+	lazy_sk = uffd_prepare_listen_socket();
 	if (lazy_sk < 0)
 		return -1;
 
@@ -1842,9 +1488,9 @@ int cr_lazy_pages(bool daemon)
 	/*
 	 * we poll nr_tasks userfault fds, UNIX socket between lazy-pages
 	 * daemon and the cr-restore, and, optionally TCP socket for
-	 * remote pages. Add +1 for the listen socket in pre-buffer mode.
+	 * remote pages
 	 */
-	nr_fds = task_entries->nr_tasks + (opts.use_page_server ? 2 : 1) + 1;
+	nr_fds = task_entries->nr_tasks + (opts.use_page_server ? 2 : 1);
 	epollfd = epoll_prepare(nr_fds, &events);
 	if (epollfd < 0)
 		return -1;

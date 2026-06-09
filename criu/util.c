@@ -1406,7 +1406,7 @@ int epoll_add_rfd(int epfd, struct epoll_rfd *rfd)
 	ev.events = EPOLLIN | EPOLLRDHUP;
 	ev.data.ptr = rfd;
 	if (epoll_ctl(epfd, EPOLL_CTL_ADD, rfd->fd, &ev) == -1) {
-		pr_perror("epoll_ctl failed for fd=%d", rfd->fd);
+		pr_perror("epoll_ctl failed");
 		return -1;
 	}
 
@@ -1416,7 +1416,7 @@ int epoll_add_rfd(int epfd, struct epoll_rfd *rfd)
 int epoll_del_rfd(int epfd, struct epoll_rfd *rfd)
 {
 	if (epoll_ctl(epfd, EPOLL_CTL_DEL, rfd->fd, NULL) == -1) {
-		pr_perror("epoll_ctl DEL failed for fd=%d", rfd->fd);
+		pr_perror("epoll_ctl failed");
 		return -1;
 	}
 

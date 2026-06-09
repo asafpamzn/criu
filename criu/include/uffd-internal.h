@@ -9,8 +9,12 @@
 #include "pagemap.h"
 #include "common/lock.h"
 
+/* CLONE mode protocol signals (shared between uffd.c and clone-uffd.c) */
+#define LAZY_PAGES_DRAIN_COMPLETE   0x44524E43
+#define LAZY_PAGES_TASKS_FROZEN     0x54534B46
+
 /*
- * Internal uffd structures shared between uffd.c and uffd_clone.c
+ * Internal uffd structures shared between uffd.c and clone-uffd.c
  */
 
 struct lazy_iov {
@@ -65,6 +69,17 @@ struct uffd_eagain_request {
 /* Helper functions from uffd.c needed by clone-uffd.c */
 extern void lpi_put(struct lazy_pages_info *lpi);
 extern void lazy_pages_summary(struct lazy_pages_info *lpi);
+
+/* Functions from uffd.c exposed for clone-phase3 */
+extern int uffd_open_task(int client, struct lazy_pages_info **_lpi);
+extern int uffd_prepare_listen_socket(void);
+extern struct list_head *uffd_get_lpis(void);
+extern struct epoll_rfd *uffd_get_lazy_sk_rfd(void);
+extern void uffd_set_epollfd(int fd);
+extern int uffd_get_epollfd(void);
+extern int uffd_lazy_sk_read_event(struct epoll_rfd *rfd);
+extern int uffd_lazy_sk_hangup_event(struct epoll_rfd *rfd);
+extern int uffd_zero(struct lazy_pages_info *lpi, __u64 address, unsigned long nr_pages);
 
 /*
  * CLONE-specific functions from uffd_clone.c

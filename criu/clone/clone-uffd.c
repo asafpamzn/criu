@@ -8,6 +8,8 @@
 #include <time.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <linux/userfaultfd.h>
 
 #include "int.h"
@@ -28,6 +30,7 @@
 #include "clone/unmapped-tracker.h"
 #include "clone/page-state-tracker.h"
 #include "pstree.h"
+#include "rst_info.h"
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "clone-uffd: "
@@ -1546,6 +1549,59 @@ int clone_setup_prebuffer_reader(void)
 
 
 /*
+ * Signal lazy-pages that tasks are frozen, wait for drain complete.
+ * Called from lazy_pages_finish_restore() after catch_tasks().
+ * Returns: 0 on success, -1 on error
+ */
+int clone_wait_for_drain(int fd)
+{
+	uint32_t tasks_frozen = LAZY_PAGES_TASKS_FROZEN;
+	uint32_t drain_signal;
+	int ret;
+
+	ret = send(fd, &tasks_frozen, sizeof(tasks_frozen), 0);
+	if (ret != sizeof(tasks_frozen)) {
+		pr_perror("Failed sending TASKS_FROZEN signal");
+		return -1;
+	}
+
+	ret = recv(fd, &drain_signal, sizeof(drain_signal), MSG_WAITALL);
+	if (ret != sizeof(drain_signal)) {
+		pr_perror("Failed receiving drain complete signal");
+		return -1;
+	}
+
+	if (drain_signal != LAZY_PAGES_DRAIN_COMPLETE) {
+		pr_err("Unexpected signal: %x\n", drain_signal);
+		return -1;
+	}
+
+	return 0;
+}
+
+/*
+ * Handle page fault in CLONE mode.
+ * Serves page from buffer or zeros if not found.
+ * Returns: 0 on success, -1 on error
+ */
+int clone_handle_page_fault(struct lazy_pages_info *lpi, unsigned long address)
+{
+	void *page_data;
+	int ret;
+
+	page_data = clone_page_buffer_lookup_and_remove(address);
+	if (page_data) {
+		page_state_set(address, PAGE_STATE_PF_PENDING);
+		ret = clone_uffd_copy(lpi->lpfd.fd, address, page_data, 1,
+				      lpi, NULL, 0, "PAGE_FAULT");
+		page_pool_put(page_data);
+		return ret < 0 ? -1 : 0;
+	}
+
+	return uffd_zero(lpi, address, 1);
+}
+
+/*
  * Handle UNMAP/REMOVE event in CLONE mode.
  * Marks pages as unmapped in trackers and removes from buffer.
  */
@@ -1581,4 +1637,155 @@ int clone_handle_lazy_accept_post_connect(struct list_head *lpis)
 	return 0;
 }
 
+/*
+ * CLONE Phase 3 - Restore loop functions
+ * Moved from uffd.c to reduce diff
+ */
 
+static struct epoll_rfd lazy_listen_rfd;
+
+static int handle_lazy_accept(struct epoll_rfd *rfd)
+{
+	struct epoll_rfd *lazy_sk_rfd = uffd_get_lazy_sk_rfd();
+	int epollfd = uffd_get_epollfd();
+	int client;
+	int i;
+	struct sockaddr_un saddr;
+	socklen_t len = sizeof(saddr);
+
+	client = accept(rfd->fd, (struct sockaddr *)&saddr, &len);
+	if (client < 0) {
+		if (errno == EAGAIN || errno == EWOULDBLOCK)
+			return 0;
+		pr_perror("accept failed");
+		return -1;
+	}
+
+	/* Set up lpi for each task (reads uffd from restore) */
+	{
+		int uffd_count = 0;
+		for (i = 0; i < task_entries->nr_tasks; i++) {
+			struct lazy_pages_info *lpi = NULL;
+
+			if (uffd_open_task(client, &lpi))
+				goto err;
+			if (lpi == NULL)
+				continue;
+			if (epoll_add_rfd(epollfd, &lpi->lpfd))
+				goto err;
+
+			lp_debug(lpi, "registered UFFD handler (fd=%d)\n", lpi->lpfd.fd);
+			uffd_count++;
+		}
+		pr_info("Registered %d UFFD handlers\n", uffd_count);
+	}
+
+	/* Set up restore-finished notification socket */
+	lazy_sk_rfd->fd = client;
+	lazy_sk_rfd->read_event = uffd_lazy_sk_read_event;
+	lazy_sk_rfd->hangup_event = uffd_lazy_sk_hangup_event;
+	if (epoll_add_rfd(epollfd, lazy_sk_rfd))
+		goto err;
+
+	epoll_del_rfd(epollfd, rfd);
+	close(rfd->fd);
+
+	clone_set_restore_connected(true);
+	pr_info("Restore connected, %lu pages buffered\n", clone_page_buffer_count());
+
+	return 0;
+
+err:
+	close(client);
+	return -1;
+}
+
+static void clone_unregister_all_uffds(void)
+{
+	struct list_head *lpis = uffd_get_lpis();
+	struct lazy_pages_info *lpi;
+	struct lazy_iov *iov;
+
+	list_for_each_entry(lpi, lpis, l) {
+		if (lpi->exited || lpi->lpfd.fd < 0)
+			continue;
+
+		list_for_each_entry(iov, &lpi->iovs, l) {
+			struct uffdio_range unreg = {
+				.start = iov->start,
+				.len = iov->end - iov->start,
+			};
+
+			if (ioctl(lpi->lpfd.fd, UFFDIO_UNREGISTER, &unreg)) {
+				if (errno != ENOMEM)
+					lp_perror(lpi, "UFFDIO_UNREGISTER 0x%lx-0x%lx",
+						  iov->start, iov->end);
+			}
+		}
+	}
+}
+
+int clone_phase3_restore_loop(int ep_fd, struct epoll_event **events, int nr_fds)
+{
+	struct epoll_rfd *lazy_sk_rfd = uffd_get_lazy_sk_rfd();
+	int lazy_sk;
+	int flags;
+	int ret;
+
+	uffd_set_epollfd(ep_fd);
+	clone_set_phase3_active(true);
+
+	lazy_sk = uffd_prepare_listen_socket();
+	if (lazy_sk < 0) {
+		pr_err("Failed to create lazy socket\n");
+		return -1;
+	}
+
+	flags = fcntl(lazy_sk, F_GETFL, 0);
+	fcntl(lazy_sk, F_SETFL, flags | O_NONBLOCK);
+
+	lazy_listen_rfd.fd = lazy_sk;
+	lazy_listen_rfd.read_event = handle_lazy_accept;
+	if (epoll_add_rfd(ep_fd, &lazy_listen_rfd)) {
+		close(lazy_sk);
+		return -1;
+	}
+
+	/* Wait for restore to connect */
+	while (!clone_is_restore_connected()) {
+		ret = epoll_run_rfds(ep_fd, *events, nr_fds, 1000);
+		if (ret < 0) {
+			pr_err("epoll failed waiting for restore\n");
+			close(lazy_sk);
+			return -1;
+		}
+	}
+
+	/* Wait for drain to complete */
+	while (clone_drain_thread_running() || clone_page_buffer_count() > 0) {
+		ret = epoll_run_rfds(ep_fd, *events, nr_fds, 10);
+		if (ret < 0) {
+			pr_err("epoll failed during drain\n");
+			return -1;
+		}
+
+		if (!clone_is_eagain_queue_empty()) {
+			if (clone_process_eagain_requests()) {
+				pr_err("EAGAIN processing failed\n");
+				return -1;
+			}
+		}
+	}
+
+	page_pool_dump_utilization();
+	clone_unregister_all_uffds();
+
+	/* Signal restore that drain is complete */
+	{
+		uint32_t drain_complete = LAZY_PAGES_DRAIN_COMPLETE;
+		if (send(lazy_sk_rfd->fd, &drain_complete, sizeof(drain_complete), 0) != sizeof(drain_complete))
+			pr_perror("Failed to send drain complete signal");
+	}
+
+	return 0;
+}

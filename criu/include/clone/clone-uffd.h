@@ -162,16 +162,18 @@ extern int clone_uffd_io_complete_bulk(struct lazy_pages_info *lpi,
 extern void clone_handle_remove_event(unsigned long start, unsigned long len);
 
 /*
- * CLONE-specific page fault handling (full flow).
- * Called from handle_page_fault when opts.clone_dump is true.
- * Returns:
- *   0 - success (page handled or waiting)
- *  -1 - error
- *   CLONE_PF_ZERO_FILL - caller should zero-fill the page
- *   CLONE_PF_HANDLE_PAGES - caller should call uffd_handle_pages
+ * Handle page fault in CLONE mode.
+ * Serves page from buffer or zeros if not found.
+ * Returns: 0 on success, -1 on error
  */
-#define CLONE_PF_ZERO_FILL     2
-#define CLONE_PF_HANDLE_PAGES  3
+extern int clone_handle_page_fault(struct lazy_pages_info *lpi, unsigned long address);
+
+/*
+ * Signal lazy-pages that tasks are frozen, wait for drain complete.
+ * Called from lazy_pages_finish_restore() after catch_tasks().
+ * Returns: 0 on success, -1 on error
+ */
+extern int clone_wait_for_drain(int fd);
 
 /*
  * CLONE post-connect initialization in handle_lazy_accept.
