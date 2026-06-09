@@ -224,13 +224,12 @@ done
 # lazy-pages connects to primary, receives skeleton files + pages over TCP,
 # then auto-triggers restore via clone_start_restore(). Backgrounded inside
 # the worker so WORKER_DONE fires immediately.
-LAZY_CMD="$CRIU_BIN lazy-pages --images-dir '$IMAGES_DIR' \
-	--page-server --clone-dump \
+CLONE_RECV_CMD="$CRIU_BIN clone-receive --images-dir '$IMAGES_DIR' \
 	--address $PRIMARY_IP --port $PORT \
-	-v4 -o lazy-pages.log &"
-send_and_wait replica "$LAZY_CMD" || die "lazy-pages dispatch timed out"
-[ "$WORKER_RC" -eq 0 ] || die "lazy-pages dispatch rc=$WORKER_RC"
-echo "=== Lazy-pages launched (auto-restores after receiving skeletons) ==="
+	-v4 -o clone-receive.log &"
+send_and_wait replica "$CLONE_RECV_CMD" || die "clone-receive dispatch timed out"
+[ "$WORKER_RC" -eq 0 ] || die "clone-receive dispatch rc=$WORKER_RC"
+echo "=== Clone-receive launched (auto-restores after receiving skeletons) ==="
 
 # --- Wait for dump to finish ---
 echo "=== Waiting for dump to complete ==="
@@ -257,7 +256,7 @@ done
 # of those signatures appear in the dump log even if the rc check above
 # somehow passed, so this whole class of dump failure can never be masked.
 DUMP_FAIL_PAT='Address already in use|Can.t bind socket|Can.t infect|Dumping FAILED'
-for _logf in "$PRIMARY_LOG" "$IMAGES_DIR/lazy-pages.log" "$IMAGES_DIR/lazy-primary.log"; do
+for _logf in "$PRIMARY_LOG" "$IMAGES_DIR/clone-receive.log"; do
 	[ -s "$_logf" ] || continue
 	if grep -qE "$DUMP_FAIL_PAT" "$_logf" 2>/dev/null; then
 		echo "=== dump-failure signature found in $_logf: ==="
@@ -267,7 +266,7 @@ for _logf in "$PRIMARY_LOG" "$IMAGES_DIR/lazy-pages.log" "$IMAGES_DIR/lazy-prima
 done
 
 # --- Start criu restore on replica ---
-# lazy-pages is waiting for restore to connect via the lazy-pages socket.
+# clone-receive daemon is waiting for restore to connect via the lazy-pages socket.
 # We launch criu restore in the replica worker (backgrounded) so it connects
 # to the lazy-pages daemon and restores the process tree.
 RESTORE_CMD="$CRIU_BIN restore --images-dir '$IMAGES_DIR' \

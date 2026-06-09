@@ -5,8 +5,13 @@
 #include <sys/epoll.h>
 
 /*
- * CLONE Phase 2 entry point.
- * Called when --clone-dump --page-server are specified.
+ * Clone receive entry point (criu clone-receive command).
+ * Receives pages from primary, buffers them, triggers restore.
+ */
+extern int cr_clone_receive(bool daemon);
+
+/*
+ * CLONE Phase 2 entry point (internal, called by cr_clone_receive).
  * Buffers incoming pages without requiring inventory.img/pstree.img.
  */
 extern int cr_clone_phase2(bool daemon);

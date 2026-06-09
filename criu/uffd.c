@@ -45,7 +45,6 @@
 #include "pagemap.h"
 #include "clone/clone-conf.h"
 #include "clone/pf-tracker.h"
-#include "clone/clone-phase2.h"
 #include "clone/clone-uffd.h"
 #include "uffd-internal.h"
 #include "clone/unmapped-tracker.h"
@@ -1447,13 +1446,6 @@ int cr_lazy_pages(bool daemon)
 
 	if (!kdat.has_uffd)
 		return -1;
-
-	/*
-	 * CLONE Phase 2: No inventory/pstree yet, just buffer pages.
-	 * Use separate code path with minimal dependencies.
-	 */
-	if (opts.clone_dump && opts.use_page_server)
-		return cr_clone_phase2(daemon);
 
 	if (prepare_dummy_pstree())
 		return -1;

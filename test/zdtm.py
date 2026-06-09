@@ -1125,9 +1125,7 @@ class criu:
                              bool(opts['lazy_pages']))
         self.__lazy_migrate = bool(opts['lazy_migrate'])
         self.__clone_dump = bool(opts.get('clone_dump'))
-        # CLONE dump needs the lazy-pages daemon to be running before criu
-        # dump so the dump can connect to it as a page-server client
-        # (criu/cr-dump.c:~2695 connect_to_page_server_to_send has no retry).
+        # CLONE dump uses lazy-pages infrastructure for restore
         if self.__clone_dump:
             self.__lazy_pages = True
         self.__restore_sibling = bool(opts['sibling'])
@@ -1179,44 +1177,6 @@ class criu:
             self.__criu = criu_config
         else:
             self.__criu = criu_cli
-
-    def __clone_wait_for_log(self, log_name, marker, timeout=120.0):
-        """Poll a CRIU log file for a marker string.
-
-        Also checks that the dump process is still alive; if it has
-        died with a non-zero exit while we're waiting, surface that.
-        """
-        path = os.path.join(self.__ddir(), log_name)
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            if self.__dump_process is not None:
-                rc = self.__dump_process.poll()
-                if rc is not None and rc != 0:
-                    grep_errors(path, err=rc)
-                    raise test_fail_exc(
-                        "criu dump --clone-dump exited %d while waiting for %r"
-                        % (rc, marker))
-            try:
-                with open(path) as f:
-                    if marker in f.read():
-                        return
-            except FileNotFoundError:
-                pass
-            time.sleep(0.1)
-        raise test_fail_exc(
-            "timeout waiting for %r in %s" % (marker, log_name))
-
-    def __clone_wait_dump_ready(self):
-        # criu/page-xfer.c:~1633 prints this once the primary's
-        # TCP page-server is listening (and empty pagemap stubs have
-        # been written so the replica daemon can discover tasks).
-        self.__clone_wait_for_log("dump.log", "PAGE SERVER READY TO SERVE")
-
-    def __clone_wait_skeleton_complete(self):
-        # criu/cr-dump.c:~3043 prints this when Phase 3 has written
-        # the full skeleton and all pages have been sent. After this,
-        # the dump process exits.
-        self.__clone_wait_for_log("dump.log", "PHASE 3 SKELETON DUMP COMPLETE")
 
     def fini(self):
         if self.__lazy_migrate:
@@ -1549,21 +1509,9 @@ class criu:
             a_opts += ["--lazy-pages", "--port", "12345"] + self.__tls
             nowait = True
         if self.__clone_dump and action == "dump":
-            # CLONE flow (see scripts/migrate_new.sh + scripts/restore_new.sh):
-            #   1. Start dump --clone-dump --lazy-pages --page-server in
-            #      background. Phase 1 writes empty pagemap-*.img stubs
-            #      (criu/mem.c:~711) so the replica daemon can discover
-            #      tasks. Dump then listens on TCP and prints
-            #      "PAGE SERVER READY TO SERVE".
-            #   2. Wait for that marker, then start the lazy-pages
-            #      daemon (acts as the replica page-server receiver).
-            #   3. Wait for "PHASE 3 SKELETON DUMP COMPLETE" +
-            #      dump to exit cleanly.
-            # Matches scripts/migrate_new.sh: --clone-dump --lazy-pages
-            # --address/--port, but NOT --page-server (that flag makes
-            # dump connect to an external page-server; CLONE dump hosts
-            # its own server internally in cr_page_server at
-            # criu/cr-dump.c:2763 once Phase 1 is ready).
+            # CLONE flow: start dump and lazy-pages concurrently.
+            # lazy-pages has retry logic (30s) for connecting to dump's
+            # page server, so no need to poll logs for synchronization.
             a_opts += [
                 "--clone-dump", "--lazy-pages",
                 "--address", "127.0.0.1", "--port", "12345",
@@ -1574,15 +1522,12 @@ class criu:
                                               opts=a_opts + opts,
                                               nowait=nowait)
         if self.__clone_dump and action == "dump":
-            self.__clone_wait_dump_ready()
-            lp_opts = [
-                "--page-server", "--clone-dump",
+            cr_opts = [
                 "--address", "127.0.0.1", "--port", "12345",
             ] + self.__tls
-            self.__lazy_pages_p = self.__criu_act("lazy-pages",
-                                                  opts=lp_opts,
+            self.__lazy_pages_p = self.__criu_act("clone-receive",
+                                                  opts=cr_opts,
                                                   nowait=True)
-            self.__clone_wait_skeleton_complete()
             ret = self.__dump_process.wait()
             self.__dump_process = None
             if ret:

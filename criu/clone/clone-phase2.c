@@ -3,6 +3,8 @@
  *
  * Phase 2: Buffer pages from primary before skeleton dump exists
  * Phase 3: After dirty bitmap arrives, start restore with buffered pages
+ *
+ * Entry point: cr_clone_receive() (criu clone-receive command)
  */
 
 #include <sys/epoll.h>
@@ -166,7 +168,20 @@ static pid_t clone_start_restore(void)
 }
 
 /*
- * CLONE Phase 2/3 entry point.
+ * criu clone-receive entry point.
+ * Sets up clone mode and calls cr_clone_phase2().
+ */
+int cr_clone_receive(bool daemon)
+{
+	/* clone-receive implies these options */
+	opts.clone_dump = true;
+	opts.use_page_server = true;
+
+	return cr_clone_phase2(daemon);
+}
+
+/*
+ * CLONE Phase 2/3 entry point (internal).
  *
  * Phase 2:
  *   1. Discovers tasks from pagemap files (no pstree needed)

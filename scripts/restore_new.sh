@@ -66,8 +66,8 @@ ulimit -c unlimited
 
 # Kill leftover criu processes
 log_timing "Killing leftover criu processes..."
-sudo pkill -9 -f "criu lazy-pages" 2>/dev/null || true
-sudo pkill -9 -f "criu/criu lazy-pages" 2>/dev/null || true
+sudo pkill -9 -f "criu clone-receive" 2>/dev/null || true
+sudo pkill -9 -f "criu/criu clone-receive" 2>/dev/null || true
 sleep 0.1
 
 # Kill existing valkey
@@ -92,8 +92,8 @@ if [ "$TREE_PID" = "$line" ]; then
 fi
 log_timing "START received (tree PID: $TREE_PID)"
 
-# Start lazy-pages (connects to page server, buffers pages, starts restore)
-log_timing "Starting lazy-pages..."
+# Start clone-receive (connects to primary, buffers pages, starts restore)
+log_timing "Starting clone-receive..."
 
 TLS_OPTS=""
 if [ "$USE_TLS" = true ] && [ -n "$TLS_CERT" ]; then
@@ -103,12 +103,10 @@ else
   log_timing "TLS disabled"
 fi
 
-sudo "$CRIU_BIN" lazy-pages \
+sudo "$CRIU_BIN" clone-receive \
   --images-dir "$IMAGES_DIR" \
-  --page-server \
   --address "$PRIMARY_IP" \
   --port "$CRIU_PORT" \
-  --clone-dump \
   --clone-p3-threads "$CLONE_P3_THREADS" \
   --clone-p3-threads-bulk "$CLONE_P3_THREADS_BULK" \
   --clone-scanners "$CLONE_SCANNERS" \
@@ -118,18 +116,18 @@ sudo "$CRIU_BIN" lazy-pages \
   --tree "$TREE_PID" \
   --tcp-close \
   $TLS_OPTS \
-  -v1 -o "$IMAGES_DIR/lazy-server.log" &
-LAZY_PAGES_PID=$!
+  -v1 -o "$IMAGES_DIR/clone-receive.log" &
+CLONE_RECEIVE_PID=$!
 
-# Wait for lazy-pages to complete (it starts restore internally)
-wait $LAZY_PAGES_PID
-LP_EXIT=$?
-if [ $LP_EXIT -ne 0 ]; then
-  log_timing "ERROR: lazy-pages failed (exit code $LP_EXIT)"
-  sudo tail -n 120 "$IMAGES_DIR/lazy-server.log" 2>/dev/null || true
+# Wait for clone-receive to complete (it starts restore internally)
+wait $CLONE_RECEIVE_PID
+CR_EXIT=$?
+if [ $CR_EXIT -ne 0 ]; then
+  log_timing "ERROR: clone-receive failed (exit code $CR_EXIT)"
+  sudo tail -n 120 "$IMAGES_DIR/clone-receive.log" 2>/dev/null || true
   exit 1
 fi
-log_timing "Lazy-pages completed (restore done)"
+log_timing "Clone-receive completed (restore done)"
 
 # Give a moment for valkey to stabilize or die
 sleep 1

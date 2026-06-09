@@ -131,7 +131,7 @@ sudo "$CRIU_BIN" dump \
   --leave-running \
   --display-stats \
   $TLS_OPTS \
-  -v2 -o "$IMAGES_DIR/lazy-primary.log" &
+  -v2 -o "$IMAGES_DIR/clone-primary.log" &
 DUMP_PID=$!
 log_timing "CRIU dump started (PID: $DUMP_PID)"
 

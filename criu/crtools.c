@@ -45,6 +45,7 @@
 #include "proc_parse.h"
 #include "kerndat.h"
 #include "clone/clone-conf.h"
+#include "clone/clone-phase2.h"
 
 #include "setproctitle.h"
 #include "sysctl.h"
@@ -91,6 +92,7 @@ struct {
 	{ "pre-dump", CR_PRE_DUMP },
 	{ "restore", CR_RESTORE },
 	{ "lazy-pages", CR_LAZY_PAGES },
+	{ "clone-receive", CR_CLONE_RECEIVE },
 	{ "check", CR_CHECK },
 	{ "page-server", CR_PAGE_SERVER },
 	{ "service", CR_SERVICE },
@@ -356,6 +358,9 @@ int main(int argc, char *argv[], char *envp[])
 	case CR_LAZY_PAGES:
 		return cr_lazy_pages(opts.daemon_mode) != 0;
 
+	case CR_CLONE_RECEIVE:
+		return cr_clone_receive(opts.daemon_mode) != 0;
+
 	case CR_CHECK:
 		return cr_check() != 0;
 
@@ -397,6 +402,7 @@ usage:
 	       "  criu service [<options>]\n"
 	       "  criu dedup\n"
 	       "  criu lazy-pages -D DIR [<options>]\n"
+	       "  criu clone-receive -D DIR --address ADDR --port PORT [<options>]\n"
 	       "\n"
 	       "Commands:\n"
 	       "  dump           checkpoint a process/tree identified by pid\n"
@@ -407,7 +413,8 @@ usage:
 	       "  service        launch service\n"
 	       "  dedup          remove duplicates in memory dump\n"
 	       "  cpuinfo dump   writes cpu information into image file\n"
-	       "  cpuinfo check  validates cpu information read from image file\n");
+	       "  cpuinfo check  validates cpu information read from image file\n"
+	       "  clone-receive  receive pages from clone-dump and restore\n");
 
 	if (usage_error) {
 		pr_msg("\nTry -h|--help for more info\n");
