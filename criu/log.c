@@ -21,6 +21,7 @@
 #include "cr_options.h"
 #include "servicefd.h"
 #include "rst-malloc.h"
+#include "common/lock.h"
 #include "string.h"
 #include "version.h"
 
