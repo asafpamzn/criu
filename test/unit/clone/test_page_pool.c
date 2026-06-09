@@ -211,8 +211,7 @@ static void test_producer_consumer_use_after_free(void)
 		/* Signal consumer to free these pages */
 		__atomic_store_n(&uaf_batches[round].ready, 1, __ATOMIC_RELEASE);
 
-		/* Wait for consumer to finish freeing before next round.
-		 * This maximizes the chance of hitting the old bug:
+		/* Wait for consumer to finish freeing before next round.		
 		 * all refs gone while we still hold current_chunk. */
 		while (!__atomic_load_n(&uaf_batches[round].done, __ATOMIC_ACQUIRE))
 			;

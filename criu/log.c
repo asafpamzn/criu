@@ -5,6 +5,7 @@
 #include <unistd.h>
 #include <stdbool.h>
 #include <limits.h>
+#include <pthread.h>
 
 #include <sys/types.h>
 #include <sys/time.h>
@@ -20,7 +21,6 @@
 #include "cr_options.h"
 #include "servicefd.h"
 #include "rst-malloc.h"
-#include "common/lock.h"
 #include "string.h"
 #include "version.h"
 
@@ -42,7 +42,7 @@ static char buffer[LOG_BUF_LEN];
  * to the shared static buffer (and the write()/timestamp) so their output is
  * not interleaved or corrupted.
  */
-static spinlock_t log_lock = SPINLOCK_INIT;
+static pthread_spinlock_t log_lock;
 static char buf_off = 0;
 /*
  * The early_log_buffer is used to store log messages before
@@ -219,6 +219,7 @@ int log_init(const char *output)
 
 	gettimeofday(&start, NULL);
 	reset_buf_off();
+	pthread_spin_init(&log_lock, PTHREAD_PROCESS_PRIVATE);
 
 	if (output && !strncmp(output, "-", 2)) {
 		new_logfd = dup(STDOUT_FILENO);
@@ -389,7 +390,7 @@ static void vprint_on_level(unsigned int loglevel, const char *format, va_list p
 	 * Serialize the shared-buffer region (timestamp, vsnprintf, write,
 	 * log_note_err) against concurrent CLONE worker threads.
 	 */
-	spin_lock(&log_lock);
+	pthread_spin_lock(&log_lock);
 
 	if (loglevel != LOG_MSG && current_loglevel >= LOG_TIMESTAMP)
 		print_ts();
@@ -408,7 +409,7 @@ static void vprint_on_level(unsigned int loglevel, const char *format, va_list p
 	if (loglevel == LOG_ERROR)
 		log_note_err(buffer + buf_off);
 
-	spin_unlock(&log_lock);
+	pthread_spin_unlock(&log_lock);
 
 	errno = _errno;
 }

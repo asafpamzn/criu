@@ -880,7 +880,6 @@ static int parasite_clone_dump_init(struct parasite_clone_dump_args *args)
 	unsigned long total_pages = 0;
 	unsigned int *failed_indices;
 
-
 	pr_debug("CLONE dump init: registering %d VMAs\n", args->nr_vmas);
 
 	args->nr_failed_vmas = 0;
@@ -889,12 +888,12 @@ static int parasite_clone_dump_init(struct parasite_clone_dump_args *args)
 	/* Create userfaultfd in target process context */
 	uffd = sys_userfaultfd(O_CLOEXEC | O_NONBLOCK);
 	if (uffd < 0) {
-		int err = -uffd;  // Convert negative errno to positive
-		pr_err("Failed to create userfaultfd: %d (%s)\n", err, 
+		int err = -uffd;
+		pr_err("Failed to create userfaultfd: %d (%s)\n", err,
 			err == ENOSYS ? "not supported" :
-			err == EPERM ? "permission denied" : 
+			err == EPERM ? "permission denied" :
 			err == EINVAL ? "invalid flags" : "unknown error");
-   		 return -1;
+		return -1;
 	}
 
 	/* Initialize userfaultfd API with requested features */
@@ -906,9 +905,7 @@ static int parasite_clone_dump_init(struct parasite_clone_dump_args *args)
 
 	ret = sys_ioctl(uffd, UFFDIO_API, (unsigned long)&api);
 	if (ret < 0) {
-		int e = (ret < 0) ? -ret : ret;     /* convert to +errno code */
-
-		pr_err("Failed to initialize userfaultfd API: %d uffd=%d but continue\n", e, uffd);
+		pr_err("Failed to initialize userfaultfd API: %d uffd=%d\n", -ret, uffd);
 		sys_close(uffd);
 		return -1;
 	}
@@ -938,16 +935,13 @@ static int parasite_clone_dump_init(struct parasite_clone_dump_args *args)
 		pr_debug("Registering VMA %d: %lx-%lx prot=%x len=%lu\n",
 			 i, addr, addr + len, vma->prot, len);
 
-		/* Skip non-writable VMAs */
+		/* Skip non-writable VMAs - mark for later dump by CRIU */
 		if (!(vma->prot & PROT_WRITE)) {
-			pr_debug("Skipping non-writable VMA: %lx-%lx len=%lu\n", addr, addr + len, len);
-
-
-			/* Mark for later dump by CRIU */
-    		failed_indices[args->nr_failed_vmas++] = i;
+			pr_debug("Skipping non-writable VMA: %lx-%lx len=%lu\n",
+				 addr, addr + len, len);
+			failed_indices[args->nr_failed_vmas++] = i;
 			continue;
 		}
-
 
 		/* Register VMA for write-protect tracking */
 		reg.range.start = addr;
@@ -955,31 +949,19 @@ static int parasite_clone_dump_init(struct parasite_clone_dump_args *args)
 		reg.mode = UFFDIO_REGISTER_MODE_WP;
 		ret = sys_ioctl(uffd, UFFDIO_REGISTER, (unsigned long)&reg);
 		if (ret) {
-			/* Some VMAs may not support WP - record index for CRIU to dump */
-			if (ret == EINVAL) {
-				pr_warn("Cannot WP-register VMA %lx-%lx len=%lu (unsupported), marking for later dump\n",
-					addr, addr + len, len);
-				
-				/* Record the index of this failed VMA */
-				failed_indices[args->nr_failed_vmas++] = i;
-				pr_debug("Marked VMA index %d for later dump (%u failed VMAs total)\n",
-					 i, args->nr_failed_vmas);
-				continue;
+			if (ret == -EINVAL) {
+				pr_warn("Cannot WP-register VMA %lx-%lx (unsupported)\n",
+					addr, addr + len);
 			} else {
-							/* Any failure to register - just dump instead of trying to track */
-				pr_err("Failed to register VMA %lx-%lx: ret=%d len=%lu\n",
-			       addr, addr + len, ret, len);
-				
-				failed_indices[args->nr_failed_vmas++] = i;
-				pr_debug("Marked VMA index %d for immediate dump (%u total)\n",
-					 i, args->nr_failed_vmas);
-    			continue;
+				pr_err("Failed to register VMA %lx-%lx: ret=%d\n",
+				       addr, addr + len, ret);
 			}
-
+			failed_indices[args->nr_failed_vmas++] = i;
+			continue;
 		}
 
 		total_pages += len / PAGE_SIZE;
-		pr_debug("Successfully registered VMA for WP tracking: %lx-%lx (%lu pages)\n",
+		pr_debug("Registered VMA for WP tracking: %lx-%lx (%lu pages)\n",
 			 addr, addr + len, len / PAGE_SIZE);
 	}
 

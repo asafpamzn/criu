@@ -56,7 +56,8 @@
 #include "compel/infect-util.h"
 #include <compel/plugins/std/syscall-codes.h>
 
-#define VMA_OPT_LEN 128
+#define VMA_OPT_LEN		128
+#define TCP_SERVER_BACKLOG	32
 
 static int xatol_base(const char *string, long *number, int base)
 {
@@ -1239,7 +1240,7 @@ int setup_tcp_server(char *type, char *addr, unsigned short *port)
 		goto out;
 	}
 
-	if (listen(sk, 32)) {
+	if (listen(sk, TCP_SERVER_BACKLOG)) {
 		pr_perror("Can't listen on %s server socket", type);
 		goto out;
 	}
@@ -1441,79 +1442,17 @@ static int epoll_hangup_event(int epollfd, struct epoll_rfd *rfd)
 	return ret;
 }
 
-/* Epoll statistics tracking */
-static struct {
-	unsigned long total_read_calls;
-	unsigned long total_read_success;
-	unsigned long epoll_wait_time_ns;
-	unsigned long epoll_wait_calls;
-	time_t last_print_time;
-} epoll_stats;
-
-static void check_and_print_epoll_stats(void)
-{
-	time_t now = time(NULL);
-	
-	if (now - epoll_stats.last_print_time >= 60) {
-		if (epoll_stats.total_read_calls > 0 || epoll_stats.total_read_success > 0 || epoll_stats.epoll_wait_calls > 0) {
-			struct timespec ts;
-			struct tm *tm;
-			clock_gettime(CLOCK_REALTIME, &ts);
-			tm = localtime(&ts.tv_sec);
-			pr_debug("[%02d:%02d:%02d.%03ld] read_calls=%lu read_success=%lu epoll_wait_calls=%lu epoll_wait_ns=%lu\n",
-				tm->tm_hour, tm->tm_min, tm->tm_sec, ts.tv_nsec / 1000000,
-				epoll_stats.total_read_calls,
-				epoll_stats.total_read_success,
-				epoll_stats.epoll_wait_calls,
-				epoll_stats.epoll_wait_time_ns);
-		}
-		
-		/* Reset counters */
-		memset(&epoll_stats, 0, sizeof(epoll_stats));
-		epoll_stats.last_print_time = now;
-	}
-}
-
-extern void check_and_print_uffd_stats(void);
-extern int clone_process_eagain_requests(void);
-
 int epoll_run_rfds(int epollfd, struct epoll_event *evs, int nr_fds, int timeout)
 {
 	int ret, i, nr_events;
 	bool have_a_break = false;
 
 	while (1) {
-		struct timespec t_wait_start, t_wait_end;
-
-		/* Check and print stats periodically */
-		check_and_print_epoll_stats();
-
-			/* Check and print statistics every second */
-		check_and_print_uffd_stats();
-
-		/* In CLONE dump mode, process pending EAGAIN requests */
-		if (opts.clone_dump) {
-			ret = clone_process_eagain_requests();
-			if (ret < 0) {
-				goto out;
-			}
-		}
-
-		clock_gettime(CLOCK_MONOTONIC, &t_wait_start);
-
-		/* Use passed-in timeout, default to 1000ms if not specified */
-		ret = epoll_wait(epollfd, evs, nr_fds, timeout > 0 ? timeout : 1000);
-		clock_gettime(CLOCK_MONOTONIC, &t_wait_end);
-		epoll_stats.epoll_wait_calls++;
-		epoll_stats.epoll_wait_time_ns += (t_wait_end.tv_sec - t_wait_start.tv_sec) * 1000000000 + (t_wait_end.tv_nsec - t_wait_start.tv_nsec);
-
+		ret = epoll_wait(epollfd, evs, nr_fds, timeout);
 		if (ret <= 0) {
-			if (ret < 0) {
+			if (ret < 0)
 				pr_perror("polling failed");
-				break;
-			}
-			/* Timeout - return 0 so caller can check exit conditions */
-			return 0;
+			break;
 		}
 
 		nr_events = ret;
@@ -1525,17 +1464,11 @@ int epoll_run_rfds(int epollfd, struct epoll_event *evs, int nr_fds, int timeout
 			events = evs[i].events;
 
 			if (events & EPOLLIN) {
-				/* Print every event when timeout is small (restore_finished) */
-				epoll_stats.total_read_calls++;
 				ret = rfd->read_event(rfd);
-
-				if (ret < 0) {
+				if (ret < 0)
 					goto out;
-				}
-				if (ret > 0) {
-					epoll_stats.total_read_success++;
+				if (ret > 0)
 					have_a_break = true;
-				}
 			}
 
 			if (events & (EPOLLHUP | EPOLLRDHUP)) {

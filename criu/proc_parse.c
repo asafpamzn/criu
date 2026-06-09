@@ -833,7 +833,7 @@ int parse_maps(pid_t pid, struct vm_area_list *vma_area_list,
 		goto err_n;
 
 	if (bfdopenr(&f))
-		goto err_n;
+		goto err;
 
 	map_files_dir = opendir_proc(pid, "map_files");
 	if (!map_files_dir) /* old kernel? */
@@ -908,8 +908,8 @@ int parse_maps(pid_t pid, struct vm_area_list *vma_area_list,
 			/* Merge all vvar vma-s into one. */
 			prev_vma_area->e->end = vma_area->e->end;
 			if (!vma_area->file_borrowed)
-				free(vma_area->vmst);
-			free(vma_area);
+				xfree(vma_area->vmst);
+			xfree(vma_area);
 			vma_area = NULL;
 			continue;
 		}
