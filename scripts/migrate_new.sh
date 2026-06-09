@@ -135,7 +135,7 @@ sudo "$CRIU_BIN" dump \
 DUMP_PID=$!
 log_timing "CRIU dump started (PID: $DUMP_PID)"
 
-# Tell replica to start (include PID so lazy-pages knows the task)
+# Tell replica to start (include PID so it knows the task)
 echo "START $PID" >&"${REPLICA[1]}"
 log_timing "Sent START $PID to replica"
 

@@ -1638,9 +1638,9 @@ class criu:
         if self.__lazy_pages or self.__lazy_migrate:
             # For --clone-dump the lazy-pages daemon was already started in
             # dump() and is still running. Don't start another one; just
-            # add --lazy-pages (and --clone-dump, matching scripts/restore_new.sh).
+            # add --clone-dump (which implies lazy-pages behavior).
             if self.__clone_dump:
-                r_opts += ["--lazy-pages", "--clone-dump"]
+                r_opts += ["--clone-dump"]
             else:
                 lp_opts = []
                 if self.__remote_lazy_pages or self.__lazy_migrate:
