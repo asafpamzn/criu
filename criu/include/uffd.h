@@ -18,16 +18,6 @@ extern int apply_buffered_pages(int uffd, unsigned long *dirty_ranges,
 /* Return uffd of first active lazy_pages_info. Used by page-xfer.c. */
 extern int get_first_lpi_uffd(void);
 
-/*
- * CLONE state accessors are in clone-uffd.c (include clone/clone-uffd.h):
- * - clone_is_restore_connected(), clone_set_restore_connected()
- * - clone_is_all_pages_sent_received(), clone_set_all_pages_sent_received()
- * - clone_get_uffd_for_vaddr()
- * - clone_queue_drain_eagain_request(), clone_is_eagain_queue_empty()
- */
-
-
-
 /* CLONE Phase 2: Initialize page buffer for pre-buffering */
 extern int page_buffer_init(void);
 

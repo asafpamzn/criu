@@ -314,33 +314,13 @@ int main(int argc, char *argv[], char *envp[])
 		pr_info("Will do snapshot from %s\n", opts.img_parent);
 
 	if (opts.clone_dump) {
-		int p3 = opts.clone_num_p3_threads;
-		int p3_bulk = opts.clone_num_p3_threads_bulk;
-		int scan = opts.clone_num_scanners;
-		int pre_scan = opts.clone_num_pre_scanners;
-		int drain = opts.clone_num_drain_threads;
-
-		if (!p3) p3 = CLONE_DEFAULT_P3_THREADS;
-		if (!p3_bulk) p3_bulk = CLONE_DEFAULT_P3_THREADS_BULK;
-		if (!scan) scan = CLONE_DEFAULT_SCANNERS;
-		if (!pre_scan) pre_scan = CLONE_DEFAULT_PRE_SCANNERS;
-		if (!drain) drain = CLONE_DEFAULT_DRAIN_THREADS;
-
-		if (p3 > CLONE_MAX_P3_THREADS) {
-			pr_err("--clone-p3-threads %d exceeds max %d\n", p3, CLONE_MAX_P3_THREADS);
+		if (clone_cfg_init_from_opts(opts.clone_num_p3_threads,
+					   opts.clone_num_p3_threads_bulk,
+					   opts.clone_num_scanners,
+					   opts.clone_num_pre_scanners,
+					   opts.clone_num_drain_threads,
+					   opts.clone_pre_scan))
 			return 1;
-		}
-		if (scan > CLONE_MAX_SCANNERS) {
-			pr_err("--clone-scanners %d exceeds max %d\n", scan, CLONE_MAX_SCANNERS);
-			return 1;
-		}
-		if (drain > CLONE_MAX_DRAIN_THREADS) {
-			pr_err("--clone-drain-threads %d exceeds max %d\n", drain, CLONE_MAX_DRAIN_THREADS);
-			return 1;
-		}
-
-		clone_cfg_init(p3, p3_bulk, scan, pre_scan, drain,
-			     opts.clone_pre_scan);
 	}
 
 	switch (opts.mode) {

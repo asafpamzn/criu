@@ -74,6 +74,40 @@ void clone_cfg_init(int p3_threads, int p3_threads_bulk,
 		p3_threads, p3_threads_bulk, scanners, pre_scanners, drain_threads, pre_scan);
 }
 
+int clone_cfg_init_from_opts(int p3, int p3_bulk, int scan,
+			   int pre_scan_threads, int drain, bool pre_scan)
+{
+	if (!p3)
+		p3 = CLONE_DEFAULT_P3_THREADS;
+	if (!p3_bulk)
+		p3_bulk = CLONE_DEFAULT_P3_THREADS_BULK;
+	if (!scan)
+		scan = CLONE_DEFAULT_SCANNERS;
+	if (!pre_scan_threads)
+		pre_scan_threads = CLONE_DEFAULT_PRE_SCANNERS;
+	if (!drain)
+		drain = CLONE_DEFAULT_DRAIN_THREADS;
+
+	if (p3 > CLONE_MAX_P3_THREADS) {
+		pr_err("--clone-p3-threads %d exceeds max %d\n",
+		       p3, CLONE_MAX_P3_THREADS);
+		return -1;
+	}
+	if (scan > CLONE_MAX_SCANNERS) {
+		pr_err("--clone-scanners %d exceeds max %d\n",
+		       scan, CLONE_MAX_SCANNERS);
+		return -1;
+	}
+	if (drain > CLONE_MAX_DRAIN_THREADS) {
+		pr_err("--clone-drain-threads %d exceeds max %d\n",
+		       drain, CLONE_MAX_DRAIN_THREADS);
+		return -1;
+	}
+
+	clone_cfg_init(p3, p3_bulk, scan, pre_scan_threads, drain, pre_scan);
+	return 0;
+}
+
 struct clone_tracked_vma {
 	unsigned long start;
 	unsigned long end;

@@ -315,4 +315,11 @@ void clone_cfg_init(int p3_threads, int p3_threads_bulk,
 		  int scanners, int pre_scanners, int drain_threads,
 		  bool pre_scan);
 
+/*
+ * Initialize and validate clone runtime config from CLI options.
+ * Returns 0 on success, -1 on validation error.
+ */
+int clone_cfg_init_from_opts(int p3, int p3_bulk, int scan,
+			   int pre_scan_threads, int drain, bool pre_scan);
+
 #endif /* __CR_CLONE_CONF_H__ */

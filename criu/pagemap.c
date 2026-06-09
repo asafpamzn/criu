@@ -468,7 +468,6 @@ static int read_page_complete(unsigned long img_id, unsigned long vaddr, unsigne
 	return ret;
 }
 
-/* On-demand transfer mode: request individual pages as needed */
 static int maybe_read_page_remote(struct page_read *pr, unsigned long vaddr, unsigned long nr, void *buf, unsigned flags)
 {
 	int ret;
@@ -482,7 +481,7 @@ static int maybe_read_page_remote(struct page_read *pr, unsigned long vaddr, uns
 
 static int read_pagemap_page(struct page_read *pr, unsigned long vaddr, unsigned long nr, void *buf, unsigned flags)
 {
-	pr_debug("pr%lu-%u Read %lx %lu pages\n", pr->img_id, pr->id, vaddr, nr);
+	pr_info("pr%lu-%u Read %lx %lu pages\n", pr->img_id, pr->id, vaddr, nr);
 	pagemap_bound_check(pr->pe, vaddr, nr);
 
 	if (pagemap_in_parent(pr->pe)) {
@@ -591,36 +590,8 @@ static int process_async_reads(struct page_read *pr)
 		}
 
 		if (ret < 0) {
-			int i;
 			pr_err("Can't read async pr bytes (%zd / %ju read, %ju off, %d iovs)\n", ret,
 			       piov->end - piov->from, piov->from, piov->nr);
-			/* Print all target addresses that failed */
-			pr_err("Failed to read for virtual addresses:\n");
-			for (i = 0; i < piov->nr; i++) {
-				unsigned long vaddr = (unsigned long)piov->to[i].iov_base;
-				size_t len = piov->to[i].iov_len;
-				off_t file_off = piov->from;
-
-				/* Calculate file offset for this specific iovec */
-				if (i > 0) {
-					int j;
-					for (j = 0; j < i; j++)
-						file_off += piov->to[j].iov_len;
-				}
-
-				pr_err("  [%d] vaddr=0x%lx len=%zu (file_off=%ju)\n",
-				       i, vaddr, len, (uintmax_t)file_off);
-			}
-
-			/* If we have pagemap context, print it */
-			if (pr->pe) {
-				pr_err("Current pagemap entry: vaddr=0x%lx nr_pages=%lu flags=0x%x (PE_PRESENT=%d PE_LAZY=%d)\n",
-				       (unsigned long)pr->pe->vaddr, (unsigned long)pr->pe->nr_pages,
-				       pr->pe->flags,
-				       !!(pr->pe->flags & PE_PRESENT),
-				       !!(pr->pe->flags & PE_LAZY));
-			}
-
 			goto err;
 		}
 
@@ -975,11 +946,11 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 	pr->id = ids++;
 	pr->img_id = img_id;
 
-	if (remote) {		
+	if (remote)
 		pr->maybe_read_page = maybe_read_page_remote;
-	} else if (opts.stream) {
+	else if (opts.stream)
 		pr->maybe_read_page = maybe_read_page_img_streamer;
-	} else {
+	else {
 		pr->maybe_read_page = maybe_read_page_local;
 		if (!pr->parent && !(opts.lazy_pages || opts.clone_dump))
 			pr->pieok = true;

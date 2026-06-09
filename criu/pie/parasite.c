@@ -934,13 +934,6 @@ static int parasite_clone_dump_init(struct parasite_clone_dump_args *args)
 		vma = vmas + i;
 		addr = vma->start;
 		len = vma->len;
-#if 0
-		if (!vma_entry_can_be_lazy(vma->e))
-		{
-			pr_err("Skipping VMEs that cannot be lazy VMA: %lx-%lx len=%lu\n", addr, addr + len, len);
-			continue;
-		}
-#endif
 
 		pr_debug("Registering VMA %d: %lx-%lx prot=%x len=%lu\n",
 			 i, addr, addr + len, vma->prot, len);
