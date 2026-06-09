@@ -55,6 +55,14 @@ log_timing() {
   echo "[$timestamp +${elapsed}ms] $1" | sudo tee -a "$TIMING_LOG" >&2
 }
 
+cleanup() {
+  log_timing "Cleaning up..."
+  sudo pkill -9 -f "criu dump" 2>/dev/null || true
+  sudo pkill -9 -f "ssh.*restore_new.sh" 2>/dev/null || true
+  exit 1
+}
+trap cleanup INT TERM
+
 PID=$(pgrep -x valkey-server | head -n1)
 if [ -z "$PID" ]; then
   echo "ERROR: valkey-server not running"

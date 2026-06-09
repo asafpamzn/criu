@@ -319,6 +319,9 @@ int main(int argc, char *argv[], char *envp[])
 		opts.clone_dump = true;
 
 	if (opts.clone_dump) {
+		/* --clone-dump implies lazy-pages mode */
+		opts.lazy_pages = true;
+
 		if (clone_cfg_init_from_opts(opts.clone_num_p3_threads,
 					   opts.clone_num_p3_threads_bulk,
 					   opts.clone_num_scanners,
