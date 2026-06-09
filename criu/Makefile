@@ -63,34 +63,6 @@ criu/pie/Makefile: ;
 criu/pie/Makefile.library: ;
 criu/pie/%: pie ;
 
-# eBPF dirty page tracker (skeleton compiled into clone/clone-bpf.o)
-# Only built if CONFIG_HAS_LIBBPF is set
-BPF_SRC		:= criu/clone/bpf/dirty_track.bpf.c
-BPF_OBJ		:= criu/clone/bpf/dirty_track.bpf.o
-BPF_SKEL	:= criu/clone/bpf/dirty_track.skel.h
-BPF_VMLINUX	:= criu/clone/bpf/vmlinux.h
-
-$(BPF_VMLINUX):
-	$(call msg-gen, $@)
-	$(Q) bpftool btf dump file /sys/kernel/btf/vmlinux format c > $@
-
-BPF_ARCH	:= $(if $(filter aarch64,$(ARCH)),arm64,$(ARCH))
-
-$(BPF_OBJ): $(BPF_SRC) $(BPF_VMLINUX)
-	$(call msg-gen, $@)
-	$(Q) clang -g -O2 -target bpf -D__TARGET_ARCH_$(BPF_ARCH) \
-		-I criu/clone/bpf -I /usr/include/bpf \
-		-c $< -o $@
-
-$(BPF_SKEL): $(BPF_OBJ)
-	$(call msg-gen, $@)
-	$(Q) bpftool gen skeleton $< > $@
-
-# clone/clone-bpf.o depends on the skeleton header
-ifeq ($(CONFIG_HAS_LIBBPF),y)
-$(obj)/clone/clone-bpf.o: $(BPF_SKEL)
-endif
-
 #
 # CRIU executable
 PROGRAM-BUILTINS	+= criu/pie/pie.lib.a

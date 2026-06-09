@@ -70,9 +70,6 @@
 #include "clone/clone-page-xfer.h"
 #include "clone/clone-bulk-send.h"
 #include "clone/clone-compare.h"
-#ifdef CONFIG_HAS_LIBBPF
-#include "clone/clone-bpf.h"
-#endif
 #include "posix-timer.h"
 #include "vdso.h"
 #include "vma.h"

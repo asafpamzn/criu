@@ -1358,20 +1358,7 @@ int cr_dump_tasks_clone_phased(pid_t pid)
 			goto err;
 	}
 
-	/*
-	 * Start BPF dirty page tracker BEFORE unfreezing the process.
-	 * This ensures we capture all page faults from the moment the
-	 * process resumes. Starting after unfreeze creates a race window
-	 * where faults could be missed.
-	 */
-#ifdef CONFIG_HAS_LIBBPF
-	if (clone_bpf_start(root_item->pid->real) == 0)
-		pr_debug("BPF dirty tracker started (before unfreeze)\n");
-	else
-		pr_info("BPF dirty tracker not available, using PAGEMAP_SCAN\n");
-#endif
-
-	/* Unfreeze — process runs with WP_ASYNC, BPF captures all faults */
+	/* Unfreeze — process runs with WP_ASYNC */
 	ret = arch_set_thread_regs(root_item, false);
 	if (ret)
 		goto err;
@@ -1434,11 +1421,6 @@ int cr_dump_tasks_clone_phased(pid_t pid)
 		pr_err("Failed to re-seize tasks\n");
 		goto err;
 	}
-
-#ifdef SCAN_COMPARE
-	/* DEBUG: Compare BPF vs PAGEMAP_SCAN and exit */
-	clone_debug_scan_compare();	
-#endif
 
 	/*
 	 * Collect pstree IDs now so vpid(item) is valid for the VMA detection.

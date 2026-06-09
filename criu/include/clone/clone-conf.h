@@ -32,17 +32,6 @@
 // #define CONFIG_PAGE_STATE_TRACKER
 
 /*
- * SCAN_COMPARE - Debug mode to compare BPF vs PAGEMAP_SCAN at freeze time.
- * When enabled, after freeze the code will:
- * 1. Drain BPF ring buffer and count unique dirty pages
- * 2. Run PAGEMAP_SCAN and count dirty pages
- * 3. Report pages that SCAN found but BPF missed
- * 4. Exit immediately (no page transfer)
- * Use this to debug why BPF might be missing pages.
- */
-// #define SCAN_COMPARE
-
-/*
  * CLONE_PRE_SCAN - Iterative dirty scanning before freeze.
  * Now runtime-configurable via --clone-pre-scan CLI option (clone_cfg.pre_scan).
  * When enabled: Scanners do iterative PAGEMAP_SCAN while process runs,
@@ -304,24 +293,7 @@
 #define CLONE_SPSC_PADDING		128
 
 /* ================================================================
- * SECTION 13: eBPF Dirty Page Tracker Configuration
- * ================================================================ */
-
-/*
- * BPF ring buffer size for dirty page addresses.
- * Each entry is 8 bytes (u64 address), so 64MB = 8M entries.
- * If this fills up, we fall back to PAGEMAP_SCAN.
- */
-#define CLONE_BPF_RING_SIZE		(64UL * 1024 * 1024)  /* 64MB */
-
-/*
- * Initial capacity for BPF drain address array.
- * Will be dynamically grown if needed.
- */
-#define CLONE_BPF_DRAIN_INITIAL_CAP	65536
-
-/* ================================================================
- * SECTION 14: Runtime Thread Configuration
+ * SECTION 13: Runtime Thread Configuration
  * ================================================================ */
 
 /*

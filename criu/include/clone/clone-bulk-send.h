@@ -149,22 +149,4 @@ void clone_set_new_vma_ranges(unsigned long *ranges, unsigned int nr_ranges);
  */
 void clone_free_new_vma_ranges(void);
 
-#ifdef CONFIG_HAS_LIBBPF
-/*
- * Drain BPF ring buffer and distribute dirty regions to sender queues.
- * Called at freeze time when using BPF mode (no scanner threads).
- * Returns number of dirty pages, or -1 on error.
- * BUG() if ring buffer overflow detected.
- */
-int clone_bpf_drain_to_queues(void);
-#endif /* CONFIG_HAS_LIBBPF */
-
-#ifdef SCAN_COMPARE
-/*
- * DEBUG: Compare BPF vs PAGEMAP_SCAN at freeze time.
- * Call after freeze. Exits after comparison - no page transfer.
- */
-void clone_debug_scan_compare(void);
-#endif
-
 #endif /* __CR_CLONE_BULK_SEND_H__ */
