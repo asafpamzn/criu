@@ -538,7 +538,9 @@ all:	$(TST) criu-rtc.so
 install: all
 .PHONY: all install
 
-$(TST_NOFILE:%=%.pid):	%.pid:	%
+# filter out tests with custom .pid rules below
+TST_NOFILE_FILTERED := $(filter-out clone_dump_file_backed,$(TST_NOFILE))
+$(TST_NOFILE_FILTERED:%=%.pid):	%.pid:	%
 	$(TEST_ENV) $(<D)/$(<F) --pidfile=$@ --outfile=$<.out
 
 $(TST_FILE:%=%.pid):	%.pid:	%
@@ -549,6 +551,9 @@ $(TST_DIR:%=%.pid):	%.pid:	%
 
 $(TST_DIR_FILE:%=%.pid):	%.pid:	%
 	$(TEST_ENV) $(<D)/$(<F) --pidfile=$@ --outfile=$<.out --dirname=$<.dir.test --filename=$<.test
+
+clone_dump_file_backed.pid: clone_dump_file_backed
+	$(TEST_ENV) $(<D)/$(<F) --pidfile=$@ --outfile=$<.out --test_dir=$(<D)
 
 cmdlinenv00.pid: cmdlinenv00
 	$(TEST_ENV) $(<D)/$(<F) --pidfile=$@ --outfile=$<.out --arg1=arg1 --arg2=arg2 --arg3=arg3

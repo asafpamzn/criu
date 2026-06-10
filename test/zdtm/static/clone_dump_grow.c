@@ -13,10 +13,10 @@
 
 const char *test_doc = "--clone-dump growth test: start with a large (30 GB by "
 		       "default) anon-private region, fill it, then during "
-		       "Phase 2 a background thread both (a) dirties pages "
-		       "in the original region (exercises WP-fault) and "
-		       "(b) mmaps a second equally-large region and fills "
-		       "it (exercises new-VMA + large-VMA growth). After "
+		       "Phase 2 two background threads run in parallel: one "
+		       "mmaps and fills a second equally-large region (exercises "
+		       "new-VMA + large-VMA growth), while the other dirties "
+		       "pages in the original region (exercises WP-fault). After "
 		       "restore, both regions must be resident and every "
 		       "page must carry one of the expected markers with no "
 		       "torn writes.";
@@ -50,31 +50,17 @@ static unsigned char *grown_region;			/* published by grower */
 static atomic_int    stop_workers;
 
 /*
- * Grower thread: runs for the whole post-test_daemon period. It does
- * two independent jobs:
- *
- *   - Allocate a second region of GROW_BYTES and fill it with
- *     MARKER_GROW. Published to `grown_region` only after fill completes.
- *
- *   - Repeatedly dirty a subset of pages in the initial region to
- *     MARKER_DIRTY, so the CLONE WP-fault path is exercised on pages
- *     that were already in the Phase-1 VMA snapshot.
+ * Grower thread: allocates a second region of GROW_BYTES and fills it with
+ * MARKER_GROW. Published to `grown_region` only after fill completes.
  *
  * The thread is frozen along with the rest of the process at the start
  * of Phase 1, unfrozen at the start of Phase 2, and re-frozen at
- * Phase 3; then restored, and runs again briefly until main() flips
- * stop_workers.
+ * Phase 3; then restored.
  */
 static void *grower_thread(void *arg)
 {
 	unsigned char *buf;
 	size_t i;
-
-	/*
-	 * No sleep needed - the thread is frozen during Phase 1 and unfrozen
-	 * when Phase 2 begins. The mmap for the grown region happens during
-	 * Phase 2 and is detected as a new VMA.
-	 */
 
 	buf = mmap(NULL, GROW_BYTES, PROT_READ | PROT_WRITE,
 		   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -97,11 +83,21 @@ static void *grower_thread(void *arg)
 	/* Publish only after fill — readers see a fully-initialized region. */
 	grown_region = buf;
 
-	/*
-	 * Keep churning the initial region until told to stop: dirties
-	 * every 256th page to MARKER_DIRTY. Bounded rate so we don't
-	 * starve CRIU's scanners.
-	 */
+	return NULL;
+}
+
+/*
+ * Dirtier thread: repeatedly dirties pages in the initial region to
+ * MARKER_DIRTY, so the CLONE WP-fault path is exercised on pages
+ * that were already in the Phase-1 VMA snapshot.
+ *
+ * Runs in parallel with grower_thread to ensure dirty processing
+ * can start immediately even if growth is slow.
+ */
+static void *dirtier_thread(void *arg)
+{
+	size_t i;
+
 	while (!atomic_load(&stop_workers)) {
 		for (i = 0; i < INITIAL_BYTES; i += PAGE_SIZE * 256) {
 			if (atomic_load(&stop_workers))
@@ -161,7 +157,7 @@ static int verify_region(const char *name, unsigned char *base,
 
 int main(int argc, char **argv)
 {
-	pthread_t th;
+	pthread_t grower_th, dirtier_th;
 	size_t i;
 	int initial_errors = 0, grown_errors = 0;
 	unsigned long drain_ms;
@@ -186,20 +182,26 @@ int main(int argc, char **argv)
 	atomic_init(&stop_workers, 0);
 	grown_region = NULL;
 
-	if (pthread_create(&th, NULL, grower_thread, NULL)) {
+	/* Start both threads in parallel */
+	if (pthread_create(&grower_th, NULL, grower_thread, NULL)) {
 		pr_perror("pthread_create grower");
+		return 1;
+	}
+	if (pthread_create(&dirtier_th, NULL, dirtier_thread, NULL)) {
+		pr_perror("pthread_create dirtier");
 		return 1;
 	}
 
 	test_daemon();
 	test_waitsig();
 
-	/* Wait for the grower to finish filling before stopping it. */
+	/* Wait for the grower to finish filling before stopping workers. */
 	while (!grown_region)
 		usleep(10 * 1000);
 
 	atomic_store(&stop_workers, 1);
-	pthread_join(th, NULL);
+	pthread_join(grower_th, NULL);
+	pthread_join(dirtier_th, NULL);
 
 	/* Drain gate for both regions. */
 	drain_ms = DRAIN_TIMEOUT_MS_PER_GB *
