@@ -112,10 +112,7 @@ static void *alloc_chunk(void)
 		hdr->chunk_idx = idx;
 		atomic_fetch_add(&nr_chunks, 1);
 	} else {
-		/*
-		 * Hit limit - try to reuse a NULL slot from a freed chunk.
-		 * This fixes the bug where freed chunk slots were never reused.
-		 */
+		/* Hit limit; reuse a NULL slot from a freed chunk. */
 		int reused_slot = -1;
 		for (int i = 0; i < CLONE_MAX_POOL_CHUNKS; i++) {
 			if (all_chunks[i] == NULL) {

@@ -45,29 +45,28 @@ void set_all_pages_sent_ack_received(void)
 }
 
 /*
- * Wait for all_pages_sent ACK from replica.
- * Called by primary after sending PS_IOV_ALL_PAGES_SENT.
- * Actually reads from socket to receive the ACK.
+ * Wait for all_pages_sent ACK from the target.
+ * Called on the source side after sending PS_IOV_ALL_PAGES_SENT.
  */
 int wait_for_all_pages_sent_ack(int sk)
 {
 	struct page_server_iov pi;
 
-	pr_info("Waiting for all_pages_sent ACK from replica...\n");
+	pr_info("Waiting for all_pages_sent ACK from target...\n");
 	BUG_ON(page_server_recv(sk, &pi, sizeof(pi), MSG_WAITALL) != sizeof(pi));
 	BUG_ON(decode_ps_cmd(pi.cmd) != PS_IOV_ALL_PAGES_SENT_ACK);
 
-	pr_info("Received all_pages_sent ACK from replica\n");
+	pr_info("Received all_pages_sent ACK from target\n");
 	set_all_pages_sent_ack_received();
 	return 0;
 }
 
 
 /*
- * Send "all pages sent" signal to replica (CLONE phased migration).
- * Called by primary after dirty bitmap transfer completes, so replica
- * knows it can zero-fill any remaining page faults for new VMAs.
- * If sk >= 0, use that socket; otherwise use global page_server_sk.
+ * Send "all pages sent" signal to the target (CLONE phased migration).
+ * Called on the source side after dirty bitmap transfer completes, so
+ * the target knows it can zero-fill any remaining page faults for new
+ * VMAs. If sk >= 0, use that socket; otherwise use global page_server_sk.
  */
 int send_all_pages_sent_signal(int sk)
 {
@@ -81,14 +80,14 @@ int send_all_pages_sent_signal(int sk)
 
 	BUG_ON(use_sk < 0);
 
-	pr_info("Sending all_pages_sent signal to replica\n");
+	pr_info("Sending all_pages_sent signal to target\n");
 	return send_psi(use_sk, &pi);
 }
 
 /*
  * Send ACK for all_pages_sent signal (CLONE phased migration).
- * Called by replica after drain thread finishes, so primary knows
- * it's safe to close the connection.
+ * Called on the target side after drain thread finishes, so the source
+ * knows it's safe to close the connection.
  */
 int send_all_pages_sent_ack(void)
 {
@@ -102,7 +101,7 @@ int send_all_pages_sent_ack(void)
 
 	BUG_ON(sk < 0);
 
-	pr_info("Sending all_pages_sent ACK to primary\n");
+	pr_info("Sending all_pages_sent ACK to source\n");
 	return send_psi(sk, &pi);
 }
 
@@ -177,12 +176,12 @@ int clone_send_skeleton_files(int sk)
 	}
 
 	closedir(dir);
-	pr_info("Sent %d skeleton files to replica\n", count);
+	pr_info("Sent %d skeleton files to target\n", count);
 	return 0;
 }
 
 /*
- * Request all pages from primary in batch mode.
+ * Request all pages from the source in batch mode.
  * CLONE-specific: used for bulk page transfer.
  */
 int clone_request_all_remote_pages(unsigned long img_id)

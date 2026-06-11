@@ -8,11 +8,11 @@
  * CLONE-specific page server protocol commands.
  * These extend the base PS_IOV_* protocol for CLONE migration.
  */
-#define PS_IOV_GET_ALL            8   /* Replica -> Primary: request all pages */
-#define PS_IOV_ADD_F_COMPRESS     10  /* Primary -> Replica: compressed page data */
-#define PS_IOV_ALL_PAGES_SENT     16  /* Primary -> Replica: all pages sent, zero-fill rest */
-#define PS_IOV_ALL_PAGES_SENT_ACK 17  /* Replica -> Primary: ACK, safe to close connection */
-#define PS_IOV_SKELETON_FILE      20  /* Primary -> Replica: skeleton image file transfer */
+#define PS_IOV_GET_ALL            8   /* Target -> Source: request all pages */
+#define PS_IOV_ADD_F_COMPRESS     10  /* Source -> Target: compressed page data */
+#define PS_IOV_ALL_PAGES_SENT     16  /* Source -> Target: all pages sent, zero-fill rest */
+#define PS_IOV_ALL_PAGES_SENT_ACK 17  /* Target -> Source: ACK, safe to close connection */
+#define PS_IOV_SKELETON_FILE      20  /* Source -> Target: skeleton image file transfer */
 
 /* Global compression statistics (used by clone-bulk-send.c) */
 extern unsigned long g_compress_uncompressed_bytes;

@@ -1,8 +1,8 @@
 /*
- * CLONE P3 Parallel Receiver - REPLICA side parallel page reception
+ * CLONE P3 Parallel Receiver - target-side parallel page reception.
  *
  * Handles parallel page reception for CLONE migration:
- * - Creates connections to PRIMARY
+ * - Creates connections to the source
  * - Spawns receiver threads for each connection
  * - Receives compressed batches and adds to page buffer
  */
@@ -259,7 +259,7 @@ static void *p3_receiver_thread_func(void *arg)
 	/* Initialize per-thread page pool for lock-free allocation */
 	BUG_ON(clone_page_buffer_thread_init(ctx->thread_id) < 0);
 
-	/* Per-connection TLS handshake (client side — REPLICA connects to PRIMARY) */
+	/* Per-connection TLS handshake (client side - target connects to source) */
 	if (opts.tls) {
 		pr_debug("P3 receiver[%d] starting TLS handshake on fd=%d\n",
 		       ctx->thread_id, ctx->socket);
@@ -285,7 +285,7 @@ static void *p3_receiver_thread_func(void *arg)
 }
 
 /*
- * Accept P3 connections for parallel transfer (PRIMARY/server side).
+ * Accept P3 connections for parallel transfer (source/server side).
  * Returns sockets to caller for use with clone_start_p3_threads().
  * Does NOT spawn threads - caller is responsible for using the sockets.
  *
@@ -373,9 +373,10 @@ void close_p3_sockets(int *sockets, int num_sockets)
 }
 
 /*
- * REPLICA side: Create P3 connections to PRIMARY and start receiver threads.
- * Called during lazy-pages startup to enable parallel page reception.
- * Returns number of receiver threads started, 0 if page server not configured.
+ * Target side: Create P3 connections to the source and start receiver
+ * threads. Called during lazy-pages startup to enable parallel page
+ * reception. Returns number of receiver threads started, 0 if page server
+ * not configured.
  */
 int start_p3_receiver_connections(int num_connections)
 {
@@ -385,7 +386,7 @@ int start_p3_receiver_connections(int num_connections)
 	if (num_connections > MAX_P3_RECEIVERS)
 		num_connections = MAX_P3_RECEIVERS;
 
-	/* Create connections to PRIMARY */
+	/* Create connections to the source */
 	num_sockets = connect_p3_sockets(p3_sockets, num_connections);
 	if (num_sockets == 0)
 		return 0;
@@ -426,7 +427,7 @@ int start_p3_receiver_connections(int num_connections)
 }
 
 /*
- * REPLICA side: Stop P3 receiver threads and close connections.
+ * Target side: Stop P3 receiver threads and close connections.
  * Called when page transfer is complete.
  */
 void stop_p3_receiver_connections(void)

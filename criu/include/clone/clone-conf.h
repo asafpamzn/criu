@@ -1,9 +1,9 @@
 /*
  * CLONE Configuration Constants
  *
- * This header consolidates all CLONE (Copy-on-Write) configuration
- * constants from the phased migration implementation. Constants
- * are organized by category for maintainability.
+ * This header consolidates all CLONE configuration constants
+ * from the phased migration implementation. Constants are
+ * organized by category for maintainability.
  *
  * All CLONE source files should include this header and use these
  * constants instead of defining their own or using magic numbers.
@@ -51,25 +51,25 @@
 
 /*
  * CONFIG_CLONE_COMPARE - Enable process comparison during CLONE dump.
- * When enabled, PRIMARY and REPLICA compare process state after freeze.
+ * When enabled, the source and target processes compare state after freeze.
  * Useful for debugging memory divergence issues.
  */
 // #define CONFIG_CLONE_COMPARE
 
 /*
  * CONFIG_CLONE_COMPARE_PAGES - Enable page hash comparison (slow).
- * When enabled, PRIMARY sends page hashes and REPLICA compares them.
+ * When enabled, the source sends page hashes and the target compares them.
  * This is very slow for large processes. Disable to only compare VMAs.
  * Requires CONFIG_CLONE_COMPARE to be enabled.
  */
 // #define CONFIG_CLONE_COMPARE_PAGES
 
 /*
- * CONFIG_CLONE_WAIT_REPLICA_TOUCH - Wait for touch file before proceeding.
- * When enabled, PRIMARY waits for /tmp/continue_replica file to exist
+ * CONFIG_CLONE_WAIT_TARGET_TOUCH - Wait for touch file before proceeding.
+ * When enabled, the source waits for /tmp/continue_target file to exist
  * before unfreezing. Useful for manual debugging/inspection.
  */
-// #define CONFIG_CLONE_WAIT_REPLICA_TOUCH
+// #define CONFIG_CLONE_WAIT_TARGET_TOUCH
 
 /* ================================================================
  * SECTION 1: Batch Transfer Configuration
@@ -214,6 +214,7 @@
 
 /* Timeout values (milliseconds) */
 #define CLONE_P3_ACCEPT_TIMEOUT_MS	5000	/* 5 seconds */
+#define CLONE_LAZY_ACCEPT_POLL_MS	1000	/* epoll poll interval while waiting for restore connect */
 
 /* Stats/logging intervals (seconds) */
 #define CLONE_STATS_PRINT_SEC		30	/* UFFD stats */

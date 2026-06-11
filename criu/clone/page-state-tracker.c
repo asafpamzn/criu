@@ -303,8 +303,8 @@ void page_state_print_history(unsigned long vaddr)
 
 /*
  * Returns true if this page's history ever passed through a page-fault
- * or urgent-request state. Such pages are owned by the replica process
- * after UFFDIO_COPY and may legitimately diverge from the primary's
+ * or urgent-request state. Such pages are owned by the target process
+ * after UFFDIO_COPY and may legitimately diverge from the source's
  * snapshot by the time compare runs — callers can use this to suppress
  * expected diffs.
  */

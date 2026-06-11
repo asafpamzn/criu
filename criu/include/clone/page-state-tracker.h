@@ -59,9 +59,9 @@ extern u32 page_state_get_crc(unsigned long vaddr);
 
 /*
  * True if the page's history ever went through PF_PENDING or
- * URGENT_PENDING. These pages were served to the replica process via
+ * URGENT_PENDING. These pages were served to the target process via
  * UFFDIO_COPY and are owned by it afterwards — they may legitimately
- * differ from the primary snapshot when compare runs.
+ * differ from the source snapshot when compare runs.
  */
 extern bool page_state_was_pf_served(unsigned long vaddr);
 

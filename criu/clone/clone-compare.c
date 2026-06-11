@@ -1,14 +1,14 @@
 /*
  * CLONE Process Comparison - Debug tool for cross-host process state comparison
  *
- * Used to compare PRIMARY (source) and REPLICA (restored) processes to verify
+ * Used to compare the source (dump) and target (restored) processes to verify
  * they are identical before unfreezing. Helps debug crashes after CLONE migration.
  *
  * Flow:
- *   1. PRIMARY listens on COMPARE_PORT after P3 completion
- *   2. REPLICA connects after drain completes
- *   3. PRIMARY sends VMA list -> REPLICA compares
- *   4. PRIMARY sends page hashes -> REPLICA compares
+ *   1. Source listens on COMPARE_PORT after P3 completion
+ *   2. Target connects after drain completes
+ *   3. Source sends VMA list -> target compares
+ *   4. Source sends page hashes -> target compares
  *   5. Differences are logged for debugging
  */
 
@@ -253,7 +253,7 @@ static int read_page(pid_t pid, uint64_t vaddr, void *buf, bool log_errors)
 #endif
 
 /*
- * PRIMARY side: Send process state to replica for comparison
+ * Source side: Send process state to target for comparison.
  */
 int clone_compare_send_state(int sk, pid_t pid)
 {
@@ -331,7 +331,7 @@ int clone_compare_send_state(int sk, pid_t pid)
 
 			if (bytes_hashed / COMPARE_PROGRESS_STEP !=
 			    (bytes_hashed - PAGE_SIZE) / COMPARE_PROGRESS_STEP)
-				pr_warn("COMPARE: PRIMARY hashed %lu GB (%d pages)\n",
+				pr_warn("COMPARE: hashed %lu GB (%d pages)\n",
 					(unsigned long)(bytes_hashed / COMPARE_PROGRESS_STEP),
 					sent_hashes);
 		}
@@ -362,14 +362,14 @@ int clone_compare_send_state(int sk, pid_t pid)
 }
 
 /*
- * REPLICA side: Receive and compare process state
+ * Target side: Receive and compare process state.
  */
 int clone_compare_receive_and_verify(int sk, pid_t pid)
 {
 	struct compare_msg_hdr hdr;
 	struct vma_info *local_vmas, *remote_vmas = NULL;
 	int local_nr_vmas, remote_nr_vmas = 0, remote_capacity = 256;
-	int vma_diffs = 0, replica_only = 0;
+	int vma_diffs = 0, target_only = 0;
 	int uncovered_ranges = 0;
 	uint64_t total_uncovered = 0;
 #ifdef CONFIG_CLONE_COMPARE_PAGES
@@ -444,7 +444,7 @@ int clone_compare_receive_and_verify(int sk, pid_t pid)
 			 * adjacent anon VMAs on restore when madvise flags don't
 			 * round-trip. The coverage check below is authoritative.
 			 */
-			pr_warn("COMPARE_DIFF: VMA 0x%016lx-0x%016lx exists on PRIMARY but not REPLICA\n",
+			pr_warn("COMPARE_DIFF: VMA 0x%016lx-0x%016lx exists on source but not target\n",
 			       (unsigned long)remote_vmas[i].start,
 			       (unsigned long)remote_vmas[i].end);
 			pr_warn("  name=%s size=%luKB\n",
@@ -461,7 +461,7 @@ int clone_compare_receive_and_verify(int sk, pid_t pid)
 		}
 	}
 
-	/* Reverse comparison: check for VMAs on REPLICA that don't exist on PRIMARY */
+	/* Reverse comparison: check for VMAs on target that don't exist on source */
 	for (j = 0; j < local_nr_vmas; j++) {
 		bool found = false;
 
@@ -481,7 +481,7 @@ int clone_compare_receive_and_verify(int sk, pid_t pid)
 			}
 		}
 		if (!found) {
-			pr_warn("COMPARE_DIFF: VMA 0x%016lx-0x%016lx exists on REPLICA but not PRIMARY\n",
+			pr_warn("COMPARE_DIFF: VMA 0x%016lx-0x%016lx exists on target but not source\n",
 			       (unsigned long)local_vmas[j].start,
 			       (unsigned long)local_vmas[j].end);
 			pr_warn("  name=%s size=%luKB\n",
@@ -494,15 +494,15 @@ int clone_compare_receive_and_verify(int sk, pid_t pid)
 			       (unsigned long)local_vmas[j].swap);
 			pr_warn("  vmflags: %s\n",
 			       local_vmas[j].vmflags[0] ? local_vmas[j].vmflags : "(none)");
-			replica_only++;
+			target_only++;
 		}
 	}
 
-	pr_warn("COMPARE: Exact boundary comparison: %d PRIMARY-only, %d REPLICA-only\n",
-		vma_diffs, replica_only);
+	pr_warn("COMPARE: Exact boundary comparison: %d source-only, %d target-only\n",
+		vma_diffs, target_only);
 
 	/*
-	 * Coverage check: verify all PRIMARY memory ranges are covered by REPLICA VMAs.
+	 * Coverage check: verify all source memory ranges are covered by target VMAs.
 	 * This catches cases where VMAs are merged/split but memory coverage is the same.
 	 * Coverage (not exact-boundary match) is the authoritative correctness check.
 	 */
@@ -532,7 +532,7 @@ int clone_compare_receive_and_verify(int sk, pid_t pid)
 						gap_end = local_vmas[j].start;
 				}
 				if (uncovered_ranges < 10) {
-					pr_warn("COVERAGE_GAP: PRIMARY 0x%016lx-0x%016lx not covered by REPLICA\n",
+					pr_warn("COVERAGE_GAP: source 0x%016lx-0x%016lx not covered by target\n",
 					       (unsigned long)addr, (unsigned long)gap_end);
 				}
 				uncovered_ranges++;
@@ -545,10 +545,10 @@ int clone_compare_receive_and_verify(int sk, pid_t pid)
 	}
 
 	if (uncovered_ranges > 0) {
-		pr_warn("COVERAGE_RESULT: %d PRIMARY ranges (%lu KB) NOT covered by REPLICA\n",
+		pr_warn("COVERAGE_RESULT: %d source ranges (%lu KB) NOT covered by target\n",
 		       uncovered_ranges, (unsigned long)(total_uncovered / 1024));
 	} else {
-		pr_warn("COVERAGE_RESULT: All PRIMARY memory ranges are covered by REPLICA (VMA merging OK)\n");
+		pr_warn("COVERAGE_RESULT: All source memory ranges are covered by target (VMA merging OK)\n");
 	}
 
 #ifdef CONFIG_CLONE_COMPARE_PAGES
@@ -579,8 +579,8 @@ int clone_compare_receive_and_verify(int sk, pid_t pid)
 			if (local_crc != remote_phi.crc32) {
 				/*
 				 * Pages served via UFFDIO_COPY from a page fault are
-				 * owned by the replica process afterwards. Writes by
-				 * the replica between the COPY and compare are
+				 * owned by the target process afterwards. Writes by
+				 * the target between the COPY and compare are
 				 * expected — don't count or log those as diffs.
 				 */
 				if (page_state_was_pf_served((unsigned long)remote_phi.vaddr)) {
@@ -607,7 +607,7 @@ int clone_compare_receive_and_verify(int sk, pid_t pid)
 
 			if (bytes_checked / COMPARE_PROGRESS_STEP !=
 			    (bytes_checked - PAGE_SIZE) / COMPARE_PROGRESS_STEP)
-				pr_warn("COMPARE: REPLICA checked %lu GB (%d pages, %d diffs)\n",
+				pr_warn("COMPARE: target checked %lu GB (%d pages, %d diffs)\n",
 					(unsigned long)(bytes_checked / COMPARE_PROGRESS_STEP),
 					pages_checked, page_diffs);
 		}
@@ -620,11 +620,11 @@ int clone_compare_receive_and_verify(int sk, pid_t pid)
 	xfree(remote_vmas);
 
 #ifdef CONFIG_CLONE_COMPARE_PAGES
-	pr_warn("COMPARE_RESULT: Checked %d pages, coverage gaps=%d, %d page diffs, %d PF-served skipped (exact-boundary: %d PRIMARY-only, %d REPLICA-only)\n",
-	       pages_checked, uncovered_ranges, page_diffs, pf_skipped, vma_diffs, replica_only);
+	pr_warn("COMPARE_RESULT: Checked %d pages, coverage gaps=%d, %d page diffs, %d PF-served skipped (exact-boundary: %d source-only, %d target-only)\n",
+	       pages_checked, uncovered_ranges, page_diffs, pf_skipped, vma_diffs, target_only);
 #else
-	pr_warn("COMPARE_RESULT: coverage gaps=%d (exact-boundary: %d PRIMARY-only, %d REPLICA-only; page comparison disabled)\n",
-	       uncovered_ranges, vma_diffs, replica_only);
+	pr_warn("COMPARE_RESULT: coverage gaps=%d (exact-boundary: %d source-only, %d target-only; page comparison disabled)\n",
+	       uncovered_ranges, vma_diffs, target_only);
 #endif
 
 	/* Send done message */
@@ -635,7 +635,7 @@ int clone_compare_receive_and_verify(int sk, pid_t pid)
 	/*
 	 * Success is defined by coverage, not exact-boundary match. Merge/split
 	 * of adjacent anon VMAs on restore is normal and harmless as long as
-	 * every PRIMARY byte is mapped on REPLICA.
+	 * every source byte is mapped on the target.
 	 */
 #ifdef CONFIG_CLONE_COMPARE_PAGES
 	return (uncovered_ranges == 0 && page_diffs == 0) ? 0 : 1;
@@ -645,7 +645,7 @@ int clone_compare_receive_and_verify(int sk, pid_t pid)
 }
 
 /*
- * PRIMARY: Listen for comparison connection
+ * Source: Listen for comparison connection.
  */
 int clone_compare_listen(int *out_sk)
 {
@@ -673,7 +673,7 @@ int clone_compare_listen(int *out_sk)
 	}
 
 	listen(listen_sk, 1);
-	pr_info("COMPARE: Listening on port %d for replica connection\n", COMPARE_PORT);
+	pr_info("COMPARE: Listening on port %d for target connection\n", COMPARE_PORT);
 
 	sk = accept(listen_sk, NULL, NULL);
 	close(listen_sk);
@@ -683,15 +683,15 @@ int clone_compare_listen(int *out_sk)
 		return -1;
 	}
 
-	pr_info("COMPARE: Replica connected\n");
+	pr_info("COMPARE: target connected\n");
 	*out_sk = sk;
 	return 0;
 }
 
 /*
- * REPLICA: Connect to primary for comparison
+ * Target: Connect to source for comparison.
  */
-int clone_compare_connect(const char *primary_addr, int *out_sk)
+int clone_compare_connect(const char *source_addr, int *out_sk)
 {
 	int sk;
 	struct sockaddr_in addr;
@@ -705,13 +705,13 @@ int clone_compare_connect(const char *primary_addr, int *out_sk)
 	memset(&addr, 0, sizeof(addr));
 	addr.sin_family = AF_INET;
 	addr.sin_port = htons(COMPARE_PORT);
-	if (inet_pton(AF_INET, primary_addr, &addr.sin_addr) <= 0) {
-		pr_err("COMPARE: Invalid address %s\n", primary_addr);
+	if (inet_pton(AF_INET, source_addr, &addr.sin_addr) <= 0) {
+		pr_err("COMPARE: Invalid address %s\n", source_addr);
 		close(sk);
 		return -1;
 	}
 
-	pr_info("COMPARE: Connecting to primary at %s:%d\n", primary_addr, COMPARE_PORT);
+	pr_info("COMPARE: Connecting to source at %s:%d\n", source_addr, COMPARE_PORT);
 
 	if (connect(sk, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
 		pr_perror("COMPARE: connect failed");
@@ -719,7 +719,7 @@ int clone_compare_connect(const char *primary_addr, int *out_sk)
 		return -1;
 	}
 
-	pr_info("COMPARE: Connected to primary\n");
+	pr_info("COMPARE: Connected to source\n");
 	*out_sk = sk;
 	return 0;
 }

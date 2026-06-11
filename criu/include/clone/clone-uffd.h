@@ -96,7 +96,7 @@ extern bool clone_is_restore_connected(void);
 extern void clone_set_restore_connected(bool connected);
 
 
-/* Check/set if all pages have been sent by primary */
+/* Check/set if all pages have been sent by the source */
 extern bool clone_is_all_pages_sent_received(void);
 extern void clone_set_all_pages_sent_received(void);
 

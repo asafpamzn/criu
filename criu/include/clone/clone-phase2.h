@@ -6,7 +6,7 @@
 
 /*
  * Clone receive entry point (criu clone-receive command).
- * Receives pages from primary, buffers them, triggers restore.
+ * Receives pages from the source, buffers them, triggers restore.
  */
 extern int cr_clone_receive(bool daemon);
 

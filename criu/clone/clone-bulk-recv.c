@@ -1,9 +1,9 @@
 /*
- * CLONE control message receiver (REPLICA side).
+ * CLONE control message receiver (target side).
  *
  * All page data is transferred via P3 receiver threads. This module
  * only handles control messages on the main page server socket:
- * - PS_IOV_ALL_PAGES_SENT signal (primary done sending pages)
+ * - PS_IOV_ALL_PAGES_SENT signal (source done sending pages)
  */
 
 #include <errno.h>
@@ -166,11 +166,11 @@ static int read_bulk_header(struct ps_async_read_bulk *ar, int flags)
 	}
 
 	if (cmd == PS_IOV_ALL_PAGES_SENT) {
-		/* Primary signals all pages sent - replica can zero-fill rest */
+		/* Source signals all pages sent; remaining pages can be zero-filled. */
 		pr_debug("All pages sent signal received\n");
 		clone_set_all_pages_sent_received();
 		/*
-		 * Return COMPLETE to stop reading - primary is waiting for ACK.
+		 * Return COMPLETE to stop reading - source is waiting for ACK.
 		 * The main loop will check clone_handle_exit() and send the ACK.
 		 */
 		return BULK_STREAM_COMPLETE;

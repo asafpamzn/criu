@@ -1072,7 +1072,7 @@ bool clone_drain_thread_running(void)
  * Exit sequence:
  * 1. Wait for all_pages_sent signal (guarantees all pages received from socket)
  * 2. Wait for drain thread to finish (buffer empty)
- * 3. Send ACK to primary
+ * 3. Send ACK to source
  * 4. Cleanup and exit
  *
  * Returns:
@@ -1083,7 +1083,7 @@ int clone_handle_exit(struct list_head *lpis)
 {
 	struct lazy_pages_info *lpi, *n;
 
-	/* Condition 1: Wait for all_pages_sent signal from primary */
+	/* Condition 1: Wait for all_pages_sent signal from source */
 	if (!clone_is_all_pages_sent_received())
 		return 0;
 
@@ -1479,7 +1479,7 @@ int clone_process_eagain_requests(void)
  * CLONE Restore State Management
  *
  * State variables and accessors for CLONE phased migration.
- * These track the state of the restore process and communication with primary.
+ * These track the state of the restore process and communication with the source.
  */
 
 /* State flags for CLONE restore synchronization */
@@ -1500,7 +1500,7 @@ void clone_set_restore_connected(bool connected)
 
 
 
-/* Check if all pages have been sent by primary */
+/* Check if all pages have been sent by the source */
 bool clone_is_all_pages_sent_received(void)
 {
 	return clone_all_pages_sent_received;
@@ -1753,7 +1753,7 @@ int clone_phase3_restore_loop(int ep_fd, struct epoll_event **events, int nr_fds
 
 	/* Wait for restore to connect */
 	while (!clone_is_restore_connected()) {
-		ret = epoll_run_rfds(ep_fd, *events, nr_fds, 1000);
+		ret = epoll_run_rfds(ep_fd, *events, nr_fds, CLONE_LAZY_ACCEPT_POLL_MS);
 		if (ret < 0) {
 			pr_err("epoll failed waiting for restore\n");
 			close(lazy_sk);

@@ -512,16 +512,10 @@ void clone_record_unmapped_range(unsigned long start, unsigned long len)
 
 	pthread_mutex_lock(&cdi->unmapped_lock);
 
-	/* Grow array if needed */
 	if (cdi->nr_unmapped_ranges >= cdi->unmapped_capacity) {
 		unsigned int new_cap = cdi->unmapped_capacity ?
 				       cdi->unmapped_capacity * 2 : 16;
-		/*
-		 * Grow via a temp: xrealloc() is realloc() that only logs on
-		 * failure (it does not abort), so on NULL we must not bump
-		 * capacity (the writes below would NULL-deref) or leak the old
-		 * buffer. Allocation failure here is not expected.
-		 */
+		/* xrealloc() returns NULL on failure without freeing; use a temp. */
 		void *grown = xrealloc(cdi->unmapped_ranges,
 				       new_cap * sizeof(*cdi->unmapped_ranges));
 		BUG_ON(!grown);
@@ -1170,18 +1164,11 @@ int clone_detect_new_vmas(struct vm_area_list *vmas,
 			pr_info("CLONE UNMAP: 0x%lx-0x%lx was unmapped, no new VMA - "
 				"truly unmapped\n", u_start, u_end);
 			/*
-			 * TODO: Send PS_IOV_UNMAP_NOTIFY to replica for cleanup.
-			 * The replica should:
-			 * - Remove pages from buffer
-			 * - MADV_DONTNEED if pages were already applied
-			 * - Update lazy IOV list
-			 *
-			 * Note: When primary unmaps without remapping, the replica's
-			 * restored process still has the VMA (from Phase 1 dump).
-			 * We release pages via MADV_DONTNEED but don't remove the
-			 * VMA itself.
-			 *
-			 * TODO: Ask CRIU maintainers if VMA mismatch is acceptable.
+			 * Pages from a region the source unmapped (without
+			 * remapping) are still present on the target as part
+			 * of the Phase-1 VMA. The pages are released via
+			 * MADV_DONTNEED on the target; the VMA itself is left
+			 * intact.
 			 */
 		}
 	}
@@ -1194,15 +1181,14 @@ int clone_detect_new_vmas(struct vm_area_list *vmas,
 	/* Log details of each new VMA range */
 	if (nr_ranges > 0) {
 		unsigned int i;
-		pr_warn("CLONE NEW VMAs: These VMAs exist on PRIMARY but were created AFTER Phase 1 dump:\n");
+		pr_warn("New VMAs created on the source after Phase 1 dump:\n");
 		for (i = 0; i < nr_ranges; i++) {
 			unsigned long start = ranges[i * 2];
 			unsigned long len = ranges[i * 2 + 1];
-			pr_debug("  NEW VMA [%u]: 0x%lx-0x%lx (size=%luKB)\n",
+			pr_debug("  new VMA [%u]: 0x%lx-0x%lx (size=%luKB)\n",
 			       i, start, start + len, len / 1024);
 		}
-		pr_warn("CLONE NEW VMAs: These VMAs will NOT exist on REPLICA!\n");
-		pr_warn("CLONE NEW VMAs: The VMA metadata was not re-dumped after Phase 1.\n");
+		pr_warn("These VMAs will not exist on the target (metadata not re-dumped after Phase 1)\n");
 	}
 
 	/* Extend tracked_vmas so fault handler can find new regions */
@@ -1268,8 +1254,9 @@ void clone_cleanup_async_uffd(void)
 /*
  * cr_dump_clone_finish - Clone-specific finish operations
  *
- * Handles signaling replica, optional comparison, unfreezing the process,
- * and cleanup. Called from cr_dump_finish() when clone dump is complete.
+ * Handles signaling the target, optional comparison, unfreezing the
+ * process, and cleanup. Called from cr_dump_finish() when clone dump is
+ * complete.
  *
  * @ret: current return status (0 = success so far)
  * Returns: updated return status
@@ -1278,11 +1265,11 @@ int cr_dump_clone_finish(int ret)
 {
 	int sk = get_page_server_sk();
 
-	pr_debug("Signaling replica (ret=%d, sk=%d)\n", ret, sk);
+	pr_debug("Signaling target (ret=%d, sk=%d)\n", ret, sk);
 
 	/*
 	 * Send single completion signal while frozen (fast).
-	 * Replica waits for this before starting restore.
+	 * Target waits for this before starting restore.
 	 */
 	if (!ret && sk >= 0) {
 		if (clone_send_skeleton_files(sk) < 0) {
@@ -1298,7 +1285,7 @@ int cr_dump_clone_finish(int ret)
 #ifdef CONFIG_CLONE_COMPARE
 	/*
 	 * When comparing, wait for ACK before compare starts.
-	 * Replica sends ACK after it's ready for comparison.
+	 * Target sends ACK after it's ready for comparison.
 	 */
 	if (!ret && sk >= 0) {
 		if (wait_for_all_pages_sent_ack(sk) < 0) {
@@ -1307,19 +1294,19 @@ int cr_dump_clone_finish(int ret)
 		}
 	}
 
-	/* Process comparison with replica (source already unfrozen) */
+	/* Process comparison with target (source already unfrozen) */
 	{
 		int compare_sk;
-		pid_t target_pid = root_item->pid->real;
+		pid_t source_pid = root_item->pid->real;
 
-		pr_debug("COMPARE: PRIMARY waiting for replica connection (PID %d running)\n",
-			 target_pid);
+		pr_debug("COMPARE: waiting for target connection (PID %d running)\n",
+			 source_pid);
 
 		if (clone_compare_listen(&compare_sk) == 0) {
-			clone_compare_send_state(compare_sk, target_pid);
+			clone_compare_send_state(compare_sk, source_pid);
 			close(compare_sk);
 		}
-		pr_debug("COMPARE: PRIMARY comparison done\n");
+		pr_debug("COMPARE: comparison done\n");
 	}
 
 	pr_debug("Unfreezing process\n");
@@ -1366,7 +1353,7 @@ int cr_dump_tasks_clone_phased(pid_t pid)
 	if (cr_dump_init(pid, &he, "CLONE Phased dump"))
 		goto err;
 
-	/* === PHASE 1: Seize + Pre-dump + WP_ASYNC === */
+	/* Phase 1: seize + pre-dump + WP_ASYNC */
 	pr_debug("PHASE 1: Seize + Pre-dump + WP_ASYNC\n");
 
 	if (collect_pstree())
@@ -1399,7 +1386,7 @@ int cr_dump_tasks_clone_phased(pid_t pid)
 
 	pstree_switch_state(root_item, TASK_ALIVE);
 
-	/* === PHASE 2: Bulk page transfer + iterative dirty scan === */
+	/* Phase 2: bulk page transfer + iterative dirty scan */
 	pr_debug("PHASE 2: Bulk page transfer + dirty scan convergence\n");
 
 	/*
@@ -1438,11 +1425,11 @@ int cr_dump_tasks_clone_phased(pid_t pid)
 	 */
 	pr_debug("Waiting for dirty page convergence\n");
 	while (!clone_all_threads_below_threshold()) {
-		usleep(10000);  /* 10ms poll */
+		usleep(CLONE_USLEEP_10MS);
 	}
 	pr_debug("CONVERGENCE: All threads below threshold\n");
 
-	/* === PHASE 3: Freeze + skeleton dump === */
+	/* Phase 3: freeze + skeleton dump */
 	pr_debug("PHASE 3: Freeze + skeleton dump\n");
 
 	/*
@@ -1501,7 +1488,7 @@ int cr_dump_tasks_clone_phased(pid_t pid)
 				 nr_new_vma_ranges);
 			pr_debug("CLONE PHASE 3: These VMAs were created while process ran during Phase 2.\n");
 			pr_debug("CLONE PHASE 3: Their PAGE DATA will be sent, but VMA METADATA is missing from dump.\n");
-			pr_debug("CLONE PHASE 3: REPLICA will NOT have these VMAs - expect comparison differences!\n");
+			pr_debug("CLONE PHASE 3: target will not have these VMAs - expect comparison differences\n");
 
 			/* Pass new VMA ranges to P3 threads for sending during final scan */
 			clone_set_new_vma_ranges(new_vma_ranges, nr_new_vma_ranges);

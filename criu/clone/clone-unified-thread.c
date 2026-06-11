@@ -1,8 +1,8 @@
 /*
  * CLONE unified page server thread.
  *
- * This module handles the PRIMARY side CLONE page transfer by starting
- * P3 bulk sender threads to transfer pages to the replica.
+ * Source-side CLONE page transfer driver: starts P3 bulk sender threads
+ * to transfer pages to the target.
  */
 
 #include <sys/socket.h>

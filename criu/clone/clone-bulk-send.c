@@ -162,10 +162,11 @@ static volatile int g_num_sender_threads = 0;
 /*
  * Pages that were scanned/work-queued but could not be sent because the
  * VMA disappeared between enumeration and process_vm_readv (ADD/REMOVE
- * race: target calls munmap during Phase 2 before the UFFD REMOVE event
- * is observed by any code path on the source side; UFFD events are
- * consumed only on the replica, so from the source's point of view the
- * kernel is the authority via EFAULT/ESRCH/ENOMEM from process_vm_readv).
+ * race: the source process calls munmap during Phase 2 before the UFFD
+ * REMOVE event is observed by any code path on the dump side; UFFD events
+ * are consumed only on the target side, so from the source dumper's point
+ * of view the kernel is the authority via EFAULT/ESRCH/ENOMEM from
+ * process_vm_readv).
  *
  * Counted so clone_wait_p3_threads' scanned==sent invariant is not
  * violated by a legitimate skip.
@@ -922,11 +923,11 @@ static int send_lazy_vma_pages_batch(struct tls_conn *tls, int sk,
 		/*
 		 * EFAULT / ESRCH / ENOMEM mean the VMA (or part of it) is
 		 * no longer mapped in the source — typically because the
-		 * target process is in Phase 2 and did a munmap between
+		 * source process is in Phase 2 and did a munmap between
 		 * VMA enumeration and the read. The REMOVE event is only
-		 * observed by the replica's lazy-pages daemon, so the
-		 * source has no other signal; process_vm_readv's errno
-		 * IS the detection mechanism. Log and skip.
+		 * observed by the target's lazy-pages daemon, so the dumper
+		 * has no other signal; process_vm_readv's errno IS the
+		 * detection mechanism. Log and skip.
 		 *
 		 * NOTE: we do NOT bump g_vma_vanished_skipped_pages here.
 		 * This path is the *initial bulk* walk — those pages were
@@ -1224,7 +1225,7 @@ static void *p3_bulk_sender_thread(void *arg)
 	       thread_id, ctx->socket, (unsigned long)ctx->dst_id);
 	clock_gettime(CLOCK_MONOTONIC, &t_start);
 
-	/* === Iteration 0: Bulk transfer with work-stealing === */
+	/* Iteration 0: bulk transfer with work-stealing */
 	{
 		struct timespec bulk_start, bulk_end;
 		long bulk_elapsed_ms;
@@ -1314,7 +1315,7 @@ static void *p3_bulk_sender_thread(void *arg)
 #endif
 	}
 
-	/* === Phase 2: Consume dirty regions from scanner queue === */
+	/* Phase 2: consume dirty regions from scanner queue */
 	{
 		struct timespec loop_start, loop_end, p3_start, scan_done_time;
 		long loop_elapsed_ms;
@@ -1481,7 +1482,7 @@ static void *p3_bulk_sender_thread(void *arg)
 		}
 	}
 
-	/* === Final: Send pages from new VMAs detected in Phase 3 === */
+	/* Final: send pages from new VMAs detected in Phase 3 */
 	{
 		struct timespec fs_start, fs_end;
 		long fs_elapsed_ms;
@@ -1633,7 +1634,7 @@ void clone_wait_p3_threads(void)
 	}
 	clock_gettime(CLOCK_MONOTONIC, &t_senders_done);
 
-	/* Tear down TLS sessions and close P3 sockets so replica receivers get EOF */
+	/* Tear down TLS sessions and close P3 sockets so target receivers get EOF */
 	for (i = 0; i < clone_cfg.num_p3_threads; i++) {
 		if (p3_threads[i].tls) {
 			tls_conn_free(p3_threads[i].tls);

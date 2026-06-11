@@ -1,7 +1,7 @@
 /*
  * CLONE Phase 2/3 - Phased migration page handling
  *
- * Phase 2: Buffer pages from primary before skeleton dump exists
+ * Phase 2: Buffer pages from the source before the skeleton dump exists
  * Phase 3: After dirty bitmap arrives, start restore with buffered pages
  *
  * Entry point: cr_clone_receive() (criu clone-receive command)
@@ -199,7 +199,7 @@ int cr_clone_phase2(bool daemon)
 	int ret = -1;
 	int nr_fds;
 
-	pr_info("REPLICA PHASE 2: Page buffering mode\n");
+	pr_info("clone-receive: Phase 2 (page buffering)\n");
 
 	/* 1. Discover tasks from pagemap files */
 	if (discover_tasks_from_pagemaps())
@@ -271,13 +271,13 @@ int cr_clone_phase2(bool daemon)
 
 	/*
 	 * 7b. Create P3 parallel connections AFTER sending page requests.
-	 * PRIMARY is now in unified_page_server_thread and ready to accept.
+	 * The source is now in unified_page_server_thread and ready to accept.
 	 */
 	if (start_p3_receiver_connections(clone_cfg.num_p3_threads) > 0) {
 		pr_info("P3 parallel receiver enabled\n");
 	}
 
-	pr_info("Waiting to receive pages from primary...\n");
+	pr_info("Waiting to receive pages from source...\n");
 
 	/* 8. Phase 2 event loop - buffer pages until dirty bitmap arrives */
 	ret = clone_phase2_handle_pages(epollfd, events, nr_fds);
@@ -286,10 +286,10 @@ int cr_clone_phase2(bool daemon)
 		goto err_disconnect;
 	}
 
-	pr_info("REPLICA PHASE 5: Starting restore\n");
+	pr_info("clone-receive: starting restore\n");
 
 	/*
-	 * All pages received, primary closed connection.
+	 * All pages received, source closed connection.
 	 * No reconnect needed - serve everything from buffer.
 	 * Remove page server fd from epoll to avoid hangup events.
 	 */
@@ -356,7 +356,7 @@ int clone_phase2_handle_pages(int epollfd, struct epoll_event *events, int nr_fd
 
 		/* All pages sent = completion signal, ready for restore */
 		if (clone_is_all_pages_sent_received()) {
-			pr_debug("REPLICA: Completion signal received, ready for restore\n");
+			pr_debug("Completion signal received, ready for restore\n");
 			BUG_ON(send_all_pages_sent_ack() < 0);
 			/* Clean up async bulk reader before socket is closed */
 			page_server_cleanup_async_bulk();

@@ -3,7 +3,6 @@
  *
  * Provides thread-safe TLS sessions: one shared credential context
  * (certificates loaded once) with independent per-socket sessions.
- * Modeled after Valkey's shared SSL_CTX + per-connection SSL pattern.
  */
 
 #include <unistd.h>

@@ -1,8 +1,8 @@
 /*
- * CLONE (Copy-on-Write) memory tracking for lazy page migration.
+ * CLONE memory tracking for lazy page migration.
  *
- * This file contains the global lazy VMA list management and
- * convergence mode handling for CLONE dump operations.
+ * Global lazy VMA list management and convergence mode handling
+ * for CLONE dump operations.
  */
 
 #include <pthread.h>

@@ -6,7 +6,7 @@
 struct epoll_rfd;
 
 /*
- * CLONE control message receiver (REPLICA side).
+ * CLONE control message receiver (target side).
  *
  * All page data is transferred via P3 receiver threads. This module
  * only handles control messages on the main page server socket:
