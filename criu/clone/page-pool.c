@@ -1,25 +1,18 @@
 /*
- * Per-Thread Page Pool - Lock-free allocation to avoid malloc/mprotect contention
+ * Per-thread page pool - lock-free allocation to avoid malloc/mprotect
+ * contention.
  *
- * When 10 receiver threads allocate PAGE_SIZE buffers via malloc, glibc's heap
- * management triggers mprotect calls that serialize on the kernel's mmap_sem
- * write lock. This pool eliminates contention via:
+ * When many receiver threads allocate PAGE_SIZE buffers via malloc, glibc's
+ * heap management triggers mprotect calls that serialize on the kernel's
+ * mmap_sem write lock. This pool avoids that via:
+ *   - Per-thread bump allocator (no locks on allocation path)
+ *   - CLONE_CHUNK_SIZE-aligned chunks for O(1) chunk lookup from a page
+ *     address (mask off the low bits)
+ *   - Atomic refcount per chunk; munmap the chunk when refcount hits zero
  *
- *   - Per-thread bump allocator (zero locks on allocation path)
- *   - 256MB aligned chunks (O(1) chunk lookup from page address)
- *   - Atomic reference counting per chunk
- *   - munmap entire chunk when refcount reaches 0
- *
- * Memory layout per chunk (256MB aligned):
- *   +------------------+  <- 256MB aligned base
- *   | Chunk header     |     (refcount, validation pointer)
- *   | (4KB page 0)     |
- *   +------------------+
- *   | Page 1 (4KB)     |  <- First allocatable page
- *   | Page 2 (4KB)     |
- *   | ...              |
- *   | Page 65535       |
- *   +------------------+
+ * Chunk layout (CLONE_CHUNK_SIZE-aligned base):
+ *   page 0  : chunk header (refcount, validation pointer)
+ *   page 1+ : allocatable pages
  */
 
 #include <sys/mman.h>
@@ -39,8 +32,6 @@
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "page-pool: "
-
-/* Pool configuration constants now in clone-conf.h */
 
 /* Chunk header - stored at start of each chunk region (uses page 0) */
 struct chunk_header {
@@ -66,7 +57,7 @@ static atomic_ulong total_put_count;
 static atomic_ulong total_alloc_count;
 static atomic_int total_chunks_freed;
 
-/* Allocate a new 256MB aligned chunk */
+/* Allocate a new CLONE_CHUNK_SIZE-aligned chunk */
 static void *alloc_chunk(void)
 {
 	void *chunk;
@@ -76,17 +67,16 @@ static void *alloc_chunk(void)
 	int idx;
 
 	/*
-	 * mmap with MAP_ANONYMOUS gives page-aligned memory.
-	 * To get 256MB alignment, allocate extra and align manually.
+	 * mmap with MAP_ANONYMOUS gives page-aligned memory; over-allocate
+	 * and align manually to get CLONE_CHUNK_SIZE alignment.
 	 */
 	raw = mmap(NULL, CLONE_CHUNK_SIZE + CLONE_CHUNK_ALIGN, PROT_READ | PROT_WRITE,
 		   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	if (raw == MAP_FAILED) {
-		pr_perror("Failed to mmap 256MB chunk");
+		pr_perror("Failed to mmap chunk");
 		BUG();
 	}
 
-	/* Align to 256MB boundary */
 	chunk = (void *)(((unsigned long)raw + CLONE_CHUNK_ALIGN - 1) & CLONE_CHUNK_ALIGN_MASK);
 
 	/* Unmap the excess at front and back */
@@ -135,8 +125,8 @@ static void *alloc_chunk(void)
 	}
 	pthread_spin_unlock(&chunk_list_lock);
 
-	pr_debug("PAGE_POOL: Allocated 256MB chunk at %p (total: %d chunks)\n",
-	       chunk, atomic_load(&nr_chunks));
+	pr_debug("PAGE_POOL: Allocated chunk at %p (total: %d chunks)\n",
+		 chunk, atomic_load(&nr_chunks));
 
 	return chunk;
 }
@@ -348,7 +338,7 @@ void page_pool_put(void *page)
 	if (!page)
 		return;
 
-	/* Calculate chunk base from page address (256MB aligned) */
+	/* Mask page address to chunk base (chunks are CLONE_CHUNK_ALIGN aligned). */
 	hdr = (struct chunk_header *)((unsigned long)page & CLONE_CHUNK_ALIGN_MASK);
 
 	/* Validate - check self-pointer */

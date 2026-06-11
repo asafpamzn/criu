@@ -1,14 +1,12 @@
 /*
- * CLONE Bulk Page Sender - Optimized P3 (regular page) transfer
+ * CLONE bulk page sender (P3 transfer).
  *
- * Sends pages in batches of 64 (256KB) for better throughput:
- * - Single process_vm_readv for 64 pages
- * - Single LZ4 compression for 256KB
- * - Single socket send
+ * Pages are sent in CLONE_BATCH_PAGES-sized batches: one process_vm_readv,
+ * one LZ4 compression, one socket send per batch.
  *
- * Work-stealing architecture:
- * - Bulk transfer: shared work queue of VMA chunks, threads pull work dynamically
- * - Queue consumption: threads can steal from other threads' queues when idle
+ * Bulk-transfer phase uses a shared work queue of VMA chunks; sender threads
+ * pull work dynamically, and idle threads can steal from other threads'
+ * dirty-region queues during the iterative dirty-scan phase.
  */
 
 #include <sched.h>

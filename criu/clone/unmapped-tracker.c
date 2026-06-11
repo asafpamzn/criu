@@ -15,8 +15,8 @@
 
 /*
  * Hash table to track unmapped pages.
- * Smaller than page buffer since unmapped ranges are typically fewer.
- * Configuration constants (CLONE_CLONE_NUM_UNMAPPED_LOCKS, etc.) are in clone-conf.h.
+ * Smaller than the page buffer since unmapped ranges are typically fewer.
+ * Lock-count and bucket-count constants live in clone-conf.h.
  */
 #define UNMAPPED_HASH_BITS 16
 #define UNMAPPED_HASH_SIZE (1 << UNMAPPED_HASH_BITS)  /* 64K buckets */

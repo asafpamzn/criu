@@ -1,3 +1,12 @@
+/*
+ * CLONE phased dump driver.
+ *
+ * Implements the WP_ASYNC -> WP_SYNC phased migration flow on the source
+ * (dump) side: pre-dump + WP_ASYNC, bulk page transfer + iterative dirty
+ * scan, freeze + skeleton dump. Tracks per-process VMA state and handles
+ * UFFD UNMAP/REMOVE/REMAP events that arrive while the process runs.
+ */
+
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>

@@ -1,3 +1,13 @@
+/*
+ * CLONE userfaultfd handling on the target (restore) side.
+ *
+ * Owns the page buffer that holds pages received in Phase 2, the drain
+ * threads that apply buffered pages via UFFDIO_COPY, and the page-fault
+ * handlers that serve in-flight faults from the buffer (or fetch on
+ * demand). Coordinates the all-pages-sent / drain-complete / restore-done
+ * handshake with the source.
+ */
+
 #include <stdbool.h>
 #include <stdatomic.h>
 #include <pthread.h>

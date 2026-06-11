@@ -3,16 +3,13 @@
 
 /*
  * Per-thread page pool to avoid malloc/mprotect contention.
- * Uses 256MB aligned chunks with reference counting.
+ * Uses CLONE_CHUNK_SIZE-aligned chunks with reference counting.
  *
- * Allocation: Lock-free bump pointer per thread
- * Deallocation: Atomic refcount decrement, munmap when zero
+ * Allocation:   lock-free bump pointer per thread.
+ * Deallocation: atomic refcount decrement; munmap when refcount hits zero.
  *
- * Design:
- *   - Each receiver thread has its own pool (no locks on allocation)
- *   - Pages come from 256MB aligned chunks
- *   - Any thread can free pages (atomic refcount decrement)
- *   - When chunk refcount reaches 0, entire 256MB is munmapped
+ * Each receiver thread has its own pool (no locks on the allocation path);
+ * any thread can free pages (atomic refcount).
  */
 
 /* Initialize pool for thread (call once per receiver thread) */
