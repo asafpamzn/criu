@@ -758,7 +758,7 @@ void clone_wait_scanner_thread(void)
 		if (scanners[i].thread) {
 			pthread_join(scanners[i].thread, NULL);
 			scanners[i].thread = 0;
-			pr_info("Scanner thread %d joined\n", i);
+			pr_debug("Scanner thread %d joined\n", i);
 		}
 	}
 	/* Senders drain their own queues during normal exit */

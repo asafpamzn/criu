@@ -2147,7 +2147,7 @@ int cr_dump_finish(int ret)
 	}
 
 	/*
-	 * CLONE phased dump path: signal replica and unfreeze.
+	 * CLONE phased dump path: signal target and unfreeze.
 	 * Inventory was already written in cr_dump_tasks_clone_phased().
 	 */
 	if (opts.clone_dump && clone_get_phase() == CLONE_PHASE_DONE) {

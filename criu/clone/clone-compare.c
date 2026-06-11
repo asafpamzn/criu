@@ -620,11 +620,15 @@ int clone_compare_receive_and_verify(int sk, pid_t pid)
 	xfree(remote_vmas);
 
 #ifdef CONFIG_CLONE_COMPARE_PAGES
-	pr_warn("COMPARE_RESULT: Checked %d pages, coverage gaps=%d, %d page diffs, %d PF-served skipped (exact-boundary: %d source-only, %d target-only)\n",
-	       pages_checked, uncovered_ranges, page_diffs, pf_skipped, vma_diffs, target_only);
+	pr_warn("COMPARE_RESULT: checked %d pages, coverage gaps=%d, %d page diffs, "
+		"%d PF-served skipped (exact-boundary: %d source-only, %d target-only)\n",
+		pages_checked, uncovered_ranges, page_diffs, pf_skipped,
+		vma_diffs, target_only);
 #else
-	pr_warn("COMPARE_RESULT: coverage gaps=%d (exact-boundary: %d source-only, %d target-only; page comparison disabled)\n",
-	       uncovered_ranges, vma_diffs, target_only);
+	pr_warn("COMPARE_RESULT: coverage gaps=%d "
+		"(exact-boundary: %d source-only, %d target-only; "
+		"page comparison disabled)\n",
+		uncovered_ranges, vma_diffs, target_only);
 #endif
 
 	/* Send done message */

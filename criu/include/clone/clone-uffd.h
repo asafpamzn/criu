@@ -180,6 +180,4 @@ extern int clone_wait_for_drain(int fd);
  */
 extern int clone_handle_lazy_accept_post_connect(struct list_head *lpis);
 
-
-
 #endif /* __CR_CLONE_UFFD_H__ */

@@ -185,7 +185,7 @@ static int read_bulk_header(struct ps_async_read_bulk *ar, int flags)
 	       cmd, (unsigned long)ar->pi.nr_pages,
 	       (unsigned long)ar->pi.vaddr,
 	       (unsigned long)ar->pi.dst_id);
-	pr_err("  all_pages_sent=%d\n",	       
+	pr_err("  all_pages_sent=%d\n",
 	       clone_is_all_pages_sent_received());
 	BUG();
 	return -1; /* unreachable */

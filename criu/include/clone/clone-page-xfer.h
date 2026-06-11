@@ -18,8 +18,6 @@
 extern unsigned long g_compress_uncompressed_bytes;
 extern unsigned long g_compress_compressed_bytes;
 
-
-
 /* CLONE all-pages-sent ACK state */
 extern void set_all_pages_sent_ack_received(void);
 

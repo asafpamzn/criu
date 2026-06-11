@@ -11,7 +11,7 @@ struct lazy_vma_entry {
 	uint64_t end;
 	struct list_head list;
 	struct vma_area *vma;
-	unsigned long total_pages;    /* Total pages in this VMA */	
+	unsigned long total_pages;    /* Total pages in this VMA */
 	u64 dst_id;                   /* Process identifier for this VMA */
 	pid_t source_pid;             /* PID for process_vm_readv */
 };
@@ -29,8 +29,5 @@ extern int add_lazy_vma_for_new_region(unsigned long start, unsigned long len,
 /* Add a lazy VMA entry during dump (called from generate_iovs in mem.c) */
 extern int clone_mem_add_lazy_vma(struct vma_area *vma, unsigned long nr_pages,
 				u64 dst_id, pid_t source_pid);
-
-
-
 
 #endif /* __CR_CLONE_MEM_H__ */

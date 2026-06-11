@@ -1388,7 +1388,7 @@ static int page_server_serve(int sk)
 			break;
 		case PS_IOV_GET_ALL:
 			/*
-			 * CLONE mode: replica requests all pages. Hand off to
+			 * CLONE mode: target requests all pages. Hand off to
 			 * clone_page_server_get_all_pages() which starts P3 senders.
 			 * Store socket and return - main dump loop continues.
 			 */

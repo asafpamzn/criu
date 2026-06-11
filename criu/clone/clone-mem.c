@@ -70,7 +70,6 @@ int add_lazy_vma_for_new_region(unsigned long start, unsigned long len,
 	lve->source_pid = source_pid;
 	lve->vma = NULL;  /* No vma_area for Phase 3 discovered regions */
 
-	
 	pthread_spin_lock(&lazy_vmas_lock);
 	list_add_tail(&lve->list, &global_lazy_vmas);
 	pthread_spin_unlock(&lazy_vmas_lock);
@@ -101,7 +100,6 @@ int clone_mem_add_lazy_vma(struct vma_area *vma, unsigned long nr_pages,
 			 u64 dst_id, pid_t source_pid)
 {
 	struct lazy_vma_entry *lve;
-	
 
 	lve = xmalloc(sizeof(*lve));
 	if (!lve)
@@ -114,8 +112,6 @@ int clone_mem_add_lazy_vma(struct vma_area *vma, unsigned long nr_pages,
 	lve->total_pages = nr_pages;
 	lve->dst_id = dst_id;
 	lve->source_pid = source_pid;
-
-	
 	lve->start = vma->e->start;
 	lve->end = vma->e->end;
 
@@ -168,7 +164,6 @@ void free_global_lazy_vmas(void)
 	pthread_spin_lock(&lazy_vmas_lock);
 	list_for_each_entry_safe(lve, tmp, &global_lazy_vmas, list) {
 		list_del(&lve->list);
-		
 		xfree(lve);
 	}
 	pthread_spin_unlock(&lazy_vmas_lock);

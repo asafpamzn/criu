@@ -64,13 +64,6 @@
  */
 // #define CONFIG_CLONE_COMPARE_PAGES
 
-/*
- * CONFIG_CLONE_WAIT_TARGET_TOUCH - Wait for touch file before proceeding.
- * When enabled, the source waits for /tmp/continue_target file to exist
- * before unfreezing. Useful for manual debugging/inspection.
- */
-// #define CONFIG_CLONE_WAIT_TARGET_TOUCH
-
 /* ================================================================
  * SECTION 1: Batch Transfer Configuration
  * ================================================================ */
@@ -245,6 +238,9 @@
 
 /* UFFD unregister yield interval (every N VMAs) */
 #define CLONE_UFFD_UNREGISTER_YIELD	10
+
+/* Scale yield interval up by 1 for each N tracked VMAs (handles huge VMA lists) */
+#define CLONE_UFFD_YIELD_VMA_DIVISOR	1000
 
 /* Drain batch size in VMA processing */
 #define CLONE_DRAIN_BATCH_SIZE		100

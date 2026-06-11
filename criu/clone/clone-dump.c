@@ -316,8 +316,8 @@ static int clone_apply_writeprotect(struct clone_dump_info *cdi)
 	} else {
 		nsec = t_end.tv_nsec - t_start.tv_nsec;
 	}
-	pr_info("TIMING: clone_dump_writeprotect took %lu.%06lu seconds (%u ranges, %u threads)\n",
-		sec, nsec / 1000, nr_ranges, created ? created : 1);
+	pr_debug("clone_dump_writeprotect took %lu.%06lu seconds (%u ranges, %u threads)\n",
+		 sec, nsec / 1000, nr_ranges, created ? created : 1);
 
 	xfree(threads);
 	xfree(jobs);
@@ -527,7 +527,7 @@ void clone_record_unmapped_range(unsigned long start, unsigned long len)
 	cdi->unmapped_ranges[cdi->nr_unmapped_ranges].end = start + len;
 	cdi->nr_unmapped_ranges++;
 
-	pr_info("Recorded unmapped range: 0x%lx-0x%lx\n", start, start + len);
+	pr_debug("Recorded unmapped range: 0x%lx-0x%lx\n", start, start + len);
 
 	pthread_mutex_unlock(&cdi->unmapped_lock);
 }
@@ -578,9 +578,9 @@ static void *clone_uffd_event_reader(void *arg)
 			unsigned long start = msg.arg.remove.start;
 			unsigned long end = msg.arg.remove.end;
 
-			pr_info("UFFD EVENT: %s 0x%lx-0x%lx\n",
-				msg.event == UFFD_EVENT_UNMAP ? "UNMAP" : "REMOVE",
-				start, end);
+			pr_debug("UFFD event: %s 0x%lx-0x%lx\n",
+				 msg.event == UFFD_EVENT_UNMAP ? "UNMAP" : "REMOVE",
+				 start, end);
 
 			clone_record_unmapped_range(start, end - start);
 		} else if (msg.event == UFFD_EVENT_REMAP) {
@@ -588,8 +588,8 @@ static void *clone_uffd_event_reader(void *arg)
 			unsigned long to = msg.arg.remap.to;
 			unsigned long len = msg.arg.remap.len;
 
-			pr_info("UFFD EVENT: REMAP 0x%lx -> 0x%lx (len=0x%lx)\n",
-				from, to, len);
+			pr_debug("UFFD event: REMAP 0x%lx -> 0x%lx (len=0x%lx)\n",
+				 from, to, len);
 
 			clone_record_unmapped_range(from, len);
 		}
@@ -868,7 +868,7 @@ static int clone_region_subtract(unsigned long start, unsigned long end,
 			(*ranges)[(*nr_ranges) * 2 + 1] = gap_len;
 			(*nr_ranges)++;
 
-			pr_info("  new region: 0x%lx-0x%lx (%lu pages)\n",
+			pr_debug("  new region: 0x%lx-0x%lx (%lu pages)\n",
 				cur_start, gap_end, gap_len / PAGE_SIZE);
 		}
 
@@ -943,7 +943,7 @@ static int clone_extend_tracked_vmas(unsigned long *ranges, unsigned int nr_rang
 
 		new_tracked[cdi->nr_tracked_vmas + i].start = start;
 		new_tracked[cdi->nr_tracked_vmas + i].end = start + len;
-		pr_info("Added new tracked VMA: 0x%lx-0x%lx\n", start, start + len);
+		pr_debug("Added new tracked VMA: 0x%lx-0x%lx\n", start, start + len);
 
 		/* Also add to global_lazy_vmas for page transfer */
 		if (add_lazy_vma_for_new_region(start, len,
@@ -1027,12 +1027,10 @@ static int __maybe_unused clone_check_tracked_vma_remapped(pid_t pid,
 		return 1;
 	}
 
-	pr_info("CLONE REMAP CHECK: 0x%lx-0x%lx first page has WPALLOWED -> original\n",
-		start, end);
+	pr_debug("CLONE REMAP CHECK: 0x%lx-0x%lx first page has WPALLOWED -> original\n",
+		 start, end);
 	return 0;
 }
-
-
 
 /*
  * clone_detect_new_vmas - Detect VMAs that appeared after Phase 1
@@ -1092,7 +1090,7 @@ int clone_detect_new_vmas(struct vm_area_list *vmas,
 			continue;
 		}
 
-		pr_info("Checking VMA 0x%lx-0x%lx\n", start, end);
+		pr_debug("Checking VMA 0x%lx-0x%lx\n", start, end);
 
 		before = nr_ranges;
 		if (clone_region_subtract(start, end, &ranges, &nr_ranges, &capacity)) {
@@ -1161,8 +1159,8 @@ int clone_detect_new_vmas(struct vm_area_list *vmas,
 			       "appeared - treating as new for full resend\n",
 			       u_start, u_end);
 		} else {
-			pr_info("CLONE UNMAP: 0x%lx-0x%lx was unmapped, no new VMA - "
-				"truly unmapped\n", u_start, u_end);
+			pr_debug("CLONE UNMAP: 0x%lx-0x%lx was unmapped, no new VMA - "
+				 "truly unmapped\n", u_start, u_end);
 			/*
 			 * Pages from a region the source unmapped (without
 			 * remapping) are still present on the target as part
@@ -1238,7 +1236,8 @@ void clone_cleanup_async_uffd(void)
 			}
 
 			/* Yield to let target process run between chunks */
-			if ((i + 1) % (CLONE_UFFD_UNREGISTER_YIELD + cdi->nr_tracked_vmas/1000) == 0)
+			if ((i + 1) % (CLONE_UFFD_UNREGISTER_YIELD +
+				       cdi->nr_tracked_vmas / CLONE_UFFD_YIELD_VMA_DIVISOR) == 0)
 				usleep(CLONE_USLEEP_10MS);
 		}
 	}

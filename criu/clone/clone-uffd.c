@@ -796,8 +796,8 @@ next_batch:;
 	if (removed > 0) {
 		__sync_fetch_and_sub(&clone_buffer.nr_pages, removed);
 		__sync_fetch_and_add(&clone_buffer.nr_discarded, removed);
-		pr_info("Removed %lu pages from buffer for UNMAP range 0x%lx-0x%lx\n",
-			removed, start, end);
+		pr_debug("Removed %lu pages from buffer for UNMAP range 0x%lx-0x%lx\n",
+			 removed, start, end);
 	}
 }
 
@@ -909,7 +909,7 @@ static void *background_drain_worker(void *arg)
 	snprintf(thread_name, sizeof(thread_name), "clone-drain-%d", thread_id);
 	pthread_setname_np(pthread_self(), thread_name);
 
-	pr_info("Drain thread %d started, buffered=%lu pages\n", thread_id, clone_buffer.nr_pages);
+	pr_debug("Drain thread %d started, buffered=%lu pages\n", thread_id, clone_buffer.nr_pages);
 	last_progress_time = time(NULL);
 
 	while (!atomic_load(&drain_thread_stop) && clone_buffer.nr_pages > 0) {
@@ -972,8 +972,8 @@ static void *background_drain_worker(void *arg)
 	/* Update global statistics */
 	atomic_fetch_add(&total_drained, drained);
 
-	pr_info("Drain thread %d finished: drained=%lu chunks_empty=%d chunks_with_batches=%d\n",
-	       thread_id, drained, chunks_empty, chunks_with_batches);
+	pr_debug("Drain thread %d finished: drained=%lu chunks_empty=%d chunks_with_batches=%d\n",
+		 thread_id, drained, chunks_empty, chunks_with_batches);
 
 	/* Decrement active thread count */
 	if (atomic_fetch_sub(&drain_threads_active, 1) == 1) {
@@ -1166,8 +1166,6 @@ static const char *get_bucket_label(int bucket)
 		return "?";
 	}
 }
-
-
 
 void check_and_print_uffd_stats(void)
 {
@@ -1464,7 +1462,7 @@ int clone_process_eagain_requests(void)
 		if (req->buf)
 			xfree(req->buf);
 		xfree(req);
-	}	
+	}
 
 	pthread_mutex_unlock(&eagain_mutex);
 
@@ -1498,8 +1496,6 @@ void clone_set_restore_connected(bool connected)
 	clone_restore_connected = connected;
 }
 
-
-
 /* Check if all pages have been sent by the source */
 bool clone_is_all_pages_sent_received(void)
 {
@@ -1512,8 +1508,6 @@ void clone_set_all_pages_sent_received(void)
 	pr_info("All pages sent signal received - can zero-fill new VMA pages\n");
 	clone_all_pages_sent_received = true;
 }
-
-
 
 /* Return uffd for a given vaddr (for background drain thread) */
 int clone_get_uffd_for_vaddr(struct list_head *lpis, unsigned long vaddr)

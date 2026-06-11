@@ -124,13 +124,13 @@ extern int request_remote_pages(unsigned long img_id, unsigned long addr, unsign
 typedef int (*ps_async_read_complete)(unsigned long img_id, unsigned long vaddr, unsigned long nr_pages, void *);
 extern int page_server_start_read(void *buf, unsigned long nr_pages, ps_async_read_complete complete, void *priv, unsigned flags);
 
-/* CLONE phased migration: signal replica all pages sent, can zero-fill rest */
+/* CLONE phased migration: signal target that all pages sent, can zero-fill rest */
 extern int send_all_pages_sent_signal(int sk);
 
-/* CLONE phased migration: replica ACK for all_pages_sent, primary can close */
+/* CLONE phased migration: target ACK for all_pages_sent, source can close */
 extern int send_all_pages_sent_ack(void);
 
-/* P3 parallel transfer: REPLICA creates connections and receiver threads */
+/* P3 parallel transfer: target creates connections and receiver threads */
 extern int start_p3_receiver_connections(int num_connections);
 extern void stop_p3_receiver_connections(void);
 

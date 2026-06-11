@@ -28,8 +28,6 @@ enum clone_dump_phase {
 	CLONE_PHASE_DONE,
 };
 
-
-
 /**
  * clone_dump_fini - Clean up CLONE dump resources
  *
@@ -45,8 +43,6 @@ extern void clone_dump_fini(void);
  * populates vpid. Call this after collect_pstree_ids() to fix it.
  */
 extern void clone_set_dst_id(u64 dst_id);
-
-
 
 /**
  * clone_dump_is_vma_tracked - Check whether a VMA is CLONE-tracked
