@@ -10,50 +10,36 @@
 #include "zdtmtst.h"
 #include "clone_dump_util.h"
 
-const char *test_doc = "--clone-dump new-VMA handling: a background thread "
-		       "mmaps new anon-private regions throughout Phase 2 "
-		       "(no munmap). After restore the test classifies each "
-		       "tracked VMA as present+correct, present+corrupt, or "
-		       "missing (mincore=ENOMEM). CRIU's own dump.log warns "
-		       "about Phase-2-era VMA metadata being missing from "
-		       "the skeleton (see criu/cr-dump.c:~2892); this test "
-		       "pins down the observable effect on the restored "
-		       "process. PASS criteria: stable region intact, no "
-		       "data corruption on surviving VMAs. Missing entries "
-		       "are reported but not fatal (documented limitation).";
-const char *test_author = "Asaf Pamuk <asafp@anthropic.com>";
+const char *test_doc = "--clone-dump new-VMA handling: tracks exactly which VMAs "
+		       "were created and their expected content. Classifies each "
+		       "as present+correct, present+corrupt, or missing.";
+const char *test_author = "Asaf Porat Stoler <asafpor@gmail.com>";
 
-#define STABLE_PAGES	256	/* 1 MB stable region */
-#define NEW_VMA_PAGES	4	/* 16 KB per new VMA */
-#define TRACKED_MAX	1024	/* upper bound on tracked entries */
-#define DRAIN_TIMEOUT	10000	/* ms */
 
-/*
- * Force every new mmap to land at its own hinted address far from the
- * others so the kernel can't merge adjacent VMAs. Without this, 230
- * consecutive 16 KB mmaps typically coalesce into one big anon VMA,
- * and CRIU's "new VMA region" detection sees just one thing, not 230.
- * We stride through a 1 TB virtual window in 2 MB steps — no two
- * tracked entries land within an even-distant page of each other.
- */
-#define HINT_BASE	((unsigned long)0x500000000000UL)	/* 80 TB */
-#define HINT_STRIDE	((unsigned long)(2UL << 20))		/* 2 MB */
+#define STABLE_PAGES	256
+#define NEW_VMA_PAGES	4
+#define TRACKED_MAX	1024
+#define DRAIN_TIMEOUT	10000
+
+#define HINT_BASE	((unsigned long)0x500000000000UL)
+#define HINT_STRIDE	((unsigned long)(2UL << 20))
 
 struct tracked_vma {
 	void *ptr;
 	size_t len;
 	unsigned char marker;
+	int initialized;
 };
 
-/*
- * The tracked-list array lives inside the stable region so that it
- * itself is guaranteed to be in the Phase-1 skeleton and therefore
- * restored. Each entry in the array then points at a VMA that may or
- * may not survive, which is what we're measuring.
- */
 static struct tracked_vma *g_tracked;
 static atomic_uint g_next;
 static atomic_int g_stop;
+
+/* Stable region uses per-page, per-offset pattern */
+static inline unsigned char stable_marker(int page_idx, int offset)
+{
+	return (unsigned char)((page_idx * 17 + offset) & 0xff);
+}
 
 static void *mapper_thread(void *arg)
 {
@@ -64,7 +50,6 @@ static void *mapper_thread(void *arg)
 
 		idx = atomic_fetch_add(&g_next, 1);
 		if (idx >= TRACKED_MAX) {
-			/* Bounded: stop claiming slots, idle. */
 			atomic_fetch_sub(&g_next, 1);
 			usleep(10 * 1000);
 			continue;
@@ -82,19 +67,14 @@ static void *mapper_thread(void *arg)
 			}
 		}
 
-		/* Marker: bias high bit to 1 so the zero-page and the
-		 * stable-region's low-index pattern bytes don't accidentally
-		 * match a VMA marker during verification. */
 		m = (unsigned char)((idx & 0x7f) | 0x80);
 		memset(p, m, NEW_VMA_PAGES * PAGE_SIZE);
 
-		/* Publish AFTER memset. A reader that sees ptr != NULL is
-		 * guaranteed to see the fully-initialized region. */
 		g_tracked[idx].len = NEW_VMA_PAGES * PAGE_SIZE;
 		g_tracked[idx].marker = m;
 		g_tracked[idx].ptr = p;
+		g_tracked[idx].initialized = 1;
 
-		/* Throttle to ~2000 mmap/s so Phase 2 always sees some. */
 		usleep(500);
 	}
 	return NULL;
@@ -112,8 +92,8 @@ int main(int argc, char **argv)
 	unsigned int new_present_corrupt = 0;
 	unsigned int new_missing = 0;
 	unsigned int new_uninitialized = 0;
-	size_t tlist_bytes;
-	size_t tlist_pages;
+	size_t tlist_bytes, tlist_pages;
+	int first_stable_error = -1;
 
 	test_init(argc, argv);
 
@@ -124,12 +104,12 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	/* Fill the whole stable region with an index-derived pattern, then
-	 * lay the tracked-list array at offset 0. The verify loop skips
-	 * the pages that overlap the array (the mapper writes there, so
-	 * the pattern is deliberately overwritten). */
-	for (i = 0; i < STABLE_PAGES; i++)
-		memset(stable + i * PAGE_SIZE, (unsigned char)(i & 0xff), PAGE_SIZE);
+	/* Fill stable region with tracked pattern */
+	for (i = 0; i < STABLE_PAGES; i++) {
+		unsigned char *page = stable + i * PAGE_SIZE;
+		for (j = 0; j < PAGE_SIZE; j++)
+			page[j] = stable_marker(i, j);
+	}
 
 	g_tracked = (struct tracked_vma *)stable;
 	memset(g_tracked, 0, TRACKED_MAX * sizeof(*g_tracked));
@@ -147,66 +127,68 @@ int main(int argc, char **argv)
 	test_daemon();
 	test_waitsig();
 
-	atomic_store(&g_stop, 1);
-	pthread_join(th, NULL);
-
 	nr_tracked = atomic_load(&g_next);
 	if (nr_tracked > TRACKED_MAX)
 		nr_tracked = TRACKED_MAX;
 
-	/* Drain gate for the stable region (which holds the tracked list). */
+	atomic_store(&g_stop, 1);
+	pthread_join(th, NULL);
+
+	test_msg("State at restore: nr_tracked=%u\n", nr_tracked);
+
 	if (clone_wait_for_drain(stable, stable_sz, DRAIN_TIMEOUT) < 0) {
-		fail("stable-region drain did not complete within %d ms", DRAIN_TIMEOUT);
+		fail("stable-region drain timeout");
 		return 1;
 	}
 
-	/* Stable-region bytewise check, skipping the tracked-list pages. */
+	/* Verify stable region (skipping tracked-list overlay) */
 	for (i = tlist_pages; i < STABLE_PAGES; i++) {
-		unsigned char expected = (unsigned char)(i & 0xff);
 		unsigned char *page = stable + i * PAGE_SIZE;
 
 		for (j = 0; j < PAGE_SIZE; j++) {
+			unsigned char expected = stable_marker(i, j);
 			if (page[j] != expected) {
-				test_msg("stable page %u offset %u: 0x%02x != 0x%02x\n",
-					 i, j, page[j], expected);
+				if (stable_errors < 8)
+					test_msg("stable page %u offset %u: "
+						 "got 0x%02x expected 0x%02x\n",
+						 i, j, page[j], expected);
+				if (first_stable_error < 0)
+					first_stable_error = i;
 				stable_errors++;
 				break;
 			}
 		}
 	}
 
-	/* Classify each tracked VMA. */
+	/* Classify tracked VMAs */
 	for (i = 0; i < nr_tracked; i++) {
 		struct tracked_vma *tv = &g_tracked[i];
-		size_t npages;
 		unsigned char vec[NEW_VMA_PAGES];
 		unsigned char *base;
 		int corrupt = 0;
 		size_t p;
 
-		/* Entry may be still-uninitialized if the mapper was pre-empted
-		 * between claiming the index and the publishing store. These
-		 * are not failures — we just didn't finish recording them. */
-		if (tv->ptr == NULL) {
+		if (!tv->initialized || tv->ptr == NULL) {
 			new_uninitialized++;
 			continue;
 		}
 
-		npages = tv->len / PAGE_SIZE;
 		if (mincore(tv->ptr, tv->len, (void *)vec) == -1) {
 			if (errno == ENOMEM) {
-				/* Not mapped in the restored process. */
 				new_missing++;
 				continue;
 			}
-			pr_perror("mincore idx=%u", i);
 			continue;
 		}
 
 		base = tv->ptr;
-		for (p = 0; p < npages; p++) {
+		for (p = 0; p < tv->len / PAGE_SIZE; p++) {
 			if (base[p * PAGE_SIZE] != tv->marker) {
 				corrupt = 1;
+				if (new_present_corrupt < 8)
+					test_msg("tracked[%u] page %zu: "
+						 "got 0x%02x expected 0x%02x\n",
+						 i, p, base[p * PAGE_SIZE], tv->marker);
 				break;
 			}
 		}
@@ -216,34 +198,26 @@ int main(int argc, char **argv)
 			new_present_ok++;
 	}
 
-	test_msg("RESULT stable_errors=%u tracked=%u present_ok=%u "
-		 "present_corrupt=%u missing=%u uninitialized=%u\n",
-		 stable_errors, nr_tracked, new_present_ok,
-		 new_present_corrupt, new_missing, new_uninitialized);
-
-	/*
-	 * Pass/fail policy:
-	 *
-	 *   stable_errors        → FAIL (CRIU broke baseline data integrity)
-	 *   nr_tracked == 0      → FAIL (test didn't exercise anything)
-	 *   new_present_corrupt  → FAIL (CRIU sent wrong data for a surviving VMA)
-	 *   new_missing > 0      → PASS (documented limitation — see dump.log
-	 *                          for "Found N new VMA regions since Phase 1")
-	 */
+	test_msg("RESULT: stable_errors=%u (first=%d) tracked=%u "
+		 "present_ok=%u present_corrupt=%u missing=%u uninit=%u\n",
+		 stable_errors, first_stable_error, nr_tracked,
+		 new_present_ok, new_present_corrupt, new_missing, new_uninitialized);
 
 	if (stable_errors) {
-		fail("%u stable-region pages corrupted", stable_errors);
+		fail("%u stable pages corrupted", stable_errors);
 		return 1;
 	}
 	if (nr_tracked == 0) {
-		fail("no tracked VMAs recorded — test did not exercise Phase 2");
+		fail("no tracked VMAs - test did not exercise Phase 2");
 		return 1;
 	}
 	if (new_present_corrupt) {
-		fail("%u surviving new VMAs have corrupt data", new_present_corrupt);
+		fail("%u surviving VMAs have corrupt data", new_present_corrupt);
 		return 1;
 	}
 
+	test_msg("OK: stable intact, %u VMAs tracked (%u ok, %u missing)\n",
+		 nr_tracked, new_present_ok, new_missing);
 	pass();
 	return 0;
 }

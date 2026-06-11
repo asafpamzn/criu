@@ -18,7 +18,8 @@ const char *test_doc = "--clone-dump shrinkage test: two equally-sized anon-priv
 		       "the dropped range must no longer be mapped. Exercises "
 		       "the UFFD REMOVE-event handler "
 		       "(clone_handle_remove_event) at working-set scale.";
-const char *test_author = "Asaf Pamuk <asafp@anthropic.com>";
+const char *test_author = "Asaf Porat Stoler <asafpor@gmail.com>";
+
 
 /*
  * Default 256 MB total (128 MB kept + 128 MB dropped) for CI.

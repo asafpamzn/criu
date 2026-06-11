@@ -16,7 +16,8 @@ const char *test_doc = "--clone-dump WP_UNPOPULATED test: "
 		       "that are mmap'd but never touched (no PTE exists). "
 		       "Without WP_UNPOPULATED, these pages cannot be WP-tracked "
 		       "and writes during Phase 2 may be missed.";
-const char *test_author = "Asaf Pamuk <asafp@anthropic.com>";
+const char *test_author = "Asaf Porat Stoler <asafpor@gmail.com>";
+
 
 /*
  * Test strategy:

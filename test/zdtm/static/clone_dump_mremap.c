@@ -16,7 +16,8 @@ const char *test_doc = "--clone-dump mremap test: "
 		       "uses mremap() to move a memory region during Phase 2. "
 		       "Without UFFD_EVENT_REMAP handling, pages at old address "
 		       "would be sent but process expects them at new address.";
-const char *test_author = "Asaf Pamuk <asafp@anthropic.com>";
+const char *test_author = "Asaf Porat Stoler <asafpor@gmail.com>";
+
 
 /*
  * Region that gets mremap'd. 64 MB is enough to prove the bug.

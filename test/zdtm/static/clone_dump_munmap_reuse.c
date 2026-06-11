@@ -18,7 +18,8 @@ const char *test_doc = "--clone-dump munmap+reuse test: allocates a large "
 		       "marker. After restore the region must carry the new "
 		       "marker on every page (source must detect the reused "
 		       "pages as new/dirty, not serve stale pre-dump content).";
-const char *test_author = "Asaf Pamuk <asafp@anthropic.com>";
+const char *test_author = "Asaf Porat Stoler <asafpor@gmail.com>";
+
 
 /*
  * Default 32 GB. Override at build time with -DCLONE_MUNMAP_REUSE_MB=N.

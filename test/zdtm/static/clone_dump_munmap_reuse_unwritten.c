@@ -16,7 +16,8 @@ const char *test_doc = "--clone-dump munmap+reuse with UNWRITTEN pages: "
 		       "zero-fill-on-demand pages that PAGEMAP_SCAN cannot see "
 		       "(no PTE → no PAGE_IS_WRITTEN). Without fix, restored "
 		       "process gets stale data from bulk transfer.";
-const char *test_author = "Asaf Pamuk <asafp@anthropic.com>";
+const char *test_author = "Asaf Porat Stoler <asafpor@gmail.com>";
+
 
 /*
  * Target region that gets remapped. 64 MB is enough to prove the bug.
