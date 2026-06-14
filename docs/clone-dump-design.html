@@ -463,14 +463,13 @@
 <p class="meta">Covers the experimental CLONE dump path in this CRIU fork (<code>--clone-dump</code>).</p>
 
 <h2 id="overview">Overview</h2>
-<p>The CLONE (Copy-on-Write) dump implementation is an experimental feature in this CRIU fork designed to minimize source process downtime during live migration. Instead of freezing the process for the entire dump duration, CLONE dump uses Linux's userfaultfd write-protect (<code>UFFD_FEATURE_WP_ASYNC</code>) to track memory writes while the process continues running, enabling incremental page transfer.</p>
+<p>CLONE dump is an experimental CRIU mode designed to minimize source-process downtime during live migration. It uses Linux's userfaultfd write-protect (<code>UFFD_FEATURE_WP_ASYNC</code>) and <code>PAGEMAP_SCAN</code> to track memory writes while the process keeps running, reducing the freeze time so pages can stream to the target while the source continues making progress.</p>
 
 <h2 id="goals">Goals</h2>
 <ol>
-  <li><strong>Minimize downtime</strong>: Keep the source process running during the bulk of the memory transfer; only freeze for a short skeleton dump + final dirty flush.</li>
-  <li><strong>Parallel, compressed transfer</strong>: Multiple sender/receiver sockets, LZ4 compression, batched I/O.</li>
-  <li><strong>Convergence</strong>: Iteratively re-send dirty pages until a threshold is reached (overwriting older copies in the target batch buffer), then do a single final frozen scan.</li>
-  <li><strong>Completeness</strong>: Capture dynamically created VMAs as well as the originally-tracked set.</li>
+  <li><strong>Reduce downtime at the source.</strong> The source process must be responsive almost the entire migration; only two short freezes are acceptable.</li>
+  <li><strong>Minimize total migration time.</strong> The wall-clock from "start migrating" to "process running on target" should be dominated by physical resources — network bandwidth or CPU — not by design limitations.</li>
+  <li><strong>No disk needed.</strong> Pages stream directly from source memory to target memory; no intermediate image file is written for pages.</li>
 </ol>
 
 <h2 id="architecture">Top-Level Architecture</h2>
@@ -677,7 +676,7 @@
 
 <p>To catch this, Phase 3 (with the process re-frozen) re-collects the live VMA list and compares it to the set tracked at Phase 1. Anything new — a freshly-mapped region, an extension of an existing VMA, or a region that was unmapped and then re-mapped at the same address — is treated as fully dirty: every page in it is queued for transfer regardless of pagemap state. The new ranges are also appended to the lazy-VMA list so the senders pick them up alongside the final dirty-page batch from the convergence scan, and so the target's page buffer keys match.</p>
 
-<p>This guarantees that the post-restore process sees exactly the address space the source had at the moment of the final freeze, not the address space it had at Phase 1. The cost is a single VMA-list diff and one extra batch of full-region transfers during the Phase 3 freeze — proportional to how much new mapping the process did during Phase 2, which for most workloads is zero.</p>
+<p>The combined effect is that the post-restore process sees the address space the source had at the moment of the final freeze rather than the one it had at Phase 1. The cost is a single VMA-list diff and one extra batch of full-region transfers during the Phase 3 freeze, proportional to how much new mapping the process did during Phase 2 — which for most workloads is zero.</p>
 
 <h2 id="unmap">Unmap Support</h2>
 
