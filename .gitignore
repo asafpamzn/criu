@@ -1,5 +1,4 @@
 .config
-.claude
 *.o
 *.d
 *.a
@@ -34,9 +33,3 @@ compel/include/asm
 include/common/asm
 include/common/config.h
 build/**
-scripts/.env
-artifacts/
-coverage-report/
-clone-coverage-report/
-coverage_html/
-docs/
