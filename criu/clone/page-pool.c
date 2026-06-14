@@ -294,8 +294,7 @@ void page_pool_put(void *page)
 	/* Last reference? munmap the entire chunk */
 	if (old_ref == 1) {
 		int chunk_idx = hdr->chunk_idx;
-
-		atomic_fetch_add(&total_chunks_freed, 1);
+		int freed_count = atomic_fetch_add(&total_chunks_freed, 1) + 1;
 
 		pr_debug("PAGE_POOL_FREE: chunk=%p[%d] total_freed=%d\n",
 		       hdr, chunk_idx, freed_count);
