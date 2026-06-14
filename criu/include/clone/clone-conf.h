@@ -49,21 +49,6 @@
  */
 // #define CONFIG_HUNG_PAGE_TRACKER
 
-/*
- * CONFIG_CLONE_COMPARE - Enable process comparison during CLONE dump.
- * When enabled, the source and target processes compare state after freeze.
- * Useful for debugging memory divergence issues.
- */
-// #define CONFIG_CLONE_COMPARE
-
-/*
- * CONFIG_CLONE_COMPARE_PAGES - Enable page hash comparison (slow).
- * When enabled, the source sends page hashes and the target compares them.
- * This is very slow for large processes. Disable to only compare VMAs.
- * Requires CONFIG_CLONE_COMPARE to be enabled.
- */
-// #define CONFIG_CLONE_COMPARE_PAGES
-
 /* ================================================================
  * SECTION 1: Batch Transfer Configuration
  * ================================================================ */

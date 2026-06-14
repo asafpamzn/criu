@@ -69,7 +69,6 @@
 #include "clone/clone-dump.h"
 #include "clone/clone-page-xfer.h"
 #include "clone/clone-bulk-send.h"
-#include "clone/clone-compare.h"
 #include "posix-timer.h"
 #include "vdso.h"
 #include "vma.h"

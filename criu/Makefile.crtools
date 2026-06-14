@@ -101,7 +101,6 @@ obj-y			+= clone/clone-p3-receiver.o
 obj-y			+= clone/tls-conn.o
 obj-y			+= clone/clone-unified-thread.o
 obj-y			+= clone/clone-bulk-recv.o
-obj-y			+= clone/clone-compare.o
 obj-y			+= config.o
 obj-y			+= servicefd.o
 obj-y			+= pie-util-vdso.o

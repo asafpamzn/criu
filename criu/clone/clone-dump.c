@@ -42,7 +42,6 @@
 #include "clone/clone-conf.h"
 #include "clone/clone-bulk-send.h"
 #include "clone/clone-page-xfer.h"
-#include "clone/clone-compare.h"
 #include "common/bug.h"
 
 /* Headers for cr_dump_tasks_clone_phased */
@@ -1218,37 +1217,6 @@ int cr_dump_clone_finish(int ret)
 		}
 	}
 
-#ifdef CONFIG_CLONE_COMPARE
-	/*
-	 * When comparing, wait for ACK before compare starts.
-	 * Target sends ACK after it's ready for comparison.
-	 */
-	if (!ret && sk >= 0) {
-		if (wait_for_all_pages_sent_ack(sk) < 0) {
-			pr_err("Failed to receive completion ACK\n");
-			ret = -1;
-		}
-	}
-
-	/* Process comparison with target (source already unfrozen) */
-	{
-		int compare_sk;
-		pid_t source_pid = root_item->pid->real;
-
-		pr_debug("COMPARE: waiting for target connection (PID %d running)\n",
-			 source_pid);
-
-		if (clone_compare_listen(&compare_sk) == 0) {
-			clone_compare_send_state(compare_sk, source_pid);
-			close(compare_sk);
-		}
-		pr_debug("COMPARE: comparison done\n");
-	}
-
-	pr_debug("Unfreezing process\n");
-	pstree_switch_state(root_item, TASK_ALIVE);
-#else
-
 	pr_debug("Unfreezing process\n");
 	pstree_switch_state(root_item, TASK_ALIVE);
 	/* Wait for ACK AFTER unfreeze - not on critical path */
@@ -1258,7 +1226,6 @@ int cr_dump_clone_finish(int ret)
 			ret = -1;
 		}
 	}
-#endif
 
 	/* Cleanup after unfreeze - not on critical path */
 	clone_cleanup_async_uffd();

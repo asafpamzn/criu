@@ -49,7 +49,6 @@
 #include "uffd-internal.h"
 #include "clone/unmapped-tracker.h"
 #include "clone/page-pool.h"
-#include "clone/clone-compare.h"
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "uffd: "
