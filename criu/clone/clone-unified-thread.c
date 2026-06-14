@@ -80,7 +80,7 @@ static void *unified_page_server_thread(void *arg)
 	pr_info("Page server thread started for dst_id=%lu\n", args->dst_id);
 
 	/* Find source_pid from lazy VMAs */
-	list_for_each_entry(lve, get_global_lazy_vmas(), list) {
+	list_for_each_entry(lve, clone_mem_get_lazy_vmas(), list) {
 		if (lve->dst_id == args->dst_id) {
 			source_pid = lve->source_pid;
 			break;
@@ -134,7 +134,7 @@ int clone_page_server_get_all_pages(int sk, u64 dst_id)
 
 	pr_info("Starting page server for dst_id=%lu\n", dst_id);
 
-	total_pages = count_lazy_vma_pages(dst_id);
+	total_pages = clone_mem_count_lazy_vma_pages(dst_id);
 	if (total_pages == 0) {
 		pr_warn("dst_id=%lu matched ZERO lazy VMA pages\n", dst_id);
 		return 0;

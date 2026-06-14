@@ -67,13 +67,6 @@ void clone_page_buffer_remove_range(unsigned long start, unsigned long len);
 void clone_page_buffer_readd(unsigned long vaddr, void *data);
 
 /*
- * UFFD Statistics (CLONE mode)
- */
-extern void check_and_print_uffd_stats(void);
-extern void clone_uffd_stats_add_io_bulk(unsigned long ns);
-extern void clone_uffd_stats_inc_io_bulk_start(void);
-
-/*
  * EAGAIN Request Handling (CLONE mode)
  */
 struct lazy_pages_info;

@@ -33,8 +33,6 @@
 #undef LOG_PREFIX
 #define LOG_PREFIX "clone-p3-recv: "
 
-#define MAX_P3_RECEIVERS CLONE_MAX_P3_THREADS
-
 /* Max batch size for P3 transfer (CLONE_BATCH_PAGES in clone-conf.h) */
 #define P3_DECOMPRESS_BUF_SIZE (CLONE_BATCH_PAGES * PAGE_SIZE)
 #define P3_COMPRESS_BUF_SIZE LZ4_compressBound(P3_DECOMPRESS_BUF_SIZE)
@@ -51,7 +49,7 @@ struct p3_receiver_ctx {
 	char *decompressed_buf;
 };
 
-static struct p3_receiver_ctx p3_receivers[MAX_P3_RECEIVERS];
+static struct p3_receiver_ctx p3_receivers[CLONE_MAX_P3_THREADS];
 static volatile int p3_receivers_active = 0;
 
 /*
@@ -380,11 +378,11 @@ void close_p3_sockets(int *sockets, int num_sockets)
  */
 int start_p3_receiver_connections(int num_connections)
 {
-	int p3_sockets[MAX_P3_RECEIVERS];
+	int p3_sockets[CLONE_MAX_P3_THREADS];
 	int num_sockets, i;
 
-	if (num_connections > MAX_P3_RECEIVERS)
-		num_connections = MAX_P3_RECEIVERS;
+	if (num_connections > CLONE_MAX_P3_THREADS)
+		num_connections = CLONE_MAX_P3_THREADS;
 
 	/* Create connections to the source */
 	num_sockets = connect_p3_sockets(p3_sockets, num_connections);
@@ -435,7 +433,7 @@ void stop_p3_receiver_connections(void)
 	int i;
 	unsigned long total_pages = 0;
 
-	for (i = 0; i < MAX_P3_RECEIVERS; i++) {
+	for (i = 0; i < CLONE_MAX_P3_THREADS; i++) {
 		if (p3_receivers[i].thread) {
 			pthread_join(p3_receivers[i].thread, NULL);
 			total_pages += p3_receivers[i].pages_received;

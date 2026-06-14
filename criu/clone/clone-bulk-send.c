@@ -197,7 +197,7 @@ static volatile int g_work_queue_next = 0;  /* Next item to dequeue (atomic) */
  */
 static void build_bulk_work_queue(u64 dst_id)
 {
-	struct list_head *lazy_vmas = get_global_lazy_vmas();
+	struct list_head *lazy_vmas = clone_mem_get_lazy_vmas();
 	struct lazy_vma_entry *lve;
 	int count = 0;
 
@@ -344,7 +344,7 @@ static void *dirty_scanner_thread(void *arg)
 	regs = xmalloc(max_regs * sizeof(struct page_region));
 	BUG_ON(!regs);
 
-	lazy_vmas = get_global_lazy_vmas();
+	lazy_vmas = clone_mem_get_lazy_vmas();
 
 	if (!clone_cfg.pre_scan)
 		goto wait_for_freeze;
@@ -705,7 +705,7 @@ out:
 int clone_start_scanner_thread(pid_t source_pid)
 {
 	int i;
-	struct list_head *lazy_vmas = get_global_lazy_vmas();
+	struct list_head *lazy_vmas = clone_mem_get_lazy_vmas();
 	struct lazy_vma_entry *lve;
 	unsigned int lve_count = 0;
 

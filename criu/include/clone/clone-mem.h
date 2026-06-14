@@ -17,13 +17,13 @@ struct lazy_vma_entry {
 };
 
 /* Global lazy VMA list management */
-extern struct list_head *get_global_lazy_vmas(void);
+extern struct list_head *clone_mem_get_lazy_vmas(void);
 extern void clone_mem_init_lazy_vmas(void);
-extern void free_global_lazy_vmas(void);
+extern void clone_mem_free_lazy_vmas(void);
 
 /* Lazy VMA lookup functions */
-extern unsigned long count_lazy_vma_pages(u64 dst_id);
-extern int add_lazy_vma_for_new_region(unsigned long start, unsigned long len,
+extern unsigned long clone_mem_count_lazy_vma_pages(u64 dst_id);
+extern int clone_mem_add_lazy_vma_range(unsigned long start, unsigned long len,
 				       u64 dst_id, pid_t source_pid);
 
 /* Add a lazy VMA entry during dump (called from generate_iovs in mem.c) */

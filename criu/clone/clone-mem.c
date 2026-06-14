@@ -30,14 +30,14 @@ void clone_mem_init_lazy_vmas(void)
 	pthread_once(&lazy_vmas_lock_once, init_lazy_vmas_lock_once);
 }
 
-struct list_head *get_global_lazy_vmas(void)
+struct list_head *clone_mem_get_lazy_vmas(void)
 {
 	return &global_lazy_vmas;
 }
 
 
 /*
- * add_lazy_vma_for_new_region - Add a new VMA to global_lazy_vmas
+ * clone_mem_add_lazy_vma_range - Add a new VMA to global_lazy_vmas
  *
  * Called from Phase 3 when new VMAs are detected that weren't present
  * in Phase 1. These need to be added to global_lazy_vmas so the page
@@ -50,7 +50,7 @@ struct list_head *get_global_lazy_vmas(void)
  *
  * Returns: 0 on success, -1 on error
  */
-int add_lazy_vma_for_new_region(unsigned long start, unsigned long len,
+int clone_mem_add_lazy_vma_range(unsigned long start, unsigned long len,
 				u64 dst_id, pid_t source_pid)
 {
 	struct lazy_vma_entry *lve;
@@ -130,7 +130,7 @@ int clone_mem_add_lazy_vma(struct vma_area *vma, unsigned long nr_pages,
 }
 
 /* Count total pages in lazy VMAs for a given dst_id (exported for page-xfer.c) */
-unsigned long count_lazy_vma_pages(u64 dst_id)
+unsigned long clone_mem_count_lazy_vma_pages(u64 dst_id)
 {
 	struct lazy_vma_entry *lve;
 	unsigned long total_pages = 0;
@@ -150,7 +150,7 @@ unsigned long count_lazy_vma_pages(u64 dst_id)
 
 
 /* Cleanup function for global lazy VMA list */
-void free_global_lazy_vmas(void)
+void clone_mem_free_lazy_vmas(void)
 {
 	struct lazy_vma_entry *lve, *tmp;
 

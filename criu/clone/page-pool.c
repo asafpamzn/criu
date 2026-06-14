@@ -212,82 +212,8 @@ int page_pool_thread_init(int thread_id)
 	return 0;
 }
 
-void *page_pool_get(int thread_id)
-{
-	struct thread_pool *pool;
-	void *page;
-
-	BUG_ON(thread_id < 0 || thread_id >= CLONE_MAX_THREADS);
-
-	pool = &pools[thread_id];
-
-	BUG_ON(!pool->initialized);
-
-	/* Need new chunk? */
-	if (pool->next_page >= CLONE_PAGES_PER_CHUNK)
-		page_pool_swap_current_chunk(pool);
-
-	/* Lock-free allocation: just bump the pointer */
-	page = (char *)pool->current_chunk + (pool->next_page * PAGE_SIZE);
-	pool->next_page++;
-
-	atomic_fetch_add(&((struct chunk_header *)pool->current_chunk)->refcount, 1);
-	atomic_fetch_add(&total_alloc_count, 1);
-
-	return page;
-}
-
-/*
- * Get a contiguous 256KB batch (64 pages) for direct decompression.
- * Returns pointer to first page of the batch.
- * Each page must be freed individually with page_pool_put().
- * Interleaved alloc/free is allowed (unused pages can be freed immediately).
- */
-void *page_pool_get_chunk(int thread_id, int *out_nr_pages)
-{
-	struct thread_pool *pool;
-	void *batch_start;
-
-	BUG_ON(thread_id < 0 || thread_id >= CLONE_MAX_THREADS);
-
-	pool = &pools[thread_id];
-
-	BUG_ON(!pool->initialized);
-
-	/* Need new chunk if not enough pages left for a batch */
-	if (pool->next_page + CLONE_ALLOC_BATCH > CLONE_PAGES_PER_CHUNK)
-		page_pool_swap_current_chunk(pool);
-
-	/* Allocate CLONE_ALLOC_BATCH contiguous pages */
-	batch_start = (char *)pool->current_chunk + (pool->next_page * PAGE_SIZE);
-	pool->next_page += CLONE_ALLOC_BATCH;
-
-	/* Update refcount and max_allocated */
-	{
-		struct chunk_header *hdr = (struct chunk_header *)pool->current_chunk;
-		int current_alloc = pool->next_page;
-		int old_max;
-
-		atomic_fetch_add(&hdr->refcount, CLONE_ALLOC_BATCH);
-
-		do {
-			old_max = atomic_load(&hdr->max_allocated);
-			if (current_alloc <= old_max)
-				break;
-		} while (!atomic_compare_exchange_weak(&hdr->max_allocated, &old_max, current_alloc));
-	}
-
-	atomic_fetch_add(&total_alloc_count, CLONE_ALLOC_BATCH);
-
-	*out_nr_pages = CLONE_ALLOC_BATCH;
-	return batch_start;
-}
-
 /*
  * Get exactly nr_pages contiguous pages for direct decompression.
- * More efficient than page_pool_get_chunk() when exact count is known,
- * as it doesn't waste pages that would need to be freed immediately.
- *
  * Each page must be freed individually with page_pool_put().
  */
 void *page_pool_get_pages(int thread_id, int nr_pages)
@@ -382,33 +308,6 @@ void page_pool_put(void *page)
 
 		madvise(hdr, CLONE_CHUNK_SIZE, MADV_DONTNEED);
 	}
-}
-
-void page_pool_destroy_all(void)
-{
-	int i, n;
-
-	if (!atomic_load(&global_init_done))
-		return;
-
-	pthread_spin_lock(&chunk_list_lock);
-	n = atomic_load(&nr_chunks);
-	for (i = 0; i < n; i++) {
-		if (all_chunks[i]) {
-			munmap(all_chunks[i], CLONE_CHUNK_SIZE);
-			all_chunks[i] = NULL;
-		}
-	}
-	atomic_store(&nr_chunks, 0);
-	pthread_spin_unlock(&chunk_list_lock);
-
-	for (i = 0; i < CLONE_MAX_THREADS; i++) {
-		pools[i].initialized = false;
-		pools[i].current_chunk = NULL;
-		pools[i].next_page = 0;
-	}
-
-	pr_debug("All page pools destroyed\n");
 }
 
 /* Print chunk stats */

@@ -27,6 +27,7 @@
 #include "criu-log.h"
 #include "page.h"
 #include "xmalloc.h"
+#include "common/bug.h"
 #include "clone/clone-conf.h"
 #include "clone/page-state-tracker.h"
 
@@ -37,6 +38,13 @@
 
 /* Emit a progress line every time this many bytes of page data are processed. */
 #define COMPARE_PROGRESS_STEP (1ULL << 30)  /* 1 GB */
+
+/*
+ * Skip CRIU restorer artifacts when comparing VMAs - VMAs below this threshold
+ * are typically CRIU's restorer code, /dev/zero mappings, or vdso. Real
+ * application VMAs are at much higher addresses.
+ */
+#define CRIU_ARTIFACT_THRESHOLD 0x10000000UL  /* 256MB */
 
 /* Message types */
 #define MSG_VMA_LIST      1
@@ -88,6 +96,7 @@ static int read_process_vmas(pid_t pid, struct vma_info **out_vmas, int *out_cou
 	}
 
 	vmas = xmalloc(capacity * sizeof(*vmas));
+	BUG_ON(!vmas);
 
 	while (fgets(line, sizeof(line), f)) {
 		struct vma_info *v;
@@ -108,6 +117,7 @@ static int read_process_vmas(pid_t pid, struct vma_info **out_vmas, int *out_cou
 		if (count >= capacity) {
 			capacity *= 2;
 			vmas = xrealloc(vmas, capacity * sizeof(*vmas));
+			BUG_ON(!vmas);
 		}
 
 		v = &vmas[count++];
@@ -390,6 +400,7 @@ int clone_compare_receive_and_verify(int sk, pid_t pid)
 	read_vma_smaps(pid, local_vmas, local_nr_vmas);
 
 	remote_vmas = xmalloc(remote_capacity * sizeof(*remote_vmas));
+	BUG_ON(!remote_vmas);
 
 	/* Step 1: Receive and compare VMA list */
 	while (recv(sk, &hdr, sizeof(hdr), MSG_WAITALL) == sizeof(hdr)) {
@@ -406,6 +417,7 @@ int clone_compare_receive_and_verify(int sk, pid_t pid)
 				remote_capacity *= 2;
 				remote_vmas = xrealloc(remote_vmas,
 						       remote_capacity * sizeof(*remote_vmas));
+				BUG_ON(!remote_vmas);
 			}
 			remote_vmas[remote_nr_vmas++] = v;
 		}
@@ -413,13 +425,6 @@ int clone_compare_receive_and_verify(int sk, pid_t pid)
 
 	pr_warn("COMPARE: Received %d remote VMAs, local has %d\n",
 		remote_nr_vmas, local_nr_vmas);
-
-	/*
-	 * Skip CRIU restorer artifacts - VMAs below this threshold are typically
-	 * CRIU's restorer code, /dev/zero mappings, or vdso. Real application
-	 * VMAs are at much higher addresses.
-	 */
-#define CRIU_ARTIFACT_THRESHOLD 0x10000000UL  /* 256MB */
 
 	/* Compare VMA lists (exact boundary match) */
 	for (i = 0; i < remote_nr_vmas; i++) {

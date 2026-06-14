@@ -35,15 +35,6 @@
 unsigned long g_compress_uncompressed_bytes = 0;
 unsigned long g_compress_compressed_bytes = 0;
 
-/* CLONE state flags for phased migration */
-static bool all_pages_sent_ack_received = false;
-
-
-void set_all_pages_sent_ack_received(void)
-{
-	all_pages_sent_ack_received = true;
-}
-
 /*
  * Wait for all_pages_sent ACK from the target.
  * Called on the source side after sending PS_IOV_ALL_PAGES_SENT.
@@ -57,7 +48,6 @@ int wait_for_all_pages_sent_ack(int sk)
 	BUG_ON(decode_ps_cmd(pi.cmd) != PS_IOV_ALL_PAGES_SENT_ACK);
 
 	pr_info("Received all_pages_sent ACK from target\n");
-	set_all_pages_sent_ack_received();
 	return 0;
 }
 
@@ -241,7 +231,7 @@ void clone_close_page_server_socket(void)
 int clone_write_lazy_vmas_to_pagemap(struct page_xfer *xfer, unsigned long before_vaddr,
 				     struct lazy_vma_entry **cur_lve)
 {
-	struct list_head *global_list = get_global_lazy_vmas();
+	struct list_head *global_list = clone_mem_get_lazy_vmas();
 	struct lazy_vma_entry *lve = *cur_lve;
 
 	/* Start from beginning if not set */

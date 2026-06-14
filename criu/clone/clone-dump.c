@@ -954,9 +954,9 @@ static int clone_extend_tracked_vmas(unsigned long *ranges, unsigned int nr_rang
 		new_tracked[cdi->nr_tracked_vmas + i].end = start + len;
 		pr_debug("Added new tracked VMA: 0x%lx-0x%lx\n", start, start + len);
 
-		/* Also add to global_lazy_vmas for page transfer */
-		if (add_lazy_vma_for_new_region(start, len,
-						cdi->dst_id, cdi->source_pid)) {
+		/* Also add to lazy VMA list for page transfer */
+		if (clone_mem_add_lazy_vma_range(start, len,
+						 cdi->dst_id, cdi->source_pid)) {
 			pr_err("Failed to add lazy VMA for 0x%lx-0x%lx\n",
 			       start, start + len);
 			BUG();
@@ -1577,8 +1577,6 @@ int cr_dump_tasks_clone_phased(pid_t pid)
 	 */
 
 	clone_set_phase(CLONE_PHASE_DONE);
-
-	/* NOTE: clone_cleanup_async_uffd() moved to cr_dump_finish() after unfreeze */
 
 	/* Set up inventory fields and write - like standard path */
 	he.has_pre_dump_mode = false;

@@ -2173,7 +2173,7 @@ out_release_clone:
 	wait_for_page_server_thread();
 	if (opts.clone_dump)
 		clone_dump_fini();
-	free_global_lazy_vmas();
+	clone_mem_free_lazy_vmas();
 
 	free_pstree(root_item);
 	seccomp_free_entries();

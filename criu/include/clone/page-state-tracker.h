@@ -11,7 +11,7 @@
  */
 enum page_state {
 	PAGE_STATE_UNKNOWN = 0,       /* Not yet tracked */
-	PAGE_STATE_IN_BUFFER,         /* In CLONE buffer (after clone_page_buffer_add) */
+	PAGE_STATE_IN_BUFFER,         /* In CLONE buffer (after clone_page_buffer_add_batch) */
 	PAGE_STATE_PF_PENDING,        /* PF handler found in buffer, about to copy */
 	PAGE_STATE_DRAIN_PENDING,     /* Drain thread removed from buffer, about to copy */
 	PAGE_STATE_URGENT_PENDING,    /* Urgent request received, about to copy */

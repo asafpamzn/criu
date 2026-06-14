@@ -21,7 +21,7 @@ static void test_get_returns_aligned(void)
 {
 	page_pool_thread_init(1);
 
-	void *page = page_pool_get(1);
+	void *page = page_pool_get_pages(1, 1);
 	TEST_ASSERT(page != NULL, "get returns non-NULL");
 	TEST_ASSERT_EQ((unsigned long)page & (PAGE_SIZE - 1), 0, "page is PAGE_SIZE aligned");
 
@@ -51,20 +51,6 @@ static void test_get_pages_contiguous(void)
 		page_pool_put((char *)pages + i * PAGE_SIZE);
 }
 
-static void test_get_chunk(void)
-{
-	page_pool_thread_init(3);
-
-	int nr_pages = 0;
-	void *chunk = page_pool_get_chunk(3, &nr_pages);
-	TEST_ASSERT(chunk != NULL, "get_chunk returns non-NULL");
-	TEST_ASSERT_EQ(nr_pages, CLONE_ALLOC_BATCH, "get_chunk returns CLONE_ALLOC_BATCH pages");
-
-	/* Free them all */
-	for (int i = 0; i < nr_pages; i++)
-		page_pool_put((char *)chunk + i * PAGE_SIZE);
-}
-
 static void test_put_refcount(void)
 {
 	page_pool_thread_init(4);
@@ -72,7 +58,7 @@ static void test_put_refcount(void)
 	/* Allocate several pages from same chunk, free them all */
 	void *pages[64];
 	for (int i = 0; i < 64; i++)
-		pages[i] = page_pool_get(4);
+		pages[i] = page_pool_get_pages(4, 1);
 
 	/* All from same chunk - verify chunk_id matches */
 	int first_id = page_pool_get_chunk_id(pages[0]);
@@ -98,7 +84,7 @@ static void *pool_allocator(void *arg)
 
 	void *pages[MT_POOL_ALLOCS];
 	for (int i = 0; i < MT_POOL_ALLOCS; i++)
-		pages[i] = page_pool_get(tid + 10);
+		pages[i] = page_pool_get_pages(tid + 10, 1);
 
 	/* Write unique pattern to detect overlaps */
 	for (int i = 0; i < MT_POOL_ALLOCS; i++)
@@ -200,13 +186,12 @@ static void test_producer_consumer_use_after_free(void)
 
 	for (int round = 0; round < UAF_ROUNDS; round++) {
 		/* Producer allocates a batch */
-		int nr_pages = 0;
-		void *batch = page_pool_get_chunk(UAF_PRODUCER_TID, &nr_pages);
-		TEST_ASSERT(batch != NULL, "producer get_chunk non-NULL");
+		void *batch = page_pool_get_pages(UAF_PRODUCER_TID, UAF_PAGES_PER_ROUND);
+		TEST_ASSERT(batch != NULL, "producer get_pages non-NULL");
 
-		for (int i = 0; i < nr_pages; i++)
+		for (int i = 0; i < UAF_PAGES_PER_ROUND; i++)
 			uaf_batches[round].pages[i] = (char *)batch + i * PAGE_SIZE;
-		uaf_batches[round].count = nr_pages;
+		uaf_batches[round].count = UAF_PAGES_PER_ROUND;
 
 		/* Signal consumer to free these pages */
 		__atomic_store_n(&uaf_batches[round].ready, 1, __ATOMIC_RELEASE);
@@ -243,7 +228,7 @@ static void test_chunk_exhaustion_and_swap(void)
 	TEST_ASSERT(pages != NULL, "malloc for page array");
 
 	for (int i = 0; i < alloc_count; i++) {
-		pages[i] = page_pool_get(tid);
+		pages[i] = page_pool_get_pages(tid, 1);
 		TEST_ASSERT(pages[i] != NULL, "get succeeds after exhaustion");
 	}
 
@@ -341,9 +326,9 @@ static void test_rapid_chunk_cycling(void)
 
 	for (int cycle = 0; cycle < 5; cycle++) {
 		/* Allocate a full batch and immediately free it */
-		int nr_pages = 0;
-		void *batch = page_pool_get_chunk(tid, &nr_pages);
-		TEST_ASSERT(batch != NULL, "cycling: get_chunk");
+		int nr_pages = CLONE_ALLOC_BATCH;
+		void *batch = page_pool_get_pages(tid, nr_pages);
+		TEST_ASSERT(batch != NULL, "cycling: get_pages");
 
 		/* Verify we can write (memory is mapped) */
 		memset(batch, cycle & 0xFF, nr_pages * PAGE_SIZE);
@@ -360,7 +345,6 @@ int main(void)
 	RUN_TEST(test_thread_init);
 	RUN_TEST(test_get_returns_aligned);
 	RUN_TEST(test_get_pages_contiguous);
-	RUN_TEST(test_get_chunk);
 	RUN_TEST(test_put_refcount);
 	RUN_TEST(test_multi_threaded_no_overlap);
 	RUN_TEST(test_nr_chunks);
@@ -369,6 +353,5 @@ int main(void)
 	RUN_TEST(test_producer_consumer_pipeline);
 	RUN_TEST(test_rapid_chunk_cycling);
 
-	page_pool_destroy_all();
 	TEST_SUMMARY();
 }

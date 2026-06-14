@@ -1120,121 +1120,6 @@ int clone_handle_exit(struct list_head *lpis)
 }
 
 /*
- * UFFD Statistics and Histogram (CLONE mode)
- */
-
-/* Histogram statistics structure */
-static struct {
-	/* Histogram buckets by page count: 1, 16, 32, 64, 128, 256, 512, 1024, >1024 */
-	unsigned long pf_hist[9]; /* Page fault histogram */
-	unsigned long bg_hist[9]; /* Background transfer histogram */
-
-	unsigned long total_pf_reqs;
-	unsigned long total_bg_reqs;
-	unsigned long total_pages;
-
-	/* Timing statistics (nanoseconds) */
-	unsigned long uffd_copy_total_ns;
-	unsigned long uffd_copy_count;
-	unsigned long drop_iovs_total_ns;
-	unsigned long drop_iovs_count;
-
-	/* EAGAIN retry statistics */
-	unsigned long eagain_processed;
-	unsigned long eagain_succeeded;
-	unsigned long eagain_blocked;
-	unsigned long eagain_errors;
-	unsigned long eagain_skipped;
-	unsigned long eagain_total_ns;
-	unsigned long eagain_calls;
-
-	time_t last_print_time;
-} uffd_stats = {0};
-
-static const char *get_bucket_label(int bucket)
-{
-	switch (bucket) {
-	case 0:
-		return "4K";
-	case 1:
-		return "64K";
-	case 2:
-		return "128K";
-	case 3:
-		return "256K";
-	case 4:
-		return "512K";
-	case 5:
-		return "1M";
-	case 6:
-		return "2M";
-	case 7:
-		return "4M";
-	case 8:
-		return ">4M";
-	default:
-		return "?";
-	}
-}
-
-void check_and_print_uffd_stats(void)
-{
-	time_t now = time(NULL);
-	int i;
-
-	if (now - uffd_stats.last_print_time >= 30) {
-		{
-			struct timespec ts;
-			struct tm *tm;
-			clock_gettime(CLOCK_REALTIME, &ts);
-			tm = localtime(&ts.tv_sec);
-			pr_debug("[UFFD_STATS] [%02d:%02d:%02d.%03ld] reqs=%lu(pf:%lu,bg:%lu) pages=%lu\n",
-				tm->tm_hour, tm->tm_min, tm->tm_sec, ts.tv_nsec / 1000000,
-				uffd_stats.total_pf_reqs + uffd_stats.total_bg_reqs,
-				uffd_stats.total_pf_reqs,
-				uffd_stats.total_bg_reqs,
-				uffd_stats.total_pages);
-		}
-
-		/* Print page fault histogram */
-		pr_debug("  PF: ");
-		for (i = 0; i < 9; i++) {
-			if (uffd_stats.pf_hist[i] > 0)
-				pr_debug(" %s=%lu", get_bucket_label(i), uffd_stats.pf_hist[i]);
-		}
-		pr_debug("\n");
-
-		/* Print background transfer histogram */
-		pr_debug("  BG: ");
-		for (i = 0; i < 9; i++) {
-			if (uffd_stats.bg_hist[i] > 0)
-				pr_debug(" %s=%lu", get_bucket_label(i), uffd_stats.bg_hist[i]);
-		}
-		pr_debug("\n");
-
-
-		/* Print EAGAIN stats */
-		if (uffd_stats.eagain_processed > 0 || uffd_stats.eagain_skipped > 0 || uffd_stats.eagain_calls > 0) {
-			pr_info("  EAGAIN: processed=%lu succeeded=%lu blocked=%lu errors=%lu skipped=%lu | time=%lu ns (%lu calls)\n",
-				uffd_stats.eagain_processed,
-				uffd_stats.eagain_succeeded,
-				uffd_stats.eagain_blocked,
-				uffd_stats.eagain_errors,
-				uffd_stats.eagain_skipped,
-				uffd_stats.eagain_calls > 0 ? uffd_stats.eagain_total_ns / uffd_stats.eagain_calls : 0,
-				uffd_stats.eagain_calls);
-		}
-
-		/* Print page fault tracker stats and clean up completed entries */
-		pf_tracker_print_stats();
-
-		/* Reset all counters */
-		memset(&uffd_stats, 0, sizeof(uffd_stats));
-		uffd_stats.last_print_time = now;
-	}
-}
-
-/*
  * EAGAIN Request Handling (CLONE mode)
  */
 
@@ -1414,15 +1299,11 @@ int clone_process_eagain_requests(void)
 {
 	struct uffd_eagain_request *req, *n;
 	int ret;
-	struct timespec t_start, t_end;
-
-	clock_gettime(CLOCK_MONOTONIC, &t_start);
 
 	pthread_mutex_lock(&eagain_mutex);
 	list_for_each_entry_safe(req, n, &eagain_requests, l) {
 		/* Skip if process has exited */
 		if (req->lpi->exited) {
-			uffd_stats.eagain_skipped++;
 			pr_warn("EAGAIN retry skipped, lpi unmapped for 0x%llx (op=%s)\n",
 				 req->address, req->buf ? "copy" : "zero");
 			page_state_set(req->address, PAGE_STATE_DISCARDED);
@@ -1432,8 +1313,6 @@ int clone_process_eagain_requests(void)
 			xfree(req);
 			continue;
 		}
-
-		uffd_stats.eagain_processed++;
 
 		pr_debug("retrying 0x%llx nr_pages=%lu op=%s buf=%p\n",
 		       req->address, req->nr_pages, req->buf ? "copy" : "zero", req->buf);
@@ -1446,12 +1325,9 @@ int clone_process_eagain_requests(void)
 
 		if (ret == -EAGAIN) {
 			/* Still blocked - keep in queue for next attempt */
-			uffd_stats.eagain_blocked++;
 			pr_debug("still blocked 0x%llx\n", req->address);
 			continue;
 		} else if (ret < 0) {
-			/* Error - remove from queue (state already set by retry func) */
-			uffd_stats.eagain_errors++;
 			pr_err("EAGAIN retry error for 0x%llx, removing from queue\n",
 			       req->address);
 			BUG();
@@ -1462,12 +1338,9 @@ int clone_process_eagain_requests(void)
 			continue;
 		}
 
-		/* Success! */
-		uffd_stats.eagain_succeeded++;
 		pr_debug("succeeded 0x%llx nr_pages=%lu\n",
 		       req->address, req->nr_pages);
 
-		/* Clean up and remove from queue */
 		list_del(&req->l);
 		if (req->buf)
 			xfree(req->buf);
@@ -1475,10 +1348,6 @@ int clone_process_eagain_requests(void)
 	}
 
 	pthread_mutex_unlock(&eagain_mutex);
-
-	clock_gettime(CLOCK_MONOTONIC, &t_end);
-	uffd_stats.eagain_total_ns += (t_end.tv_sec - t_start.tv_sec) * 1000000000 + (t_end.tv_nsec - t_start.tv_nsec);
-	uffd_stats.eagain_calls++;
 
 	return 0;
 }

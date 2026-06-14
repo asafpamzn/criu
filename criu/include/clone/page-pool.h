@@ -15,20 +15,11 @@
 /* Initialize pool for thread (call once per receiver thread) */
 int page_pool_thread_init(int thread_id);
 
-/* Get a page from this thread's pool (lock-free) */
-void *page_pool_get(int thread_id);
-
-/* Get contiguous chunk for direct decompression (returns first page after header) */
-void *page_pool_get_chunk(int thread_id, int *out_nr_pages);
-
-/* Get exactly nr_pages contiguous pages (more efficient when exact count is known) */
+/* Get nr_pages contiguous pages from this thread's pool (lock-free) */
 void *page_pool_get_pages(int thread_id, int nr_pages);
 
 /* Return a page - any thread can call (atomic refcount) */
 void page_pool_put(void *page);
-
-/* Cleanup all pools */
-void page_pool_destroy_all(void);
 
 /* Debug: print chunk stats */
 void page_pool_dump_stats(void);
