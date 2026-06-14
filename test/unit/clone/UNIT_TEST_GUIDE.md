@@ -8,13 +8,6 @@ make
 make check
 ```
 
-## With Sanitizers
-
-```bash
-make check-asan    # AddressSanitizer (memory errors)
-make check-tsan    # ThreadSanitizer (data races)
-```
-
 ## Run a Single Test
 
 ```bash

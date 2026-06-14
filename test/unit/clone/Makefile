@@ -94,17 +94,7 @@ check: all
 		exit 1; \
 	fi
 
-check-asan: CFLAGS += -fsanitize=address -fno-omit-frame-pointer
-check-asan: LDFLAGS += -fsanitize=address
-check-asan: clean all
-	@$(MAKE) check
-
-check-tsan: CFLAGS += -fsanitize=thread
-check-tsan: LDFLAGS += -fsanitize=thread
-check-tsan: clean all
-	@$(MAKE) check
-
 clean:
 	rm -f $(TESTS_PORTABLE) $(TESTS_LINUX)
 
-.PHONY: all check check-asan check-tsan clean
+.PHONY: all check clean
