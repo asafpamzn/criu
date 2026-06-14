@@ -571,7 +571,7 @@ void page_state_print_stats(void)
 {
 	int i, j;
 	unsigned long state_counts[CLONE_PAGE_STATE_MAX] = {0};
-	unsigned long total_pages, illegal_transitions;
+	unsigned long total_pages, illegal_trans;
 	unsigned long transitions[CLONE_PAGE_STATE_MAX][CLONE_PAGE_STATE_MAX];
 	struct page_state_entry *entry;
 
@@ -583,9 +583,13 @@ void page_state_print_stats(void)
 	/* Snapshot stats first (quick lock) */
 	pthread_spin_lock(&g_page_state.stats_lock);
 	total_pages = g_page_state.total_pages;
-	illegal_transitions = g_page_state.illegal_transitions;
+	illegal_trans = g_page_state.illegal_transitions;
 	memcpy(transitions, g_page_state.transitions, sizeof(transitions));
 	pthread_spin_unlock(&g_page_state.stats_lock);
+
+	/* Suppress unused-variable warnings when pr_info is a no-op */
+	(void)total_pages;
+	(void)illegal_trans;
 
 	/* Count pages in each state - lock one bucket at a time */
 	for (i = 0; i < CLONE_PAGE_STATE_HASH_SIZE; i++) {
@@ -599,7 +603,7 @@ void page_state_print_stats(void)
 
 	pr_info("PAGE STATE TRACKER STATS\n");
 	pr_info("Total pages tracked: %lu\n", total_pages);
-	pr_info("Illegal transitions: %lu\n", illegal_transitions);
+	pr_info("Illegal transitions: %lu\n", illegal_trans);
 
 	pr_info("Current state counts:\n");
 	for (i = 0; i < CLONE_PAGE_STATE_MAX; i++) {

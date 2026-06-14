@@ -222,14 +222,14 @@ void *page_pool_get_pages(int thread_id, int nr_pages)
 	void *pages_start;
 
 	BUG_ON(thread_id < 0 || thread_id >= CLONE_MAX_THREADS);
-	BUG_ON(nr_pages <= 0 || nr_pages > CLONE_PAGES_PER_CHUNK - 1);
+	BUG_ON(nr_pages <= 0 || (unsigned int)nr_pages > CLONE_PAGES_PER_CHUNK - 1);
 
 	pool = &pools[thread_id];
 
 	BUG_ON(!pool->initialized);
 
 	/* Need new chunk if not enough pages left */
-	if (pool->next_page + nr_pages > CLONE_PAGES_PER_CHUNK)
+	if (pool->next_page + (unsigned int)nr_pages > CLONE_PAGES_PER_CHUNK)
 		page_pool_swap_current_chunk(pool);
 
 	/* Allocate exactly nr_pages contiguous pages */
@@ -293,8 +293,9 @@ void page_pool_put(void *page)
 
 	/* Last reference? munmap the entire chunk */
 	if (old_ref == 1) {
-		int freed_count = atomic_fetch_add(&total_chunks_freed, 1) + 1;
 		int chunk_idx = hdr->chunk_idx;
+
+		atomic_fetch_add(&total_chunks_freed, 1);
 
 		pr_debug("PAGE_POOL_FREE: chunk=%p[%d] total_freed=%d\n",
 		       hdr, chunk_idx, freed_count);
