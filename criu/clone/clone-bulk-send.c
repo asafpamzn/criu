@@ -1103,19 +1103,6 @@ static int send_dirty_slices(struct p3_thread_ctx *ctx,
 }
 
 /*
- * NOTE: Work-stealing from queue consumption was removed because the sender
- * queues use SPSC (Single Producer Single Consumer) design. Stealing would
- * introduce multiple consumers and cause race conditions.
- *
- * The bulk transfer phase uses work-stealing via the shared work queue
- * (g_work_queue), which is safe because it uses atomic fetch-and-add.
- *
- * For better queue balancing, consider:
- * 1. Having scanners distribute more evenly (round-robin by page count, not region count)
- * 2. Using MPMC queues if work-stealing is needed
- */
-
-/*
  * Send all pages from new VMAs detected in Phase 3.
  * New VMAs need ALL their pages sent (not just dirty), split among threads.
  */

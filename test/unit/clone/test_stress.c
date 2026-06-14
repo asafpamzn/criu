@@ -17,6 +17,15 @@
  * race conditions, memory ordering bugs, and performance issues.
  */
 
+/* Forward declarations for free functions */
+struct mpsc_payload;
+struct spmc_payload;
+struct spsc_payload;
+
+static void noop_free_mpsc(struct mpsc_payload *p) { (void)p; }
+static void noop_free_spmc(struct spmc_payload *p) { (void)p; }
+static void noop_free_spsc(struct spsc_payload *p) { (void)p; }
+
 /* ================================================================
  * MPSC Stress: Many producers, consumer reads while producers enqueue.
  * Tests the window between atomic_exchange on tail and store to prev->next.
@@ -103,6 +112,8 @@ static void test_mpsc_stress_concurrent(void)
 	long consumed = atomic_load(&mpsc_consumed);
 	TEST_ASSERT_EQ(consumed, MPSC_TOTAL,
 		       "MPSC stress: all items consumed");
+
+	mpsc_drain(mpsc_head, noop_free_mpsc);
 }
 
 /* ================================================================
@@ -194,6 +205,8 @@ static void test_spmc_stress_no_duplicates(void)
 	TEST_ASSERT_EQ(dups, 0, "SPMC stress: no duplicate consumption");
 	TEST_ASSERT_EQ(missing, 0, "SPMC stress: no items lost");
 	TEST_ASSERT_EQ(total, SPMC_ITEMS, "SPMC stress: total matches");
+
+	spmc_drain(spmc_head, noop_free_spmc);
 }
 
 /* ================================================================
@@ -269,6 +282,8 @@ static void test_spsc_stress_1m(void)
 	TEST_ASSERT_EQ(actual_sum, expected_sum, "SPSC 1M: checksum matches");
 	TEST_ASSERT(ordered, "SPSC 1M: strict sequential ordering");
 	TEST_ASSERT_EQ(spsc_size(spsc_size), 0, "SPSC 1M: queue empty");
+
+	spsc_drain(spsc_head, noop_free_spsc);
 }
 
 /* ================================================================
@@ -358,8 +373,6 @@ static void *drain_producer(void *arg)
 	}
 	return NULL;
 }
-
-static void noop_free_mpsc(struct mpsc_payload *p) { (void)p; }
 
 static void test_mpsc_drain_after_flood(void)
 {

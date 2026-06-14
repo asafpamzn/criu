@@ -23,21 +23,6 @@ struct dirty_region_entry {
 DECLARE_SPSC_NODE(dirty_region, struct dirty_region_entry);
 
 /*
- * Per-queue structure for dirty region distribution.
- * SPSC queues - single producer (scanner), single consumer at a time.
- * Threads get next queue via atomic counter - simple round-robin.
- * Cache-line padded to avoid false sharing.
- */
-struct sender_queue {
-	struct dirty_region_spsc_node *head;
-	char _pad1[CLONE_CACHE_LINE_SIZE - sizeof(struct dirty_region_spsc_node *)];
-	struct dirty_region_spsc_node *tail;
-	char _pad2[CLONE_CACHE_LINE_SIZE - sizeof(struct dirty_region_spsc_node *)];
-	unsigned long size;
-	char _pad3[CLONE_CACHE_LINE_SIZE - sizeof(unsigned long)];
-};
-
-/*
  * Send a batch of pages with LZ4 compression.
  * Used by bulk sender and dirty page dump.
  *
@@ -80,11 +65,6 @@ void clone_wait_scanner_thread(void);
  * Check if scanner has completed (for senders to know when to exit).
  */
 bool clone_is_scan_complete(void);
-
-/*
- * Get sender queue for a thread.
- */
-struct sender_queue *clone_get_sender_queue(int thread_id);
 
 /*
  * Start multiple P3 bulk sender threads (up to 20 threads for parallel transfer).

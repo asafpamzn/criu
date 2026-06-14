@@ -105,15 +105,6 @@ extern int clone_get_uffd_for_vaddr(struct list_head *lpis, unsigned long vaddr)
 extern int clone_setup_prebuffer_reader(void);
 
 
-/* Handle lazy accept in CLONE mode */
-extern int clone_handle_lazy_accept(struct list_head *lpis, int epollfd,
-				  int client, bool phase3_active);
-
-
-/* Set phase3_active flag */
-extern void clone_set_phase3_active(bool active);
-
-
 /*
  * CLONE_TRACK_* flags for clone_uffd_copy()
  */

@@ -1403,13 +1403,6 @@ int clone_get_uffd_for_vaddr(struct list_head *lpis, unsigned long vaddr)
  * in the hash table until the uffd is available.
  */
 
-static bool phase3_active_flag = false;
-
-void clone_set_phase3_active(bool active)
-{
-	phase3_active_flag = active;
-}
-
 /*
  * Initialize the control message reader on the main page server socket.
  * All page data flows through P3 receiver threads; the main socket only
@@ -1606,7 +1599,6 @@ int clone_phase3_restore_loop(int ep_fd, struct epoll_event **events, int nr_fds
 	int ret;
 
 	uffd_set_epollfd(ep_fd);
-	clone_set_phase3_active(true);
 
 	lazy_sk = uffd_prepare_listen_socket();
 	if (lazy_sk < 0) {

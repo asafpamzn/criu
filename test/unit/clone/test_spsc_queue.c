@@ -23,6 +23,8 @@ static void test_init_and_empty(void)
 
 	struct payload *p = spsc_dequeue(q_head, q_size);
 	TEST_ASSERT(p == NULL, "dequeue from empty = NULL");
+
+	spsc_drain(q_head, noop_free);
 }
 
 static void test_enqueue_dequeue_fifo(void)
@@ -46,6 +48,8 @@ static void test_enqueue_dequeue_fifo(void)
 	}
 	TEST_ASSERT_EQ(spsc_size(q_size), 0, "size = 0 after drain");
 	TEST_ASSERT(!spsc_peek(q_head), "empty after drain");
+
+	spsc_drain(q_head, noop_free);
 }
 
 #define STRESS_COUNT 100000
@@ -97,6 +101,8 @@ static void test_threaded_stress(void)
 	}
 	TEST_ASSERT(ordered, "threaded: FIFO ordering preserved across 100K items");
 	TEST_ASSERT_EQ(spsc_size(q_size), 0, "threaded: queue empty at end");
+
+	spsc_drain(q_head, noop_free);
 }
 
 static void noop_free(struct payload *p)

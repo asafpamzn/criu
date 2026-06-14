@@ -16,6 +16,11 @@ static struct test_mpsc_node *q_head;
 static struct test_mpsc_node *q_tail;
 static unsigned long q_size;
 
+static void noop_free(struct payload *p)
+{
+	(void)p;
+}
+
 static void test_init_and_empty(void)
 {
 	int rc = mpsc_init(q_head, q_tail, q_size, struct test_mpsc_node);
@@ -25,6 +30,8 @@ static void test_init_and_empty(void)
 
 	struct payload *p = mpsc_dequeue(q_head, q_size);
 	TEST_ASSERT(p == NULL, "dequeue from empty = NULL");
+
+	mpsc_drain(q_head, noop_free);
 }
 
 static void test_single_producer_fifo(void)
@@ -47,6 +54,8 @@ static void test_single_producer_fifo(void)
 			TEST_ASSERT_EQ(p->value, i, "FIFO order");
 	}
 	TEST_ASSERT_EQ(mpsc_size(q_size), 0, "empty after drain");
+
+	mpsc_drain(q_head, noop_free);
 }
 
 #define NUM_PRODUCERS    8
@@ -97,6 +106,8 @@ static void test_multi_producer(void)
 	TEST_ASSERT_EQ(total, TOTAL_ITEMS, "all items received");
 	TEST_ASSERT(ordering_ok, "per-producer FIFO ordering preserved");
 	TEST_ASSERT_EQ(mpsc_size(q_size), 0, "queue empty at end");
+
+	mpsc_drain(q_head, noop_free);
 }
 
 static void test_size_accuracy(void)
@@ -117,11 +128,8 @@ static void test_size_accuracy(void)
 	for (int i = 0; i < 50; i++)
 		mpsc_dequeue(q_head, q_size);
 	TEST_ASSERT_EQ(mpsc_size(q_size), 0, "size after full drain");
-}
 
-static void noop_free(struct payload *p)
-{
-	(void)p;
+	mpsc_drain(q_head, noop_free);
 }
 
 static void test_drain(void)

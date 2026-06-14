@@ -15,6 +15,11 @@ static struct test_spmc_node *q_head;
 static struct test_spmc_node *q_tail;
 static unsigned long q_size;
 
+static void noop_free(struct payload *p)
+{
+	(void)p;
+}
+
 static void test_init_and_empty(void)
 {
 	int rc = spmc_init(q_head, q_tail, q_size, struct test_spmc_node);
@@ -24,6 +29,8 @@ static void test_init_and_empty(void)
 
 	struct payload *p = spmc_dequeue(q_head, q_size);
 	TEST_ASSERT(p == NULL, "dequeue from empty = NULL");
+
+	spmc_drain(q_head, noop_free);
 }
 
 static void test_single_consumer_fifo(void)
@@ -46,6 +53,8 @@ static void test_single_consumer_fifo(void)
 			TEST_ASSERT_EQ(p->value, i * 5, "FIFO order preserved");
 	}
 	TEST_ASSERT_EQ(spmc_size(q_size), 0, "size = 0 after drain");
+
+	spmc_drain(q_head, noop_free);
 }
 
 #define MC_NUM_ITEMS     50000
@@ -100,6 +109,8 @@ static void test_multi_consumer(void)
 	TEST_ASSERT_EQ(missing, 0, "no items lost with multi-consumer");
 	TEST_ASSERT_EQ(__atomic_load_n(&mc_total_received, __ATOMIC_RELAXED),
 		       MC_NUM_ITEMS, "total received matches total sent");
+
+	spmc_drain(q_head, noop_free);
 }
 
 #define MC_CONCURRENT_ITEMS 100000
@@ -156,11 +167,8 @@ static void test_concurrent_producer_consumers(void)
 			missing++;
 	}
 	TEST_ASSERT_EQ(missing, 0, "no items lost with concurrent prod+cons");
-}
 
-static void noop_free(struct payload *p)
-{
-	(void)p;
+	spmc_drain(q_head, noop_free);
 }
 
 static void test_drain(void)
