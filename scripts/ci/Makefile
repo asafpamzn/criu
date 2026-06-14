@@ -57,6 +57,7 @@ $(TARGETS):
 		$(if $(ZDTM_OPTS),-e ZDTM_OPTS) \
 		$(if $(ZDTM_SHARD_INDEX),-e ZDTM_SHARD_INDEX) \
 		$(if $(ZDTM_SHARD_COUNT),-e ZDTM_SHARD_COUNT) \
+		$(if $(CLANG),-e CC=clang -e HOSTCC=clang) \
 		$(CONTAINER_OPTS) \
 		criu-$@ scripts/ci/run-ci-tests.sh
 
@@ -72,20 +73,6 @@ podman-test:
 
 java-test:
 	./java-test.sh
-
-setup-vagrant:
-	./vagrant.sh setup
-
-vagrant-fedora-no-vdso: setup-vagrant
-	./vagrant.sh fedora-no-vdso
-
-vagrant-fedora-rawhide: setup-vagrant
-	./vagrant.sh fedora-rawhide
-
-vagrant-fedora-non-root: setup-vagrant
-	./vagrant.sh fedora-non-root
-
-.PHONY: setup-vagrant vagrant-fedora-no-vdso vagrant-fedora-rawhide vagrant-fedora-non-root
 
 check-commit:
 	(cd ../.. && git clean -dfx)

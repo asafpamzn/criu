@@ -2509,7 +2509,7 @@ def grep_errors(fname, err=False):
         print_sep("grep Error (no)", "-", 60)
         first = False
         for i in before:
-            print_next = print_error(i)
+            print_error(i)
 
     if not first:
         print_sep("ERROR OVER", "-", 60)
@@ -3074,8 +3074,9 @@ if __name__ == '__main__':
 
     if opts['action'] == run_tests:
         criu.available()
-    for tst in test_classes.values():
-        tst.available()
+    if opts['action'] != clean_stuff:
+        for tst in test_classes.values():
+            tst.available()
 
     orig_hugepages = set_nr_hugepages(20)
     opts['action'](opts)

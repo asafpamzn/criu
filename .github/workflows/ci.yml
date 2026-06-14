@@ -11,6 +11,7 @@ jobs:
   alpine-test:
     name: Alpine Test (${{ matrix.target }}, ${{ matrix.shard_name }})
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-22.04]
         target: [GCC=1, CLANG=1]
@@ -39,6 +40,7 @@ jobs:
     name: Alpine Test ARM64
     needs: [alpine-test]
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-22.04-arm]
         target: [GCC=1, CLANG=1]
@@ -51,6 +53,7 @@ jobs:
   aarch64-test:
     needs: [alpine-test]
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-24.04-arm, ubuntu-22.04-arm]
         target: [GCC=1, CLANG=1]
@@ -67,20 +70,66 @@ jobs:
           ZDTM_OPTS="-x zdtm/static/change_mnt_context -x zdtm/static/maps05"
 
   archlinux-test:
+    name: Arch Linux Test (${{ matrix.shard_name }})
     needs: [alpine-test]
     # archlinux:latest + pacman -Syu is a rolling-release build; failures
     # caused by upstream package churn are outside CRIU's control.
     continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4]
+        include:
+          - shard: 0
+            shard_name: zdtm 1/4
+          - shard: 1
+            shard_name: zdtm 2/4
+          - shard: 2
+            shard_name: zdtm 3/4
+          - shard: 3
+            shard_name: zdtm 4/4
+          - shard: 4
+            shard_name: non-zdtm
     runs-on: ubuntu-22.04
     steps:
     - uses: actions/checkout@v4
-    - name: Run Arch Linux Test
-      run: sudo -E make -C scripts/ci archlinux
+    - name: Run Arch Linux ${{ matrix.shard_name }} Test
+      run: >
+        sudo -E make -C scripts/ci archlinux
+        ZDTM_SHARD_INDEX=${{ matrix.shard }}
+        ZDTM_SHARD_COUNT=4
+
+  centos-stream-test:
+    name: CentOS Stream ${{ matrix.version }}
+    # aarch64 is not supported by lima-vm/lima-actions
+    # https://github.com/lima-vm/lima-actions/pull/1
+    needs: [alpine-test]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        version: [9, 10]
+    steps:
+    - uses: actions/checkout@v4
+    - uses: ./.github/actions/lima-vm-setup
+      with:
+        template: centos-stream-${{ matrix.version }}
+        cache-key-prefix: lima-centos-stream-${{ matrix.version }}
+    - name: Setup VM
+      run: lima sudo /home/criu/scripts/ci/lima.sh centos-stream-setup
+    - name: Show VM info
+      run: |
+        lima uname -a
+        lima cat /proc/cmdline
+    - name: Run tests
+      run: ssh -tt lima-default sudo -i /home/criu/scripts/ci/lima.sh centos-stream-test
 
   compat-test:
     needs: [alpine-test]
     runs-on: ubuntu-22.04
     strategy:
+      fail-fast: false
       matrix:
         target: [GCC, CLANG]
     steps:
@@ -119,6 +168,7 @@ jobs:
     needs: [alpine-test]
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-22.04]
     steps:
@@ -139,6 +189,7 @@ jobs:
     needs: [alpine-test]
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-22.04
@@ -154,8 +205,8 @@ jobs:
       # FIXME: https://github.com/containers/podman/issues/14920
       run: sudo -E XDG_RUNTIME_DIR= make -C scripts/ci fedora-rawhide CONTAINER_RUNTIME=podman BUILD_OPTIONS="--security-opt seccomp=unconfined"
 
-  vagrant-fedora-rawhide-test:
-    name: Vagrant Fedora ${{ matrix.name }} based test
+  vm-fedora-rawhide-test:
+    name: VM Fedora ${{ matrix.name }} based test
     needs: [alpine-test]
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -165,28 +216,26 @@ jobs:
         include:
           - variant: fedora-stable
             name: Stable
+            reboot: true
           - variant: fedora-next
             name: Next
+            reboot: true
+          - variant: fedora-no-vdso
+            name: No VDSO
+            reboot: true
+          - variant: fedora-non-root
+            name: Non-Root
+            reboot: false
     steps:
     - uses: actions/checkout@v4
-    - name: Install Lima
-      uses: lima-vm/lima-actions/setup@v1
-    - name: Cache Lima images
-      uses: actions/cache@v4
+    - uses: ./.github/actions/lima-vm-setup
       with:
-        path: ~/.cache/lima
-        key: lima-fedora-${{ github.sha }}
-        restore-keys: lima-fedora-
-    - name: Start Fedora VM
-      run: limactl start --plain --name=default --cpus=4 --memory=12 template://fedora
-    - name: Copy source into VM
-      run: |
-        lima sudo mkdir -p /home/criu
-        lima sudo chown "$(lima whoami)" /home/criu
-        limactl copy -r . default:/home/criu
+        template: fedora
+        cache-key-prefix: lima-fedora
     - name: Setup VM
       run: lima sudo /home/criu/scripts/ci/lima.sh ${{ matrix.variant }}-setup
     - name: Reboot VM to activate new kernel
+      if: matrix.reboot
       run: |
         limactl stop default
         limactl start default
