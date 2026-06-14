@@ -296,6 +296,7 @@ void page_pool_put(void *page)
 		int chunk_idx = hdr->chunk_idx;
 		int freed_count = atomic_fetch_add(&total_chunks_freed, 1) + 1;
 
+		(void)freed_count; /* used by pr_debug when logging enabled */
 		pr_debug("PAGE_POOL_FREE: chunk=%p[%d] total_freed=%d\n",
 		       hdr, chunk_idx, freed_count);
 
