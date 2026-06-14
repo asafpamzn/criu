@@ -732,20 +732,16 @@ sudo criu dump -t &lt;pid&gt; \
 
 <h2 id="limits">Known Limitations</h2>
 <ol>
-  <li><strong>Single process tree</strong>: tracking metadata is shared-global (<code>g_clone_info</code>, <code>global_lazy_vmas</code>).</li>
+  <li><strong>Single process tree</strong>: tracking metadata is shared-global, so only one CLONE dump can run at a time.</li>
   <li><strong>Kernel requirements</strong>: Linux 6.7+ — requires both <code>UFFD_FEATURE_WP_ASYNC</code> (kernel 6.1+) and <code>PAGEMAP_SCAN</code> (kernel 6.7+).</li>
-  <li><strong>Memory overhead</strong>: target uses up to 512GB worth of 64MB chunks (<code>CLONE_MAX_POOL_CHUNKS</code>), refcount-freed as drain progresses.</li>
-  <li><strong>UFFD cleanup</strong>: page-table walks during <code>UFFDIO_UNREGISTER</code> can take seconds on large memory; <code>clone_cleanup_async_uffd()</code> chunks the work and relies on close-on-exit for the rest. A hardcoded 15s sleep currently precedes cleanup (investigation outstanding).</li>
-  <li><strong>Network lock skipped</strong>: CLONE path does not call <code>network_lock()</code>.</li>
-  <li><strong>New-VMA metadata gap</strong>: VMAs created between Phase 1 and Phase 3 have their pages transferred but their VMA records are not re-dumped — they won't exist on the target. Logged as <code>pr_err</code> at Phase 3.</li>
+  <li><strong>UFFD cleanup</strong>: page-table walks during <code>UFFDIO_UNREGISTER</code> can take seconds on large memory; cleanup is chunked and relies on close-on-exit for the rest.</li>
 </ol>
 
 <h2 id="future">Future Improvements</h2>
 <ol>
   <li>Multi-process tree support (drop global singletons).</li>
   <li>Adaptive convergence threshold driven by measured write rate.</li>
-  <li>Better handling of rapidly-dirtying workloads (e.g. pin-to-CPU heuristics during bulk already in <code>CLONE_P3_SENDER_CPU</code>).</li>
-  <li>Integration with container runtimes (containerd, CRI-O).</li>
+  <li><strong>WP_SYNC support</strong> — switch the dirty-tracking path from <code>UFFD_FEATURE_WP_ASYNC</code> to synchronous write-protect during the convergence phase, so writes to already-shipped pages block until CRIU has re-fetched them. This bounds the worst-case dirty set during Phase&nbsp;2b and shortens convergence on write-heavy workloads at the cost of brief in-process stalls.</li>
 </ol>
 
 </main>
