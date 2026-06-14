@@ -74,7 +74,6 @@ struct batch_buffer_entry {
 
 static struct {
 	struct hlist_head *hash_table;
-	unsigned long nr_batches;	/* Number of batch entries */
 	unsigned long nr_pages;		/* Total individual pages buffered */
 	unsigned long nr_applied;
 	unsigned long nr_discarded;
@@ -360,7 +359,6 @@ int clone_page_buffer_init(void)
 	}
 	atomic_store(&chunk_index_initialized, true);
 
-	clone_buffer.nr_batches = 0;
 	clone_buffer.nr_pages = 0;
 	clone_buffer.nr_applied = 0;
 	clone_buffer.nr_discarded = 0;
@@ -509,7 +507,6 @@ int clone_page_buffer_add_batch(unsigned long base_vaddr, void *data,
 		}
 	}
 
-	__sync_fetch_and_add(&clone_buffer.nr_batches, 1);
 	__sync_fetch_and_add(&clone_buffer.nr_pages, nr_pages);
 	return 0;
 }
@@ -598,7 +595,7 @@ void clone_page_buffer_mark_pages(unsigned long base_vaddr,
  *
  * Unlinks the entry from both indices it lives in (the hash table and its
  * per-chunk drain list), returns the pool pages selected by @free_bm to the
- * pool, poisons the entry and frees it, and updates nr_batches.
+ * pool, poisons the entry and frees it.
  *
  * Contract: caller holds hash_locks[@lock_idx] and has ALREADY decided the
  * batch is empty. This function performs the hlist_del and DROPS that lock
@@ -634,7 +631,6 @@ static void clone_batch_destroy_locked(struct batch_buffer_entry *entry,
 
 	entry->magic = BATCH_ENTRY_DEAD;
 	xfree(entry);
-	__sync_fetch_and_sub(&clone_buffer.nr_batches, 1);
 }
 
 /*
@@ -952,7 +948,6 @@ static void *background_drain_worker(void *arg)
 				}
 
 				__sync_fetch_and_sub(&clone_buffer.nr_pages, nr);
-				__sync_fetch_and_sub(&clone_buffer.nr_batches, 1);
 
 				drained += drain_apply_batch(entry, drain_lpis);
 				chunk_drained += nr;
