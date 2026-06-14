@@ -14,6 +14,11 @@ static struct test_spsc_node *q_head;
 static struct test_spsc_node *q_tail;
 static unsigned long q_size;
 
+static void noop_free(struct payload *p)
+{
+	(void)p;
+}
+
 static void test_init_and_empty(void)
 {
 	int rc = spsc_init(q_head, q_tail, q_size, struct test_spsc_node);
@@ -103,11 +108,6 @@ static void test_threaded_stress(void)
 	TEST_ASSERT_EQ(spsc_size(q_size), 0, "threaded: queue empty at end");
 
 	spsc_drain(q_head, noop_free);
-}
-
-static void noop_free(struct payload *p)
-{
-	(void)p;
 }
 
 static void test_drain(void)
