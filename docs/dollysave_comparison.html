@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Valkey SAVE methods — Tenets &amp; Comparison: BGSave vs ThreadSave vs DollySave</title>
+<style>
+  :root {
+    --fg: #1f2328;
+    --muted: #57606a;
+    --bg: #ffffff;
+    --bg-alt: #f6f8fa;
+    --border: #d0d7de;
+    --accent: #0969da;
+    --good: #1a7f37;
+    --warn: #9a6700;
+    --bad:  #cf222e;
+    --header: #24292f;
+  }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+    color: var(--fg);
+    background: var(--bg);
+    max-width: 1080px;
+    margin: 32px auto;
+    padding: 0 24px 64px;
+    line-height: 1.55;
+    font-size: 15px;
+  }
+  h1 { font-size: 26px; margin: 0 0 6px; color: var(--header); }
+  h2 { font-size: 20px; margin: 36px 0 10px; color: var(--header); border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+  h3 { font-size: 16px; margin: 22px 0 8px; color: var(--header); }
+  p, li { color: var(--fg); }
+  .lede { color: var(--muted); margin: 0 0 24px; font-size: 15px; }
+  ol.tenets { padding-left: 20px; }
+  ol.tenets > li { margin-bottom: 12px; }
+  ol.tenets > li > strong { color: var(--header); }
+  ul.sub { margin: 6px 0 0 0; padding-left: 20px; }
+  ul.sub > li { margin: 2px 0; color: var(--fg); }
+  ul.cell { margin: 4px 0 0; padding-left: 18px; }
+  ul.cell > li { margin: 2px 0; }
+
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 12px 0 8px;
+    font-size: 13.5px;
+  }
+  th, td {
+    border: 1px solid var(--border);
+    padding: 8px 10px;
+    text-align: left;
+    vertical-align: top;
+  }
+  th {
+    background: var(--bg-alt);
+    font-weight: 600;
+    color: var(--header);
+  }
+  td.tenet {
+    background: var(--bg-alt);
+    font-weight: 600;
+    color: var(--header);
+  }
+  td.dim { font-weight: 600; }
+  .good { color: var(--good); font-weight: 700; }
+  .bad  { color: var(--bad);  font-weight: 700; }
+  .warn { color: var(--warn); font-weight: 700; }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; font-size: 92%; background: var(--bg-alt); padding: 1px 5px; border-radius: 4px; }
+  .legend { font-size: 12.5px; color: var(--muted); margin: 6px 0 0; }
+  .footnote { font-size: 13px; color: var(--muted); margin-top: 24px; border-top: 1px solid var(--border); padding-top: 14px; }
+  .summary-table th:first-child, .summary-table td:first-child { width: 22%; }
+</style>
+</head>
+<body>
+
+<h1>A new SAVE path for Valkey — Tenets &amp; Comparison</h1>
+<p class="lede">
+  This document proposes the tenets we should use to evaluate any full-sync / SAVE mechanism for Valkey,
+  and compares the three candidates — <strong>BGSave</strong> (the current fork-based path),
+  <strong>ThreadSave</strong> (proposed in <a href="https://github.com/valkey-io/valkey/issues/2878">#2878</a>),
+  and <strong>DollySave</strong> (proposed in <a href="https://github.com/valkey-io/valkey/issues/3609">#3609</a>) —
+  against those tenets.
+</p>
+
+<h2>Tenets — How we choose the best full sync method</h2>
+<p>Listed in priority order. If two methods tie on a higher tenet, the next one breaks the tie.</p>
+
+<ol class="tenets">
+  <li>
+    <strong>Cost — Memory &amp; CPU.</strong>
+    <ul class="sub">
+      <li><strong>Memory:</strong> Memory is the largest cost contributor for an in-memory database. The SAVE path must not require reserving headroom that grows with the write rate (no copy-on-write amplification).</li>
+      <li><strong>CPU:</strong> As more cores are dedicated to steady-state request processing (io-threads, future high-TPS targets), an infrequent operation like SAVE should not pin cores or steal cycles from the request path.</li>
+    </ul>
+  </li>
+  <li>
+    <strong>Minimize customer-visible latency and downtime.</strong>
+    <ul class="sub">
+      <li>The best SAVE is one the customer doesn't notice.</li>
+      <li>Minimal p50 and p99 impact while SAVE runs, and minimal process-freeze time — across <em>all</em> workloads, including pipelined clients, multi-key commands, and large objects.</li>
+    </ul>
+  </li>
+  <li>
+    <strong>Robustness.</strong>
+    <ul class="sub">
+      <li>Must work reliably across all workloads, data types, and modules (including VSS / vector indexes, Streams, large complex objects).</li>
+      <li>Must not OOM the host under heavy write traffic.</li>
+      <li>Must not require fall-through to a different mechanism for whole-DB module aux-data.</li>
+    </ul>
+  </li>
+  <li>
+    <strong>Speed of sync.</strong>
+    <ul class="sub">
+      <li>Faster SAVE → shorter replica unavailability, smaller availability / data-loss window, faster scale-up and replica recovery.</li>
+    </ul>
+  </li>
+</ol>
+
+<h2>Comparison: BGSave vs ThreadSave vs DollySave</h2>
+<p class="legend">
+  <span class="good">green</span> = best, <span class="warn">amber</span> = workable but limited,
+  <span class="bad">red</span> = major customer impact.
+</p>
+
+<table>
+  <thead>
+    <tr>
+      <th style="width:12%">Tenet</th>
+      <th style="width:7%">Dimension</th>
+      <th style="width:18%">BGSave</th>
+      <th style="width:48%">ThreadSave</th>
+      <th style="width:20%">DollySave</th>
+    </tr>
+  </thead>
+  <tbody>
+
+    <!-- Tenet 1: Cost -->
+    <tr>
+      <td class="tenet" rowspan="2">1. Cost</td>
+      <td class="dim">Memory</td>
+      <td class="bad">Up to <strong>2×</strong> dataset memory</td>
+      <td class="good">None — no extra memory</td>
+      <td class="good">Minor — constant, regardless of write rate</td>
+    </tr>
+    <tr>
+      <td class="dim">CPU</td>
+      <td class="bad">Slow — dominated by per-key object serialization (RDB encoding)</td>
+      <td class="bad">Slow — dominated by per-key object serialization (RDB encoding)</td>
+      <td class="good"><strong>~6× faster per thread</strong> — no object serialization, streams raw memory</td>
+    </tr>
+
+    <!-- Tenet 2: Latency — Freeze -->
+    <tr>
+      <td class="tenet">2. Latency — Freeze</td>
+      <td class="dim">Process freeze</td>
+      <td class="bad">High — multi-second (4–9 s)</td>
+      <td class="good">None</td>
+      <td class="good">Low</td>
+    </tr>
+
+    <!-- Tenet 2: Latency — p50/p99 during SAVE -->
+    <tr>
+      <td class="tenet">2. Latency — p50/p99 during SAVE</td>
+      <td class="dim">Impact on running traffic</td>
+      <td>
+        <span class="bad"><strong>Writes (heavy):</strong> p50 / p99 elevated <strong>2–3×</strong> due to COW page faults; recovery can take ~19–49 s after SAVE under heavy load.</span><br>
+        <strong>Reads:</strong> minimal impact.
+      </td>
+      <td class="bad">
+        <span class="bad"><strong>High impact across many command shapes:</strong></span>
+        <ul class="cell bad">
+          <li><strong>Small objects:</strong> in our tests, p50 elevated <strong>3×</strong> and p99 elevated <strong>5×</strong> for the entire save duration when the main thread is utilized — the main-thread iterator competes with command processing.</li>
+          <li><strong>Large objects:</strong> serialization time is linear in object size and can reach <strong>hundreds of milliseconds</strong> per object.</li>
+          <li><strong>MSET / multi-key writes:</strong> the more keys a single command touches, the higher the chance at least one is "already transferred" and the whole command must block. In our tests with MSET-of-20, p50 climbs from sub-millisecond to <strong>6–11 ms</strong> and p99 to <strong>12–15 ms</strong>, sustained for ~29 min. Other commands that block the same way: <span class="mono">MSETNX</span>, <span class="mono">DEL</span>, <span class="mono">UNLINK</span>, <span class="mono">RENAME</span>, <span class="mono">RENAMENX</span>, <span class="mono">SMOVE</span>, <span class="mono">LMOVE</span>, <span class="mono">BLMOVE</span>, <span class="mono">RPOPLPUSH</span>, <span class="mono">BRPOPLPUSH</span>, <span class="mono">LMPOP</span>, <span class="mono">BLMPOP</span>, <span class="mono">MIGRATE</span>, <span class="mono">EVAL</span>, <span class="mono">EVALSHA</span>, <span class="mono">FCALL</span>, <span class="mono">COPY</span>, <span class="mono">SDIFFSTORE</span>, <span class="mono">SINTERSTORE</span>, <span class="mono">SUNIONSTORE</span>, <span class="mono">ZDIFFSTORE</span>, <span class="mono">ZINTERSTORE</span>, <span class="mono">ZUNIONSTORE</span>, <span class="mono">ZRANGESTORE</span>, <span class="mono">GEOSEARCHSTORE</span>, <span class="mono">PFMERGE</span>, <span class="mono">SORT…STORE</span>.</li>
+          <li><strong>Pipelined writes:</strong> if any key in the pipeline is currently being serialized, the entire pipeline is blocked behind it — head-of-line blocking on every contended pipeline. This matters because pipelining is the recommended pattern for valkey-GLIDE, Lettuce, Redisson, valkey-py, SE.Redis, and the node.js clients.</li>
+          <li><strong>VSS / module aux-data:</strong> ThreadSave cannot handle module aux-data iteratively. Multi-GB vector indexes (VSS/Search) <strong>may preclude use of forkless save entirely</strong>, requiring a fallback to fork — negating the memory benefits.</li>
+        </ul>
+      </td>
+      <td class="good">
+        <strong>Minimal impact</strong> — no copy-on-write. The kernel only marks (colors) dirty pages; writes proceed unimpeded with no page-clone cost.
+      </td>
+    </tr>
+
+    <!-- Tenet 3: Robustness -->
+    <tr>
+      <td class="tenet">3. Robustness</td>
+      <td class="dim">Across workloads, types, modules</td>
+      <td class="bad">OOMs under heavy writes</td>
+      <td class="warn">No OOM, but blocks on large objects, multi-key commands, pipelines, and VSS / module aux-data</td>
+      <td class="good"><strong>High</strong></td>
+    </tr>
+
+    <!-- Tenet 4: Speed -->
+    <tr>
+      <td class="tenet">4. Speed of sync</td>
+      <td class="dim">Time until replica is up</td>
+      <td class="bad">Slow</td>
+      <td class="bad">Slow</td>
+      <td class="good"><strong>Up to 70× faster</strong> in multithreaded environments; <strong>~6× faster</strong> on a single thread</td>
+    </tr>
+
+    <!-- Other -->
+    <tr>
+      <td class="tenet" rowspan="3">Other</td>
+      <td class="dim">Cross-version sync</td>
+      <td class="good">Yes</td>
+      <td class="good">Yes</td>
+      <td class="bad">No — requires identical binary &amp; kernel; needs two-phase upgrade</td>
+    </tr>
+    <tr>
+      <td class="dim">OS / kernel</td>
+      <td class="good">Any Linux</td>
+      <td class="good">Any Linux</td>
+      <td class="warn">Linux ≥ 6.7</td>
+    </tr>
+    <tr>
+      <td class="dim">Valkey OSS code change</td>
+      <td>none (existing)</td>
+      <td>issue #2878</td>
+      <td>1 admin command (~240 LoC, PR #3608)</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>How DollySave addresses each tenet</h2>
+
+<table class="summary-table">
+  <thead>
+    <tr>
+      <th>Tenet</th>
+      <th>Mechanism</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>1. Cost — Memory</strong></td>
+      <td>No <span class="mono">fork()</span>, no COW. Dirty pages are tracked by the kernel via <span class="mono">UFFD_FEATURE_WP_ASYNC</span> and read in bulk via <span class="mono">PAGEMAP_SCAN</span> — no page duplication, no userspace fault handler.</td>
+    </tr>
+    <tr>
+      <td><strong>1. Cost — CPU</strong></td>
+      <td>No object serialization on the main thread. Memory is streamed raw; compression runs on parallel workers off the request path.</td>
+    </tr>
+    <tr>
+      <td><strong>2. Latency &amp; downtime</strong></td>
+      <td>Bulk transfer happens while the process runs. Only a brief final freeze captures last-moment dirty pages. No per-key locking, no head-of-line blocking, no special path for large objects or modules.</td>
+    </tr>
+    <tr>
+      <td><strong>3. Robustness</strong></td>
+      <td>Constant memory → cannot OOM. Large complex objects, multi-GB module aux-data (VSS, search indexes), multi-key commands, EVAL, MIGRATE, and pipelines are all handled the same way: they are just memory. CRIU restores threads, mutexes, file descriptors, sockets, and signal handlers.</td>
+    </tr>
+    <tr>
+      <td><strong>4. Speed</strong></td>
+      <td>Streams raw memory, skips RDB encoding entirely. Wins hold even single-threaded on a small instance — confirming the speedup is not just from parallelism.</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>DollySave limitations</h2>
+<ul>
+  <li><strong>Cross-version sync:</strong> DollySave transfers a live process image, so primary and replica must run identical binaries and kernel versions. Version upgrades need a two-phase workflow (DollySave to a same-version intermediate node, then a standard sync to the upgraded target).</li>
+  <li><strong>Kernel floor:</strong> Linux ≥ 6.7. Older kernels and non-Linux platforms still need BGSave or ThreadSave as a fallback.</li>
+  <li><strong>RDB-format snapshots:</strong> DollySave produces a process image, not RDB. Existing RDB-export workflows need either eager (background) or lazy (on-restore) conversion.</li>
+</ul>
+
+<h3>Note on multithreaded BGSave</h3>
+<p>Multithreaded BGSave could make it faster and reduce OOM risk, but it would require <strong>~6× more CPU</strong> than DollySave to achieve comparable speed. Those threads would compete with io-threads for resources, or require customers to reserve 6× spare cores for an infrequent operation.</p>
+<h2>Summary</h2>
+<p>DollySave + <a href="https://github.com/asafpamzn/valkey/commit/80985b14c">UPGRADE</a> should cover most workflows. BGSave remains available as a fallback for older kernels and non-Linux platforms.</p>
+
+<p class="footnote">
+  References:
+  <a href="https://github.com/valkey-io/valkey/issues/3609">issue #3609 (DollySave)</a> ·
+  <a href="https://github.com/valkey-io/valkey/pull/3608">draft PR #3608</a> ·
+  <a href="https://github.com/valkey-io/valkey/issues/2878">issue #2878 (Forkless / ThreadSave)</a> ·
+  <a href="https://asafpamzn.github.io/criu/cow-dump-high-level-design.html">DollySave high-level design</a> ·
+  <a href="https://asafpamzn.github.io/criu/cow-dump-design.html">DollySave detailed design</a>.
+</p>
+
+</body>
+</html>
