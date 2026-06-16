@@ -5,6 +5,7 @@
 #include <unistd.h>
 #include <stdbool.h>
 #include <limits.h>
+#include <pthread.h>
 
 #include <sys/types.h>
 #include <sys/time.h>
@@ -37,6 +38,12 @@ static unsigned int current_loglevel = DEFAULT_LOGLEVEL;
 static void vprint_on_level(unsigned int, const char *, va_list);
 
 static char buffer[LOG_BUF_LEN];
+/*
+ * CLONE dump runs many worker threads that all call pr_*(); serialize access
+ * to the shared static buffer (and the write()/timestamp) so their output is
+ * not interleaved or corrupted.
+ */
+static pthread_spinlock_t log_lock;
 static char buf_off = 0;
 /*
  * The early_log_buffer is used to store log messages before
@@ -213,6 +220,7 @@ int log_init(const char *output)
 
 	gettimeofday(&start, NULL);
 	reset_buf_off();
+	pthread_spin_init(&log_lock, PTHREAD_PROCESS_PRIVATE);
 
 	if (output && !strncmp(output, "-", 2)) {
 		new_logfd = dup(STDOUT_FILENO);
@@ -377,9 +385,16 @@ static void vprint_on_level(unsigned int loglevel, const char *format, va_list p
 		if (loglevel > current_loglevel)
 			return;
 		fd = log_get_fd();
-		if (current_loglevel >= LOG_TIMESTAMP)
-			print_ts();
 	}
+
+	/*
+	 * Serialize the shared-buffer region (timestamp, vsnprintf, write,
+	 * log_note_err) against concurrent CLONE worker threads.
+	 */
+	pthread_spin_lock(&log_lock);
+
+	if (loglevel != LOG_MSG && current_loglevel >= LOG_TIMESTAMP)
+		print_ts();
 
 	size = vsnprintf(buffer + buf_off, sizeof buffer - buf_off, format, params);
 	size += buf_off;
@@ -394,6 +409,8 @@ static void vprint_on_level(unsigned int loglevel, const char *format, va_list p
 	/* This is missing for messages in the early_log_buffer. */
 	if (loglevel == LOG_ERROR)
 		log_note_err(buffer + buf_off);
+
+	pthread_spin_unlock(&log_lock);
 
 	errno = _errno;
 }
