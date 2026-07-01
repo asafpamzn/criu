@@ -8,6 +8,7 @@
 #include <limits.h>
 
 #include "types.h"
+#include "atomic.h"
 #include "image.h"
 #include "cr_options.h"
 #include "servicefd.h"
@@ -857,7 +858,8 @@ int probe_pages_o_direct(int fd)
 int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int pr_flags)
 {
 	int flags, i_typ;
-	static unsigned ids = 1;
+	/* Shared across asyncd fill-daemon workers, which open page-reads concurrently. */
+	static atomic_t ids = { 0 };
 	bool remote = pr_flags & PR_REMOTE;
 
 	/*
@@ -943,7 +945,7 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 	pr->seek_pagemap = seek_pagemap;
 	pr->reset = reset_pagemap;
 	pr->io_complete = NULL; /* set up by the client if needed */
-	pr->id = ids++;
+	pr->id = atomic_inc_return(&ids);
 	pr->img_id = img_id;
 
 	if (remote)

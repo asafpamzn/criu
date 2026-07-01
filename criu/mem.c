@@ -916,6 +916,10 @@ static inline bool check_cow_vmas(struct vma_area *vma, struct vma_area *pvma)
 	/* ... belong to the same file if being filemap */
 	if (!(vma->e->flags & MAP_ANONYMOUS) && vma->e->shmid != pvma->e->shmid)
 		return false;
+	/* ... both be accountable, since COW VMAs may carry restored pages */
+	if (vma_area_is(vma, VMA_AREA_NOT_ACCOUNTABLE) ||
+	    vma_area_is(pvma, VMA_AREA_NOT_ACCOUNTABLE))
+		return false;
 
 	pr_debug("Found two COW VMAs @0x%" PRIx64 "-0x%" PRIx64 "\n", vma->e->start, pvma->e->end);
 	return true;

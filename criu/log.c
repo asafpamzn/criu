@@ -1,5 +1,6 @@
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
 #include <stdarg.h>
 #include <errno.h>
 #include <unistd.h>
@@ -37,14 +38,14 @@
 static unsigned int current_loglevel = DEFAULT_LOGLEVEL;
 static void vprint_on_level(unsigned int, const char *, va_list);
 
-static char buffer[LOG_BUF_LEN];
 /*
- * CLONE dump runs many worker threads that all call pr_*(); serialize access
- * to the shared static buffer (and the write()/timestamp) so their output is
- * not interleaved or corrupted.
+ * Written once per task in log_init_by_pid(), before any asyncd worker
+ * thread starts, then only read -- so it is safe to share while the
+ * workers log concurrently. The timestamp and message are built per call
+ * into a stack-local buffer (see vprint_on_level).
  */
-static pthread_spinlock_t log_lock;
-static char buf_off = 0;
+static char pid_prefix[16];
+static int pid_prefix_len;
 /*
  * The early_log_buffer is used to store log messages before
  * logging is set up to make sure no logs are lost.
@@ -73,15 +74,16 @@ static void timediff(struct timeval *from, struct timeval *to)
 	}
 }
 
-static void print_ts(void)
+static int format_ts(char *dst)
 {
 	struct timeval t;
 
 	gettimeofday(&t, NULL);
 	timediff(&start, &t);
-	snprintf(buffer, TS_BUF_OFF, "(%02u.%06u", (unsigned)t.tv_sec, (unsigned)t.tv_usec);
-	buffer[TS_BUF_OFF - 2] = ')'; /* this will overwrite the last digit if tv_sec>=100 */
-	buffer[TS_BUF_OFF - 1] = ' '; /* kill the '\0' produced by snprintf */
+	snprintf(dst, TS_BUF_OFF, "(%02u.%06u", (unsigned)t.tv_sec, (unsigned)t.tv_usec);
+	dst[TS_BUF_OFF - 2] = ')'; /* this will overwrite the last digit if tv_sec>=100 */
+	dst[TS_BUF_OFF - 1] = ' '; /* kill the '\0' produced by snprintf */
+	return TS_BUF_OFF;
 }
 
 int log_get_fd(void)
@@ -103,11 +105,7 @@ void log_get_logstart(struct timeval *s)
 
 static void reset_buf_off(void)
 {
-	if (current_loglevel >= LOG_TIMESTAMP)
-		/* reserve space for a timestamp */
-		buf_off = TS_BUF_OFF;
-	else
-		buf_off = 0;
+	pid_prefix_len = 0;
 }
 
 /*
@@ -268,13 +266,13 @@ int log_init_by_pid(pid_t pid)
 	char path[PATH_MAX];
 
 	/*
-	 * reset buf_off as this fn is called on each fork while
+	 * reset the pid prefix as this fn is called on each fork while
 	 * restoring process tree
 	 */
 	reset_buf_off();
 
 	if (!opts.log_file_per_pid) {
-		buf_off += snprintf(buffer + buf_off, sizeof buffer - buf_off, "%6d: ", pid);
+		pid_prefix_len = snprintf(pid_prefix, sizeof pid_prefix, "%6d: ", pid);
 		return 0;
 	}
 
@@ -367,12 +365,13 @@ static void early_vprint(const char *format, unsigned int loglevel, va_list para
 
 static void vprint_on_level(unsigned int loglevel, const char *format, va_list params)
 {
-	int fd, size, ret, off = 0;
+	int fd, size, ret, off = 0, prefix;
 	int _errno = errno;
+	char buf[LOG_BUF_LEN];
 
 	if (unlikely(loglevel == LOG_MSG)) {
 		fd = STDOUT_FILENO;
-		off = buf_off; /* skip dangling timestamp */
+		prefix = 0; /* print the message without a timestamp or pid */
 	} else {
 		/*
 		 * If logging has not yet been initialized (init_done == 0)
@@ -385,22 +384,24 @@ static void vprint_on_level(unsigned int loglevel, const char *format, va_list p
 		if (loglevel > current_loglevel)
 			return;
 		fd = log_get_fd();
+		/* Format into a stack-local buffer (thread-safe, see pid_prefix). */
+		prefix = (current_loglevel >= LOG_TIMESTAMP) ? format_ts(buf) : 0;
+		memcpy(buf + prefix, pid_prefix, pid_prefix_len);
+		prefix += pid_prefix_len;
 	}
 
+	size = vsnprintf(buf + prefix, sizeof(buf) - prefix, format, params);
+	size += prefix;
+
 	/*
-	 * Serialize the shared-buffer region (timestamp, vsnprintf, write,
-	 * log_note_err) against concurrent CLONE worker threads.
-	 */
-	pthread_spin_lock(&log_lock);
+	 * vsprintf returns return the number of characters which would have
+	 * been written if enough space had been available.
+         */
+	if (size > sizeof(buf) - 1)
+		size = sizeof(buf) - 1;
 
-	if (loglevel != LOG_MSG && current_loglevel >= LOG_TIMESTAMP)
-		print_ts();
-
-	size = vsnprintf(buffer + buf_off, sizeof buffer - buf_off, format, params);
-	size += buf_off;
-
-	while (off < size) {
-		ret = write(fd, buffer + off, size - off);
+	for (off = 0; off < size;) {
+		ret = write(fd, buf + off, size - off);
 		if (ret <= 0)
 			break;
 		off += ret;
@@ -408,7 +409,7 @@ static void vprint_on_level(unsigned int loglevel, const char *format, va_list p
 
 	/* This is missing for messages in the early_log_buffer. */
 	if (loglevel == LOG_ERROR)
-		log_note_err(buffer + buf_off);
+		log_note_err(buf + prefix);
 
 	pthread_spin_unlock(&log_lock);
 

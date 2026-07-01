@@ -1221,7 +1221,8 @@ static int write_id_map(pid_t pid, UidGidExtent **extents, int n, char *id_map)
 
 static int usernsd_pid;
 
-inline void unsc_msg_init(struct unsc_msg *m, uns_call_t *c, int *x, void *arg, size_t asize, int fd, pid_t *pid)
+static void unsc_msg_init_flags(struct unsc_msg *m, uns_call_t *c, int *x, void *arg, size_t asize, int fd, pid_t *pid,
+				bool send_creds)
 {
 	struct cmsghdr *ch;
 	struct ucred *ucred;
@@ -1251,24 +1252,31 @@ inline void unsc_msg_init(struct unsc_msg *m, uns_call_t *c, int *x, void *arg, 
 	 */
 	memzero(&m->c, sizeof(m->c));
 
-	m->h.msg_controllen = CMSG_SPACE(sizeof(struct ucred));
+	m->h.msg_controllen = 0;
+	ch = NULL;
 
-	ch = CMSG_FIRSTHDR(&m->h);
-	ch->cmsg_len = CMSG_LEN(sizeof(struct ucred));
-	ch->cmsg_level = SOL_SOCKET;
-	ch->cmsg_type = SCM_CREDENTIALS;
+	if (send_creds) {
+		m->h.msg_controllen = CMSG_SPACE(sizeof(struct ucred));
+		ch = CMSG_FIRSTHDR(&m->h);
+		ch->cmsg_len = CMSG_LEN(sizeof(struct ucred));
+		ch->cmsg_level = SOL_SOCKET;
+		ch->cmsg_type = SCM_CREDENTIALS;
 
-	ucred = (struct ucred *)CMSG_DATA(ch);
-	if (pid)
-		ucred->pid = *pid;
-	else
-		ucred->pid = getpid();
-	ucred->uid = getuid();
-	ucred->gid = getgid();
+		ucred = (struct ucred *)CMSG_DATA(ch);
+		if (pid)
+			ucred->pid = *pid;
+		else
+			ucred->pid = getpid();
+		ucred->uid = getuid();
+		ucred->gid = getgid();
+	}
 
 	if (fd >= 0) {
 		m->h.msg_controllen += CMSG_SPACE(sizeof(int));
-		ch = CMSG_NXTHDR(&m->h, ch);
+		if (ch)
+			ch = CMSG_NXTHDR(&m->h, ch);
+		else
+			ch = CMSG_FIRSTHDR(&m->h);
 		BUG_ON(!ch);
 		ch->cmsg_len = CMSG_LEN(sizeof(int));
 		ch->cmsg_level = SOL_SOCKET;
@@ -1277,23 +1285,33 @@ inline void unsc_msg_init(struct unsc_msg *m, uns_call_t *c, int *x, void *arg, 
 	}
 }
 
+void unsc_msg_init(struct unsc_msg *m, uns_call_t *c, int *x, void *arg, size_t asize, int fd, pid_t *pid)
+{
+	unsc_msg_init_flags(m, c, x, arg, asize, fd, pid, true);
+}
+
+void unsc_msg_init_nocreds(struct unsc_msg *m, uns_call_t *c, int *x, void *arg, size_t asize, int fd)
+{
+	unsc_msg_init_flags(m, c, x, arg, asize, fd, NULL, false);
+}
+
 void unsc_msg_pid_fd(struct unsc_msg *um, pid_t *pid, int *fd)
 {
 	struct cmsghdr *ch;
 	struct ucred *ucred;
 
 	ch = CMSG_FIRSTHDR(&um->h);
-	BUG_ON(!ch);
-	BUG_ON(ch->cmsg_len != CMSG_LEN(sizeof(struct ucred)));
-	BUG_ON(ch->cmsg_level != SOL_SOCKET);
-	BUG_ON(ch->cmsg_type != SCM_CREDENTIALS);
-
-	if (pid) {
-		ucred = (struct ucred *)CMSG_DATA(ch);
-		*pid = ucred->pid;
+	if (ch && ch->cmsg_level == SOL_SOCKET && ch->cmsg_type == SCM_CREDENTIALS) {
+		BUG_ON(ch->cmsg_len != CMSG_LEN(sizeof(struct ucred)));
+		if (pid) {
+			ucred = (struct ucred *)CMSG_DATA(ch);
+			*pid = ucred->pid;
+		}
+		ch = CMSG_NXTHDR(&um->h, ch);
+	} else {
+		if (pid)
+			*pid = -1;
 	}
-
-	ch = CMSG_NXTHDR(&um->h, ch);
 
 	if (ch && ch->cmsg_len == CMSG_LEN(sizeof(int))) {
 		BUG_ON(ch->cmsg_level != SOL_SOCKET);
@@ -1447,7 +1465,7 @@ out:
 	return ret;
 }
 
-int start_unix_cred_daemon(pid_t *pid, int (*daemon_func)(int sk))
+int start_unix_cred_daemon(pid_t *pid, int (*daemon_func)(int sk), bool passcred)
 {
 	int sk[2];
 	int one = 1;
@@ -1470,14 +1488,20 @@ int start_unix_cred_daemon(pid_t *pid, int (*daemon_func)(int sk))
 		return -1;
 	}
 
-	if (setsockopt(sk[0], SOL_SOCKET, SO_PASSCRED, &one, sizeof(one)) < 0) {
-		pr_perror("failed to setsockopt");
-		return -1;
-	}
+	if (passcred) {
+		if (setsockopt(sk[0], SOL_SOCKET, SO_PASSCRED, &one, sizeof(one)) < 0) {
+			pr_perror("failed to setsockopt");
+			close(sk[0]);
+			close(sk[1]);
+			return -1;
+		}
 
-	if (setsockopt(sk[1], SOL_SOCKET, SO_PASSCRED, &one, sizeof(1)) < 0) {
-		pr_perror("failed to setsockopt");
-		return -1;
+		if (setsockopt(sk[1], SOL_SOCKET, SO_PASSCRED, &one, sizeof(1)) < 0) {
+			pr_perror("failed to setsockopt");
+			close(sk[0]);
+			close(sk[1]);
+			return -1;
+		}
 	}
 
 	*pid = fork();
@@ -1506,7 +1530,7 @@ static int start_usernsd(void)
 	if (!(root_ns_mask & CLONE_NEWUSER))
 		return 0;
 
-	sk = start_unix_cred_daemon(&usernsd_pid, usernsd);
+	sk = start_unix_cred_daemon(&usernsd_pid, usernsd, true);
 	if (sk < 0) {
 		pr_err("failed to start usernsd\n");
 		return -1;

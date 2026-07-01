@@ -240,93 +240,80 @@ exit:
 
 int amdgpu_plugin_drm_dump_file(int fd, int id, struct stat *drm)
 {
-	CriuRenderNode *rd = NULL;
+	struct drm_amdgpu_gem_list_handles_entry *entries = NULL;
+	struct drm_amdgpu_gem_list_handles handles = {
+		.num_entries = 8,
+	};
+	bool libdrm_initialized = false;
+	unsigned long buffer_size = 0;
+	amdgpu_device_handle h_dev;
 	char path[PATH_MAX];
+	CriuRenderNode *rd;
 	unsigned char *buf;
-	int minor;
-	int len;
-	int ret;
+	void *buffer = NULL;
+	int len, ret;
 	size_t image_size;
 	struct tp_node *tp_node;
-	struct drm_amdgpu_gem_list_handles list_handles_args = { 0 };
-	struct drm_amdgpu_gem_list_handles_entry *list_handles_entries = NULL;
-	int num_bos;
 
 	rd = xmalloc(sizeof(*rd));
-	if (!rd) {
-		ret = -ENOMEM;
-		goto exit;
-	}
+	if (!rd)
+		return -ENOMEM;
+
 	criu_render_node__init(rd);
 
 	/* Get the topology node of the DRM device */
-	minor = minor(drm->st_rdev);
-	rd->drm_render_minor = minor;
+	rd->drm_render_minor = minor(drm->st_rdev);
 	rd->id = id;
 
-	num_bos = 8;
-	list_handles_entries = xzalloc(sizeof(struct drm_amdgpu_gem_list_handles_entry) * num_bos);
-	if (!list_handles_entries) {
-		ret = -ENOMEM;
-		goto exit;
-	}
-	list_handles_args.num_entries = num_bos;
-	list_handles_args.entries = (uintptr_t)list_handles_entries;
+	do {
+		unsigned int num_entries = handles.num_entries;
 
-	ret = drmIoctl(fd, DRM_IOCTL_AMDGPU_GEM_LIST_HANDLES, &list_handles_args);
-	if (ret && errno == EINVAL) {
-		pr_info("This kernel appears not to have AMDGPU_GEM_LIST_HANDLES ioctl. Consider disabling Dmabuf IPC or updating your kernel.\n");
-		list_handles_args.num_entries = 0;
-	} else if (ret) {
-		pr_perror("Failed to call bo info ioctl");
-		goto exit;
-	}
+		if (entries) {
+			xfree(entries);
+			entries = NULL;
+		}
 
-	if (list_handles_args.num_entries > num_bos) {
-		num_bos = list_handles_args.num_entries;
-		xfree(list_handles_entries);
-		list_handles_entries = xzalloc(sizeof(struct drm_amdgpu_gem_list_handles_entry) * num_bos);
-		if (!list_handles_entries) {
+		entries = xzalloc(sizeof(*entries) * handles.num_entries);
+		if (!entries) {
 			ret = -ENOMEM;
 			goto exit;
 		}
-		list_handles_args.num_entries = num_bos;
-		list_handles_args.entries = (uintptr_t)list_handles_entries;
-		ret = drmIoctl(fd, DRM_IOCTL_AMDGPU_GEM_LIST_HANDLES, &list_handles_args);
+
+		handles.entries = (uintptr_t)entries;
+		ret = drmIoctl(fd, DRM_IOCTL_AMDGPU_GEM_LIST_HANDLES, &handles);
 		if (ret) {
-			pr_perror("Failed to call bo info ioctl");
+			ret = -errno;
+			if (errno == EINVAL)
+				pr_err("This kernel appears not to have AMDGPU_GEM_LIST_HANDLES ioctl. Consider disabling Dmabuf IPC or updating your kernel.\n");
+			else
+				pr_perror("Failed to call bo info ioctl");
 			goto exit;
 		}
-	} else {
-		num_bos = list_handles_args.num_entries;
-	}
 
-	rd->num_of_bos = num_bos;
-	ret = allocate_bo_entries(rd, num_bos);
+		if (handles.num_entries <= num_entries)
+			break;
+	} while (true);
+
+	rd->num_of_bos = handles.num_entries;
+	ret = allocate_bo_entries(rd, handles.num_entries);
 	if (ret)
 		goto exit;
 
-	for (int i = 0; i < num_bos; i++) {
+	for (int i = 0; i < handles.num_entries; i++) {
 		int num_vm_entries = 8;
 		struct drm_amdgpu_gem_vm_entry *vm_info_entries = NULL;
 		DrmBoEntry *boinfo = rd->bo_entries[i];
-		struct drm_amdgpu_gem_list_handles_entry handle_entry = list_handles_entries[i];
+		struct drm_amdgpu_gem_list_handles_entry *entry = &entries[i];
 		union drm_amdgpu_gem_mmap mmap_args = { 0 };
 		int bo_contents_fd;
 		int dmabuf_fd;
-		uint32_t major, minor;
-		amdgpu_device_handle h_dev;
-		void *buffer = NULL;
-		char img_path[40];
-		int device_fd;
 
-		boinfo->size = handle_entry.size;
-
-		boinfo->alloc_flags = handle_entry.alloc_flags;
-		boinfo->preferred_domains = handle_entry.preferred_domains;
-		boinfo->alignment = handle_entry.alignment;
-		boinfo->handle = handle_entry.gem_handle;
-		boinfo->is_import = (handle_entry.flags & AMDGPU_GEM_LIST_HANDLES_FLAG_IS_IMPORT) || shared_bo_has_exporter(boinfo->handle);
+		boinfo->size = entry->size;
+		boinfo->alloc_flags = entry->alloc_flags;
+		boinfo->preferred_domains = entry->preferred_domains;
+		boinfo->alignment = entry->alignment;
+		boinfo->handle = entry->gem_handle;
+		boinfo->is_import = (entry->flags & AMDGPU_GEM_LIST_HANDLES_FLAG_IS_IMPORT) || shared_bo_has_exporter(boinfo->handle);
 
 		mmap_args.in.handle = boinfo->handle;
 
@@ -340,7 +327,7 @@ int amdgpu_plugin_drm_dump_file(int fd, int id, struct stat *drm)
 
 		while (1) {
 			struct drm_amdgpu_gem_op vm_info_args = {
-				.handle = handle_entry.gem_handle,
+				.handle = entry->gem_handle,
 				.num_entries = num_vm_entries,
 				.op = AMDGPU_GEM_OP_GET_MAPPING_INFO,
 			};
@@ -387,67 +374,69 @@ int amdgpu_plugin_drm_dump_file(int fd, int id, struct stat *drm)
 			vminfo->offset = vm_info_entries[j].offset;
 			vminfo->flags = vm_info_entries[j].flags;
 		}
+		xfree(vm_info_entries);
 
-		ret = amdgpu_device_initialize(fd, &major, &minor, &h_dev);
-		if (ret) {
-			pr_err("Failed to initialize amdgpu device - %s\n", strerror(-ret));
-			xfree(vm_info_entries);
-			goto exit;
+		if (!libdrm_initialized) {
+			uint32_t major, minor;
+
+			ret = amdgpu_device_initialize(fd, &major, &minor,
+						       &h_dev);
+			if (ret) {
+				pr_err("Failed to initialize amdgpu device - %s\n",
+				       strerror(-ret));
+				goto exit;
+			}
+
+			libdrm_initialized = true;
 		}
 
-		device_fd = amdgpu_device_get_fd(h_dev);
-
-		ret = drmPrimeHandleToFD(device_fd, boinfo->handle, 0, &dmabuf_fd);
+		ret = drmPrimeHandleToFD(fd, boinfo->handle, 0, &dmabuf_fd);
 		if (ret) {
 			pr_perror("Failed to get dmabuf fd from handle");
-			amdgpu_device_deinitialize(h_dev);
-			xfree(vm_info_entries);
 			goto exit;
 		}
 
-		snprintf(img_path, sizeof(img_path), IMG_DRM_PAGES_FILE, rd->id, rd->drm_render_minor, i);
-		image_size = handle_entry.size;
-		bo_contents_fd = open_img_file(img_path, true, &image_size, true);
+		snprintf(path, sizeof(path), IMG_DRM_PAGES_FILE, rd->id, rd->drm_render_minor, i);
+		image_size = entry->size;
+		bo_contents_fd = open_img_file(path, true, &image_size, true);
 		if (bo_contents_fd < 0) {
 			ret = bo_contents_fd;
 			close(dmabuf_fd);
-			amdgpu_device_deinitialize(h_dev);
-			xfree(vm_info_entries);
 			goto exit;
 		}
 
-		ret = posix_memalign(&buffer, sysconf(_SC_PAGE_SIZE), handle_entry.size);
-		if (ret) {
-			errno = ret;
-			pr_perror("Failed to allocate buffer");
-			ret = -ret;
-			close(bo_contents_fd);
-			close(dmabuf_fd);
-			amdgpu_device_deinitialize(h_dev);
-			xfree(vm_info_entries);
-			goto exit;
+		if (buffer_size < entry->size) {
+			if (buffer_size) {
+				free(buffer);
+				buffer = NULL;
+			}
+
+			ret = posix_memalign(&buffer, sysconf(_SC_PAGE_SIZE),
+					     entry->size);
+			if (ret) {
+				errno = ret;
+				pr_perror("Failed to allocate userptr buffer");
+				ret = -ret;
+				close(bo_contents_fd);
+				close(dmabuf_fd);
+				goto exit;
+			}
+
+			buffer_size = entry->size;
 		}
 
-		ret = sdma_copy_bo(dmabuf_fd, handle_entry.size, bo_contents_fd,
-				   buffer, handle_entry.size, h_dev, 0x1000,
+		ret = sdma_copy_bo(dmabuf_fd, entry->size, bo_contents_fd,
+				   buffer, entry->size, h_dev, 0x1000,
 				   SDMA_OP_VRAM_READ, false);
 		close(bo_contents_fd);
 		if (ret)
 			goto exit;
 
-		xfree(buffer);
-
 		if (dmabuf_fd != KFD_INVALID_FD)
 			close(dmabuf_fd);
-
-		ret = amdgpu_device_deinitialize(h_dev);
-		if (ret)
-			goto exit;
-
-		xfree(vm_info_entries);
 	}
 
-	for (int i = 0; i < num_bos; i++) {
+	for (int i = 0; i < handles.num_entries; i++) {
 		DrmBoEntry *boinfo = rd->bo_entries[i];
 
 		ret = record_shared_bo(boinfo->handle, boinfo->is_import);
@@ -455,9 +444,10 @@ int amdgpu_plugin_drm_dump_file(int fd, int id, struct stat *drm)
 			goto exit;
 	}
 
-	tp_node = sys_get_node_by_render_minor(&src_topology, minor);
+	tp_node = sys_get_node_by_render_minor(&src_topology, rd->drm_render_minor);
 	if (!tp_node) {
-		pr_err("Failed to find a device with minor number = %d\n", minor);
+		pr_err("Failed to find a device with minor number = %d\n",
+		       rd->drm_render_minor);
 		return -ENODEV;
 	}
 
@@ -480,9 +470,11 @@ int amdgpu_plugin_drm_dump_file(int fd, int id, struct stat *drm)
 
 	xfree(buf);
 exit:
-	xfree(list_handles_entries);
-	if (rd)
-		free_e(rd);
+	free(buffer);
+	xfree(entries);
+	free_e(rd);
+	if (libdrm_initialized)
+		amdgpu_device_deinitialize(h_dev);
 	return ret;
 }
 

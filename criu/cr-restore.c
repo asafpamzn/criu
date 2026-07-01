@@ -49,6 +49,7 @@
 #include "crtools.h"
 #include "uffd.h"
 #include "namespaces.h"
+#include "asyncd.h"
 #include "mem.h"
 #include "mount.h"
 #include "fsnotify.h"
@@ -143,6 +144,8 @@ static inline int stage_participants(int next_stage)
 		return 1;
 	case CR_STATE_FORKING:
 		return task_entries->nr_tasks + task_entries->nr_helpers;
+	case CR_STATE_PRE_RESTORER:
+		return task_entries->nr_tasks + task_entries->nr_helpers;
 	case CR_STATE_RESTORE:
 		return task_entries->nr_threads + task_entries->nr_helpers;
 	case CR_STATE_RESTORE_SIGCHLD:
@@ -158,16 +161,8 @@ static inline int stage_current_participants(int next_stage)
 {
 	switch (next_stage) {
 	case CR_STATE_FORKING:
+	case CR_STATE_PRE_RESTORER:
 		return 1;
-	case CR_STATE_RESTORE:
-		/*
-		 * Each thread has to be reported about this stage,
-		 * so if we want to wait all other tasks, we have to
-		 * exclude all threads of the current process.
-		 * It is supposed that we will wait other tasks,
-		 * before creating threads of the current task.
-		 */
-		return current->nr_threads;
 	}
 
 	BUG();
@@ -801,6 +796,7 @@ static int restore_one_zombie(CoreEntry *core)
 
 	prctl(PR_SET_NAME, (long)(void *)core->tc->comm, 0, 0, 0);
 
+	restore_finish_stage(task_entries, CR_STATE_PRE_RESTORER);
 	if (task_entries != NULL) {
 		wait_exiting_children();
 		zombie_prepare_signals();
@@ -978,6 +974,7 @@ static int restore_one_helper(void)
 	if (prepare_fds(current))
 		return -1;
 
+	restore_finish_stage(task_entries, CR_STATE_PRE_RESTORER);
 	if (wait_exiting_children())
 		return -1;
 
@@ -1670,8 +1667,6 @@ static int __restore_task_with_children(void *_arg)
 	if (populate_pid_proc())
 		goto err;
 
-	sfds_protected = true;
-
 	if (unmap_guard_pages(current))
 		goto err;
 
@@ -1694,11 +1689,18 @@ static int __restore_task_with_children(void *_arg)
 		if (restore_wait_other_tasks())
 			goto err;
 		fini_restore_mntns();
-		__restore_switch_stage(CR_STATE_RESTORE);
+
+		/* streamer serves each image once, one at a time; asyncd reads in parallel. */
+		if (!opts.stream && start_asyncd())
+			goto err;
+
+		__restore_switch_stage(CR_STATE_PRE_RESTORER);
 	} else {
 		if (restore_finish_stage(task_entries, CR_STATE_FORKING) < 0)
 			goto err;
 	}
+
+	sfds_protected = true;
 
 	if (restore_one_task(vpid(current), ca->core))
 		goto err;
@@ -1706,6 +1708,13 @@ static int __restore_task_with_children(void *_arg)
 	return 0;
 
 err:
+	/*
+	 * Reap the async daemon before waking the coordinator: once the
+	 * abort is signalled the coordinator tears down the task tree and
+	 * may kill us mid-reap. stop_asyncd() is a no-op if no daemon was
+	 * started (asyncd_pid == 0).
+	 */
+	stop_asyncd();
 	if (current->parent == NULL)
 		futex_abort_and_wake(&task_entries->nr_in_progress);
 	exit(1);
@@ -2184,7 +2193,7 @@ skip_ns_bouncing:
 		goto out_kill;
 
 	/*
-	 * Zombies die after CR_STATE_RESTORE which is switched
+	 * Zombies die after CR_STATE_PRE_RESTORER which is switched
 	 * by root task, not by us. See comment before CR_STATE_FORKING
 	 * in the header for details.
 	 */
@@ -3241,6 +3250,12 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 			goto err_nv;
 		if (root_ns_mask & CLONE_NEWNS && remount_readonly_mounts())
 			goto err_nv;
+		if (stop_asyncd())
+			goto err_nv;
+		__restore_switch_stage(CR_STATE_RESTORE);
+	} else {
+		if (restore_finish_stage(task_entries, CR_STATE_PRE_RESTORER) < 0)
+			goto err;
 	}
 
 	/*
@@ -3603,6 +3618,8 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 err:
 	free_mappings(&self_vmas);
 err_nv:
+	/* Reap the async daemon if it is still running (no-op otherwise). */
+	stop_asyncd();
 	/* Just to be sure */
 	exit(1);
 	return -1;

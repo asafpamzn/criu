@@ -306,6 +306,7 @@ enum {
 	 * purely to make sure all tasks be in sync.
 	 */
 	CR_STATE_FORKING,
+	CR_STATE_PRE_RESTORER,
 	/*
 	 * Main restore stage. By the end of it all tasks are
 	 * almost ready and what's left is:

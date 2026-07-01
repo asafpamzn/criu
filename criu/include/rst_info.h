@@ -17,6 +17,7 @@ struct task_entries {
 	mutex_t userns_sync_lock;
 	mutex_t cgroupd_sync_lock;
 	mutex_t last_pid_mutex;
+	int asyncd_sk_id;
 };
 
 struct fdt {

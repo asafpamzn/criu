@@ -44,6 +44,7 @@ obj-y			+= mount.o
 obj-y			+= mount-v2.o
 obj-y			+= filesystems.o
 obj-y			+= namespaces.o
+obj-y			+= asyncd.o
 obj-y			+= netfilter.o
 obj-y			+= net.o
 obj-y			+= pagemap-cache.o

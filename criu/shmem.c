@@ -28,6 +28,7 @@
 #include "protobuf.h"
 #include "images/pagemap.pb-c.h"
 #include "namespaces.h"
+#include "asyncd.h"
 
 #ifndef SEEK_DATA
 #define SEEK_DATA 3
@@ -516,23 +517,18 @@ int restore_sysv_shmem_content(void *addr, unsigned long size, unsigned long shm
 	return do_restore_shmem_content(addr, round_up(size, PAGE_SIZE), shmid);
 }
 
-int restore_memfd_shmem_content(int fd, unsigned long shmid, unsigned long size)
+int restore_shmem_fd_content(int fd, unsigned long shmid, unsigned long size)
 {
-	void *addr = NULL;
-	int ret = 1;
+	void *addr = MAP_FAILED;
+	int exit_code = -1;
 
 	if (size == 0)
 		return 0;
 
-	if (ftruncate(fd, size) < 0) {
-		pr_perror("Can't resize shmem 0x%lx size=%ld", shmid, size);
-		goto out;
-	}
-
 	addr = mmap(NULL, size, PROT_WRITE | PROT_READ, MAP_SHARED, fd, 0);
 	if (addr == MAP_FAILED) {
-		pr_perror("Can't mmap shmem 0x%lx size=%ld", shmid, size);
-		goto out;
+		pr_perror("Can't mmap shmem 0x%lx size=%lu", shmid, size);
+		goto err;
 	}
 
 	/*
@@ -540,15 +536,24 @@ int restore_memfd_shmem_content(int fd, unsigned long shmid, unsigned long size)
 	 */
 	if (do_restore_shmem_content(addr, round_up(size, PAGE_SIZE), shmid) < 0) {
 		pr_err("Can't restore shmem content\n");
-		goto out;
+		goto err;
 	}
 
-	ret = 0;
-
-out:
-	if (addr)
+	exit_code = 0;
+err:
+	if (addr != MAP_FAILED)
 		munmap(addr, size);
-	return ret;
+	return exit_code;
+}
+
+int async_restore_shmem_content(void *arg, int fd, pid_t pid)
+{
+	struct async_restore_shmem_args *args = arg;
+
+	if (restore_shmem_fd_content(fd, args->shmid, args->size))
+		return -1;
+
+	return 0;
 }
 
 struct open_map_file_args {
@@ -607,43 +612,59 @@ static int open_shmem(int pid, struct vma_area *vma)
 			pr_perror("Unable to create memfd");
 			goto err;
 		}
-
-		if (ftruncate(f, si->size)) {
-			pr_perror("Unable to truncate memfd");
+		if (ftruncate(f, si->size) < 0) {
+			pr_perror("Can't resize shmem 0x%" PRIx64 " size=%lu", vi->shmid, si->size);
 			goto err;
 		}
 		flags |= MAP_FILE;
 	} else
 		flags |= MAP_ANONYMOUS;
 
-	/*
-	 * The following hack solves problems:
-	 * vi->pgoff may be not zero in a target process.
-	 * This mapping may be mapped more then once.
-	 * The restorer doesn't have snprintf.
-	 * Here is a good place to restore content
-	 */
-	addr = mmap(NULL, si->size, PROT_WRITE | PROT_READ, flags, f, 0);
-	if (addr == MAP_FAILED) {
-		pr_perror("Can't mmap shmid=0x%" PRIx64 " size=%ld", vi->shmid, si->size);
-		goto err;
-	}
-
-	if (restore_shmem_content(addr, si) < 0) {
-		pr_err("Can't restore shmem content\n");
-		goto err;
-	}
-
 	if (f == -1) {
-		struct open_map_file_args args = {
-			.addr = (unsigned long)addr,
-			.size = si->size,
-		};
+		struct open_map_file_args args;
+
+		addr = mmap(NULL, si->size, PROT_WRITE | PROT_READ, flags, f, 0);
+		if (addr == MAP_FAILED) {
+			pr_perror("Can't mmap shmid=0x%" PRIx64 " size=%lu", vi->shmid, si->size);
+			goto err;
+		}
+		args.addr = (unsigned long)addr;
+		args.size = si->size;
 		f = userns_call(open_map_file, UNS_FDOUT, &args, sizeof(args), -1);
 		if (f < 0)
 			goto err;
+		munmap(addr, si->size);
+		addr = MAP_FAILED;
 	}
-	munmap(addr, si->size);
+
+	/*
+	 * The following hack solves problems:
+	 * vi->pgoff may be not zero in a target process.
+	 * This mapping may be mapped more than once.
+	 * The restorer doesn't have snprintf.
+	 * Here is a good place to restore content
+	 */
+	if (opts.stream) {
+		/*
+		 * The async fill daemon reads content out-of-band, which is
+		 * incompatible with the single sequential pass of
+		 * criu-image-streamer, so fill inline when restoring from a
+		 * stream.
+		 */
+		if (restore_shmem_fd_content(f, si->shmid, si->size))
+			goto err;
+	} else {
+		struct async_restore_shmem_args async_args = {
+			.shmid = si->shmid,
+			.size = si->size,
+		};
+
+		if (async_call(async_restore_shmem_content, 0,
+			       &async_args, sizeof(async_args), f)) {
+			pr_err("Can't offload shmem restore\n");
+			goto err;
+		}
+	}
 
 	si->fd = f;
 
